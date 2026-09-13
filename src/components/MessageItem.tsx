@@ -33,12 +33,15 @@ export function MessageItem({
   streaming,
   readOnly,
   running,
+  editBlocked,
 }: {
   msg: Message;
   isLastUser: boolean;
   streaming: boolean;
   readOnly: boolean;
   running: boolean;
+  /** 临时空间对话：合并点（含）之前的消息不可编辑重发 */
+  editBlocked?: boolean;
 }) {
   const pushToast = useStore((s) => s.pushToast);
   const [editing, setEditing] = useState(false);
@@ -103,7 +106,7 @@ export function MessageItem({
     return (
       <div className="flex justify-end group relative">
         <div className="max-w-[85%] flex items-start gap-2">
-          {isLastUser && !running && !readOnly && (
+          {isLastUser && !running && !readOnly && !editBlocked && (
             <button
               className="opacity-0 group-hover:opacity-100 mt-2 w-7 h-7 rounded-lg hover:bg-panel3 flex items-center justify-center text-inkdim shrink-0"
               title="编辑并重新发送（其后的消息将被作废）"

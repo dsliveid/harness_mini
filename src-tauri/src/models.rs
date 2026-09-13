@@ -229,6 +229,169 @@ pub struct Session {
     pub last_message_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// 临时空间对话：工作区为项目/关联项目的临时副本，合并前原目录不受影响
+    #[serde(default)]
+    pub is_temp: bool,
+    #[serde(default)]
+    pub temp_code: Option<String>,
+    #[serde(default)]
+    pub temp_root: Option<String>,
+    /// 临时空间来源：主项目原始目录
+    #[serde(default)]
+    pub source_workspace: Option<String>,
+    /// 最近一次合并时的消息序号边界：该序号（含）之前的消息永久不可编辑重发
+    #[serde(default)]
+    pub merged_seq: Option<i64>,
+    /// 已合并且临时空间尚未清空：期间禁止继续发送消息（清空后解除）
+    #[serde(default)]
+    pub merged_pending: bool,
+}
+
+/// 临时空间中被拷贝的单个项目条目（主项目 key="main"，关联项目 key="link:<id>"）
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TempProjectEntry {
+    pub key: String,
+    pub name: String,
+    pub source: String,
+    pub temp: String,
+    #[serde(default)]
+    pub description: String,
+    /// 拷贝后基线提交的 commit sha（变更检测与合并的对照基准）
+    #[serde(default)]
+    pub baseline: Option<String>,
+}
+
+/// 临时空间清单：会话与 `数据目录\temp-project\<code>` 的映射快照（存 session_kv）
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TempManifest {
+    pub code: String,
+    pub root: String,
+    pub projects: Vec<TempProjectEntry>,
+}
+
+/// alloc_temp_code 返回给草稿的临时空间计划（首发落库时原样回传）
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TempAlloc {
+    pub code: String,
+    pub root: String,
+    pub main_temp: String,
+    pub source_workspace: String,
+    pub projects: Vec<TempProjectEntry>,
+}
+
+/// get_temp_info：驱动临时对话按钮禁用态与消息编辑边界的运行时状态
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TempInfo {
+    pub is_temp: bool,
+    /// 临时空间目录当前是否存在
+    pub exists: bool,
+    pub has_changes: bool,
+    pub changed_count: usize,
+    pub merged: bool,
+    pub merged_pending: bool,
+    pub merged_seq: Option<i64>,
+    pub temp_root: Option<String>,
+    pub source_workspace: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MergeProjectSummary {
+    pub name: String,
+    pub source: String,
+    /// 直接复制写回的文件数
+    pub applied: usize,
+    /// 经 AI 智能合并写回的文件数
+    pub ai_merged: usize,
+    /// 未能自动处理（需人工介入）的条目："路径: 原因"
+    pub skipped: Vec<String>,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MergeSummary {
+    pub projects: Vec<MergeProjectSummary>,
+    pub total_applied: usize,
+    pub total_ai_merged: usize,
+    pub total_skipped: usize,
+}
+
+// ---------- 变更列表 / 文件 diff（临时空间变更弹窗） ----------
+
+/// 变更文件条目（左侧列表）
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TempChangeFile {
+    /// 相对项目根的路径（正斜杠，来自 git 输出）
+    pub path: String,
+    pub name: String,
+    /// added | modified | deleted
+    pub change: String,
+    pub added: usize,
+    pub removed: usize,
+    pub binary: bool,
+    pub too_large: bool,
+}
+
+/// 按项目分组的变更（左侧列表的分组头）
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TempChangeProject {
+    pub key: String,
+    pub name: String,
+    pub source: String,
+    pub temp: String,
+    pub files: Vec<TempChangeFile>,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TempChanges {
+    pub total_files: usize,
+    pub projects: Vec<TempChangeProject>,
+}
+
+/// diff 行：tag = same | del | add；old_no / new_no 为 1 起始行号（该侧无对应行时为 None）
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffLine {
+    pub tag: String,
+    pub old_no: Option<usize>,
+    pub new_no: Option<usize>,
+    pub text: String,
+}
+
+/// diff 分块（±3 行上下文），同一份数据可渲染统一视图与并排对比
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffHunk {
+    pub old_start: usize,
+    pub old_lines: usize,
+    pub new_start: usize,
+    pub new_lines: usize,
+    pub lines: Vec<DiffLine>,
+}
+
+/// 单文件 diff（弹窗右侧）
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TempFileDiff {
+    pub project_key: String,
+    pub project_name: String,
+    pub path: String,
+    pub name: String,
+    pub change: String,
+    pub binary: bool,
+    pub too_large: bool,
+    pub added: usize,
+    pub removed: usize,
+    /// diff 行数超限时截断
+    pub truncated: bool,
+    pub hunks: Vec<DiffHunk>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -291,6 +454,9 @@ pub struct SendResult {
     pub session_id: String,
     pub message_id: String,
     pub queued: bool,
+    /// 会话实体（草稿首发落库时为新会话）：前端在切换会话前先入列，
+    /// 避免「currentId 已切换、会话事件未到达」期间界面按草稿渲染造成闪现
+    pub session: Option<Session>,
 }
 
 /// 粗略 token 估算：CJK 按字计、其余按 4 字符 1 token

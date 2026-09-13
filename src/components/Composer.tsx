@@ -9,15 +9,25 @@ export function Composer() {
   const readOnly = useStore((s) => s.readOnly);
   const session = useStore((s) => (s.currentId && s.currentId !== DRAFT_ID ? s.sessions.find((x) => x.id === s.currentId) ?? null : null));
   const draft = useStore((s) => s.draft);
+  const tempInfo = useStore((s) => s.tempInfo);
   const selectSession = useStore((s) => s.selectSession);
   const pushToast = useStore((s) => s.pushToast);
 
   const [text, setText] = useState("");
   const taRef = useRef<HTMLTextAreaElement>(null);
 
+  // 临时空间对话：已合并且临时空间未清空期间禁止发送（清空后可继续）
+  const tempBlocked = !!(
+    session?.mergedPending &&
+    session.isTemp &&
+    (tempInfo[session.id]?.exists ?? false)
+  );
+
   // 空对话（未选中会话/临时对话）也可发送：首条消息发送后由后端自动落库为新会话
-  const canSend = !readOnly;
-  const placeholder = readOnly
+  const canSend = !readOnly && !tempBlocked;
+  const placeholder = tempBlocked
+    ? "已合并到原项目，清空临时空间后可继续发送消息"
+    : readOnly
     ? "已归档会话为只读，取消归档后可继续对话"
     : running
     ? "Agent 运行中…输入消息回车将加入待执行列表"
@@ -57,10 +67,19 @@ export function Composer() {
         isDraftLike ? null : currentId,
         t,
         isDraftLike ? draft?.workspacePath ?? undefined : undefined,
-        isDraftLike ? draft?.projectId ?? st.currentProjectId ?? undefined : undefined
+        isDraftLike ? draft?.projectId ?? st.currentProjectId ?? undefined : undefined,
+        isDraftLike ? draft?.temp ?? undefined : undefined
       );
+      const st2 = useStore.getState();
+      // 后端随结果带回会话实体：切换前先入列，避免「currentId 已切换、会话事件未到达」
+      // 期间顶栏/输入框按未保存草稿渲染造成闪现
+      if (res.session) st2.onSessionUpdate(res.session);
+      // 已触发运行：立即进入运行态，停止按钮不再等待 run:status 事件（事件稍后覆盖为同一状态）
+      if (!res.queued && res.sessionId && st2.runStatus[res.sessionId] === undefined) {
+        st2.onRunStatus({ sessionId: res.sessionId, status: "running" });
+      }
       if (isDraftLike && res.sessionId) {
-        await selectSession(res.sessionId);
+        await st2.selectSession(res.sessionId);
       }
     } catch (e) {
       pushToast(String(e));

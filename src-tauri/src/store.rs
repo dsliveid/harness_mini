@@ -108,6 +108,13 @@ fn init(conn: &Connection) -> Result<(), String> {
     // 旧库迁移：projects 补 path / constraints 列（新建库的 CREATE TABLE 已含该列时跳过）
     ensure_column(conn, "projects", "path", "path TEXT")?;
     ensure_column(conn, "projects", "constraints", "constraints TEXT NOT NULL DEFAULT ''")?;
+    // 临时空间对话字段
+    ensure_column(conn, "sessions", "is_temp", "is_temp INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "sessions", "temp_code", "temp_code TEXT")?;
+    ensure_column(conn, "sessions", "temp_root", "temp_root TEXT")?;
+    ensure_column(conn, "sessions", "source_workspace", "source_workspace TEXT")?;
+    ensure_column(conn, "sessions", "merged_seq", "merged_seq INTEGER")?;
+    ensure_column(conn, "sessions", "merged_pending", "merged_pending INTEGER NOT NULL DEFAULT 0")?;
     Ok(())
 }
 
@@ -486,6 +493,31 @@ mod tests {
         create_project(&conn, "A", Some("D:\\a")).unwrap();
         assert!(find_project_by_path(&conn, "d:/a/").unwrap().is_some());
     }
+
+    #[test]
+    fn session_temp_and_merge_state_roundtrip() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let s = create_session(&conn, "D:\\tmp\\x", None, "t").unwrap();
+        assert!(!s.is_temp);
+        set_session_temp(&conn, &s.id, "abc123", "D:\\data\\temp-project\\abc123", "D:\\proj").unwrap();
+        let got = get_session(&conn, &s.id).unwrap().unwrap();
+        assert!(got.is_temp);
+        assert_eq!(got.temp_code.as_deref(), Some("abc123"));
+        assert_eq!(got.temp_root.as_deref(), Some("D:\\data\\temp-project\\abc123"));
+        assert_eq!(got.source_workspace.as_deref(), Some("D:\\proj"));
+
+        set_session_merge_state(&conn, &s.id, Some(9), true).unwrap();
+        let got = get_session(&conn, &s.id).unwrap().unwrap();
+        assert_eq!(got.merged_seq, Some(9));
+        assert!(got.merged_pending);
+
+        // 清空临时空间后解除禁止发送，但编辑边界保留
+        set_session_merge_state(&conn, &s.id, got.merged_seq, false).unwrap();
+        let got = get_session(&conn, &s.id).unwrap().unwrap();
+        assert!(!got.merged_pending);
+        assert_eq!(got.merged_seq, Some(9));
+    }
 }
 
 pub fn remove_project(conn: &Connection, id: &str) -> Result<(), String> {
@@ -631,11 +663,18 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         last_message_at: r.get(6)?,
         created_at: r.get(7)?,
         updated_at: r.get(8)?,
+        is_temp: r.get::<_, i64>(9)? != 0,
+        temp_code: r.get(10)?,
+        temp_root: r.get(11)?,
+        source_workspace: r.get(12)?,
+        merged_seq: r.get(13)?,
+        merged_pending: r.get::<_, i64>(14)? != 0,
     })
 }
 
 const SESSION_COLS: &str =
-    "id, title, workspace_path, access_mode, project_id, status, last_message_at, created_at, updated_at";
+    "id, title, workspace_path, access_mode, project_id, status, last_message_at, created_at, updated_at, \
+     is_temp, temp_code, temp_root, source_workspace, merged_seq, merged_pending";
 
 pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>, String> {
     conn.query_row(
@@ -676,6 +715,12 @@ pub fn create_session(
         last_message_at: Some(t.clone()),
         created_at: t.clone(),
         updated_at: t,
+        is_temp: false,
+        temp_code: None,
+        temp_root: None,
+        source_workspace: None,
+        merged_seq: None,
+        merged_pending: false,
     };
     conn.execute(
         "INSERT INTO sessions(id, title, workspace_path, access_mode, project_id, status, last_message_at, created_at, updated_at)
@@ -741,6 +786,26 @@ pub fn set_session_mode(conn: &Connection, id: &str, mode: Option<&str>) -> Resu
     conn.execute(
         "UPDATE sessions SET access_mode = ?2 WHERE id = ?1",
         params![id, mode],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 标记临时空间会话（workspace_path 已是临时副本路径）
+pub fn set_session_temp(conn: &Connection, id: &str, code: &str, root: &str, source_workspace: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE sessions SET is_temp = 1, temp_code = ?2, temp_root = ?3, source_workspace = ?4, updated_at = ?5 WHERE id = ?1",
+        params![id, code, root, source_workspace, now()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 更新合并状态：merged_seq 记录消息编辑边界（永久生效），merged_pending 表示待清空临时空间（清空时解除）
+pub fn set_session_merge_state(conn: &Connection, id: &str, merged_seq: Option<i64>, merged_pending: bool) -> Result<(), String> {
+    conn.execute(
+        "UPDATE sessions SET merged_seq = ?2, merged_pending = ?3, updated_at = ?4 WHERE id = ?1",
+        params![id, merged_seq, merged_pending as i64, now()],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -1111,6 +1176,16 @@ pub fn set_kv(conn: &Connection, session_id: &str, key: &str, value: &str) -> Re
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+pub fn get_kv(conn: &Connection, session_id: &str, key: &str) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT value FROM session_kv WHERE session_id = ?1 AND key = ?2",
+        params![session_id, key],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
 }
 
 // ---------- secrets（API Key 加密落库） ----------

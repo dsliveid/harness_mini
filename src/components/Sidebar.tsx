@@ -62,11 +62,13 @@ export function Sidebar() {
   const setView = useStore((s) => s.setView);
   const enterProject = useStore((s) => s.enterProject);
   const newDraft = useStore((s) => s.newDraft);
+  const newTempDraft = useStore((s) => s.newTempDraft);
   const selectSession = useStore((s) => s.selectSession);
   const draft = useStore((s) => s.draft);
   const setShowArchive = useStore((s) => s.setShowArchive);
   const setShowSettings = useStore((s) => s.setShowSettings);
   const setProjectSettings = useStore((s) => s.setProjectSettings);
+  const pushToast = useStore((s) => s.pushToast);
   const [menuFor, setMenuFor] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   // 项目视图顶部大分类（项目 / 对话）的收起状态
@@ -94,18 +96,30 @@ export function Sidebar() {
         const t = await askPrompt({ title: "重命名会话", value: s.title });
         if (t && t.trim()) await ipc.renameSession(s.id, t.trim());
       } },
-    { label: "归档", onClick: () => ipc.archiveSession(s.id) },
+    { label: "归档", onClick: async () => {
+        // 临时空间对话在其临时空间未清空时会被后端拒绝，需把原因提示出来
+        try {
+          await ipc.archiveSession(s.id);
+        } catch (e) {
+          pushToast(String(e));
+        }
+      } },
     { label: "删除", danger: true, onClick: async () => {
-        if (await askConfirm(`确定删除会话「${s.title}」？`)) {
+        if (!(await askConfirm(`确定删除会话「${s.title}」？`))) return;
+        try {
           await ipc.deleteSession(s.id);
           if (currentId === s.id) newDraft(s.projectId ?? null); // 落回可发送的空对话（保持项目上下文）
+        } catch (e) {
+          pushToast(String(e));
         }
       } },
   ];
 
-  const projectMenu = (pid: string, pinned: boolean) => [
+  const projectMenu = (pid: string, pinned: boolean, hasPath: string | null | undefined) => [
+    ...(hasPath
+      ? [{ label: "临时空间对话", onClick: () => void newTempDraft(pid) }]
+      : []),
     { label: "项目设置", onClick: () => setProjectSettings(pid) },
-    { label: "新建对话", onClick: () => newDraft(pid) },
     { label: pinned ? "取消固定" : "固定到顶部", onClick: () => ipc.setProjectPinned(pid, !pinned) },
     { label: "移除项目", danger: true, onClick: async () => {
         if (await askConfirm("移除该项目？（项目下的对话将移回顶层，不会被删除）", "移除")) {
@@ -127,9 +141,16 @@ export function Sidebar() {
           <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse shrink-0" title="Agent 运行中" />
         )}
         <div className="flex-1 min-w-0">
-          <div className="truncate text-[13px]">{s.title}</div>
-          <div className={`text-[11px] ${isRunning ? "text-green-400" : "text-inkdim"}`}>
-            {isRunning ? "运行中…" : timeLabel(s.lastMessageAt ?? s.createdAt)}
+          <div className="truncate text-[13px]" title={s.title}>
+            {s.title}
+          </div>
+          <div className={`flex items-center gap-1.5 text-[11px] ${isRunning ? "text-green-400" : "text-inkdim"}`}>
+            <span className="truncate">{isRunning ? "运行中…" : timeLabel(s.lastMessageAt ?? s.createdAt)}</span>
+            {s.isTemp && (
+              <span className="shrink-0 px-1.5 py-[1px] rounded text-[10px] leading-none bg-amber-500/15 text-amber-400 border border-amber-500/30">
+                临时
+              </span>
+            )}
           </div>
         </div>
         <button
@@ -248,6 +269,28 @@ export function Sidebar() {
                               {p.name}
                             </div>
                           </div>
+                          {p.path && (
+                            <button
+                              className="opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-[13px] leading-none"
+                              title="临时空间（拷贝项目到临时目录开新对话，原目录不受影响）"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void newTempDraft(p.id);
+                              }}
+                            >
+                              🌪
+                            </button>
+                          )}
+                          <button
+                            className="opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-inkdim text-[15px] leading-none"
+                            title="新建对话（归入该项目）"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              newDraft(p.id);
+                            }}
+                          >
+                            +
+                          </button>
                           <button
                             className={`opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-inkdim ${
                               menuFor === p.id ? "opacity-100" : ""
@@ -259,7 +302,7 @@ export function Sidebar() {
                           >
                             …
                           </button>
-                          {menuFor === p.id && <ItemMenu items={projectMenu(p.id, p.pinned)} onClose={() => setMenuFor(null)} />}
+                          {menuFor === p.id && <ItemMenu items={projectMenu(p.id, p.pinned, p.path)} onClose={() => setMenuFor(null)} />}
                         </div>
                         {!isCollapsed &&
                           children.map((s) => <SessionRow key={s.id} s={s} indent={true} />)}

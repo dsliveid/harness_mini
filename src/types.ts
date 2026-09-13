@@ -57,6 +57,111 @@ export interface Session {
   lastMessageAt?: string | null;
   createdAt: string;
   updatedAt: string;
+  /** 临时空间对话：工作区为项目/关联项目的临时副本 */
+  isTemp: boolean;
+  /** 临时空间来源：主项目原始目录 */
+  sourceWorkspace?: string | null;
+  mergedSeq?: number | null; // 最近一次合并的消息序号边界，之前的消息不可编辑
+  mergedPending: boolean; // 已合并且临时空间未清空：禁止继续发送
+}
+
+/** 临时空间中被拷贝的单个项目条目（主项目 key="main"，关联项目 key="link:<id>"） */
+export interface TempProjectEntry {
+  key: string;
+  name: string;
+  source: string;
+  temp: string;
+  description: string;
+  baseline?: string | null;
+}
+
+/** alloc_temp_code 返回的临时空间计划（草稿持有，首发落库时原样回传） */
+export interface TempAlloc {
+  code: string;
+  root: string;
+  mainTemp: string;
+  sourceWorkspace: string;
+  projects: TempProjectEntry[];
+}
+
+/** 临时空间运行时状态（后端 get_temp_info / temp:update 事件） */
+export interface TempInfo {
+  isTemp: boolean;
+  exists: boolean;
+  hasChanges: boolean;
+  changedCount: number;
+  merged: boolean;
+  mergedPending: boolean;
+  mergedSeq?: number | null;
+  tempRoot?: string | null;
+  sourceWorkspace?: string | null;
+}
+
+/** 合并结果汇总 */
+export interface MergeSummary {
+  projects: { name: string; source: string; applied: number; aiMerged: number; skipped: string[] }[];
+  totalApplied: number;
+  totalAiMerged: number;
+  totalSkipped: number;
+}
+
+// ---------- 临时空间变更列表 / 文件 diff ----------
+
+/** 变更文件条目（弹窗左侧列表项） */
+export interface TempChangeFile {
+  path: string;
+  name: string;
+  change: "added" | "modified" | "deleted";
+  added: number;
+  removed: number;
+  binary: boolean;
+  tooLarge: boolean;
+}
+
+/** 按项目分组的变更（弹窗左侧分组头） */
+export interface TempChangeProject {
+  key: string;
+  name: string;
+  source: string;
+  temp: string;
+  files: TempChangeFile[];
+}
+
+export interface TempChanges {
+  totalFiles: number;
+  projects: TempChangeProject[];
+}
+
+/** diff 行：tag = same | del | add；oldNo / newNo 为 1 起始行号（该侧无对应行时为 null） */
+export interface DiffLine {
+  tag: "same" | "del" | "add";
+  oldNo?: number | null;
+  newNo?: number | null;
+  text: string;
+}
+
+/** diff 分块（±3 行上下文），统一视图与并排对比共用 */
+export interface DiffHunk {
+  oldStart: number;
+  oldLines: number;
+  newStart: number;
+  newLines: number;
+  lines: DiffLine[];
+}
+
+/** 单文件 diff（弹窗右侧） */
+export interface TempFileDiff {
+  projectKey: string;
+  projectName: string;
+  path: string;
+  name: string;
+  change: "added" | "modified" | "deleted";
+  binary: boolean;
+  tooLarge: boolean;
+  added: number;
+  removed: number;
+  truncated: boolean;
+  hunks: DiffHunk[];
 }
 
 export interface ToolEvent {

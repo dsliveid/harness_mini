@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DataStatus, Message, Project, ProjectLink, Session, Settings, ToolEvent } from "./types";
+import type { DataStatus, Message, MergeSummary, Project, ProjectLink, Session, Settings, TempAlloc, TempChanges, TempFileDiff, TempInfo, ToolEvent } from "./types";
 
 export const ipc = {
   getSettings: () => invoke<Settings>("get_settings"),
@@ -45,12 +45,19 @@ export const ipc = {
   getMessages: (sessionId: string, beforeSeq?: number, limit?: number) =>
     invoke<Message[]>("get_messages", { sessionId, beforeSeq: beforeSeq ?? null, limit: limit ?? 200 }),
 
-  sendMessage: (sessionId: string | null, text: string, workspacePath?: string, projectId?: string) =>
-    invoke<{ sessionId: string; messageId: string; queued: boolean }>("send_message", {
+  sendMessage: (
+    sessionId: string | null,
+    text: string,
+    workspacePath?: string,
+    projectId?: string,
+    temp?: TempAlloc,
+  ) =>
+    invoke<{ sessionId: string; messageId: string; queued: boolean; session?: Session | null }>("send_message", {
       sessionId,
       text,
       workspacePath: workspacePath ?? null,
       projectId: projectId ?? null,
+      temp: temp ?? null,
     }),
   listQueued: (sessionId: string) => invoke<Message[]>("list_queued", { sessionId }),
   guideMessage: (sessionId: string, messageId: string) =>
@@ -64,6 +71,18 @@ export const ipc = {
   respondApproval: (eventId: string, decision: string, reason?: string) =>
     invoke<void>("respond_approval", { eventId, decision, reason: reason ?? null }),
   getSessionTodos: (sessionId: string) => invoke<any>("get_session_todos", { sessionId }),
+
+  // 临时空间
+  allocTempCode: (projectId: string) => invoke<TempAlloc>("alloc_temp_code", { projectId }),
+  getTempInfo: (sessionId: string) => invoke<TempInfo>("get_temp_info", { sessionId }),
+  listTempChanges: (sessionId: string) => invoke<TempChanges>("list_temp_changes", { sessionId }),
+  getTempChangeDiff: (sessionId: string, projectKey: string, path: string) =>
+    invoke<TempFileDiff>("get_temp_change_diff", { sessionId, projectKey, path }),
+  mergeTempSpace: (sessionId: string) => invoke<MergeSummary>("merge_temp_space", { sessionId }),
+  clearTempSpace: (sessionId: string) => invoke<void>("clear_temp_space", { sessionId }),
+
+  // 打开目录（系统文件管理器）
+  openDir: (path: string) => invoke<void>("open_dir", { path }),
 };
 
-export type { Message, Session, Project, ProjectLink, Settings, ToolEvent, DataStatus };
+export type { Message, Session, Project, ProjectLink, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary };

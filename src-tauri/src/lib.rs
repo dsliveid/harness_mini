@@ -7,6 +7,7 @@ mod models;
 mod paths;
 mod secrets;
 mod store;
+mod temp;
 mod tools;
 
 use agent::SessionHandle;
@@ -207,6 +208,13 @@ pub fn run() {
             commands::edit_and_resend,
             commands::respond_approval,
             commands::get_session_todos,
+            commands::alloc_temp_code,
+            commands::get_temp_info,
+            commands::list_temp_changes,
+            commands::get_temp_change_diff,
+            commands::merge_temp_space,
+            commands::clear_temp_space,
+            commands::open_dir,
             commands::get_data_status,
             commands::set_data_dir,
             commands::reset_data_dir,

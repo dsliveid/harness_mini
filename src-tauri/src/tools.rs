@@ -31,6 +31,9 @@ pub struct ToolSpec {
 
 pub struct ToolCtx {
     pub workspace: PathBuf,
+    /// 路径越界判定用的沙箱根：临时空间会话为临时空间根目录（含主项目与关联项目副本）；
+    /// 普通会话为 None（等同 workspace）
+    pub sandbox_root: Option<PathBuf>,
     pub command_timeout: std::time::Duration,
 }
 
@@ -181,10 +184,11 @@ fn resolve(ctx: &ToolCtx, rel: &str) -> PathBuf {
     }
 }
 
-/// 路径是否位于工作区内（用于审批判定）
+/// 路径是否位于沙箱内（用于审批判定；临时空间会话的沙箱为整个临时空间根目录）
 pub fn inside_workspace(ctx: &ToolCtx, rel: &str) -> bool {
     let p = resolve(ctx, rel);
-    match (p.canonicalize(), ctx.workspace.canonicalize()) {
+    let root = ctx.sandbox_root.as_ref().unwrap_or(&ctx.workspace);
+    match (p.canonicalize(), root.canonicalize()) {
         (Ok(p), Ok(w)) => p.starts_with(&w),
         _ => false,
     }

@@ -3,6 +3,7 @@ use crate::llm::{self, LlmCfg};
 use crate::models::*;
 use crate::store;
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, State};
 
@@ -214,6 +215,7 @@ pub fn rename_session(state: State<'_, crate::AppState>, app: AppHandle, id: Str
 
 #[tauri::command]
 pub fn delete_session(state: State<'_, crate::AppState>, app: AppHandle, id: String) -> Result<(), String> {
+    ensure_temp_cleared(&state, &id)?;
     if is_run_active(&state, &id) {
         agent::stop_session(&app, &id);
     }
@@ -226,11 +228,29 @@ pub fn delete_session(state: State<'_, crate::AppState>, app: AppHandle, id: Str
 
 #[tauri::command]
 pub fn archive_session(state: State<'_, crate::AppState>, app: AppHandle, id: String) -> Result<(), String> {
+    // 与删除同一流程：临时空间仍在时禁止归档，须先清空
+    ensure_temp_cleared(&state, &id)?;
     let db = state.db.lock().unwrap();
     store::set_session_status(&db, &id, "archived")?;
     drop(db);
     emit_session(&state, &app, &id);
     let _ = app.emit("sessions:changed", json!({"archived": id}));
+    Ok(())
+}
+
+/// 生命周期守卫：临时空间对话在其临时空间目录仍存在时不允许删除/归档
+fn ensure_temp_cleared(state: &crate::AppState, id: &str) -> Result<(), String> {
+    let db = state.db.lock().unwrap();
+    if let Some(s) = store::get_session(&db, id)? {
+        if s.is_temp
+            && s.temp_root
+                .as_deref()
+                .map(|r| Path::new(r).exists())
+                .unwrap_or(false)
+        {
+            return Err("该对话存在临时空间，请先清空临时空间后再删除/归档".into());
+        }
+    }
     Ok(())
 }
 
@@ -300,6 +320,7 @@ pub fn send_message(
     text: String,
     workspace_path: Option<String>,
     project_id: Option<String>,
+    temp: Option<TempAlloc>,
 ) -> Result<SendResult, String> {
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -310,6 +331,40 @@ pub fn send_message(
         // 临时对话：首次发送时才真正落库
         let sid = match session_id {
             Some(id) => id,
+            None if temp.is_some() => {
+                // 临时空间对话：落库为临时会话。工作区 = 主项目临时副本；
+                // 归属原项目；绝不按临时路径自动创建项目；不记住 last_workspace_path
+                let t = temp.unwrap();
+                let proj_id = project_id.ok_or("临时空间对话缺少归属项目")?;
+                store::get_project(&db, &proj_id)?.ok_or("归属项目不存在")?;
+                let data_dir = state
+                    .data_dir
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or("数据目录不可用")?;
+                let root = PathBuf::from(&t.root);
+                crate::temp::validate_root(&root, &data_dir)?;
+                for p in &t.projects {
+                    if !crate::temp::is_under(Path::new(&p.temp), &root) {
+                        return Err(format!("临时空间路径非法: {}", p.temp));
+                    }
+                }
+                let title: String = text.chars().take(24).collect();
+                let s = store::create_session(&db, &t.main_temp, Some(&proj_id), &title)?;
+                store::set_session_temp(&db, &s.id, &t.code, &t.root, &t.source_workspace)?;
+                crate::temp::save_manifest(
+                    &db,
+                    &s.id,
+                    &TempManifest {
+                        code: t.code.clone(),
+                        root: t.root.clone(),
+                        projects: t.projects.clone(),
+                    },
+                )?;
+                let _ = app.emit("sessions:changed", json!({"created": s.id}));
+                s.id
+            }
             None => {
                 // 空字符串 = 未绑定工作区（纯对话模式），草稿的工作区由前端显式传入
                 let ws = workspace_path.clone().unwrap_or_default();
@@ -332,11 +387,13 @@ pub fn send_message(
         let msg = store::new_message(&db, &sid, "user", Some(text), active)?;
         let msg_id = msg.id.clone();
         store::touch_session(&db, &sid)?;
-        // 记住最近工作区（未绑定工作区的纯对话不覆盖）
+        // 记住最近工作区（未绑定工作区的纯对话不覆盖；临时空间路径不记住）
+        let mut session_row: Option<Session> = None;
         if let Ok(Some(s)) = store::get_session(&db, &sid) {
             let ws = s.workspace_path.clone();
+            let is_temp = s.is_temp;
             let mut settings = store::get_settings(&db).unwrap_or_default();
-            if !ws.is_empty() {
+            if !ws.is_empty() && !is_temp {
                 settings.last_workspace_path = Some(ws);
             }
             let mut clean = settings.clone();
@@ -349,8 +406,9 @@ pub fn send_message(
                 );
             }
             let _ = app.emit("session:update", &s);
+            session_row = Some(s);
         }
-        let r = SendResult { session_id: sid, message_id: msg_id.clone(), queued: active };
+        let r = SendResult { session_id: sid, message_id: msg_id.clone(), queued: active, session: session_row };
         (r, (msg, active, msg_id))
     };
     let (msg, queued_flag, msg_id) = queued;
@@ -424,6 +482,14 @@ pub fn edit_and_resend(
         let m = store::get_message(&db, &message_id)?
             .filter(|m| m.session_id == session_id && m.role == "user" && !m.queued)
             .ok_or("仅支持编辑会话内的用户消息")?;
+        // 临时空间对话：合并点（含）之前的消息永久不可编辑重发
+        if let Some(s) = store::get_session(&db, &session_id)? {
+            if let Some(boundary) = s.merged_seq {
+                if m.seq <= boundary {
+                    return Err("合并前的消息不可编辑".into());
+                }
+            }
+        }
         store::update_message_content(&db, &message_id, &text, None)?;
         store::delete_messages_after(&db, &session_id, m.seq)?;
         store::touch_session(&db, &session_id)?;
@@ -464,6 +530,123 @@ pub fn get_session_todos(state: State<'_, crate::AppState>, session_id: String) 
         )
         .ok();
     Ok(raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null))
+}
+
+// ---------- 临时空间 ----------
+
+/// 为项目生成临时空间计划（仅地址，不创建目录）。git 不可用时拒绝并给出安装提示。
+#[tauri::command]
+pub fn alloc_temp_code(state: State<'_, crate::AppState>, project_id: String) -> Result<TempAlloc, String> {
+    let data_dir = state
+        .data_dir
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("数据目录不可用")?;
+    let (project, links) = {
+        let db = state.db.lock().unwrap();
+        (
+            store::get_project(&db, &project_id)?.ok_or("项目不存在")?,
+            store::list_project_links(&db, &project_id)?,
+        )
+    };
+    crate::temp::alloc(&data_dir, &project, &links)
+}
+
+/// 临时空间运行时状态：驱动临时目录 / 合并 / 清空按钮的禁用态
+#[tauri::command]
+pub fn get_temp_info(state: State<'_, crate::AppState>, session_id: String) -> Result<TempInfo, String> {
+    let db = state.db.lock().unwrap();
+    let s = store::get_session(&db, &session_id)?.ok_or("会话不存在")?;
+    Ok(crate::temp::temp_info(&db, &s))
+}
+
+/// 变更列表（弹窗左侧）：按项目分组 + 增删行数统计
+#[tauri::command]
+pub fn list_temp_changes(state: State<'_, crate::AppState>, session_id: String) -> Result<TempChanges, String> {
+    let manifest = {
+        let db = state.db.lock().unwrap();
+        let s = store::get_session(&db, &session_id)?.ok_or("会话不存在")?;
+        if !s.is_temp {
+            return Err("该对话不是临时空间对话".into());
+        }
+        crate::temp::load_manifest(&db, &session_id)?.ok_or("临时空间清单缺失")?
+    };
+    crate::temp::list_temp_changes(&manifest)
+}
+
+/// 单文件 diff（弹窗右侧；path 必须在变更清单内）
+#[tauri::command]
+pub fn get_temp_change_diff(
+    state: State<'_, crate::AppState>,
+    session_id: String,
+    project_key: String,
+    path: String,
+) -> Result<TempFileDiff, String> {
+    let manifest = {
+        let db = state.db.lock().unwrap();
+        let s = store::get_session(&db, &session_id)?.ok_or("会话不存在")?;
+        if !s.is_temp {
+            return Err("该对话不是临时空间对话".into());
+        }
+        crate::temp::load_manifest(&db, &session_id)?.ok_or("临时空间清单缺失")?
+    };
+    let entry = manifest
+        .projects
+        .iter()
+        .find(|p| p.key == project_key)
+        .ok_or("临时空间中不存在该项目")?;
+    crate::temp::file_diff(entry, &path)
+}
+
+/// 合并：把临时空间的变更写回各项目原目录（冲突走 AI 智能合并）
+#[tauri::command]
+pub async fn merge_temp_space(
+    state: State<'_, crate::AppState>,
+    app: AppHandle,
+    session_id: String,
+) -> Result<MergeSummary, String> {
+    crate::temp::merge_space(&state, &app, &session_id).await
+}
+
+/// 清空临时空间：删除整个随机码目录（含全部项目副本）。
+/// 声明为 async：删除整棵目录（大量小文件）可能耗时，同步命令会在主线程执行导致界面冻结闪现
+#[tauri::command]
+pub async fn clear_temp_space(state: State<'_, crate::AppState>, app: AppHandle, session_id: String) -> Result<(), String> {
+    crate::temp::clear_space(&state, &app, &session_id)
+}
+
+// ---------- 打开目录 ----------
+
+/// 在系统文件管理器中打开目录
+#[tauri::command]
+pub fn open_dir(path: String) -> Result<(), String> {
+    let p = PathBuf::from(path.trim());
+    if !p.is_dir() {
+        return Err(format!("目录不存在: {}", p.display()));
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer")
+            .arg(&p)
+            .spawn()
+            .map_err(|e| format!("打开目录失败: {e}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&p)
+            .spawn()
+            .map_err(|e| format!("打开目录失败: {e}"))?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&p)
+            .spawn()
+            .map_err(|e| format!("打开目录失败: {e}"))?;
+    }
+    Ok(())
 }
 
 // ---------- 数据目录 ----------

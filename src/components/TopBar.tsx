@@ -13,12 +13,15 @@ export function TopBar() {
   const projects = useStore((s) => s.projects);
   const runStatus = useStore((s) => s.runStatus);
   const setDraftWorkspace = useStore((s) => s.setDraftWorkspace);
+  const newDraft = useStore((s) => s.newDraft);
   const setSettingsLocal = useStore((s) => s.setSettingsLocal);
   const pushToast = useStore((s) => s.pushToast);
   const [wsMenu, setWsMenu] = useState(false);
 
   const running = currentId ? runStatus[currentId] === "running" : false;
   const workspacePath = session?.workspacePath ?? draft?.workspacePath ?? "";
+  // 临时空间对话（含未落库草稿）：工作区为临时副本，固定不可切换
+  const isTempConv = !!session?.isTemp || (currentId === DRAFT_ID && !!draft?.temp);
   // 顶栏模型选择：按厂商分组（optgroup）；激活厂商失效时回落到第一个有模型的厂商
   const groups = settings.providers.filter((p) => (p.models ?? []).length > 0);
   const active = resolveActiveModel(settings);
@@ -28,19 +31,25 @@ export function TopBar() {
     ? ((session.accessMode ?? settings.globalAccessMode) as "confirm" | "full_access")
     : settings.globalAccessMode;
 
-  // 已保存的对话工作空间只读：工作区在首次发送转正时固定，仅未保存草稿可选择/切换
+  // 已保存的对话工作空间只读：工作区在首次发送转正时固定，仅未保存草稿可选择/切换；
+  // 临时空间对话的工作区为临时副本，同样只读
   const isSaved = !!session;
 
   // 展示用：工作区对应的项目（工作区即项目），或仅绑定了无目录项目
   const boundProject = projects.find((p) => samePath(p.path, workspacePath));
   const boundProjectId = session?.projectId ?? draft?.projectId ?? null;
+  const boundProjectById = projects.find((p) => p.id === boundProjectId);
   const pathlessProject = !workspacePath ? projects.find((p) => p.id === boundProjectId && !p.path) : undefined;
-  const wsLabel = workspacePath
+  const wsLabel = isTempConv
+    ? `${boundProjectById?.name ?? "项目"}（临时空间）`
+    : workspacePath
     ? boundProject?.name ?? workspacePath
     : pathlessProject
     ? `${pathlessProject.name}（未绑定目录）`
     : "";
-  const wsTitle = isSaved
+  const wsTitle = isTempConv
+    ? `临时空间对话：工作区为「${boundProjectById?.name ?? "项目"}」及其关联项目的临时副本\n原目录 ${draft?.temp?.sourceWorkspace ?? session?.sourceWorkspace ?? ""} 不会被修改`
+    : isSaved
     ? `${workspacePath ? (boundProject ? `${boundProject.name}\n${boundProject.path}` : workspacePath) : "未绑定工作区"}\n对话已保存，工作空间为只读，不允许切换`
     : workspacePath
     ? boundProject
@@ -73,6 +82,11 @@ export function TopBar() {
   const clearWorkspace = () => {
     setWsMenu(false);
     if (currentId !== DRAFT_ID) return;
+    if (draft?.temp) {
+      // 临时空间草稿：丢弃整个临时空间计划，回到该项目的普通空对话
+      newDraft(draft.projectId);
+      return;
+    }
     setDraftWorkspace(null, null);
   };
 
@@ -96,14 +110,14 @@ export function TopBar() {
         {session?.title ?? (currentId === DRAFT_ID ? "新对话（未保存）" : "harness_mini")}
       </div>
 
-      {/* 工作区（工作区即项目：未保存草稿可选已有项目 / 目录 / 不选择；已保存对话只读） */}
+      {/* 工作区（工作区即项目：未保存草稿可选已有项目 / 目录 / 不选择；已保存与临时空间对话只读） */}
       <div className="relative flex items-center gap-1">
-        {isSaved ? (
+        {isSaved || isTempConv ? (
           <div
             className="flex items-center gap-1.5 bg-panel2 border border-edge rounded-lg px-2.5 py-1.5 text-[12px] text-inkdim max-w-[280px] cursor-default"
             title={wsTitle}
           >
-            <span>🔒</span>
+            <span>{isTempConv ? "🌪" : "🔒"}</span>
             <span className="truncate">{wsLabel || "未选择工作区"}</span>
           </div>
         ) : (
@@ -117,7 +131,7 @@ export function TopBar() {
             <span className="text-[10px] opacity-70">▾</span>
           </button>
         )}
-        {workspacePath && !isSaved && (
+        {workspacePath && !isSaved && !isTempConv && (
           <button
             className="w-5 h-5 rounded text-[11px] text-inkdim hover:text-ink hover:bg-panel2 flex items-center justify-center"
             title="清除工作区（转为纯对话）"
@@ -126,7 +140,17 @@ export function TopBar() {
             ✕
           </button>
         )}
-        {wsMenu && !isSaved && (
+        {/* 打开工作区目录（临时空间对话用临时目录按钮，见 TempActions） */}
+        {workspacePath && !isTempConv && (
+          <button
+            className="w-5 h-5 rounded text-[12px] text-inkdim hover:text-ink hover:bg-panel2 flex items-center justify-center"
+            title={`打开工作区目录\n${workspacePath}`}
+            onClick={() => ipc.openDir(workspacePath).catch((e) => pushToast(String(e)))}
+          >
+            📂
+          </button>
+        )}
+        {wsMenu && !isSaved && !isTempConv && (
           <>
             <div className="fixed inset-0 z-40" onMouseDown={() => setWsMenu(false)} />
             <div className="absolute left-0 top-10 z-50 w-[320px] bg-panel2 border border-edge rounded-lg shadow-xl py-1 max-h-[60vh] overflow-y-auto">

@@ -199,6 +199,13 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
     };
     let Some(session) = session else { return RunOutcome::Failed };
     let workspace = PathBuf::from(&session.workspace_path);
+    // 临时空间会话：每次运行前检查/重建临时空间（拷贝缺失的项目副本 + 基线提交）
+    if session.is_temp {
+        if let Err(e) = crate::temp::ensure_space(&state, app, &session) {
+            emit_error(app, session_id, "temp", format!("临时空间准备失败: {e}"));
+            return RunOutcome::Failed;
+        }
+    }
     // 未绑定工作区（空字符串）的会话为纯对话模式，跳过存在性检查
     if !session.workspace_path.is_empty() && !workspace.exists() {
         emit_error(app, session_id, "workspace", format!("工作区不存在: {}", session.workspace_path));
@@ -223,6 +230,12 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
 
     let tool_ctx = ToolCtx {
         workspace: workspace.clone(),
+        // 临时空间会话：沙箱为整个临时空间根目录（AI 可访问主项目与关联项目的临时副本）
+        sandbox_root: if session.is_temp {
+            session.temp_root.as_ref().map(PathBuf::from)
+        } else {
+            None
+        },
         command_timeout: Duration::from_secs(settings.command_timeout_secs.max(5)),
     };
     let specs = tools::tool_specs();
@@ -249,12 +262,20 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
 
     // 项目约束 + 关联项目说明：按会话所属项目动态组装进 system prompt。
     // system 位于上下文第 0 位且永不截断 → 新对话注入一次、同对话多条消息不重复；
-    // 每次运行重建，修改约束 / 关联后同对话下一条消息就地生效
+    // 每次运行重建，修改约束 / 关联后同对话下一条消息就地生效。
+    // 临时空间会话改用临时空间说明段（含临时路径映射与优先级 临时空间 > 关联项目 > 项目约束）
     let project_section = {
         let db = state.db.lock().unwrap();
-        match &session.project_id {
-            Some(pid) => build_project_section(&db, pid).unwrap_or(None),
-            None => None,
+        if session.is_temp {
+            match crate::temp::load_manifest(&db, session_id) {
+                Ok(Some(m)) => Some(crate::temp::build_prompt_section(&db, &session, &m)),
+                _ => None,
+            }
+        } else {
+            match &session.project_id {
+                Some(pid) => build_project_section(&db, pid).unwrap_or(None),
+                None => None,
+            }
         }
     };
     let sys = system_prompt(&session, project_section.as_deref());
@@ -983,6 +1004,12 @@ mod tests {
             last_message_at: None,
             created_at: String::new(),
             updated_at: String::new(),
+            is_temp: false,
+            temp_code: None,
+            temp_root: None,
+            source_workspace: None,
+            merged_seq: None,
+            merged_pending: false,
         };
         let with = system_prompt(&session, Some("## 项目约束\nX"));
         assert!(with.contains("工作区根目录：D:\\ws"));

@@ -5,11 +5,13 @@ import { ArchiveModal } from "./components/ArchiveModal";
 import { ChatView } from "./components/ChatView";
 import { Composer } from "./components/Composer";
 import { DataDirGate } from "./components/DataDirGate";
+import { DiffModal } from "./components/DiffModal";
 import { PendingQueue } from "./components/PendingQueue";
 import { PromptHost } from "./components/PromptModal";
 import { ProjectSettingsModal } from "./components/ProjectSettingsModal";
 import { SettingsModal } from "./components/SettingsModal";
 import { Sidebar } from "./components/Sidebar";
+import { TempActions } from "./components/TempActions";
 import { Toasts } from "./components/Toasts";
 import { TopBar } from "./components/TopBar";
 
@@ -34,11 +36,16 @@ export default function App() {
         <TopBar />
         <ChatView />
         <PendingQueue />
-        <Composer />
+        <div className="relative">
+          <Composer />
+          {/* 临时空间操作（变更 / 临时目录 / 合并 / 清空空间）：悬浮在输入框上方左对齐 */}
+          <TempActions />
+        </div>
       </div>
       <SettingsModal />
       <ProjectSettingsModal />
       <ArchiveModal />
+      <DiffModal />
       <PromptHost />
       <Toasts />
       <DataDirGate />

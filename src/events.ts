@@ -22,6 +22,7 @@ export function useAppEvents() {
       listen<Session>("session:update", (e) => s.onSessionUpdate(e.payload as Session)),
       listen<any>("sessions:changed", (e) => s.onSessionsChanged(e.payload)),
       listen<any>("projects:changed", () => s.onProjectsChanged()),
+      listen<any>("temp:update", (e) => s.onTempUpdate(e.payload)),
       listen<any>("messages:changed", (e) => s.reloadMessages(e.payload?.sessionId)),
       listen<any>("error", (ev) => s.onError(ev.payload)),
     ];
