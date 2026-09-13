@@ -140,16 +140,7 @@ export function TopBar() {
             ✕
           </button>
         )}
-        {/* 打开工作区目录（临时空间对话用临时目录按钮，见 TempActions） */}
-        {workspacePath && !isTempConv && (
-          <button
-            className="w-5 h-5 rounded text-[12px] text-inkdim hover:text-ink hover:bg-panel2 flex items-center justify-center"
-            title={`打开工作区目录\n${workspacePath}`}
-            onClick={() => ipc.openDir(workspacePath).catch((e) => pushToast(String(e)))}
-          >
-            📂
-          </button>
-        )}
+        {/* 打开工作区目录：已移至侧栏项目下拉「打开目录」；临时空间对话用输入框左侧的「临时目录」按钮 */}
         {wsMenu && !isSaved && !isTempConv && (
           <>
             <div className="fixed inset-0 z-40" onMouseDown={() => setWsMenu(false)} />

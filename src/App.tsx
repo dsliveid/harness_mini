@@ -19,6 +19,7 @@ export default function App() {
   useAppEvents();
   const bootstrap = useStore((s) => s.bootstrap);
   const ready = useStore((s) => s.ready);
+  const tempClearing = useStore((s) => s.tempClearing);
 
   useEffect(() => {
     void bootstrap();
@@ -32,7 +33,7 @@ export default function App() {
   return (
     <div className="h-full flex text-[14px]">
       <Sidebar />
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className="flex-1 flex flex-col min-w-0 relative">
         <TopBar />
         <ChatView />
         <PendingQueue />
@@ -41,6 +42,14 @@ export default function App() {
           {/* 临时空间操作（变更 / 临时目录 / 合并 / 清空空间）：悬浮在输入框上方左对齐 */}
           <TempActions />
         </div>
+        {tempClearing && (
+          <div className="absolute inset-0 z-40 bg-black/40 flex items-center justify-center">
+            <div className="bg-panel2 border border-edge rounded-xl px-6 py-5 flex flex-col items-center gap-3 shadow-xl">
+              <span className="w-6 h-6 rounded-full border-2 border-edge border-t-accent animate-spin" />
+              <span className="text-[13px] text-inkdim">正在删除临时空间…</span>
+            </div>
+          </div>
+        )}
       </div>
       <SettingsModal />
       <ProjectSettingsModal />

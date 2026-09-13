@@ -117,7 +117,7 @@ export function Sidebar() {
 
   const projectMenu = (pid: string, pinned: boolean, hasPath: string | null | undefined) => [
     ...(hasPath
-      ? [{ label: "临时空间对话", onClick: () => void newTempDraft(pid) }]
+      ? [{ label: "打开目录", onClick: () => ipc.openDir(hasPath).catch((e) => pushToast(String(e))) }]
       : []),
     { label: "项目设置", onClick: () => setProjectSettings(pid) },
     { label: pinned ? "取消固定" : "固定到顶部", onClick: () => ipc.setProjectPinned(pid, !pinned) },

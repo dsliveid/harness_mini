@@ -5,7 +5,7 @@ use crate::store;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 fn is_run_active(state: &crate::AppState, session_id: &str) -> bool {
     agent::is_run_active(state, session_id)
@@ -610,10 +610,16 @@ pub async fn merge_temp_space(
 }
 
 /// 清空临时空间：删除整个随机码目录（含全部项目副本）。
-/// 声明为 async：删除整棵目录（大量小文件）可能耗时，同步命令会在主线程执行导致界面冻结闪现
+/// 删除整棵目录（大量小文件）是长耗时纯阻塞 IO：同步命令会在主线程执行导致界面冻结闪现，
+/// 直接在 async fn 里内联执行又会占死 tokio worker，故放入 spawn_blocking 的阻塞线程池执行
 #[tauri::command]
-pub async fn clear_temp_space(state: State<'_, crate::AppState>, app: AppHandle, session_id: String) -> Result<(), String> {
-    crate::temp::clear_space(&state, &app, &session_id)
+pub async fn clear_temp_space(app: AppHandle, session_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<crate::AppState>();
+        crate::temp::clear_space(&state, &app, &session_id)
+    })
+    .await
+    .map_err(|e| format!("清空临时空间任务失败: {e}"))?
 }
 
 // ---------- 打开目录 ----------

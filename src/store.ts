@@ -32,6 +32,8 @@ interface Store {
   showArchive: boolean;
   /** 临时空间变更列表弹窗（仅临时空间对话可用） */
   showChanges: boolean;
+  /** 临时空间清空进行中：对话区显示「删除中」遮罩，期间屏蔽交互 */
+  tempClearing: boolean;
   /** 项目设置弹窗当前打开的项目 id；null = 关闭 */
   projectSettingsId: string | null;
   /** 程序数据目录状态；pending=true 时启动拦截对话框等待用户选择 */
@@ -54,6 +56,7 @@ interface Store {
   setShowSettings: (v: boolean) => void;
   setShowArchive: (v: boolean) => void;
   setShowChanges: (v: boolean) => void;
+  setTempClearing: (v: boolean) => void;
   setProjectSettings: (id: string | null) => void;
   setSettingsLocal: (s: Settings) => void;
   pushToast: (text: string) => void;
@@ -154,6 +157,7 @@ export const useStore = create<Store>((set, get) => ({
   showSettings: false,
   showArchive: false,
   showChanges: false,
+  tempClearing: false,
   projectSettingsId: null,
   dataStatus: null,
   // 启动默认进入项目视图
@@ -317,6 +321,9 @@ export const useStore = create<Store>((set, get) => ({
   },
   setShowChanges(v) {
     set({ showChanges: v });
+  },
+  setTempClearing(v) {
+    set({ tempClearing: v });
   },
   setProjectSettings(id) {
     set({ projectSettingsId: id });

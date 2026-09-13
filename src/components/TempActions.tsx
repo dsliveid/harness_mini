@@ -49,11 +49,16 @@ export function TempActions() {
   const onClear = async () => {
     if (!session) return;
     if (!(await askConfirm(`确认删除临时空间目录？\n${root}`, "删除"))) return;
+    // 删除整棵临时目录可能耗时：期间在对话区显示「删除中」遮罩并屏蔽交互
+    const setTempClearing = useStore.getState().setTempClearing;
+    setTempClearing(true);
     try {
       await ipc.clearTempSpace(session.id);
       pushToast("临时空间已清空，可继续发送消息");
     } catch (e) {
       pushToast(String(e));
+    } finally {
+      setTempClearing(false);
     }
   };
 
