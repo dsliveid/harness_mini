@@ -1,0 +1,322 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCfg {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    /// 该厂商下配置的模型列表（同一厂商可配多个模型）
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// 旧版单模型字段，仅用于读取旧配置并迁移到 models
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub api_key: String,
+}
+
+fn default_access_mode() -> String {
+    "confirm".into()
+}
+fn default_max_steps() -> u32 {
+    30
+}
+fn default_cmd_timeout() -> u64 {
+    120
+}
+fn default_ctx_tokens() -> usize {
+    28000
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsData {
+    #[serde(default)]
+    pub providers: Vec<ProviderCfg>,
+    #[serde(default)]
+    pub active_provider_id: Option<String>,
+    /// 全局激活的模型（属于 active_provider_id 指向的厂商），缺省时取该厂商第一个模型
+    #[serde(default)]
+    pub active_model: Option<String>,
+    #[serde(default = "default_access_mode")]
+    pub global_access_mode: String,
+    #[serde(default = "default_max_steps")]
+    pub max_steps: u32,
+    #[serde(default = "default_cmd_timeout")]
+    pub command_timeout_secs: u64,
+    #[serde(default = "default_ctx_tokens")]
+    pub context_token_limit: usize,
+    #[serde(default)]
+    pub last_workspace_path: Option<String>,
+    #[serde(default)]
+    pub approval_rules: Vec<ApprovalRule>,
+}
+
+impl Default for SettingsData {
+    fn default() -> Self {
+        Self {
+            providers: vec![],
+            active_provider_id: None,
+            active_model: None,
+            global_access_mode: default_access_mode(),
+            max_steps: default_max_steps(),
+            command_timeout_secs: default_cmd_timeout(),
+            context_token_limit: default_ctx_tokens(),
+            last_workspace_path: None,
+            approval_rules: vec![],
+        }
+    }
+}
+
+impl SettingsData {
+    /// 旧版配置迁移：models 为空且 model 非空时，把单模型迁移进 models
+    pub fn migrate_legacy_model(&mut self) {
+        for p in self.providers.iter_mut() {
+            if p.models.is_empty() && !p.model.is_empty() {
+                p.models = vec![p.model.clone()];
+            }
+        }
+    }
+}
+
+/// 解析当前生效的 (厂商, 模型)：优先全局激活项，激活项缺失/失效时回落到第一个有模型的厂商
+pub fn resolve_active_model(settings: &SettingsData) -> Option<(&ProviderCfg, &str)> {
+    let provider = settings
+        .providers
+        .iter()
+        .find(|p| Some(p.id.as_str()) == settings.active_provider_id.as_deref() && !p.models.is_empty())
+        .or_else(|| settings.providers.iter().find(|p| !p.models.is_empty()))?;
+    let model = settings
+        .active_model
+        .as_deref()
+        .filter(|m| provider.models.iter().any(|x| x == m))
+        .or_else(|| provider.models.first().map(|x| x.as_str()))?;
+    Some((provider, model))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(id: &str, name: &str, models: &[&str]) -> ProviderCfg {
+        ProviderCfg {
+            id: id.into(),
+            name: name.into(),
+            base_url: "https://example.com".into(),
+            models: models.iter().map(|m| m.to_string()).collect(),
+            model: String::new(),
+            api_key: String::new(),
+        }
+    }
+
+    #[test]
+    fn legacy_single_model_migrates_into_models() {
+        let mut s = SettingsData::default();
+        s.providers = vec![ProviderCfg {
+            id: "p1".into(),
+            name: "智谱".into(),
+            base_url: "https://example.com".into(),
+            models: vec![],
+            model: "glm-4.6".into(),
+            api_key: String::new(),
+        }];
+        s.migrate_legacy_model();
+        assert_eq!(s.providers[0].models, vec!["glm-4.6".to_string()]);
+        let (p, m) = resolve_active_model(&s).unwrap();
+        assert_eq!(p.id, "p1");
+        assert_eq!(m, "glm-4.6");
+    }
+
+    #[test]
+    fn resolves_active_provider_and_model() {
+        let mut s = SettingsData::default();
+        s.providers = vec![
+            provider("a", "厂商A", &["model-a1", "model-a2"]),
+            provider("b", "厂商B", &["model-b1"]),
+        ];
+        s.active_provider_id = Some("b".into());
+        s.active_model = Some("model-b1".into());
+        let (p, m) = resolve_active_model(&s).unwrap();
+        assert_eq!(p.id, "b");
+        assert_eq!(m, "model-b1");
+
+        // active_model 不属于当前厂商时回落到第一个模型
+        s.active_model = Some("model-a1".into());
+        let (p, m) = resolve_active_model(&s).unwrap();
+        assert_eq!(p.id, "b");
+        assert_eq!(m, "model-b1");
+
+        // 激活厂商没有模型时回落到第一个有模型的厂商
+        s.providers = vec![
+            provider("c", "空厂商", &[]),
+            provider("b", "厂商B", &["model-b1"]),
+        ];
+        s.active_provider_id = Some("c".into());
+        s.active_model = None;
+        let (p, m) = resolve_active_model(&s).unwrap();
+        assert_eq!(p.id, "b");
+        assert_eq!(m, "model-b1");
+    }
+
+    #[test]
+    fn no_models_yields_none() {
+        let mut s = SettingsData::default();
+        s.providers = vec![provider("c", "空厂商", &[])];
+        assert!(resolve_active_model(&s).is_none());
+        s.providers = vec![];
+        assert!(resolve_active_model(&s).is_none());
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalRule {
+    pub id: String,
+    pub kind: String, // "command_prefix" | "path_write" | "tool"
+    pub pattern: String,
+    #[serde(default = "default_scope")]
+    pub scope: String,
+    pub created_at: String,
+}
+fn default_scope() -> String {
+    "global".into()
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    /// 项目绑定的目录（工作区即项目）；早期手动创建的项目可能为空
+    #[serde(default)]
+    pub path: Option<String>,
+    pub pinned: bool,
+    pub created_at: String,
+    #[serde(default)]
+    pub last_activity_at: Option<String>,
+    /// 项目约束（Markdown：规范 / 注意事项等）；空 = 未设置。
+    /// 该项目下每个新对话都会把此内容注入 system prompt
+    #[serde(default)]
+    pub constraints: String,
+}
+
+/// 关联项目：当前项目对另一目录的引用 + 说明（Markdown）。
+/// 只存目录不存对方 project_id：对方项目被移除后目录关系仍成立，
+/// 注入时按路径只读解析对方项目的自身约束
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLink {
+    pub id: String,
+    pub project_id: String,
+    pub path: String,
+    pub description: String,
+    pub created_at: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Session {
+    pub id: String,
+    pub title: String,
+    pub workspace_path: String,
+    #[serde(default)]
+    pub access_mode: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    pub status: String, // active | archived
+    #[serde(default)]
+    pub last_message_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolEvent {
+    pub id: String,
+    pub message_id: String,
+    pub tool_name: String,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub params: serde_json::Value,
+    #[serde(default)]
+    pub result_text: Option<String>,
+    pub status: String, // pending_approval | running | success | failed | denied | timeout
+    #[serde(default)]
+    pub approval_scope: Option<String>, // mode | rule | session | once | none
+    pub created_at: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Message {
+    pub id: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    pub seq: i64,
+    pub role: String, // user | assistant | tool | system
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub queued: bool,
+    #[serde(default)]
+    pub usage: Option<serde_json::Value>,
+    pub created_at: String,
+    #[serde(default)]
+    pub tool_events: Vec<ToolEvent>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalRequest {
+    pub event_id: String,
+    pub session_id: String,
+    pub tool_name: String,
+    pub params: serde_json::Value,
+    pub risk: String,    // write | execute | path
+    pub preview: String, // 命令文本或 diff 预览
+    pub force_once: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SendResult {
+    pub session_id: String,
+    pub message_id: String,
+    pub queued: bool,
+}
+
+/// 粗略 token 估算：CJK 按字计、其余按 4 字符 1 token
+pub fn estimate_tokens(s: &str) -> usize {
+    let mut cjk = 0usize;
+    let mut other = 0usize;
+    for ch in s.chars() {
+        if ch.is_ascii() {
+            other += 1;
+        } else {
+            cjk += 1;
+        }
+    }
+    (cjk as f64 * 0.7) as usize + other / 4
+}
+
+/// 工具结果上限
+pub const TOOL_RESULT_LIMIT: usize = 32 * 1024;
+
+pub fn truncate_result(s: &str) -> String {
+    if s.len() <= TOOL_RESULT_LIMIT {
+        return s.to_string();
+    }
+    let mut end = TOOL_RESULT_LIMIT;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n\n[结果过长，已截断至 32KB]", &s[..end])
+}

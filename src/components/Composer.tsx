@@ -1,0 +1,127 @@
+import { useRef, useState } from "react";
+import { ipc } from "../ipc";
+import { useStore } from "../store";
+import { DRAFT_ID } from "../types";
+
+export function Composer() {
+  const currentId = useStore((s) => s.currentId);
+  const running = useStore((s) => (s.currentId ? s.runStatus[s.currentId] === "running" : false));
+  const readOnly = useStore((s) => s.readOnly);
+  const session = useStore((s) => (s.currentId && s.currentId !== DRAFT_ID ? s.sessions.find((x) => x.id === s.currentId) ?? null : null));
+  const draft = useStore((s) => s.draft);
+  const selectSession = useStore((s) => s.selectSession);
+  const pushToast = useStore((s) => s.pushToast);
+
+  const [text, setText] = useState("");
+  const taRef = useRef<HTMLTextAreaElement>(null);
+
+  // 空对话（未选中会话/临时对话）也可发送：首条消息发送后由后端自动落库为新会话
+  const canSend = !readOnly;
+  const placeholder = readOnly
+    ? "已归档会话为只读，取消归档后可继续对话"
+    : running
+    ? "Agent 运行中…输入消息回车将加入待执行列表"
+    : "输入消息，Enter 发送，Alt+Enter 换行";
+
+  const resize = () => {
+    const ta = taRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
+  };
+
+  const insertNewline = () => {
+    const ta = taRef.current;
+    if (!ta) return;
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    const next = text.slice(0, start) + "\n" + text.slice(end);
+    setText(next);
+    requestAnimationFrame(() => {
+      ta.selectionStart = ta.selectionEnd = start + 1;
+      resize();
+    });
+  };
+
+  const doSend = async () => {
+    const t = text.trim();
+    if (!t || !canSend) return;
+    setText("");
+    requestAnimationFrame(resize);
+    try {
+      const st = useStore.getState();
+      // 未选中会话（含临时对话）时按新对话发送，后端自动创建会话保存
+      const isDraftLike = !currentId || currentId === DRAFT_ID;
+      const draft = st.draft;
+      const res = await ipc.sendMessage(
+        isDraftLike ? null : currentId,
+        t,
+        isDraftLike ? draft?.workspacePath ?? undefined : undefined,
+        isDraftLike ? draft?.projectId ?? st.currentProjectId ?? undefined : undefined
+      );
+      if (isDraftLike && res.sessionId) {
+        await selectSession(res.sessionId);
+      }
+    } catch (e) {
+      pushToast(String(e));
+      setText(t); // 发送失败恢复内容
+    }
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key !== "Enter") return;
+    // 中文输入法组合态回车不发送
+    if ((e.nativeEvent as unknown as { isComposing?: boolean }).isComposing) return;
+    if (e.altKey) {
+      // Alt+Enter 换行
+      e.preventDefault();
+      insertNewline();
+      return;
+    }
+    e.preventDefault();
+    void doSend();
+  };
+
+  const effectiveWorkspace = session?.workspacePath ?? draft?.workspacePath ?? "";
+
+  return (
+    <div className="p-3">
+      <div className="flex items-end gap-2 bg-panel2 border border-edge rounded-xl px-3 py-2 focus-within:border-accent/60">
+        <textarea
+          ref={taRef}
+          className="flex-1 bg-transparent outline-none resize-none text-[14px] leading-relaxed max-h-[200px] py-1 disabled:opacity-50"
+          rows={1}
+          value={text}
+          placeholder={placeholder}
+          disabled={!canSend}
+          onChange={(e) => {
+            setText(e.target.value);
+            resize();
+          }}
+          onKeyDown={onKeyDown}
+        />
+        {running ? (
+          <button
+            className="shrink-0 w-9 h-9 rounded-lg bg-red-600/80 hover:bg-red-500 text-white flex items-center justify-center"
+            title="停止"
+            onClick={() => currentId && ipc.stopRun(currentId)}
+          >
+            ■
+          </button>
+        ) : (
+          <button
+            className="shrink-0 w-9 h-9 rounded-lg bg-accent hover:bg-blue-500 text-white flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed"
+            title="发送（Enter）"
+            disabled={!canSend || !text.trim()}
+            onClick={() => void doSend()}
+          >
+            ▶
+          </button>
+        )}
+      </div>
+      <div className="text-[11px] text-inkdim mt-1 px-1">
+        {effectiveWorkspace || "未绑定工作区 · 可直接对话（文件/命令工具不可用）"}
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,110 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  @apply bg-panel text-ink text-sm;
+  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #3f3f46;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Markdown 内容样式 */
+.md-content {
+  @apply leading-relaxed break-words;
+}
+.md-content p {
+  @apply my-2;
+}
+.md-content p:first-child {
+  @apply mt-0;
+}
+.md-content p:last-child {
+  @apply mb-0;
+}
+.md-content h1,
+.md-content h2,
+.md-content h3,
+.md-content h4 {
+  @apply font-semibold mt-4 mb-2;
+}
+.md-content ul,
+.md-content ol {
+  @apply my-2 pl-5;
+}
+.md-content ul {
+  list-style: disc;
+}
+.md-content ol {
+  list-style: decimal;
+}
+.md-content li {
+  @apply my-1;
+}
+.md-content a {
+  @apply text-accent underline;
+}
+.md-content blockquote {
+  @apply border-l-4 border-edge pl-3 text-inkdim my-2;
+}
+.md-content table {
+  @apply border-collapse my-2;
+}
+.md-content th,
+.md-content td {
+  @apply border border-edge px-2 py-1;
+}
+.md-content code:not(pre code) {
+  @apply bg-panel3 rounded px-1 py-0.5 font-mono text-[13px];
+}
+.md-content pre {
+  @apply bg-[#111114] rounded-lg p-3 my-2 overflow-x-auto text-[13px];
+}
+.md-content pre code {
+  @apply font-mono bg-transparent p-0;
+}
+/* diff 着色（highlight.js diff 语言） */
+.md-content .hljs-addition {
+  color: #4ade80;
+  background: rgba(74, 222, 128, 0.08);
+  display: inline-block;
+  width: 100%;
+}
+.md-content .hljs-deletion {
+  color: #f87171;
+  background: rgba(248, 113, 113, 0.08);
+  display: inline-block;
+  width: 100%;
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.stream-cursor::after {
+  content: "▍";
+  animation: pulse-dot 1s infinite;
+  @apply text-inkdim;
+}

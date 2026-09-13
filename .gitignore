@@ -1,0 +1,6 @@
+node_modules/
+dist/
+src-tauri/target/
+
+# 开发模式本地数据（SQLite + 主密钥，位于项目根目录，避开 tauri dev 文件监视）
+.dev-data/
