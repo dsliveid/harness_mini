@@ -683,7 +683,7 @@ async fn ai_merge(
         orig_text = orig_text,
     );
     let messages = [json!({"role": "user", "content": prompt})];
-    let result = llm::chat_stream(cfg, &messages, &[], |_| {}).await.ok()?;
+    let result = llm::chat_stream(cfg, &messages, &[], |_| {}, |_| {}).await.ok()?;
     let content = result.content.trim();
     if content.is_empty() || content.contains(AI_MERGE_FAILED) {
         return None;

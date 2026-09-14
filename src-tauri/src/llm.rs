@@ -23,6 +23,8 @@ pub struct ToolCallAcc {
 #[derive(Default)]
 pub struct LlmResult {
     pub content: String,
+    /// 模型思考过程（reasoning_content / reasoning），与正文分开累积
+    pub reasoning: String,
     pub tool_calls: Vec<ToolCallAcc>,
     pub usage: Option<Value>,
 }
@@ -44,6 +46,7 @@ pub async fn chat_stream(
     messages: &[Value],
     tools: &[Value],
     mut on_text: impl FnMut(&str) + Send,
+    mut on_reasoning: impl FnMut(&str) + Send,
 ) -> Result<LlmResult, String> {
     let url = endpoint(&cfg.base_url);
     let mut body = json!({
@@ -106,6 +109,18 @@ pub async fn chat_stream(
                 if !text.is_empty() {
                     result.content.push_str(text);
                     on_text(text);
+                }
+            }
+            // 推理型模型（DeepSeek R1、GLM-Reasoning 等）的思考过程：
+            // OpenAI 兼容端点常见字段为 reasoning_content，部分实现用 reasoning
+            if let Some(text) = delta
+                .get("reasoning_content")
+                .or_else(|| delta.get("reasoning"))
+                .and_then(|c| c.as_str())
+            {
+                if !text.is_empty() {
+                    result.reasoning.push_str(text);
+                    on_reasoning(text);
                 }
             }
             if let Some(tcs) = delta.get("tool_calls").and_then(|c| c.as_array()) {

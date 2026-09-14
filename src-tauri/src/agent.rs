@@ -309,22 +309,57 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
         let mid2 = assistant_id.clone();
         let mut last_flush = Instant::now();
         let buf2: std::sync::Arc<Mutex<String>> = std::sync::Arc::new(Mutex::new(String::new()));
-        let call = llm::chat_stream(&cfg, &messages, &schemas, move |delta| {
-            let mut b = buf2.lock().unwrap();
-            b.push_str(delta);
-            let _ = tauri::Emitter::emit(
-                &app2,
-                "message:delta",
-                json!({"sessionId": sid2, "messageId": mid2, "delta": delta}),
-            );
-            // 周期性落库，防止崩溃丢失全部内容
-            if last_flush.elapsed() > Duration::from_millis(800) {
-                let st = app2.state::<crate::AppState>();
-                let db = st.db.lock().unwrap();
-                let _ = store::update_message_content(&db, &mid2, &b.clone(), None);
-                last_flush = Instant::now();
-            }
-        })
+        let rbuf2: std::sync::Arc<Mutex<String>> = std::sync::Arc::new(Mutex::new(String::new()));
+        // 正文与思考增量各用一组捕获（闭包互斥持有，不能共享同一组 move 变量）
+        let app_text = app2.clone();
+        let sid_text = sid2.clone();
+        let mid_text = mid2.clone();
+        let app_reason = app2.clone();
+        let sid_reason = sid2.clone();
+        let mid_reason = mid2.clone();
+        let call = llm::chat_stream(
+            &cfg,
+            &messages,
+            &schemas,
+            {
+                let buf2 = buf2.clone();
+                move |delta| {
+                    let mut b = buf2.lock().unwrap();
+                    b.push_str(delta);
+                    let _ = tauri::Emitter::emit(
+                        &app_text,
+                        "message:delta",
+                        json!({"sessionId": sid_text, "messageId": mid_text, "delta": delta}),
+                    );
+                    // 周期性落库，防止崩溃丢失全部内容
+                    if last_flush.elapsed() > Duration::from_millis(800) {
+                        let st = app_text.state::<crate::AppState>();
+                        let db = st.db.lock().unwrap();
+                        let _ = store::update_message_content(&db, &mid_text, &b.clone(), None);
+                        last_flush = Instant::now();
+                    }
+                }
+            },
+            {
+                let rbuf2 = rbuf2.clone();
+                let mut reasoning_flush = Instant::now();
+                move |delta| {
+                    let mut b = rbuf2.lock().unwrap();
+                    b.push_str(delta);
+                    let _ = tauri::Emitter::emit(
+                        &app_reason,
+                        "message:reasoning:delta",
+                        json!({"sessionId": sid_reason, "messageId": mid_reason, "delta": delta}),
+                    );
+                    if reasoning_flush.elapsed() > Duration::from_millis(800) {
+                        let st = app_reason.state::<crate::AppState>();
+                        let db = st.db.lock().unwrap();
+                        let _ = store::update_message_reasoning(&db, &mid_reason, &b.clone());
+                        reasoning_flush = Instant::now();
+                    }
+                }
+            },
+        )
         .await;
 
         let result = match call {
@@ -355,6 +390,9 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
             {
                 let db = state.db.lock().unwrap();
                 let _ = store::update_message_content(&db, &assistant_id, &result.content, Some(&usage));
+                if !result.reasoning.is_empty() {
+                    let _ = store::update_message_reasoning(&db, &assistant_id, &result.reasoning);
+                }
             }
             let final_msg = {
                 let db = state.db.lock().unwrap();
@@ -393,6 +431,9 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
                 &Value::Array(tc_json),
                 &result.content,
             );
+            if !result.reasoning.is_empty() {
+                let _ = store::update_message_reasoning(&db, &assistant_id, &result.reasoning);
+            }
         }
         let final_msg = {
             let db = state.db.lock().unwrap();
@@ -898,9 +939,11 @@ fn emit_error(app: &AppHandle, session_id: &str, kind: &str, message: String) {
     {
         let state = app.state::<crate::AppState>();
         let db = state.db.lock().unwrap();
-        let _ = db.execute(
+          let _ = db.execute(
             "DELETE FROM messages WHERE session_id = ?1 AND role = 'assistant'
-               AND (content IS NULL OR content = '') AND tool_calls_json IS NULL",
+                 AND (content IS NULL OR content = '')
+                 AND (reasoning IS NULL OR reasoning = '')
+                 AND tool_calls_json IS NULL",
             rusqlite::params![session_id],
         );
         // 2) 错误以 system 消息持久化进对话流（前端渲染为错误卡片）

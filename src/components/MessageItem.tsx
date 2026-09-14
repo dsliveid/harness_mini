@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ipc } from "../ipc";
 import { useStore } from "../store";
 import type { Message, ToolEvent } from "../types";
@@ -25,6 +25,36 @@ function orderedEvents(msg: Message): ToolEvent[] {
     if (!ordered.includes(e)) ordered.push(e);
   }
   return ordered;
+}
+
+/** 思考过程折叠卡片：流式期间默认展开，便于实时可见；完成后默认折叠 */
+function ReasoningBlock({ text, streaming }: { text: string; streaming: boolean }) {
+  const [open, setOpen] = useState(streaming);
+  // 流式结束后自动收起，避免思考正文长期占据对话空间
+  useEffect(() => {
+    if (!streaming && open) setOpen(false);
+  }, [streaming]); // eslint-disable-line react-hooks/exhaustive-deps
+  return (
+    <div className="rounded-xl border border-edge bg-panel2/60 overflow-hidden">
+      <button
+        className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-panel2"
+        onClick={() => setOpen(!open)}
+      >
+        <span className="text-[11px] text-inkdim w-3 shrink-0">{open ? "▾" : "▸"}</span>
+        <span className="text-[12px] text-inkdim">🧠 思考过程</span>
+        {streaming && open && (
+          <span className="flex gap-1 ml-1">
+            <span className="w-1 h-1 rounded-full bg-inkdim animate-bounce" style={{ animationDelay: "0ms" }} />
+            <span className="w-1 h-1 rounded-full bg-inkdim animate-bounce" style={{ animationDelay: "120ms" }} />
+            <span className="w-1 h-1 rounded-full bg-inkdim animate-bounce" style={{ animationDelay: "240ms" }} />
+          </span>
+        )}
+      </button>
+      {open && (
+        <div className="px-3 pb-3 text-[13px] text-inkdim whitespace-pre-wrap leading-relaxed">{text}</div>
+      )}
+    </div>
+  );
 }
 
 export function MessageItem({
@@ -129,11 +159,13 @@ export function MessageItem({
   if (msg.role === "assistant") {
     const events = orderedEvents(msg);
     const hasContent = !!msg.content;
+    const hasReasoning = !!msg.reasoning;
     return (
       <div className="flex flex-col gap-2">
         {events.map((ev) => (
           <ToolCard key={ev.id} ev={ev} />
         ))}
+        {hasReasoning && <ReasoningBlock text={msg.reasoning!} streaming={streaming} />}
         {hasContent && (
           <div className="group relative">
             <Markdown content={msg.content!} />

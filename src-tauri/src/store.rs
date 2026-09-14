@@ -61,6 +61,7 @@ fn init(conn: &Connection) -> Result<(), String> {
           seq INTEGER NOT NULL,
           role TEXT NOT NULL,
           content TEXT,
+          reasoning TEXT,
           tool_calls_json TEXT,
           tool_call_id TEXT,
           queued INTEGER NOT NULL DEFAULT 0,
@@ -115,6 +116,8 @@ fn init(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "sessions", "source_workspace", "source_workspace TEXT")?;
     ensure_column(conn, "sessions", "merged_seq", "merged_seq INTEGER")?;
     ensure_column(conn, "sessions", "merged_pending", "merged_pending INTEGER NOT NULL DEFAULT 0")?;
+    // 旧库迁移：messages 补 reasoning 列（模型思考过程）
+    ensure_column(conn, "messages", "reasoning", "reasoning TEXT")?;
     Ok(())
 }
 
@@ -518,6 +521,52 @@ mod tests {
         assert!(!got.merged_pending);
         assert_eq!(got.merged_seq, Some(9));
     }
+
+    #[test]
+    fn message_reasoning_roundtrip() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let s = create_session(&conn, ".", None, "t").unwrap();
+        let m = new_message(&conn, &s.id, "assistant", Some(String::new()), false).unwrap();
+        assert_eq!(m.reasoning, None);
+
+        update_message_reasoning(&conn, &m.id, "先分析文件结构，再决定修改方案。").unwrap();
+        let got = get_message(&conn, &m.id).unwrap().unwrap();
+        assert_eq!(got.reasoning.as_deref(), Some("先分析文件结构，再决定修改方案。"));
+
+        let list = get_messages(&conn, &s.id, None, 10).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].reasoning.as_deref(), Some("先分析文件结构，再决定修改方案。"));
+    }
+
+    #[test]
+    fn legacy_messages_table_gets_reasoning_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        // 模拟旧库：messages 无 reasoning 列
+        conn.execute_batch(
+            "CREATE TABLE messages (
+               id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               run_id TEXT,
+               seq INTEGER NOT NULL,
+               role TEXT NOT NULL,
+               content TEXT,
+               tool_calls_json TEXT,
+               tool_call_id TEXT,
+               queued INTEGER NOT NULL DEFAULT 0,
+               usage_json TEXT,
+               created_at TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+
+        let s = create_session(&conn, ".", None, "t").unwrap();
+        let m = new_message(&conn, &s.id, "assistant", Some(String::new()), false).unwrap();
+        update_message_reasoning(&conn, &m.id, "迁移后思考过程可写入").unwrap();
+        let got = get_message(&conn, &m.id).unwrap().unwrap();
+        assert_eq!(got.reasoning.as_deref(), Some("迁移后思考过程可写入"));
+    }
 }
 
 pub fn remove_project(conn: &Connection, id: &str) -> Result<(), String> {
@@ -841,8 +890,8 @@ pub fn next_seq(conn: &Connection, session_id: &str) -> Result<i64, String> {
 
 pub fn insert_message(conn: &Connection, m: &Message) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO messages(id, session_id, run_id, seq, role, content, tool_calls_json, tool_call_id, queued, usage_json, created_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        "INSERT INTO messages(id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
         params![
             m.id,
             m.session_id,
@@ -850,6 +899,7 @@ pub fn insert_message(conn: &Connection, m: &Message) -> Result<(), String> {
             m.seq,
             m.role,
             m.content,
+            m.reasoning,
             m.tool_calls.as_ref().and_then(|v| serde_json::to_string(v).ok()),
             m.tool_call_id,
             m.queued as i64,
@@ -876,6 +926,7 @@ pub fn new_message(
         seq,
         role: role.to_string(),
         content,
+        reasoning: None,
         tool_calls: None,
         tool_call_id: None,
         queued,
@@ -896,6 +947,16 @@ pub fn update_message_content(
     conn.execute(
         "UPDATE messages SET content = ?2, usage_json = COALESCE(?3, usage_json) WHERE id = ?1",
         params![id, content, usage.and_then(|v| serde_json::to_string(v).ok())],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 更新 assistant 消息的思考过程（reasoning_content）；仅落库展示，不进入上下文组装
+pub fn update_message_reasoning(conn: &Connection, id: &str, reasoning: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE messages SET reasoning = ?2 WHERE id = ?1",
+        params![id, reasoning],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -923,15 +984,15 @@ pub fn get_messages(
 ) -> Result<Vec<Message>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, run_id, seq, role, content, tool_calls_json, tool_call_id, queued, usage_json, created_at
+            "SELECT id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at
              FROM messages WHERE session_id = ?1 AND seq < COALESCE(?2, 9223372036854775807)
              ORDER BY seq DESC LIMIT ?3",
         )
         .map_err(|e| e.to_string())?;
     let mut msgs: Vec<Message> = stmt
         .query_map(params![session_id, before_seq, limit], |r| {
-            let tc: Option<String> = r.get(5)?;
-            let usage: Option<String> = r.get(8)?;
+            let tc: Option<String> = r.get(6)?;
+            let usage: Option<String> = r.get(9)?;
             Ok(Message {
                 id: r.get(0)?,
                 session_id: session_id.to_string(),
@@ -939,11 +1000,12 @@ pub fn get_messages(
                 seq: r.get(2)?,
                 role: r.get(3)?,
                 content: r.get(4)?,
+                reasoning: r.get(5)?,
                 tool_calls: tc.and_then(|s| serde_json::from_str(&s).ok()),
-                tool_call_id: r.get(6)?,
-                queued: r.get::<_, i64>(7)? != 0,
+                tool_call_id: r.get(7)?,
+                queued: r.get::<_, i64>(8)? != 0,
                 usage: usage.and_then(|s| serde_json::from_str(&s).ok()),
-                created_at: r.get(9)?,
+                created_at: r.get(10)?,
                 tool_events: vec![],
             })
         })
@@ -1014,12 +1076,12 @@ pub fn delete_messages_after(conn: &Connection, session_id: &str, seq: i64) -> R
 pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, String> {
     let opt = conn
         .query_row(
-            "SELECT id, session_id, run_id, seq, role, content, tool_calls_json, tool_call_id, queued, usage_json, created_at
+            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at
              FROM messages WHERE id = ?1",
             params![id],
             |r| {
-                let tc: Option<String> = r.get(6)?;
-                let usage: Option<String> = r.get(9)?;
+                let tc: Option<String> = r.get(7)?;
+                let usage: Option<String> = r.get(10)?;
                 Ok(Message {
                     id: r.get(0)?,
                     session_id: r.get(1)?,
@@ -1027,11 +1089,12 @@ pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, Strin
                     seq: r.get(3)?,
                     role: r.get(4)?,
                     content: r.get(5)?,
+                    reasoning: r.get(6)?,
                     tool_calls: tc.and_then(|s| serde_json::from_str(&s).ok()),
-                    tool_call_id: r.get(7)?,
-                    queued: r.get::<_, i64>(8)? != 0,
+                    tool_call_id: r.get(8)?,
+                    queued: r.get::<_, i64>(9)? != 0,
                     usage: usage.and_then(|s| serde_json::from_str(&s).ok()),
-                    created_at: r.get(10)?,
+                    created_at: r.get(11)?,
                     tool_events: vec![],
                 })
             },
@@ -1046,14 +1109,14 @@ pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, Strin
 pub fn list_queued(conn: &Connection, session_id: &str) -> Result<Vec<Message>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, session_id, run_id, seq, role, content, tool_calls_json, tool_call_id, queued, usage_json, created_at
+            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at
              FROM messages WHERE session_id = ?1 AND queued = 1 ORDER BY seq ASC",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(params![session_id], |r| {
-            let tc: Option<String> = r.get(6)?;
-            let usage: Option<String> = r.get(9)?;
+            let tc: Option<String> = r.get(7)?;
+            let usage: Option<String> = r.get(10)?;
             Ok(Message {
                 id: r.get(0)?,
                 session_id: r.get(1)?,
@@ -1061,11 +1124,12 @@ pub fn list_queued(conn: &Connection, session_id: &str) -> Result<Vec<Message>, 
                 seq: r.get(3)?,
                 role: r.get(4)?,
                 content: r.get(5)?,
+                reasoning: r.get(6)?,
                 tool_calls: tc.and_then(|s| serde_json::from_str(&s).ok()),
-                tool_call_id: r.get(7)?,
+                tool_call_id: r.get(8)?,
                 queued: true,
                 usage: usage.and_then(|s| serde_json::from_str(&s).ok()),
-                created_at: r.get(10)?,
+                created_at: r.get(11)?,
                 tool_events: vec![],
             })
         })

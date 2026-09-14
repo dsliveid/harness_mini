@@ -183,6 +183,8 @@ export interface Message {
   seq: number;
   role: string; // user | assistant | tool | system
   content?: string | null;
+  /** 模型思考过程（reasoning_content），仅用于展示与存档，不进入上下文组装 */
+  reasoning?: string | null;
   toolCalls?: any[] | null;
   toolCallId?: string | null;
   queued: boolean;

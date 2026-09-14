@@ -64,6 +64,7 @@ interface Store {
 
   // 事件处理
   onMessageDelta: (p: any) => void;
+  onMessageReasoningDelta: (p: any) => void;
   onMessageFinal: (m: Message) => void;
   onToolUpdate: (p: any) => void;
   onToolOutput: (p: any) => void;
@@ -88,11 +89,27 @@ function upsertMessage(list: Message[], m: Message): Message[] {
   return [...list, m];
 }
 
-function upsertToolEvent(list: Message[], ev: ToolEvent): Message[] {
-  const idx = list.findIndex((m) => m.id === ev.id);
-  if (idx < 0) return list;
+function upsertToolEvent(list: Message[], ev: ToolEvent, sessionId: string): Message[] {
+  let idx = list.findIndex((m) => m.id === ev.messageId);
+  let msg: Message;
+  if (idx < 0) {
+    // 模型首次回复即工具调用（无思考/正文增量）时，tool:update 先于消息到达，
+    // 以 messageId 创建占位 assistant 消息承载工具卡片
+    msg = {
+      id: ev.messageId,
+      sessionId,
+      seq: Number.MAX_SAFE_INTEGER,
+      role: "assistant",
+      content: "",
+      reasoning: null,
+      queued: false,
+      createdAt: ev.createdAt ?? new Date().toISOString(),
+      toolEvents: [ev],
+    };
+    return [...list, msg];
+  }
   const next = list.slice();
-  const msg = { ...next[idx] };
+  msg = { ...next[idx] };
   const evIdx = msg.toolEvents.findIndex((e) => e.id === ev.id);
   const events = msg.toolEvents.slice();
   if (evIdx >= 0) events[evIdx] = ev;
@@ -116,6 +133,7 @@ function mergeSessionMessages(local: Message[] | undefined, fetched: Message[]):
     return {
       ...m,
       content: (l.content?.length ?? 0) >= (m.content?.length ?? 0) ? l.content : m.content,
+      reasoning: (l.reasoning?.length ?? 0) >= (m.reasoning?.length ?? 0) ? l.reasoning : m.reasoning,
       toolEvents: l.toolEvents.length >= m.toolEvents.length ? l.toolEvents : m.toolEvents,
       toolCalls: (m.toolCalls?.length ?? 0) > 0 ? m.toolCalls : l.toolCalls,
     };
@@ -356,6 +374,7 @@ export const useStore = create<Store>((set, get) => ({
           seq: Number.MAX_SAFE_INTEGER,
           role: "assistant",
           content: delta,
+          reasoning: null,
           queued: false,
           createdAt: new Date().toISOString(),
           toolEvents: [],
@@ -364,6 +383,32 @@ export const useStore = create<Store>((set, get) => ({
       }
       const next = list.slice();
       next[idx] = { ...next[idx], content: (next[idx].content ?? "") + delta };
+      return { messages: { ...st.messages, [sessionId]: next } };
+    });
+  },
+
+  onMessageReasoningDelta(p) {
+    const { sessionId, messageId, delta } = p;
+    set((st) => {
+      const list = st.messages[sessionId] ?? [];
+      const idx = list.findIndex((m) => m.id === messageId);
+      if (idx < 0) {
+        // 流式占位消息（思考通常先于正文到达）
+        const placeholder: Message = {
+          id: messageId,
+          sessionId,
+          seq: Number.MAX_SAFE_INTEGER,
+          role: "assistant",
+          content: "",
+          reasoning: delta,
+          queued: false,
+          createdAt: new Date().toISOString(),
+          toolEvents: [],
+        };
+        return { messages: { ...st.messages, [sessionId]: [...list, placeholder] } };
+      }
+      const next = list.slice();
+      next[idx] = { ...next[idx], reasoning: (next[idx].reasoning ?? "") + delta };
       return { messages: { ...st.messages, [sessionId]: next } };
     });
   },
@@ -380,7 +425,7 @@ export const useStore = create<Store>((set, get) => ({
     const ev: ToolEvent = p.event;
     set((st) => {
       const list = st.messages[p.sessionId] ?? [];
-      return { messages: { ...st.messages, [p.sessionId]: upsertToolEvent(list, ev) } };
+      return { messages: { ...st.messages, [p.sessionId]: upsertToolEvent(list, ev, p.sessionId) } };
     });
     if (ev.status !== "running" && ev.status !== "pending_approval") {
       set((st) => {

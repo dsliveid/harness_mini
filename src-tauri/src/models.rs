@@ -424,6 +424,8 @@ pub struct Message {
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
+    pub reasoning: Option<String>,
+    #[serde(default)]
     pub tool_calls: Option<serde_json::Value>,
     #[serde(default)]
     pub tool_call_id: Option<String>,

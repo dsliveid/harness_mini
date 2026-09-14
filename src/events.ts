@@ -13,6 +13,7 @@ export function useAppEvents() {
     let cancelled = false;
     const regs: Promise<UnlistenFn>[] = [
       listen<any>("message:delta", (e) => s.onMessageDelta(e.payload)),
+      listen<any>("message:reasoning:delta", (e) => s.onMessageReasoningDelta(e.payload)),
       listen<Message>("message:final", (e) => s.onMessageFinal(e.payload as Message)),
       listen<any>("tool:update", (e) => s.onToolUpdate(e.payload)),
       listen<any>("tool:output", (e) => s.onToolOutput(e.payload)),
