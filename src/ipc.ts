@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DataStatus, Message, MergeSummary, Project, ProjectLink, Session, Settings, TempAlloc, TempChanges, TempFileDiff, TempInfo, ToolEvent } from "./types";
+import type { ApprovalRule, DataStatus, Message, MergeSummary, Project, ProjectLink, Session, Settings, TempAlloc, TempChanges, TempFileDiff, TempInfo, ToolEvent } from "./types";
 
 export const ipc = {
   getSettings: () => invoke<Settings>("get_settings"),
@@ -51,6 +51,7 @@ export const ipc = {
     workspacePath?: string,
     projectId?: string,
     temp?: TempAlloc,
+    accessMode?: string,
   ) =>
     invoke<{ sessionId: string; messageId: string; queued: boolean; session?: Session | null }>("send_message", {
       sessionId,
@@ -58,6 +59,7 @@ export const ipc = {
       workspacePath: workspacePath ?? null,
       projectId: projectId ?? null,
       temp: temp ?? null,
+      accessMode: accessMode ?? null,
     }),
   listQueued: (sessionId: string) => invoke<Message[]>("list_queued", { sessionId }),
   guideMessage: (sessionId: string, messageId: string) =>
@@ -70,6 +72,12 @@ export const ipc = {
 
   respondApproval: (eventId: string, decision: string, reason?: string) =>
     invoke<void>("respond_approval", { eventId, decision, reason: reason ?? null }),
+
+  // 审批规则（会话级：仅对所属对话生效）
+  listSessionRules: (sessionId: string) =>
+    invoke<ApprovalRule[]>("list_session_rules", { sessionId }),
+  deleteSessionRule: (sessionId: string, id: string) =>
+    invoke<ApprovalRule[]>("delete_session_rule", { sessionId, id }),
   getSessionTodos: (sessionId: string) => invoke<any>("get_session_todos", { sessionId }),
 
   // 临时空间

@@ -10,6 +10,7 @@ import { PendingQueue } from "./components/PendingQueue";
 import { PromptHost } from "./components/PromptModal";
 import { ProjectSettingsModal } from "./components/ProjectSettingsModal";
 import { SettingsModal } from "./components/SettingsModal";
+import { SessionSettingsModal } from "./components/SessionSettingsModal";
 import { Sidebar } from "./components/Sidebar";
 import { TempActions } from "./components/TempActions";
 import { Toasts } from "./components/Toasts";
@@ -52,6 +53,7 @@ export default function App() {
         )}
       </div>
       <SettingsModal />
+      <SessionSettingsModal />
       <ProjectSettingsModal />
       <ArchiveModal />
       <DiffModal />

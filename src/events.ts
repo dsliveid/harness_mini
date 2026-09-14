@@ -18,9 +18,13 @@ export function useAppEvents() {
       listen<any>("tool:update", (e) => s.onToolUpdate(e.payload)),
       listen<any>("tool:output", (e) => s.onToolOutput(e.payload)),
       listen<any>("approval:request", (e) => s.onApprovalRequest(e.payload)),
+      // 切到「完全访问」时后端会放行挂起的审批条，前端据此收起审批卡片
+      listen<any>("approval:resolved", (e) => s.approvalDone(e.payload?.eventId)),
       listen<any>("run:status", (e) => s.onRunStatus(e.payload)),
       listen<any>("queue:update", (e) => s.onQueueUpdate(e.payload)),
       listen<Session>("session:update", (e) => s.onSessionUpdate(e.payload as Session)),
+      listen<any>("settings:changed", (e) => s.onSettingsChanged(e.payload)),
+      listen<any>("session:rules", (e) => s.onSessionRules(e.payload)),
       listen<any>("sessions:changed", (e) => s.onSessionsChanged(e.payload)),
       listen<any>("projects:changed", () => s.onProjectsChanged()),
       listen<any>("temp:update", (e) => s.onTempUpdate(e.payload)),

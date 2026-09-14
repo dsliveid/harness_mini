@@ -68,6 +68,7 @@ export function Sidebar() {
   const setShowArchive = useStore((s) => s.setShowArchive);
   const setShowSettings = useStore((s) => s.setShowSettings);
   const setProjectSettings = useStore((s) => s.setProjectSettings);
+  const setSessionSettings = useStore((s) => s.setSessionSettings);
   const pushToast = useStore((s) => s.pushToast);
   const [menuFor, setMenuFor] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
@@ -92,6 +93,7 @@ export function Sidebar() {
   const ungrouped = sorted.filter((s) => !s.projectId);
 
   const sessionMenu = (s: Session) => [
+    { label: "会话设置", onClick: () => setSessionSettings(s.id) },
     { label: "重命名", onClick: async () => {
         const t = await askPrompt({ title: "重命名会话", value: s.title });
         if (t && t.trim()) await ipc.renameSession(s.id, t.trim());
@@ -344,7 +346,7 @@ export function Sidebar() {
                     title="新建纯对话"
                     onClick={(e) => {
                       e.stopPropagation();
-                      newDraft(null);
+                      newDraft(null, false);
                     }}
                   >
                     +

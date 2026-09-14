@@ -207,6 +207,8 @@ pub fn run() {
             commands::stop_run,
             commands::edit_and_resend,
             commands::respond_approval,
+            commands::list_session_rules,
+            commands::delete_session_rule,
             commands::get_session_todos,
             commands::alloc_temp_code,
             commands::get_temp_info,

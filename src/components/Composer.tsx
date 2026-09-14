@@ -31,7 +31,7 @@ export function Composer() {
     ? "已归档会话为只读，取消归档后可继续对话"
     : running
     ? "Agent 运行中…输入消息回车将加入待执行列表"
-    : "输入消息，Enter 发送，Alt+Enter 换行";
+    : "输入消息，Enter 发送，Alt+Enter / Shift+Enter 换行";
 
   const resize = () => {
     const ta = taRef.current;
@@ -68,7 +68,9 @@ export function Composer() {
         t,
         isDraftLike ? draft?.workspacePath ?? undefined : undefined,
         isDraftLike ? draft?.projectId ?? st.currentProjectId ?? undefined : undefined,
-        isDraftLike ? draft?.temp ?? undefined : undefined
+        isDraftLike ? draft?.temp ?? undefined : undefined,
+        // 访问模式为会话级：新对话落库时带上草稿上的取值（已从“上一条对话”继承）
+        isDraftLike ? draft?.accessMode ?? undefined : undefined
       );
       const st2 = useStore.getState();
       // 后端随结果带回会话实体：切换前先入列，避免「currentId 已切换、会话事件未到达」
@@ -91,8 +93,8 @@ export function Composer() {
     if (e.key !== "Enter") return;
     // 中文输入法组合态回车不发送
     if ((e.nativeEvent as unknown as { isComposing?: boolean }).isComposing) return;
-    if (e.altKey) {
-      // Alt+Enter 换行
+    if (e.altKey || e.shiftKey) {
+      // Alt+Enter / Shift+Enter 换行
       e.preventDefault();
       insertNewline();
       return;

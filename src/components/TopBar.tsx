@@ -27,9 +27,11 @@ export function TopBar() {
   const active = resolveActiveModel(settings);
   const selectValue = active ? modelKey(active.provider.id, active.model) : "";
 
+  // 访问模式为会话级：已保存对话取自身取值，未保存草稿取草稿上的取值（新建时已从
+  // “上一条对话”继承）。不再有“跟随全局”状态，全局值仅作为新建对话的默认值。
   const accessMode: "confirm" | "full_access" = session
     ? ((session.accessMode ?? settings.globalAccessMode) as "confirm" | "full_access")
-    : settings.globalAccessMode;
+    : draft?.accessMode ?? settings.globalAccessMode;
 
   // 已保存的对话工作空间只读：工作区在首次发送转正时固定，仅未保存草稿可选择/切换；
   // 临时空间对话的工作区为临时副本，同样只读
@@ -90,15 +92,7 @@ export function TopBar() {
     setDraftWorkspace(null, null);
   };
 
-  const saveGlobalMode = async (mode: string) => {
-    const next = { ...settings, globalAccessMode: mode as "confirm" | "full_access" };
-    setSettingsLocal(next);
-    try {
-      await ipc.setSettings(next);
-    } catch (e) {
-      pushToast(String(e));
-    }
-  };
+  const setDraftAccessMode = useStore((s) => s.setDraftAccessMode);
 
   const selectModeLabel = (m: "confirm" | "full_access") =>
     m === "full_access" ? "完全访问" : "变更前确认";
@@ -201,8 +195,10 @@ export function TopBar() {
               );
               if (!confirmed) return;
             }
+            // 访问模式仅作用于当前对话：已保存对话落库（即时生效），未保存草稿先记在草稿上，
+            // 首次发送时随会话一起落库（不影响其他对话）
             if (session) await ipc.setSessionMode(session.id, v);
-            else await saveGlobalMode(v);
+            else setDraftAccessMode(v);
           }}
           title="访问模式"
         >

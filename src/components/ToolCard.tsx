@@ -98,20 +98,13 @@ function ApprovalSection({ ev }: { ev: ToolEvent }) {
           允许一次
         </button>
         {!req.forceOnce && (
-          <>
-            <button
-              className="px-3 py-1.5 rounded-lg bg-panel3 hover:bg-edge text-ink text-[13px]"
-              onClick={() => respond("allow_session")}
-            >
-              本会话允许
-            </button>
-            <button
-              className="px-3 py-1.5 rounded-lg bg-panel3 hover:bg-edge text-ink text-[13px]"
-              onClick={() => respond("allow_always")}
-            >
-              总是允许
-            </button>
-          </>
+          <button
+            className="px-3 py-1.5 rounded-lg bg-panel3 hover:bg-edge text-ink text-[13px]"
+            title="记住该规则：仅对当前对话生效，重启后仍保留；可在会话设置中删除"
+            onClick={() => respond("allow_session")}
+          >
+            本会话允许
+          </button>
         )}
         <button
           className="px-3 py-1.5 rounded-lg bg-panel3 hover:bg-edge text-red-400 text-[13px]"
@@ -192,7 +185,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
         {statusBadge(ev.status)}
         {ev.approvalScope && ev.approvalScope !== "none" && ev.status !== "pending_approval" && (
           <span className="text-[10px] text-inkdim shrink-0">
-            ({ev.approvalScope === "mode" ? "完全访问" : ev.approvalScope === "once" ? "一次放行" : ev.approvalScope === "session" ? "会话规则" : "永久规则"})
+            ({ev.approvalScope === "mode" ? "完全访问" : ev.approvalScope === "once" ? "一次放行" : "会话规则"})
           </span>
         )}
       </button>

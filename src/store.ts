@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "./ipc";
-import { DRAFT_ID, type ApprovalReq, type DataStatus, type Message, type Project, type QueuedItem, type Session, type Settings, type TempAlloc, type TempInfo, type ToolEvent } from "./types";
+import { DRAFT_ID, samePath, type ApprovalReq, type ApprovalRule, type DataStatus, type Message, type Project, type QueuedItem, type Session, type Settings, type TempAlloc, type TempInfo, type ToolEvent } from "./types";
 
 export interface Toast {
   id: string;
@@ -16,7 +16,13 @@ interface Store {
   projects: Project[];
   sessions: Session[];
   currentId: string | null; // 会话 id 或 DRAFT_ID
-  draft: { projectId: string | null; workspacePath: string | null; temp?: TempAlloc | null } | null;
+  draft: {
+    projectId: string | null;
+    workspacePath: string | null;
+    temp?: TempAlloc | null;
+    /** 访问模式（会话级）：新建草稿时继承“上一条对话”，首次发送时随会话落库 */
+    accessMode: "confirm" | "full_access";
+  } | null;
   /** 临时空间运行时状态（临时目录是否存在 / 是否有变更 / 合并状态），按会话 id 缓存 */
   tempInfo: Record<string, TempInfo>;
   currentProjectId: string | null; // 当前进入的项目（项目视图下发送空对话时落库到该项目）
@@ -36,6 +42,10 @@ interface Store {
   tempClearing: boolean;
   /** 项目设置弹窗当前打开的项目 id；null = 关闭 */
   projectSettingsId: string | null;
+  /** 会话设置弹窗当前打开的会话 id；null = 关闭 */
+  sessionSettingsId: string | null;
+  /** 各对话的审批规则（会话级：仅对所属对话生效），按会话 id 缓存 */
+  sessionRules: Record<string, ApprovalRule[]>;
   /** 程序数据目录状态；pending=true 时启动拦截对话框等待用户选择 */
   dataStatus: DataStatus | null;
   view: "list" | "project";
@@ -45,10 +55,12 @@ interface Store {
   refreshProjects: () => Promise<void>;
   setView: (v: "list" | "project") => void;
   enterProject: (projectId: string) => void;
-  newDraft: (projectId?: string | null) => void;
+  newDraft: (projectId?: string | null, inherit?: boolean) => void;
   /** 临时空间对话：向项目要一个临时空间计划（仅地址不建目录），以草稿形式打开 */
   newTempDraft: (projectId: string) => Promise<void>;
   setDraftWorkspace: (p: string | null, projectId?: string | null) => void;
+  /** 顶栏切换未保存对话的访问模式（仅改草稿，首次发送时落库） */
+  setDraftAccessMode: (mode: "confirm" | "full_access") => void;
   selectSession: (id: string, readOnly?: boolean) => Promise<void>;
   loadEarlier: (id: string) => Promise<void>;
   reloadMessages: (id: string) => Promise<void>;
@@ -58,7 +70,12 @@ interface Store {
   setShowChanges: (v: boolean) => void;
   setTempClearing: (v: boolean) => void;
   setProjectSettings: (id: string | null) => void;
+  /** 打开/关闭会话设置弹窗（打开时顺带拉取该对话的审批规则） */
+  setSessionSettings: (id: string | null) => void;
+  refreshSessionRules: (id: string) => Promise<void>;
+  onSessionRules: (p: { sessionId: string; rules: ApprovalRule[] }) => void;
   setSettingsLocal: (s: Settings) => void;
+  onSettingsChanged: (s: Settings) => void;
   pushToast: (text: string) => void;
   dismissToast: (id: string) => void;
 
@@ -156,7 +173,6 @@ export const useStore = create<Store>((set, get) => ({
     commandTimeoutSecs: 120,
     contextTokenLimit: 28000,
     lastWorkspacePath: null,
-    approvalRules: [],
   },
   projects: [],
   sessions: [],
@@ -177,6 +193,8 @@ export const useStore = create<Store>((set, get) => ({
   showChanges: false,
   tempClearing: false,
   projectSettingsId: null,
+  sessionSettingsId: null,
+  sessionRules: {},
   dataStatus: null,
   // 启动默认进入项目视图
   view: "project",
@@ -238,16 +256,37 @@ export const useStore = create<Store>((set, get) => ({
     get().newDraft(projectId);
   },
 
-  newDraft(projectId) {
+  newDraft(projectId, inherit = true) {
     // 工作区即项目：从项目新建空对话时，草稿直接绑定该项目的目录；
-    // 其余新对话默认为纯对话（未选择工作区），需要时在顶栏选择项目/目录
-    const proj = projectId ? get().projects.find((p) => p.id === projectId) : null;
+    // 其余新对话（inherit=true）默认继承“上一条对话”（= 当前选中的对话）的模式与工作区；
+    // inherit=false 用于“新建纯对话”：工作区始终为空。
+    // 没有可继承来源（当前无选中对话）时：纯对话 + 设置页的新对话默认模式。
+    const st = get();
+    const prev = inherit ? currentSession(st) : null;
+    const explicit = projectId ? st.projects.find((p) => p.id === projectId) ?? null : null;
+    let workspacePath: string | null;
+    let boundProjectId: string | null;
+    if (explicit) {
+      workspacePath = explicit.path ?? null;
+      boundProjectId = explicit.id;
+    } else if (inherit) {
+      // 临时空间对话的工作区是临时副本，不作为继承来源
+      workspacePath = prev && !prev.isTemp ? prev.workspacePath || null : null;
+      boundProjectId = workspacePath
+        ? st.projects.find((p) => samePath(p.path, workspacePath))?.id ?? null
+        : null;
+    } else {
+      workspacePath = null;
+      boundProjectId = null;
+    }
     localStorage.removeItem(LAST_SESSION_KEY); // 草稿不可恢复，清除记住的会话
     set({
       draft: {
-        projectId: projectId ?? null,
-        workspacePath: proj?.path ?? null,
+        projectId: boundProjectId,
+        workspacePath,
         temp: null,
+        // 模式继承上一条对话；无可继承来源时用设置页的新对话默认值
+        accessMode: (inherit ? prev?.accessMode : undefined) ?? st.settings.globalAccessMode,
       },
       currentId: DRAFT_ID,
       readOnly: false,
@@ -259,11 +298,15 @@ export const useStore = create<Store>((set, get) => ({
     try {
       // 后端生成唯一随机码与计划路径，不创建目录；git 缺失时在此报错提示
       const temp = await ipc.allocTempCode(projectId);
+      const st = get();
+      const prev = currentSession(st);
       set({
         draft: {
           projectId,
           workspacePath: temp.mainTemp,
           temp,
+          // 临时空间对话同样继承上一条对话的访问模式
+          accessMode: prev?.accessMode ?? st.settings.globalAccessMode,
         },
         currentId: DRAFT_ID,
         readOnly: false,
@@ -279,6 +322,12 @@ export const useStore = create<Store>((set, get) => ({
     if (!d) return;
     // projectId 未传时保持不变；显式传 null 表示脱离项目
     set({ draft: { ...d, workspacePath: p, projectId: projectId === undefined ? d.projectId : projectId } });
+  },
+
+  setDraftAccessMode(mode) {
+    const d = get().draft;
+    if (!d) return;
+    set({ draft: { ...d, accessMode: mode } });
   },
 
   async selectSession(id, readOnly = false) {
@@ -346,7 +395,27 @@ export const useStore = create<Store>((set, get) => ({
   setProjectSettings(id) {
     set({ projectSettingsId: id });
   },
+  setSessionSettings(id) {
+    set({ sessionSettingsId: id });
+    if (id) void get().refreshSessionRules(id);
+  },
+  async refreshSessionRules(id) {
+    try {
+      const rules = await ipc.listSessionRules(id);
+      set((st) => ({ sessionRules: { ...st.sessionRules, [id]: rules } }));
+    } catch (e) {
+      get().pushToast(String(e));
+    }
+  },
+  onSessionRules(p) {
+    set((st) => ({ sessionRules: { ...st.sessionRules, [p.sessionId]: p.rules ?? [] } }));
+  },
   setSettingsLocal(s) {
+    set({ settings: s });
+  },
+
+  /** 后端设置变更时同步刷新缓存 */
+  onSettingsChanged(s) {
     set({ settings: s });
   },
 

@@ -70,6 +70,15 @@ fn init(conn: &Connection) -> Result<(), String> {
         );
         CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
 
+        CREATE TABLE IF NOT EXISTS session_rules_t (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          kind TEXT NOT NULL,
+          pattern TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_rules_session ON session_rules_t(session_id);
+
         CREATE TABLE IF NOT EXISTS tool_events (
           id TEXT PRIMARY KEY,
           message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -106,6 +115,30 @@ fn init(conn: &Connection) -> Result<(), String> {
         "#,
     )
     .map_err(|e| e.to_string())?;
+    // 旧库迁移：会话访问模式回填为具体值。访问模式已改为纯会话级（无“跟随全局”
+    // 状态），遗留的 NULL 用当前全局默认值填充，未设置过则用 confirm。
+    // 回填后运行时代码不再遇到 NULL；此语句在无 NULL 时不影响任何行。
+    let global_mode: String = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![SETTINGS_KEY],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<SettingsData>(&s).ok())
+        .map(|s| s.global_access_mode)
+        .unwrap_or_else(|| "confirm".into());
+    conn.execute(
+        "UPDATE sessions SET access_mode = ?1 WHERE access_mode IS NULL",
+        params![normalize_access_mode(&global_mode)],
+    )
+    .map_err(|e| e.to_string())?;
+    // 审批规则已改为会话级（session_rules_t）：旧的全局限用规则表整体丢弃
+    // （规则不再跨对话生效，保留后又无法归属到具体对话，因此不迁移）
+    conn.execute("DROP TABLE IF EXISTS approval_rules_t", [])
+        .map_err(|e| e.to_string())?;
     // 旧库迁移：projects 补 path / constraints 列（新建库的 CREATE TABLE 已含该列时跳过）
     ensure_column(conn, "projects", "path", "path TEXT")?;
     ensure_column(conn, "projects", "constraints", "constraints TEXT NOT NULL DEFAULT ''")?;
@@ -162,7 +195,6 @@ pub fn get_settings(conn: &Connection) -> Result<SettingsData, String> {
         None => SettingsData::default(),
     };
     data.migrate_legacy_model();
-    data.approval_rules = list_rules(conn)?;
     Ok(data)
 }
 
@@ -181,9 +213,7 @@ pub fn get_settings_with_secrets(conn: &Connection, master: &[u8; 32]) -> Result
 }
 
 pub fn save_settings(conn: &Connection, data: &SettingsData) -> Result<(), String> {
-    let mut clean = data.clone();
-    replace_rules(conn, &data.approval_rules)?;
-    clean.approval_rules = vec![];
+    let clean = data.clone();
     let json = serde_json::to_string(&clean).map_err(|e| e.to_string())?;
     conn.execute(
         "INSERT INTO settings(key, value) VALUES(?1, ?2)
@@ -194,34 +224,19 @@ pub fn save_settings(conn: &Connection, data: &SettingsData) -> Result<(), Strin
     Ok(())
 }
 
-// ---------- approval rules ----------
+// ---------- approval rules（会话级：仅对所属对话生效） ----------
 
-pub fn list_rules(conn: &Connection) -> Result<Vec<ApprovalRule>, String> {
+pub fn list_session_rules(conn: &Connection, session_id: &str) -> Result<Vec<ApprovalRule>, String> {
     let mut stmt = conn
-        .prepare("SELECT id, kind, pattern, scope, created_at FROM approval_rules_t")
-        .or_else(|_| {
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS approval_rules_t (
-                   id TEXT PRIMARY KEY,
-                   kind TEXT NOT NULL,
-                   pattern TEXT NOT NULL,
-                   scope TEXT NOT NULL DEFAULT 'global',
-                   created_at TEXT NOT NULL
-                 )",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
-            conn.prepare("SELECT id, kind, pattern, scope, created_at FROM approval_rules_t")
-                .map_err(|e| e.to_string())
-        })
+        .prepare("SELECT id, session_id, kind, pattern, created_at FROM session_rules_t WHERE session_id = ?1 ORDER BY created_at")
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map(params![session_id], |r| {
             Ok(ApprovalRule {
                 id: r.get(0)?,
-                kind: r.get(1)?,
-                pattern: r.get(2)?,
-                scope: r.get(3)?,
+                session_id: r.get(1)?,
+                kind: r.get(2)?,
+                pattern: r.get(3)?,
                 created_at: r.get(4)?,
             })
         })
@@ -229,33 +244,46 @@ pub fn list_rules(conn: &Connection) -> Result<Vec<ApprovalRule>, String> {
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
-pub fn replace_rules(conn: &Connection, rules: &[ApprovalRule]) -> Result<(), String> {
-    conn.execute("CREATE TABLE IF NOT EXISTS approval_rules_t (id TEXT PRIMARY KEY, kind TEXT NOT NULL, pattern TEXT NOT NULL, scope TEXT NOT NULL DEFAULT 'global', created_at TEXT NOT NULL)", [])
-        .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM approval_rules_t", [])
-        .map_err(|e| e.to_string())?;
-    for r in rules {
-        conn.execute(
-            "INSERT INTO approval_rules_t(id, kind, pattern, scope, created_at) VALUES(?1,?2,?3,?4,?5)",
-            params![r.id, r.kind, r.pattern, r.scope, r.created_at],
-        )
-        .map_err(|e| e.to_string())?;
+/// 新增会话规则；同一对话下 kind+pattern 已存在时直接返回已有规则，避免重复堆积
+pub fn add_session_rule(
+    conn: &Connection,
+    session_id: &str,
+    kind: &str,
+    pattern: &str,
+) -> Result<ApprovalRule, String> {
+    if let Some(existing) = list_session_rules(conn, session_id)?
+        .into_iter()
+        .find(|r| r.kind == kind && r.pattern == pattern)
+    {
+        return Ok(existing);
     }
-    Ok(())
-}
-
-pub fn add_rule(conn: &Connection, kind: &str, pattern: &str) -> Result<ApprovalRule, String> {
     let rule = ApprovalRule {
         id: uuid::Uuid::new_v4().to_string(),
+        session_id: session_id.to_string(),
         kind: kind.to_string(),
         pattern: pattern.to_string(),
-        scope: "global".into(),
         created_at: now(),
     };
-    let mut rules = list_rules(conn)?;
-    rules.push(rule.clone());
-    replace_rules(conn, &rules)?;
+    conn.execute(
+        "INSERT INTO session_rules_t(id, session_id, kind, pattern, created_at) VALUES(?1,?2,?3,?4,?5)",
+        params![rule.id, rule.session_id, rule.kind, rule.pattern, rule.created_at],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(rule)
+}
+
+/// 删除单条会话规则；返回该对话剩余的规则列表
+pub fn delete_session_rule(
+    conn: &Connection,
+    session_id: &str,
+    id: &str,
+) -> Result<Vec<ApprovalRule>, String> {
+    conn.execute(
+        "DELETE FROM session_rules_t WHERE id = ?1 AND session_id = ?2",
+        params![id, session_id],
+    )
+    .map_err(|e| e.to_string())?;
+    list_session_rules(conn, session_id)
 }
 
 // ---------- projects ----------
@@ -501,7 +529,7 @@ mod tests {
     fn session_temp_and_merge_state_roundtrip() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
-        let s = create_session(&conn, "D:\\tmp\\x", None, "t").unwrap();
+        let s = create_session(&conn, "D:\\tmp\\x", None, "t", "confirm").unwrap();
         assert!(!s.is_temp);
         set_session_temp(&conn, &s.id, "abc123", "D:\\data\\temp-project\\abc123", "D:\\proj").unwrap();
         let got = get_session(&conn, &s.id).unwrap().unwrap();
@@ -526,7 +554,7 @@ mod tests {
     fn message_reasoning_roundtrip() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
-        let s = create_session(&conn, ".", None, "t").unwrap();
+        let s = create_session(&conn, ".", None, "t", "confirm").unwrap();
         let m = new_message(&conn, &s.id, "assistant", Some(String::new()), false).unwrap();
         assert_eq!(m.reasoning, None);
 
@@ -561,11 +589,160 @@ mod tests {
         .unwrap();
         init_schema(&conn).unwrap();
 
-        let s = create_session(&conn, ".", None, "t").unwrap();
+        let s = create_session(&conn, ".", None, "t", "confirm").unwrap();
         let m = new_message(&conn, &s.id, "assistant", Some(String::new()), false).unwrap();
         update_message_reasoning(&conn, &m.id, "迁移后思考过程可写入").unwrap();
         let got = get_message(&conn, &m.id).unwrap().unwrap();
         assert_eq!(got.reasoning.as_deref(), Some("迁移后思考过程可写入"));
+    }
+
+    #[test]
+    fn session_rules_are_scoped_to_their_session() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let a = create_session(&conn, "D:\\a", None, "a", "confirm").unwrap();
+        let b = create_session(&conn, "D:\\b", None, "b", "full_access").unwrap();
+
+        add_session_rule(&conn, &a.id, "command_prefix", "npm").unwrap();
+        add_session_rule(&conn, &b.id, "command_prefix", "cargo").unwrap();
+
+        let ra = list_session_rules(&conn, &a.id).unwrap();
+        let rb = list_session_rules(&conn, &b.id).unwrap();
+        assert_eq!(ra.len(), 1);
+        assert_eq!(rb.len(), 1);
+        assert_eq!(ra[0].pattern, "npm");
+        assert_eq!(ra[0].session_id, a.id);
+        assert_eq!(rb[0].pattern, "cargo");
+    }
+
+    #[test]
+    fn add_session_rule_dedups_same_kind_and_pattern() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let s = create_session(&conn, ".", None, "t", "confirm").unwrap();
+
+        let first = add_session_rule(&conn, &s.id, "command_prefix", "npm").unwrap();
+        let again = add_session_rule(&conn, &s.id, "command_prefix", "npm").unwrap();
+        assert_eq!(first.id, again.id);
+        assert_eq!(list_session_rules(&conn, &s.id).unwrap().len(), 1);
+
+        // 同 pattern 不同 kind 视为两条规则
+        add_session_rule(&conn, &s.id, "tool", "npm").unwrap();
+        assert_eq!(list_session_rules(&conn, &s.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn delete_session_rule_returns_remaining_and_delete_session_cleans_up() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let s = create_session(&conn, ".", None, "t", "confirm").unwrap();
+        let r1 = add_session_rule(&conn, &s.id, "command_prefix", "npm").unwrap();
+        add_session_rule(&conn, &s.id, "command_prefix", "cargo").unwrap();
+
+        let left = delete_session_rule(&conn, &s.id, &r1.id).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].pattern, "cargo");
+
+        // 对话删除后规则一并清理，不残留孤儿规则
+        delete_session(&conn, &s.id).unwrap();
+        assert!(list_session_rules(&conn, &s.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_global_rule_table_is_dropped_on_open() {
+        let conn = Connection::open_in_memory().unwrap();
+        // 模拟旧库：存在全局限用规则表且已有数据
+        conn.execute_batch(
+            "CREATE TABLE approval_rules_t (
+               id TEXT PRIMARY KEY,
+               kind TEXT NOT NULL,
+               pattern TEXT NOT NULL,
+               scope TEXT NOT NULL DEFAULT 'global',
+               created_at TEXT NOT NULL
+             );
+             INSERT INTO approval_rules_t(id, kind, pattern, scope, created_at)
+             VALUES('r1','command_prefix','npm','global','2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+
+        // 旧全局规则整体丢弃（无法归属到具体对话），表结构一并移除
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='approval_rules_t'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn create_session_stores_normalized_access_mode() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        let full = create_session(&conn, "D:\\a", None, "a", "full_access").unwrap();
+        assert_eq!(full.access_mode.as_deref(), Some("full_access"));
+        assert_eq!(
+            get_session(&conn, &full.id).unwrap().unwrap().access_mode.as_deref(),
+            Some("full_access")
+        );
+
+        // 非法/空值一律规范为 confirm（访问模式无“跟随全局”状态）
+        let odd = create_session(&conn, "D:\\b", None, "b", "").unwrap();
+        assert_eq!(odd.access_mode.as_deref(), Some("confirm"));
+        let odd2 = create_session(&conn, "D:\\c", None, "c", "global").unwrap();
+        assert_eq!(odd2.access_mode.as_deref(), Some("confirm"));
+    }
+
+    #[test]
+    fn set_session_mode_never_writes_null() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let s = create_session(&conn, "D:\\a", None, "a", "confirm").unwrap();
+
+        set_session_mode(&conn, &s.id, "full_access").unwrap();
+        assert_eq!(
+            get_session(&conn, &s.id).unwrap().unwrap().access_mode.as_deref(),
+            Some("full_access")
+        );
+        // 传入无法识别的值也不会退回 NULL（旧实现的“跟随全局”）
+        set_session_mode(&conn, &s.id, "follow_global").unwrap();
+        assert_eq!(
+            get_session(&conn, &s.id).unwrap().unwrap().access_mode.as_deref(),
+            Some("confirm")
+        );
+    }
+
+    #[test]
+    fn legacy_null_access_mode_is_backfilled_with_global_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        // 模拟旧库：会话访问模式为 NULL（旧实现表示“跟随全局”），settings 中已有全局默认值
+        conn.execute_batch(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO settings(key, value) VALUES('app_settings', '{\"globalAccessMode\":\"full_access\"}');
+             CREATE TABLE sessions (
+               id TEXT PRIMARY KEY,
+               title TEXT NOT NULL,
+               workspace_path TEXT NOT NULL,
+               access_mode TEXT,
+               project_id TEXT,
+               status TEXT NOT NULL DEFAULT 'active',
+               last_message_at TEXT,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             INSERT INTO sessions(id, title, workspace_path, access_mode, status, created_at, updated_at)
+             VALUES('s1','t','D:\\a',NULL,'active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        // 回填为当时的全局默认值，运行时代码不再遇到 NULL
+        let got = get_session(&conn, "s1").unwrap().unwrap();
+        assert_eq!(got.access_mode.as_deref(), Some("full_access"));
     }
 }
 
@@ -752,13 +929,15 @@ pub fn create_session(
     workspace_path: &str,
     project_id: Option<&str>,
     title: &str,
+    access_mode: &str,
 ) -> Result<Session, String> {
     let t = now();
     let s = Session {
         id: uuid::Uuid::new_v4().to_string(),
         title: title.to_string(),
         workspace_path: workspace_path.to_string(),
-        access_mode: None,
+        // 访问模式为会话级：创建时必须给定具体值（由前端按“上一条对话”继承或传默认值）
+        access_mode: Some(normalize_access_mode(access_mode)),
         project_id: project_id.map(|s| s.to_string()),
         status: "active".into(),
         last_message_at: Some(t.clone()),
@@ -817,6 +996,9 @@ pub fn delete_session(conn: &Connection, id: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM session_kv WHERE session_id = ?1", params![id])
         .map_err(|e| e.to_string())?;
+    // 会话规则随对话删除一并清理（不残留孤儿规则）
+    conn.execute("DELETE FROM session_rules_t WHERE session_id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -831,10 +1013,12 @@ pub fn set_session_status(conn: &Connection, id: &str, status: &str) -> Result<(
     Ok(())
 }
 
-pub fn set_session_mode(conn: &Connection, id: &str, mode: Option<&str>) -> Result<(), String> {
+/// 设置会话访问模式：始终写入具体值（confirm / full_access），
+/// 拒绝写入 NULL——访问模式为纯会话级，不存在“跟随全局”状态。
+pub fn set_session_mode(conn: &Connection, id: &str, mode: &str) -> Result<(), String> {
     conn.execute(
         "UPDATE sessions SET access_mode = ?2 WHERE id = ?1",
-        params![id, mode],
+        params![id, normalize_access_mode(mode)],
     )
     .map_err(|e| e.to_string())?;
     Ok(())

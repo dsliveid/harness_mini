@@ -13,7 +13,6 @@ use tauri::{AppHandle, Emitter, Manager};
 pub struct SessionHandle {
     pub abort: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     pub active_run: Mutex<Option<String>>,
-    pub session_rules: Mutex<Vec<ApprovalRule>>,
 }
 
 impl SessionHandle {
@@ -21,7 +20,6 @@ impl SessionHandle {
         Self {
             abort: Mutex::new(None),
             active_run: Mutex::new(None),
-            session_rules: Mutex::new(vec![]),
         }
     }
 }
@@ -253,11 +251,6 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
             })
         })
         .collect();
-    let access_mode = session
-        .access_mode
-        .clone()
-        .unwrap_or_else(|| settings.global_access_mode.clone());
-    let full_access = access_mode == "full_access";
     let max_steps = settings.max_steps.max(1) as usize;
 
     // 项目约束 + 关联项目说明：按会话所属项目动态组装进 system prompt。
@@ -456,8 +449,6 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
                 &args,
                 &specs,
                 &tool_ctx,
-                full_access,
-                &settings,
             )
             .await;
             // 工具结果作为 tool 消息进入上下文
@@ -496,8 +487,6 @@ async fn handle_tool_call(
     args: &Value,
     specs: &[ToolSpec],
     ctx: &ToolCtx,
-    full_access: bool,
-    settings: &SettingsData,
 ) -> (String, String) {
     let state = app.state::<crate::AppState>();
     let now = chrono::Utc::now().to_rfc3339();
@@ -544,7 +533,21 @@ async fn handle_tool_call(
     let outside = path_arg.map(|p| !tools::inside_workspace(ctx, p)).unwrap_or(false);
     let mut already_inserted = false;
 
-    // ---- 权限判定：访问模式 → 规则 → 风险级 → 审批 ----
+    // ---- 权限判定：访问模式 → 会话规则 → 风险级 → 审批 ----
+    // 访问模式与会话规则均在此实时读取：对话进行中在顶栏改模式、审批时选「本会话允许」，
+    // 都能对本次运行内后续的工具调用立即生效，不必等下一轮运行。
+    let (full_access, session_rules) = {
+        let db = state.db.lock().unwrap();
+        let mode = store::get_session(&db, session_id)
+            .ok()
+            .flatten()
+            .and_then(|s| s.access_mode)
+            .unwrap_or_else(|| "confirm".into());
+        (
+            mode == "full_access",
+            store::list_session_rules(&db, session_id).unwrap_or_default(),
+        )
+    };
     let mut scope: Option<&'static str> = None;
     let mut need_ask = false;
     let mut ask_risk = "write";
@@ -560,34 +563,22 @@ async fn handle_tool_call(
             need_ask = true;
             ask_risk = "execute";
             force_once = true;
+        } else if session_rules
+            .iter()
+            .any(|r| approval::rule_matches(r, tool_name, args, ctx))
+        {
+            scope = Some("session");
+        } else if risk == Risk::ReadOnly && !outside {
+            scope = Some("none");
         } else {
-            let sr = state
-                .handles
-                .lock()
-                .unwrap()
-                .get(session_id)
-                .map(|h| h.session_rules.lock().unwrap().clone())
-                .unwrap_or_default();
-            if sr.iter().any(|r| approval::rule_matches(r, tool_name, args, ctx)) {
-                scope = Some("session");
-            } else if settings
-                .approval_rules
-                .iter()
-                .any(|r| approval::rule_matches(r, tool_name, args, ctx))
-            {
-                scope = Some("rule");
-            } else if risk == Risk::ReadOnly && !outside {
-                scope = Some("none");
+            need_ask = true;
+            ask_risk = if risk == Risk::Execute {
+                "execute"
+            } else if outside {
+                "path"
             } else {
-                need_ask = true;
-                ask_risk = if risk == Risk::Execute {
-                    "execute"
-                } else if outside {
-                    "path"
-                } else {
-                    "write"
-                };
-            }
+                "write"
+            };
         }
     }
 
@@ -629,22 +620,18 @@ async fn handle_tool_call(
             }
             d => {
                 ev.approval_scope = Some(d.scope_str().into());
-                // 记忆放行规则
-                if let Decision::AllowSession | Decision::AllowAlways = d {
+                // 记忆放行规则：「本会话允许」把规则写入当前对话并落库，
+                // 仅对该对话生效、重启后仍保留
+                if let Decision::AllowSession = d {
                     let (kind, pattern) = approval::rule_for(tool_name, args);
                     if !pattern.is_empty() {
-                        if let Decision::AllowAlways = d {
+                        let rules = {
                             let db = state.db.lock().unwrap();
-                            let _ = store::add_rule(&db, &kind, &pattern);
-                        } else if let Some(h) = state.handles.lock().unwrap().get(session_id) {
-                            h.session_rules.lock().unwrap().push(ApprovalRule {
-                                id: uuid::Uuid::new_v4().to_string(),
-                                kind,
-                                pattern,
-                                scope: "session".into(),
-                                created_at: chrono::Utc::now().to_rfc3339(),
-                            });
-                        }
+                            let _ = store::add_session_rule(&db, session_id, &kind, &pattern);
+                            store::list_session_rules(&db, session_id).unwrap_or_default()
+                        };
+                        // 通知前端刷新该对话的规则列表
+                        emit_session_rules(app, session_id, &rules);
                     }
                 }
             }
@@ -927,6 +914,14 @@ fn emit_tool(app: &AppHandle, session_id: &str, ev: &ToolEvent) {
     );
 }
 
+/// 广播某对话的审批规则列表（新增/删除规则时调用，前端据此刷新会话设置）
+fn emit_session_rules(app: &AppHandle, session_id: &str, rules: &[ApprovalRule]) {
+    let _ = app.emit(
+        "session:rules",
+        json!({"sessionId": session_id, "rules": rules}),
+    );
+}
+
 fn emit_tool_with(app: &AppHandle, session_id: &str, ev: &ToolEvent, extra: Value) {
     let _ = app.emit(
         "tool:update",
@@ -978,7 +973,7 @@ mod tests {
         let sys = "sys";
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         store::init_schema(&conn).unwrap();
-        let s = store::create_session(&conn, ".", None, "t").unwrap();
+        let s = store::create_session(&conn, ".", None, "t", "confirm").unwrap();
         let u = store::new_message(&conn, &s.id, "user", Some("hi".into()), false).unwrap();
         let a = store::new_message(&conn, &s.id, "assistant", Some(String::new()), false).unwrap();
         store::update_message_tool_calls(

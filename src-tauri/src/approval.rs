@@ -8,8 +8,8 @@ use tokio::sync::oneshot;
 #[derive(Clone, Debug)]
 pub enum Decision {
     AllowOnce,
+    /// 本会话允许：写入该对话的审批规则并持久化，仅对该对话生效
     AllowSession,
-    AllowAlways,
     Deny(Option<String>),
 }
 
@@ -18,7 +18,6 @@ impl Decision {
         match s {
             "allow_once" => Some(Decision::AllowOnce),
             "allow_session" => Some(Decision::AllowSession),
-            "allow_always" => Some(Decision::AllowAlways),
             "deny" => Some(Decision::Deny(reason)),
             _ => None,
         }
@@ -28,7 +27,6 @@ impl Decision {
         match self {
             Decision::AllowOnce => "once",
             Decision::AllowSession => "session",
-            Decision::AllowAlways => "rule",
             Decision::Deny(_) => "denied",
         }
     }

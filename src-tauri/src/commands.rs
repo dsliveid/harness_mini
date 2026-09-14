@@ -34,6 +34,15 @@ fn emit_queue(state: &crate::AppState, app: &AppHandle, session_id: &str) {
 
 // ---------- settings ----------
 
+/// 广播设置变更（含审批规则），前端据此刷新缓存中的设置与规则列表
+pub fn emit_settings_changed(state: &crate::AppState) {
+    let db = state.db.lock().unwrap();
+    let master = state.master_key.lock().unwrap();
+    if let Ok(settings) = store::get_settings_with_secrets(&db, &master) {
+        state.emit("settings:changed", &settings);
+    }
+}
+
 #[tauri::command]
 pub fn get_settings(state: State<'_, crate::AppState>) -> Result<SettingsData, String> {
     let db = state.db.lock().unwrap();
@@ -61,6 +70,9 @@ pub fn set_settings(state: State<'_, crate::AppState>, settings: SettingsData) -
         }
     }
     store::save_settings(&db, &clean)?;
+    drop(master);
+    drop(db);
+    emit_settings_changed(&state);
     Ok(())
 }
 
@@ -266,12 +278,71 @@ pub fn unarchive_session(state: State<'_, crate::AppState>, app: AppHandle, id: 
 
 #[tauri::command]
 pub fn set_session_mode(state: State<'_, crate::AppState>, app: AppHandle, id: String, mode: String) -> Result<(), String> {
-    let mode = if mode == "full_access" { Some("full_access") } else if mode == "confirm" { Some("confirm") } else { None };
-    let db = state.db.lock().unwrap();
-    store::set_session_mode(&db, &id, mode)?;
-    drop(db);
+    // 访问模式为会话级：仅接受具体的 confirm / full_access（规范化后落库）
+    let mode = crate::models::normalize_access_mode(&mode);
+    {
+        let db = state.db.lock().unwrap();
+        store::set_session_mode(&db, &id, &mode)?;
+    }
+    // 切到「完全访问」：立即放行该对话下已经弹出的审批条。
+    // 运行中的 Agent 会在下一次工具调用判定时实时读到新模式；此处只处理已经挂起的
+    // 审批请求，否则它们会一直挂到超时（5 分钟）才被拒绝。
+    if mode == "full_access" {
+        resolve_pending_approvals(&state, &app, &id);
+    }
     emit_session(&state, &app, &id);
     Ok(())
+}
+
+/// 放行指定对话下所有挂起的审批请求（切换到「完全访问」时调用）
+fn resolve_pending_approvals(state: &crate::AppState, app: &AppHandle, session_id: &str) {
+    let pending: Vec<(String, tokio::sync::oneshot::Sender<crate::approval::Decision>)> = {
+        let mut map = state.approvals.lock().unwrap();
+        let ids: Vec<String> = map
+            .iter()
+            .filter(|(_, p)| p.session_id == session_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        ids.into_iter()
+            .filter_map(|k| map.remove(&k).map(|p| (k, p.tx)))
+            .collect()
+    };
+    for (event_id, tx) in pending {
+        let _ = tx.send(crate::approval::Decision::AllowOnce);
+        let _ = app.emit(
+            "approval:resolved",
+            json!({"eventId": event_id, "decision": "allow_once"}),
+        );
+    }
+}
+
+/// 某对话的审批规则列表（会话设置面板使用）
+#[tauri::command]
+pub fn list_session_rules(
+    state: State<'_, crate::AppState>,
+    session_id: String,
+) -> Result<Vec<ApprovalRule>, String> {
+    let db = state.db.lock().unwrap();
+    store::list_session_rules(&db, &session_id)
+}
+
+/// 删除某对话的一条审批规则；返回剩余规则并广播，保证运行中的对话也能即时刷新
+#[tauri::command]
+pub fn delete_session_rule(
+    state: State<'_, crate::AppState>,
+    app: AppHandle,
+    session_id: String,
+    id: String,
+) -> Result<Vec<ApprovalRule>, String> {
+    let rules = {
+        let db = state.db.lock().unwrap();
+        store::delete_session_rule(&db, &session_id, &id)?
+    };
+    let _ = app.emit(
+        "session:rules",
+        json!({"sessionId": session_id, "rules": &rules}),
+    );
+    Ok(rules)
 }
 
 #[tauri::command]
@@ -321,11 +392,14 @@ pub fn send_message(
     workspace_path: Option<String>,
     project_id: Option<String>,
     temp: Option<TempAlloc>,
+    access_mode: Option<String>,
 ) -> Result<SendResult, String> {
     let text = text.trim().to_string();
     if text.is_empty() {
         return Err("消息不能为空".into());
     }
+    // 访问模式为会话级：新对话落库时由前端传入（继承“上一条对话”或默认值）
+    let access_mode = crate::models::normalize_access_mode(access_mode.as_deref().unwrap_or("confirm"));
     let (result, queued) = {
         let db = state.db.lock().unwrap();
         // 临时对话：首次发送时才真正落库
@@ -351,7 +425,7 @@ pub fn send_message(
                     }
                 }
                 let title: String = text.chars().take(24).collect();
-                let s = store::create_session(&db, &t.main_temp, Some(&proj_id), &title)?;
+                let s = store::create_session(&db, &t.main_temp, Some(&proj_id), &title, &access_mode)?;
                 store::set_session_temp(&db, &s.id, &t.code, &t.root, &t.source_workspace)?;
                 crate::temp::save_manifest(
                     &db,
@@ -378,7 +452,7 @@ pub fn send_message(
                     let _ = app.emit("projects:changed", &p);
                     Some(pid)
                 };
-                let s = store::create_session(&db, &ws, project_id.as_deref(), &title)?;
+                let s = store::create_session(&db, &ws, project_id.as_deref(), &title, &access_mode)?;
                 let _ = app.emit("sessions:changed", json!({"created": s.id}));
                 s.id
             }
@@ -396,9 +470,7 @@ pub fn send_message(
             if !ws.is_empty() && !is_temp {
                 settings.last_workspace_path = Some(ws);
             }
-            let mut clean = settings.clone();
-            clean.approval_rules = vec![];
-            if let Ok(json) = serde_json::to_string(&clean) {
+            if let Ok(json) = serde_json::to_string(&settings) {
                 let _ = db.execute(
                     "INSERT INTO settings(key, value) VALUES('app_settings', ?1)
                      ON CONFLICT(key) DO UPDATE SET value = excluded.value",

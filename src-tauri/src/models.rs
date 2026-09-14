@@ -19,6 +19,16 @@ pub struct ProviderCfg {
 fn default_access_mode() -> String {
     "confirm".into()
 }
+
+/// 规范化访问模式取值：仅接受 confirm / full_access，其余（含空串、历史 NULL）一律按 confirm。
+/// 访问模式为会话级、无“跟随全局”状态，因此运行时与落库始终是具体值。
+pub fn normalize_access_mode(mode: &str) -> String {
+    if mode == "full_access" {
+        "full_access".into()
+    } else {
+        "confirm".into()
+    }
+}
 fn default_max_steps() -> u32 {
     30
 }
@@ -49,8 +59,6 @@ pub struct SettingsData {
     pub context_token_limit: usize,
     #[serde(default)]
     pub last_workspace_path: Option<String>,
-    #[serde(default)]
-    pub approval_rules: Vec<ApprovalRule>,
 }
 
 impl Default for SettingsData {
@@ -64,7 +72,6 @@ impl Default for SettingsData {
             command_timeout_secs: default_cmd_timeout(),
             context_token_limit: default_ctx_tokens(),
             last_workspace_path: None,
-            approval_rules: vec![],
         }
     }
 }
@@ -169,18 +176,16 @@ mod tests {
     }
 }
 
+/// 审批规则：仅对所属对话生效（会话级；不跨对话共享，也不存在全局规则）
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalRule {
     pub id: String,
+    /// 所属对话 id：规则仅在该对话内参与判定，随对话删除一并清理
+    pub session_id: String,
     pub kind: String, // "command_prefix" | "path_write" | "tool"
     pub pattern: String,
-    #[serde(default = "default_scope")]
-    pub scope: String,
     pub created_at: String,
-}
-fn default_scope() -> String {
-    "global".into()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -408,7 +413,7 @@ pub struct ToolEvent {
     pub result_text: Option<String>,
     pub status: String, // pending_approval | running | success | failed | denied | timeout
     #[serde(default)]
-    pub approval_scope: Option<String>, // mode | rule | session | once | none
+    pub approval_scope: Option<String>, // mode | session | once | none
     pub created_at: String,
 }
 

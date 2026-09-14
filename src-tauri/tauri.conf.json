@@ -5,7 +5,7 @@
   "identifier": "com.harness.mini",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "devUrl": "http://localhost:1420",
+    "devUrl": "http://localhost:5601",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },

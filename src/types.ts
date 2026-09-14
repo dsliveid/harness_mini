@@ -8,9 +8,10 @@ export interface Provider {
 
 export interface ApprovalRule {
   id: string;
+  /** 所属对话：规则仅在该对话内参与判定，随对话删除一并清理 */
+  sessionId: string;
   kind: string; // command_prefix | path_write | tool
   pattern: string;
-  scope: string;
   createdAt: string;
 }
 
@@ -23,7 +24,6 @@ export interface Settings {
   commandTimeoutSecs: number;
   contextTokenLimit: number;
   lastWorkspacePath?: string | null;
-  approvalRules: ApprovalRule[];
 }
 
 export interface Project {

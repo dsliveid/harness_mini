@@ -5,7 +5,7 @@ import type { Provider, Settings } from "../types";
 import { DataDirSection } from "./DataDirSection";
 import { ModalActions, ModalClose } from "./ModalActions";
 
-type Tab = "models" | "rules" | "datadir";
+type Tab = "models" | "datadir";
 
 export function SettingsModal() {
   const show = useStore((s) => s.showSettings);
@@ -29,6 +29,14 @@ export function SettingsModal() {
       setVisibleKeys({});
       setCopiedId(null);
       setNewModel({});
+      // 打开时从后端拉取最新设置，避免草稿基于启动时的旧缓存回写
+      ipc
+        .getSettings()
+        .then((fresh) => {
+          setSettingsLocal(fresh);
+          setLocal(structuredClone(fresh));
+        })
+        .catch((e) => pushToast(String(e)));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [show]);
@@ -146,9 +154,6 @@ export function SettingsModal() {
           <aside className="w-[150px] shrink-0 border-r border-edge p-2 flex flex-col gap-1">
             <button className={menuCls(tab === "models")} onClick={() => setTab("models")}>
               🤖 模型设置
-            </button>
-            <button className={menuCls(tab === "rules")} onClick={() => setTab("rules")}>
-              🛡️ 审批规则
             </button>
             <button className={menuCls(tab === "datadir")} onClick={() => setTab("datadir")}>
               📂 数据目录
@@ -295,7 +300,7 @@ export function SettingsModal() {
                   <div className="font-medium mb-2">运行参数</div>
                   <div className="grid grid-cols-3 gap-3">
                     <label className="flex flex-col gap-1">
-                      <span className="text-inkdim">访问模式默认值</span>
+                      <span className="text-inkdim">新对话默认访问模式</span>
                       <select
                         className={inputCls}
                         value={local.globalAccessMode}
@@ -341,32 +346,6 @@ export function SettingsModal() {
                   </label>
                 </section>
               </div>
-            )}
-
-            {tab === "rules" && (
-              /* 审批规则 */
-              <section>
-                <div className="font-medium mb-2">审批规则（永久放行）</div>
-                <div className="flex flex-col gap-1">
-                  {local.approvalRules.map((r) => (
-                    <div key={r.id} className="flex items-center gap-2 bg-panel border border-edge rounded-lg px-3 py-2">
-                      <span className="text-[12px] text-inkdim w-24 shrink-0">
-                        {r.kind === "command_prefix" ? "命令前缀" : r.kind === "path_write" ? "路径写入" : "工具"}
-                      </span>
-                      <span className="font-mono text-[12px] flex-1 truncate">{r.pattern}</span>
-                      <button
-                        className="text-[12px] text-red-400 hover:underline shrink-0"
-                        onClick={() => setLocal({ ...local, approvalRules: local.approvalRules.filter((x) => x.id !== r.id) })}
-                      >
-                        删除
-                      </button>
-                    </div>
-                  ))}
-                  {local.approvalRules.length === 0 && (
-                    <div className="text-inkdim">暂无规则。审批时选择「总是允许」会添加到这里。</div>
-                  )}
-                </div>
-              </section>
             )}
 
             {tab === "datadir" && (
