@@ -51,6 +51,10 @@ interface Store {
   view: "list" | "project";
 
   bootstrap: () => Promise<void>;
+  /** 拉取全局运行中的会话，恢复各会话的“运行中”状态显示（启动/界面刷新后调用） */
+  refreshRunStatus: () => Promise<void>;
+  /** 请求停止会话当前运行：乐观置为空闲，后端会补发 run:status 事件兜底 */
+  stopRun: (sessionId: string) => void;
   refreshSessions: () => Promise<void>;
   refreshProjects: () => Promise<void>;
   setView: (v: "list" | "project") => void;
@@ -213,6 +217,8 @@ export const useStore = create<Store>((set, get) => ({
         ipc.listProjects(),
       ]);
       set({ settings, sessions, projects, ready: true });
+      // 恢复各会话的运行状态（运行状态不持久化在前端，以数据库为准）
+      void get().refreshRunStatus();
       // 恢复上次查看的会话；已被删除/归档则回落到列表第一个
       const lastId = localStorage.getItem(LAST_SESSION_KEY);
       const last = lastId ? sessions.find((s) => s.id === lastId) : null;
@@ -228,6 +234,24 @@ export const useStore = create<Store>((set, get) => ({
       set({ ready: true });
       get().pushToast(String(e));
     }
+  },
+
+  async refreshRunStatus() {
+    try {
+      const runs = await ipc.listRunningSessions();
+      const running: Record<string, "running"> = {};
+      for (const r of runs) running[r.sessionId] = "running";
+      set((st) => ({ runStatus: { ...st.runStatus, ...running } }));
+    } catch (e) {
+      get().pushToast(String(e));
+    }
+  },
+
+  stopRun(sessionId: string) {
+    // 乐观置为空闲（按钮立即恢复“发送”）；后端收到后补发 run:status(idle) 兜底，
+    // 队列未空时后端会自动继续消费并重新进入运行态
+    set((st) => ({ runStatus: { ...st.runStatus, [sessionId]: "idle" } }));
+    void ipc.stopRun(sessionId).catch((e) => get().pushToast(String(e)));
   },
 
   async refreshSessions() {

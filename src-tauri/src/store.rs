@@ -1414,6 +1414,28 @@ pub fn finish_run(conn: &Connection, id: &str, status: &str) -> Result<(), Strin
     Ok(())
 }
 
+/// 会话退出运行循环时兜底：把该会话残留的 running 状态 run 标记为 interrupted
+/// （如 stop 中止任务未走到 finish_run、或异常退出留下的记录），避免状态永远漂在“运行中”
+pub fn fail_open_runs(conn: &Connection, session_id: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE runs SET status = 'interrupted', ended_at = ?2 WHERE session_id = ?1 AND status = 'running'",
+        params![session_id, now()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 全部运行中的 run（跨会话）：前端界面刷新后据此恢复各会话的运行状态
+pub fn all_running_runs(conn: &Connection) -> Result<Vec<(String, String)>, String> {
+    let mut stmt = conn
+        .prepare("SELECT session_id, id FROM runs WHERE status = 'running'")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
 // ---------- session kv ----------
 
 pub fn set_kv(conn: &Connection, session_id: &str, key: &str, value: &str) -> Result<(), String> {

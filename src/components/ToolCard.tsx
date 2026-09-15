@@ -47,6 +47,12 @@ const TOOL_LABELS: Record<string, string> = {
   edit_file: "编辑文件",
   run_command: "执行命令",
   todo: "任务清单",
+  temp_status: "临时空间状态",
+  temp_changes: "临时空间变更",
+  temp_diff: "临时空间 diff",
+  temp_snapshot: "临时空间快照",
+  temp_restore: "临时空间恢复",
+  temp_merge: "合并到原目录",
 };
 
 function TodoList({ todos }: { todos: any[] }) {
@@ -70,7 +76,16 @@ function ApprovalSection({ ev }: { ev: ToolEvent }) {
   const [reason, setReason] = useState("");
 
   if (!req) return null;
-  const riskLabel = req.risk === "execute" ? "执行命令" : req.risk === "path" ? "访问工作区之外的路径" : "写入文件";
+  const riskLabel =
+    req.toolName === "temp_merge"
+      ? "把临时空间变更合并写回你的原始目录"
+      : req.toolName === "temp_restore"
+        ? "恢复临时空间（丢弃之后的修改）"
+        : req.risk === "execute"
+          ? "执行命令"
+          : req.risk === "path"
+            ? "访问工作区之外的路径"
+            : "写入文件";
 
   const respond = async (decision: string, r?: string) => {
     approvalDone(ev.id);

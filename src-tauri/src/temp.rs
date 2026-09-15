@@ -381,6 +381,26 @@ fn pair_is_binary(old: &Option<Vec<u8>>, new: &Option<Vec<u8>>) -> bool {
     [old, new].iter().any(|b| b.as_deref().map(is_binary).unwrap_or(false))
 }
 
+/// 单文件相对基线的增删行数（供 Agent 的 temp_changes 工具展示）
+pub fn change_stat(entry: &TempProjectEntry, path: &str, change: char) -> (usize, usize) {
+    let (old, new, too_large) = read_change_pair(entry, change, path);
+    if too_large || pair_is_binary(&old, &new) {
+        return (0, 0);
+    }
+    let old_str = String::from_utf8_lossy(old.as_deref().unwrap_or(b"")).to_string();
+    let new_str = String::from_utf8_lossy(new.as_deref().unwrap_or(b"")).to_string();
+    let d = similar::TextDiff::from_lines(old_str.as_str(), new_str.as_str());
+    let (mut a, mut r) = (0usize, 0usize);
+    for ch in d.iter_all_changes() {
+        match ch.tag() {
+            similar::ChangeTag::Insert => a += 1,
+            similar::ChangeTag::Delete => r += 1,
+            similar::ChangeTag::Equal => {}
+        }
+    }
+    (a, r)
+}
+
 /// 变更列表（弹窗左侧）：按项目分组，带增删行数统计
 pub fn list_temp_changes(manifest: &TempManifest) -> Result<TempChanges, String> {
     let mut projects = Vec::new();
@@ -846,6 +866,339 @@ pub async fn merge_space(
     emit_session_update(state, app, session_id);
     emit_temp_update(state, app, session_id);
     Ok(summary)
+}
+
+// ---------- Agent 工具层（temp_status / temp_changes / temp_diff / temp_snapshot / temp_restore / temp_merge） ----------
+
+/// Agent temp_* 工具的运行上下文：由 run_once 在 ensure_space 之后组装，
+/// 非临时空间会话为 None（temp_* 工具不可用，specs 也不下发）
+pub struct TempAgentCtx {
+    pub manifest: TempManifest,
+}
+
+/// 从清单解析项目条目：key 精确匹配，其次按项目名称匹配（大小写不敏感）。
+/// 不让 Agent 传绝对路径，从源头避免越界。
+pub fn resolve_entry<'a>(
+    manifest: &'a TempManifest,
+    key_or_name: Option<&str>,
+) -> Result<&'a TempProjectEntry, String> {
+    let target = key_or_name.map(str::trim).filter(|s| !s.is_empty());
+    let Some(t) = target else {
+        return manifest
+            .projects
+            .iter()
+            .find(|p| p.key == "main")
+            .ok_or_else(|| "清单中缺少主项目（main）".to_string());
+    };
+    if let Some(p) = manifest.projects.iter().find(|p| p.key == t) {
+        return Ok(p);
+    }
+    let hits: Vec<&TempProjectEntry> = manifest
+        .projects
+        .iter()
+        .filter(|p| p.name.eq_ignore_ascii_case(t))
+        .collect();
+    match hits.len() {
+        1 => Ok(hits[0]),
+        0 => {
+            let names: Vec<String> = manifest
+                .projects
+                .iter()
+                .map(|p| format!("{}（key: {}）", p.name, p.key))
+                .collect();
+            Err(format!("未找到项目「{t}」。可用项目：{}", names.join("、")))
+        }
+        _ => Err(format!(
+            "项目名称「{t}」对应多个项目，请改用项目 key 指定"
+        )),
+    }
+}
+
+/// 快照/项目子目录名清洗：仅保留字母数字与 - _，其余替换为下划线
+fn sanitize_component(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.trim().chars() {
+        if c.is_alphanumeric() || matches!(c, '-' | '_') {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    let t = out.trim_matches('_').to_string();
+    if t.is_empty() { "_".into() } else { t.chars().take(60).collect() }
+}
+
+#[derive(Debug, Default)]
+pub struct SnapshotOutcome {
+    pub label: String,
+    pub dir: String,
+    pub copied: usize,
+    pub failed: Vec<String>,
+}
+
+/// 快照当前临时空间：把每个项目副本完整拷贝到 `<临时根>\<label>.snapshot-<时间戳>\`
+/// （按项目 key 分子目录，排除 .git 与被忽略文件）。目标目录已存在时报错，绝不覆盖历史快照。
+pub fn snapshot_workspace(manifest: &TempManifest, label: &str) -> Result<SnapshotOutcome, String> {
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let label = sanitize_component(label);
+    let dir = PathBuf::from(&manifest.root).join(format!("{label}.snapshot-{ts}"));
+    if dir.exists() {
+        return Err(format!("快照目录已存在，请更换 label 后重试: {}", dir.display()));
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建快照目录失败: {e}"))?;
+    let mut out = SnapshotOutcome {
+        label,
+        dir: dir.to_string_lossy().to_string(),
+        ..Default::default()
+    };
+    for entry in &manifest.projects {
+        let src = PathBuf::from(&entry.temp);
+        let dst = dir.join(sanitize_component(&entry.key));
+        match copy_project(&src, &dst) {
+            Ok(n) => out.copied += n,
+            Err(e) => out.failed.push(format!("「{}」: {e}", entry.name)),
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone)]
+pub enum RestoreTarget {
+    /// 恢复到基线提交：丢弃全部未提交修改
+    Baseline,
+    /// 恢复到快照（temp_status 输出的快照目录名，允许只写时间戳前缀）
+    Snapshot(String),
+}
+
+#[derive(Debug, Default)]
+pub struct RestoreOutcome {
+    pub restored: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+/// 把临时空间恢复到基线或指定快照。只动临时副本，不触碰任何原始目录。
+/// 注意：不会撤销已合并到原始目录的变更（合并发生在源目录，恢复只重置副本）。
+pub fn restore_workspace(manifest: &TempManifest, target: &RestoreTarget) -> Result<RestoreOutcome, String> {
+    let mut out = RestoreOutcome::default();
+    match target {
+        RestoreTarget::Baseline => {
+            for entry in &manifest.projects {
+                match restore_entry_baseline(entry) {
+                    Ok(()) => out.restored.push(entry.name.clone()),
+                    Err(e) => out.failed.push(format!("「{}」: {e}", entry.name)),
+                }
+            }
+        }
+        RestoreTarget::Snapshot(name) => {
+            let dir = resolve_snapshot_dir(&manifest.root, name)?;
+            for entry in &manifest.projects {
+                match restore_entry_from_snapshot(entry, &dir) {
+                    Ok(()) => out.restored.push(entry.name.clone()),
+                    Err(e) => out.failed.push(format!("「{}」: {e}", entry.name)),
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 恢复单个项目副本到基线提交：受控文件还原为基线，删除未跟踪的非忽略文件
+/// （保留 node_modules/.env 等被忽略文件，避免破坏可重新生成的本地产物与环境配置）
+fn restore_entry_baseline(entry: &TempProjectEntry) -> Result<(), String> {
+    let dir = PathBuf::from(&entry.temp);
+    if !dir.join(".git").exists() {
+        return Err(format!("「{}」缺少 git 仓库，无法恢复基线", entry.name));
+    }
+    let baseline = entry.baseline.clone().unwrap_or_else(|| "HEAD".into());
+    run_git(&dir, &["reset", "--hard", &baseline])?;
+    run_git(&dir, &["clean", "-fd"])?;
+    Ok(())
+}
+
+/// 从快照恢复单个项目副本：
+/// 1) 受控文件回到基线、清掉未跟踪非忽略文件；2) 基线有而快照没有的受控文件删除；
+/// 3) 快照内容覆盖回工作区。恢复后工作区与基线的差异即快照相对基线的修改，diff 照常可用。
+fn restore_entry_from_snapshot(entry: &TempProjectEntry, snap_root: &Path) -> Result<(), String> {
+    let dir = PathBuf::from(&entry.temp);
+    if !dir.exists() {
+        return Err(format!("项目副本不存在: {}", entry.temp));
+    }
+    if !dir.join(".git").exists() {
+        return Err(format!("「{}」缺少 git 仓库，无法恢复", entry.name));
+    }
+    let snap = snap_root.join(sanitize_component(&entry.key));
+    if !snap.is_dir() {
+        return Err(format!("快照中缺少项目「{}」的数据", entry.name));
+    }
+    run_git(&dir, &["reset", "--hard"])?;
+    run_git(&dir, &["clean", "-fd"])?;
+    let tracked = run_git(&dir, &["ls-files"])?;
+    for f in tracked.lines() {
+        let f = f.trim();
+        if f.is_empty() || snap.join(f).is_file() {
+            continue;
+        }
+        let p = dir.join(f);
+        if p.is_file() {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+    copy_over(&snap, &dir)?;
+    Ok(())
+}
+
+/// 把 src 目录的文件覆盖拷贝到已存在的 dst（补齐缺失的父目录；不删除 dst 独有文件）
+fn copy_over(src: &Path, dst: &Path) -> Result<usize, String> {
+    use ignore::WalkBuilder;
+    let mut count = 0usize;
+    let walker = WalkBuilder::new(src)
+        .hidden(false)
+        .require_git(false)
+        .git_global(false)
+        .parents(false)
+        .build();
+    for entry in walker {
+        let entry = entry.map_err(|e| format!("遍历快照失败: {e}"))?;
+        if entry.depth() == 0 {
+            continue;
+        }
+        let Some(ft) = entry.file_type() else { continue };
+        if !ft.is_file() {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(src).unwrap_or(entry.path());
+        let target = dst.join(rel);
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::copy(entry.path(), &target)
+            .map_err(|e| format!("恢复失败 {}: {e}", entry.path().display()))?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// 解析快照目录：精确名称优先，否则按 `<name>.snapshot-*` 前缀匹配取最新（时间戳字典序最大）
+pub fn resolve_snapshot_dir(root: &str, name: &str) -> Result<PathBuf, String> {
+    let base = PathBuf::from(root);
+    let rd = std::fs::read_dir(&base).map_err(|e| format!("读取临时空间根目录失败: {e}"))?;
+    let want = name.trim();
+    let mut exact: Option<PathBuf> = None;
+    let mut prefixed: Vec<PathBuf> = Vec::new();
+    for e in rd.flatten() {
+        let n = e.file_name().to_string_lossy().to_string();
+        if !n.contains(".snapshot-") {
+            continue;
+        }
+        if n == want {
+            exact = Some(e.path());
+        } else if n.starts_with(&format!("{want}.snapshot-")) {
+            prefixed.push(e.path());
+        }
+    }
+    if let Some(p) = exact {
+        return Ok(p);
+    }
+    prefixed.sort();
+    prefixed
+        .pop()
+        .ok_or_else(|| format!("未找到快照「{want}」，可用快照见 temp_status 输出"))
+}
+
+/// 列出临时根目录下的快照目录名（供 temp_status 展示）
+pub fn list_snapshots(root: &str) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(root) else { return Vec::new() };
+    let mut v: Vec<String> = rd
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains(".snapshot-"))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Agent 发起的合并：与用户手动合并相同，但跳过「Agent 正在运行」互斥检查
+/// （调用方正是 Agent 运行本身）。合并成功后同样落库状态并刷新 UI。
+pub async fn merge_from_agent(
+    state: &crate::AppState,
+    app: &tauri::AppHandle,
+    session_id: &str,
+) -> Result<MergeSummary, String> {
+    let session = {
+        let db = state.db.lock().unwrap();
+        store::get_session(&db, session_id)?.ok_or("会话不存在")?
+    };
+    if !session.is_temp {
+        return Err("该对话不是临时空间对话".into());
+    }
+    if session.merged_pending {
+        return Err("本次变更已合并，请等待用户清空临时空间后再发起新的修改".into());
+    }
+    let root = PathBuf::from(session.temp_root.clone().ok_or("临时空间缺失")?);
+    {
+        let data_dir = state.data_dir.lock().unwrap().clone().ok_or("数据目录不可用")?;
+        validate_root(&root, &data_dir)?;
+    }
+    if !root.exists() {
+        return Err("临时空间目录不存在，无法合并".into());
+    }
+    let (manifest, settings) = {
+        let db = state.db.lock().unwrap();
+        let master = state.master_key.lock().unwrap();
+        (
+            load_manifest(&db, session_id)?.ok_or("临时空间清单缺失")?,
+            store::get_settings_with_secrets(&db, &master).unwrap_or_default(),
+        )
+    };
+    let llm_cfg = resolve_active_model(&settings).map(|(pc, m)| LlmCfg {
+        base_url: pc.base_url.clone(),
+        api_key: pc.api_key.clone(),
+        model: m.to_string(),
+    });
+
+    let summary = apply_merge(&manifest, llm_cfg.as_ref()).await;
+
+    {
+        let db = state.db.lock().unwrap();
+        let max_seq: i64 = db
+            .query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE session_id = ?1",
+                [session_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        store::set_session_merge_state(&db, session_id, Some(max_seq), true)?;
+    }
+    emit_session_update(state, app, session_id);
+    emit_temp_update(state, app, session_id);
+    Ok(summary)
+}
+
+/// 把合并结果格式化为给 Agent 的文本（含需人工处理的冲突清单与后续指引）
+pub fn format_merge_summary(s: &MergeSummary) -> String {
+    let mut t = format!(
+        "合并完成：直接写回 {} 个文件，AI 智能合并 {} 个，需人工处理 {} 个。",
+        s.total_applied, s.total_ai_merged, s.total_skipped
+    );
+    for p in &s.projects {
+        t.push_str(&format!(
+            "\n- 「{}」：直接写回 {}，AI 合并 {}，人工处理 {}",
+            p.name,
+            p.applied,
+            p.ai_merged,
+            p.skipped.len()
+        ));
+        for x in &p.skipped {
+            t.push_str(&format!("\n    - {x}"));
+        }
+    }
+    if s.total_skipped > 0 {
+        t.push_str(
+            "\n存在需人工处理的冲突文件（原始目录与临时空间都改动过且无法自动合并）。\n\
+             请把上面的文件清单明确告知用户，在编辑器中人工处理；本次合并已记录，不要再次调用 temp_merge。",
+        );
+    }
+    t
 }
 
 // ---------- system prompt 临时空间段 ----------

@@ -572,6 +572,23 @@ pub fn edit_and_resend(
     Ok(())
 }
 
+// ---------- 运行状态 ----------
+
+/// 全局运行中的会话列表：界面刷新后前端据此恢复各会话的“运行中”状态显示
+/// （以数据库 runs 表为准；任务中止/退出循环时均会兜底清理，不会残留）
+#[tauri::command]
+pub fn list_running_sessions(
+    state: State<'_, crate::AppState>,
+) -> Result<Vec<RunningSession>, String> {
+    let db = state.db.lock().unwrap();
+    let rows = store::all_running_runs(&db)?;
+    Ok(rows
+        .into_iter()
+        .map(|(session_id, run_id)| RunningSession { session_id, run_id })
+        .collect())
+}
+
+
 // ---------- 审批 ----------
 
 #[tauri::command]
@@ -671,13 +688,18 @@ pub fn get_temp_change_diff(
     crate::temp::file_diff(entry, &path)
 }
 
-/// 合并：把临时空间的变更写回各项目原目录（冲突走 AI 智能合并）
+/// 合并：把临时空间的变更写回各项目原目录（冲突走 AI 智能合并）。
+/// from_agent=true 时为 Agent 工具的透传调用（运行互斥检查跳过，审批已在工具层完成）
 #[tauri::command]
 pub async fn merge_temp_space(
     state: State<'_, crate::AppState>,
     app: AppHandle,
     session_id: String,
+    from_agent: Option<bool>,
 ) -> Result<MergeSummary, String> {
+    if from_agent.unwrap_or(false) {
+        return crate::temp::merge_from_agent(&state, &app, &session_id).await;
+    }
     crate::temp::merge_space(&state, &app, &session_id).await
 }
 

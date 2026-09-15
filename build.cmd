@@ -32,6 +32,7 @@ if not defined BASH_EXE (
   echo.
   echo Install Git for Windows: https://git-scm.com/download/win
   echo or add Git's bin directory to PATH, then retry.
+  call :pause_on_failure
   exit /b 1
 )
 
@@ -45,6 +46,14 @@ set "RC=%ERRORLEVEL%"
 
 if defined OLDCP chcp%OLDCP% >nul
 exit /b %RC%
+
+:pause_on_failure
+rem Keep the window open on failure. The message is ASCII on purpose: cmd.exe reads
+rem .cmd files using the OEM code page, so Chinese text here would be garbled.
+echo.
+echo Press Enter to close this window...
+pause >nul
+exit /b 0
 
 :try
 rem resolve to a full path first: cmd's "if exist" does not collapse ".." segments

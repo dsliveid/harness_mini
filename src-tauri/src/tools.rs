@@ -2,6 +2,7 @@ use crate::diffutil;
 use crate::models::truncate_result;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use tauri::Manager;
 use tokio::io::AsyncBufReadExt;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -35,6 +36,40 @@ pub struct ToolCtx {
     /// 普通会话为 None（等同 workspace）
     pub sandbox_root: Option<PathBuf>,
     pub command_timeout: std::time::Duration,
+    /// 临时空间上下文：仅临时空间会话有值，temp_* 工具依赖它定位清单与项目
+    pub temp: Option<crate::temp::TempAgentCtx>,
+    /// 宿主上下文（AppState / AppHandle / 会话 id）：仅 run_once 运行期间存在
+    pub host: Option<HostCtx>,
+}
+
+/// 把变更类型字符渲染为可读标记（工具输出用）
+fn change_mark(c: char) -> &'static str {
+    match c {
+        'A' => "A",
+        'D' => "D",
+        _ => "M",
+    }
+}
+
+/// 临时空间会话下发的 temp_* 工具集（普通会话不下发，见 agent.rs run_once 的 specs 过滤）
+pub const TEMP_TOOL_NAMES: &[&str] = &[
+    "temp_status",
+    "temp_changes",
+    "temp_diff",
+    "temp_snapshot",
+    "temp_restore",
+    "temp_merge",
+];
+
+/// temp_* 工具在非临时空间上下文中的报错文案
+const TEMP_NO_CTX: &str = "临时空间上下文不可用（该对话可能不是临时空间对话）";
+
+/// 工具对宿主的只读引用：供 temp_merge 等需要应用状态的工具使用。
+/// AppState 由 tauri 托管，工具内部用 `app.state::<AppState>()` 借用即可。
+#[derive(Clone)]
+pub struct HostCtx {
+    pub app: tauri::AppHandle,
+    pub session_id: String,
 }
 
 pub fn tool_specs() -> Vec<ToolSpec> {
@@ -155,6 +190,66 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "required": ["todos"]
             }),
         },
+        // ---------- 临时空间专用（普通会话不下发，见 agent.rs run_once 的 specs 过滤） ----------
+        ToolSpec {
+            name: "temp_status",
+            description: "查看当前临时空间状态：项目清单（key/名称/临时路径）、各项目变更文件数、已保存的快照。",
+            risk: Risk::ReadOnly,
+            schema: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "temp_changes",
+            description: "列出临时空间中指定项目相对基线的全部变更文件（含增删行数）。",
+            risk: Risk::ReadOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "项目 key 或名称（temp_status 可查），默认主项目"}
+                }
+            }),
+        },
+        ToolSpec {
+            name: "temp_diff",
+            description: "查看临时空间中单个变更文件的 diff（基线 vs 当前副本，±3 行上下文分块）。",
+            risk: Risk::ReadOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "temp_changes 返回的相对路径"},
+                    "project": {"type": "string", "description": "项目 key 或名称，默认主项目"}
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolSpec {
+            name: "temp_snapshot",
+            description: "为临时空间当前状态建立快照（完整拷贝全部项目副本）。做有风险的批量修改前建议先建快照作为恢复点。",
+            risk: Risk::Write,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string", "description": "快照名称（建议简短英文/数字，如 before-refactor）"}
+                }
+            }),
+        },
+        ToolSpec {
+            name: "temp_restore",
+            description: "把临时空间恢复到基线（丢弃全部未提交修改）或指定快照。只影响临时副本，不动原目录；已合并回原目录的内容不会被撤销。危险操作，需用户逐次审批。",
+            risk: Risk::Write,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "enum": ["baseline"], "description": "baseline = 恢复到基线"},
+                    "snapshot": {"type": "string", "description": "快照名（temp_status 列出，可只写到时间戳前缀）；提供时优先生效"}
+                }
+            }),
+        },
+        ToolSpec {
+            name: "temp_merge",
+            description: "把临时空间的全部变更写回各项目原目录（冲突走 AI 智能合并）。不可逆且影响用户原始目录：务必在任务完成、验证通过并向用户说明后调用。",
+            risk: Risk::Write,
+            schema: json!({ "type": "object", "properties": {} }),
+        },
     ]
 }
 
@@ -260,6 +355,12 @@ pub async fn execute(
         "edit_file" => edit_file(args, ctx).await,
         "run_command" => run_command(args, ctx, on_partial).await,
         "todo" => Ok("ok".to_string()),
+        "temp_status" => temp_status(ctx).await,
+        "temp_changes" => temp_changes(args, ctx).await,
+        "temp_diff" => temp_diff(args, ctx).await,
+        "temp_snapshot" => temp_snapshot(args, ctx).await,
+        "temp_restore" => temp_restore(args, ctx).await,
+        "temp_merge" => temp_merge(ctx).await,
         other => Err(format!("未知工具: {other}")),
     }
 }
@@ -588,6 +689,138 @@ async fn run_command(
         Err(_) => -1,
     };
     Ok(truncate_result(&format!("{output}\n[exit code: {code}]")))
+}
+
+// ---------- 临时空间工具实现 ----------
+
+/// temp_status：项目清单 + 各项目变更文件数 + 快照列表
+async fn temp_status(ctx: &ToolCtx) -> Result<String, String> {
+    let t = ctx.temp.as_ref().ok_or(TEMP_NO_CTX)?;
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "临时空间根目录: {}", t.manifest.root);
+    let _ = writeln!(out, "快照目录: {}", crate::temp::list_snapshots(&t.manifest.root).join("、"));
+    for p in &t.manifest.projects {
+        let n = crate::temp::list_changes(p).map(|c| c.len()).unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "- 「{}」 key={} 变更文件 {} 个\n  临时目录: {}\n  原目录: {}",
+            p.name, p.key, n, p.temp, p.source
+        );
+    }
+    Ok(truncate_result(&out))
+}
+
+/// temp_changes：指定项目相对基线的变更文件清单（含增删行数）
+async fn temp_changes(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let t = ctx.temp.as_ref().ok_or(TEMP_NO_CTX)?;
+    let project = args.get("project").and_then(|v| v.as_str());
+    let entry = crate::temp::resolve_entry(&t.manifest, project)?;
+    let changes = crate::temp::list_changes(entry)?;
+    if changes.is_empty() {
+        return Ok(format!("「{}」暂无变更", entry.name));
+    }
+    use std::fmt::Write;
+    let mut out = String::new();
+    for f in &changes {
+        let (a, r) = crate::temp::change_stat(entry, &f.path, f.change);
+        let _ = writeln!(out, "{}\t{}\t+{} −{}", change_mark(f.change), f.path, a, r);
+    }
+    Ok(truncate_result(&format!(
+        "「{}」共 {} 个变更文件：\n{out}",
+        entry.name,
+        changes.len()
+    )))
+}
+
+/// temp_diff：单文件 diff（复用 UI 弹窗同源的数据，仅渲染为文本）
+async fn temp_diff(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let t = ctx.temp.as_ref().ok_or(TEMP_NO_CTX)?;
+    let path = args.get("path").and_then(|v| v.as_str()).ok_or("缺少 path")?;
+    let project = args.get("project").and_then(|v| v.as_str());
+    let entry = crate::temp::resolve_entry(&t.manifest, project)?;
+    let d = crate::temp::file_diff(entry, path)?;
+    if d.binary {
+        return Ok(format!("{}（二进制文件，不显示 diff）", d.path));
+    }
+    if d.too_large {
+        return Ok(format!("{}（文件过大，不显示 diff）", d.path));
+    }
+    if d.hunks.is_empty() {
+        return Ok(format!("{}（无差异）", d.path));
+    }
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "「{}」{}（+{} −{}）", d.project_name, d.path, d.added, d.removed);
+    if d.truncated {
+        out.push_str("[diff 过长已截断]\n");
+    }
+    for h in &d.hunks {
+        let _ = writeln!(out, "@@ -{},{} +{},{} @@", h.old_start, h.old_lines, h.new_start, h.new_lines);
+        for l in &h.lines {
+            let mark = match l.tag.as_str() {
+                "add" => "+",
+                "del" => "-",
+                _ => " ",
+            };
+            let _ = writeln!(out, "{mark}{}", l.text);
+        }
+    }
+    Ok(truncate_result(&out))
+}
+
+/// temp_snapshot：快照当前临时空间
+async fn temp_snapshot(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let t = ctx.temp.as_ref().ok_or(TEMP_NO_CTX)?;
+    let label = args
+        .get("label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("manual");
+    let out = crate::temp::snapshot_workspace(&t.manifest, label)?;
+    let mut text = format!(
+        "快照「{}」已保存至 {}（拷贝 {} 个文件）",
+        out.label, out.dir, out.copied
+    );
+    for f in &out.failed {
+        text.push_str(&format!("\n- 失败: {f}"));
+    }
+    if !out.failed.is_empty() {
+        text.push_str("\n快照不完整，谨慎使用该恢复点。");
+    }
+    Ok(truncate_result(&text))
+}
+
+/// temp_restore：恢复到基线或快照（仅动临时副本）
+async fn temp_restore(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let t = ctx.temp.as_ref().ok_or(TEMP_NO_CTX)?;
+    let snapshot = args.get("snapshot").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let target = match snapshot {
+        Some(name) => crate::temp::RestoreTarget::Snapshot(name.to_string()),
+        None => crate::temp::RestoreTarget::Baseline,
+    };
+    let out = crate::temp::restore_workspace(&t.manifest, &target)?;
+    let mut text = match target {
+        crate::temp::RestoreTarget::Baseline => "已恢复到基线（丢弃全部未提交修改）".to_string(),
+        crate::temp::RestoreTarget::Snapshot(_) => "已恢复到快照".to_string(),
+    };
+    for r in &out.restored {
+        text.push_str(&format!("\n✅ {r}"));
+    }
+    for f in &out.failed {
+        text.push_str(&format!("\n❌ {f}"));
+    }
+    if out.failed.is_empty() {
+        text.push_str("\n注意：仅重置了临时副本，已合并回原目录的内容不受影响。");
+    }
+    Ok(truncate_result(&text))
+}
+
+/// temp_merge：把临时空间变更合并回原目录（Agent 发起，跳过运行互斥）
+async fn temp_merge(ctx: &ToolCtx) -> Result<String, String> {
+    let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
+    let state = host.app.state::<crate::AppState>();
+    let summary = crate::temp::merge_from_agent(&state, &host.app, &host.session_id).await?;
+    Ok(truncate_result(&crate::temp::format_merge_summary(&summary)))
 }
 
 #[cfg(test)]

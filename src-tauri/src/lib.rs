@@ -205,6 +205,7 @@ pub fn run() {
             commands::guide_message,
             commands::delete_queued_message,
             commands::stop_run,
+            commands::list_running_sessions,
             commands::edit_and_resend,
             commands::respond_approval,
             commands::list_session_rules,

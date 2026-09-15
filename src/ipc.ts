@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ApprovalRule, DataStatus, Message, MergeSummary, Project, ProjectLink, Session, Settings, TempAlloc, TempChanges, TempFileDiff, TempInfo, ToolEvent } from "./types";
+import type { ApprovalRule, DataStatus, Message, MergeSummary, Project, ProjectLink, RunningSession, Session, Settings, TempAlloc, TempChanges, TempFileDiff, TempInfo, ToolEvent } from "./types";
 
 export const ipc = {
   getSettings: () => invoke<Settings>("get_settings"),
@@ -67,6 +67,7 @@ export const ipc = {
   deleteQueuedMessage: (sessionId: string, messageId: string) =>
     invoke<void>("delete_queued_message", { sessionId, messageId }),
   stopRun: (sessionId: string) => invoke<void>("stop_run", { sessionId }),
+  listRunningSessions: () => invoke<RunningSession[]>("list_running_sessions"),
   editAndResend: (sessionId: string, messageId: string, newText: string) =>
     invoke<void>("edit_and_resend", { sessionId, messageId, newText }),
 
@@ -93,4 +94,4 @@ export const ipc = {
   openDir: (path: string) => invoke<void>("open_dir", { path }),
 };
 
-export type { Message, Session, Project, ProjectLink, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary };
+export type { Message, Session, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary };

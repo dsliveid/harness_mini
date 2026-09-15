@@ -125,7 +125,7 @@ export function Composer() {
           <button
             className="shrink-0 w-9 h-9 rounded-lg bg-red-600/80 hover:bg-red-500 text-white flex items-center justify-center"
             title="停止"
-            onClick={() => currentId && ipc.stopRun(currentId)}
+            onClick={() => currentId && useStore.getState().stopRun(currentId)}
           >
             ■
           </button>

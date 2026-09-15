@@ -30,13 +30,13 @@ pub fn normalize_access_mode(mode: &str) -> String {
     }
 }
 fn default_max_steps() -> u32 {
-    30
+    50
 }
 fn default_cmd_timeout() -> u64 {
     120
 }
 fn default_ctx_tokens() -> usize {
-    28000
+    280000
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -492,4 +492,12 @@ pub fn truncate_result(s: &str) -> String {
         end -= 1;
     }
     format!("{}\n\n[结果过长，已截断至 32KB]", &s[..end])
+}
+
+/// 运行中的会话（全局查询结果项）：界面刷新后恢复运行状态用
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RunningSession {
+    pub session_id: String,
+    pub run_id: String,
 }

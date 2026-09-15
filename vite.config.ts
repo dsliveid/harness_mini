@@ -8,7 +8,7 @@ export default defineConfig({
   clearScreen: false,
   server: {
     port: 5601,
-    strictPort: true,
+    strictPort: false, // 端口被占时 +1 顺延（多实例开发）；实际端口由 scripts/tauri-dev.mjs 解析后覆盖到 tauri devUrl，勿绕过 npm run tauri dev 直连 npx tauri dev（会脏跑到第一实例的 vite 上）
     host: host || false,
     hmr: host
       ? { protocol: "ws", host, port: 1421 }

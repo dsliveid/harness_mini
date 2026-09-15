@@ -93,13 +93,21 @@ pub fn stop_session(app: &AppHandle, session_id: &str) {
         .unwrap()
         .retain(|_, p| p.session_id != session_id);
     if let Some(run_id) = aborted_run {
-        if run_id != "starting" {
+        // starting = 任务尚未拿到 run_id；无论哪种情况都把库中残留的 running 记录收尾，
+        // 避免停止后数据库里留下永久“运行中”的 run（运行状态恢复以数据库为准）
+        {
             let db = state.db.lock().unwrap();
-            let _ = store::finish_run(&db, &run_id, "cancelled");
+            let _ = store::fail_open_runs(&db, session_id);
         }
         let _ = app.emit(
             "run:status",
             json!({"sessionId": session_id, "runId": run_id, "status": "cancelled"}),
+        );
+    } else {
+        // 会话本就空闲（如前端状态漂移后误点停止）：补发空闲事件让前端复位
+        let _ = app.emit(
+            "run:status",
+            json!({"sessionId": session_id, "status": "idle"}),
         );
     }
     // 队列未空则继续依次执行
@@ -168,6 +176,12 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
     if let Some(h) = state.handles.lock().unwrap().get(&session_id) {
         *h.active_run.lock().unwrap() = None;
     }
+    // 兜底：任务被中止（stop）时走不到 finish_run，把残留的 running run 标记为 interrupted，
+    // 否则以数据库为准的运行状态恢复会把该会话永远显示为“运行中”
+    {
+        let db = state.db.lock().unwrap();
+        let _ = store::fail_open_runs(&db, &session_id);
+    }
     let _ = app.emit(
         "queue:update",
         json!({"sessionId": session_id, "items": queued_payload(&state, &session_id)}),
@@ -226,6 +240,16 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
         model: model.to_string(),
     };
 
+    // 临时空间上下文：temp_* 工具依赖的清单（非临时会话为 None，对应工具不下发也不可用）
+    let temp_ctx = if session.is_temp {
+        let db = state.db.lock().unwrap();
+        match crate::temp::load_manifest(&db, session_id) {
+            Ok(Some(m)) => Some(crate::temp::TempAgentCtx { manifest: m }),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let tool_ctx = ToolCtx {
         workspace: workspace.clone(),
         // 临时空间会话：沙箱为整个临时空间根目录（AI 可访问主项目与关联项目的临时副本）
@@ -235,8 +259,17 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
             None
         },
         command_timeout: Duration::from_secs(settings.command_timeout_secs.max(5)),
+        temp: temp_ctx,
+        host: Some(tools::HostCtx {
+            app: app.clone(),
+            session_id: session_id.to_string(),
+        }),
     };
-    let specs = tools::tool_specs();
+    let specs: Vec<ToolSpec> = tools::tool_specs()
+        .into_iter()
+        // 临时空间专用工具仅对临时空间会话下发
+        .filter(|s| session.is_temp || !tools::TEMP_TOOL_NAMES.contains(&s.name))
+        .collect();
     // 标准 OpenAI tools 格式：function 必须含 name/description/parameters
     let schemas: Vec<Value> = specs
         .iter()
@@ -553,7 +586,7 @@ async fn handle_tool_call(
     let mut ask_risk = "write";
     let mut force_once = false;
 
-    if full_access {
+    if full_access && tool_name != "temp_merge" {
         scope = Some("mode");
     } else {
         let high_danger =
@@ -562,6 +595,12 @@ async fn handle_tool_call(
             // 高危命令：强制逐次审批，不可记忆放行
             need_ask = true;
             ask_risk = "execute";
+            force_once = true;
+        } else if tool_name == "temp_merge" {
+            // 合并写回用户原始目录：不可逆且影响范围超出沙箱，
+            // 任何访问模式下都强制逐次审批，且不可记忆放行
+            need_ask = true;
+            ask_risk = "write";
             force_once = true;
         } else if session_rules
             .iter()
@@ -693,6 +732,28 @@ fn build_preview(tool_name: &str, args: &Value) -> String {
             .and_then(|c| c.as_str())
             .unwrap_or("")
             .to_string(),
+        "temp_merge" => {
+            "把临时空间的全部变更写回各项目原目录（冲突走 AI 智能合并）。\
+             该操作影响你的原始目录且不可自动撤销；存在无法自动合并的冲突文件时将列出清单供人工处理。"
+                .to_string()
+        }
+        "temp_snapshot" => {
+            let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("manual");
+            format!("为临时空间全部项目副本建立快照：{label}")
+        }
+        "temp_restore" => {
+            let snap = args
+                .get("snapshot")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match snap {
+                Some(s) => format!(
+                    "把临时空间全部项目副本恢复到快照「{s}」：丢弃快照之后的全部修改（不影响原目录）。"
+                ),
+                None => "把临时空间全部项目副本恢复到基线：丢弃全部未提交修改（不影响原目录）。".to_string(),
+            }
+        }
         "write_file" => {
             let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
             let content = args.get("content").and_then(|c| c.as_str()).unwrap_or("");

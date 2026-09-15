@@ -32,7 +32,17 @@ npm run tauri dev  # 开发模式（Rust 首次编译较久）
 ./run.sh                # 启动开发模式（Windows：run.cmd）
 ./run.sh --skip-install # 跳过依赖检查
 ./run.sh --dry-run      # 只检查环境并打印将要执行的命令，不真正启动
+./run.sh --no-pause     # 失败后不等待回车，立即退出
 ```
+
+### 多实例开发（端口顺延）
+
+- 默认 dev 端口 5601 被占用时（如已开着另一份实例），vite 会自动 +1 顺延；实际端口由
+  `scripts/tauri-dev.mjs` 从 vite 输出解析后覆盖到 `tauri dev --config` 的 devUrl，两个实例完全独立。
+- 经 `npm run tauri dev` / `run.cmd` / `run.sh` 启动即自动生效，无需任何配置。
+- 请勿绕过包装器直接 `npx tauri dev`：CLI 读不到顺延后的端口，第二实例会挂到第一实例的 vite 上。
+- 同一工作区内多开受 cargo 产物锁限制（旧实例运行中时无法重链接 `harness-mini.exe`），
+  多目录副本各自独立 target，无此限制。
 
 ## 构建安装包
 
@@ -50,11 +60,27 @@ npm run tauri build
 ./build.sh --debug        # debug 构建，仅用于验证
 ./build.sh --clean        # 构建前 cargo clean（全量重编译）
 ./build.sh --dry-run      # 只检查环境并打印将要执行的命令，不真正构建
+./build.sh --no-pause     # 失败后不等待回车，立即退出
 ```
 
 两个脚本用 bash 编写，可在 Git Bash、Linux、macOS 直接运行。Windows 上 Git Bash 若不在 PATH，
 直接运行 `run.cmd` / `build.cmd` 即可：包装器会自动定位 Git Bash（PATH → 由 `git.exe` 位置反推 →
 常见安装目录），并临时把控制台切到 UTF-8 代码页以保证中文输出正常。
+
+### 失败不被窗口“吞掉”
+
+脚本失败时不会立即退出：先打印退出码，再提示**“按回车键关闭窗口”**，等待回车后才退出，
+因此双击启动也能看清报错而不会被窗口一闪而过。退出码原样保留，可直接用于脚本/CI 判断。
+
+判断依据只有一个：**stdin 是不是终端**（`[ -t 0 ]`）。
+
+- 双击 `run.cmd` / `build.cmd`，或直接在 Git Bash 里运行 → stdin 是终端，失败时暂停。
+- CI、输出被重定向、IDE/工具宿主（stdin 不是终端）→ **不暂停**，避免流水线卡在等待输入。
+- 退出码 0（正常结束、`--help`）不暂停。
+- 用 `--no-pause` 可关闭暂停。
+
+> 注意：不要去掉这个 `[ -t 0 ]` 判断。在 IDE/工具宿主里 stdin 不是终端，但 `read` 仍会一直
+> 阻塞（已实测），去掉后脚本会挂死而不是报错退出。
 
 要求：Node 18+、Rust 1.75+、Windows 10/11（WebView2 随系统分发）。
 

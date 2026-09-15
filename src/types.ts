@@ -267,3 +267,9 @@ export function dirName(p: string): string {
   const i = Math.max(t.lastIndexOf("/"), t.lastIndexOf("\\"));
   return (i >= 0 ? t.slice(i + 1) : t) || t;
 }
+
+/** 运行中的会话（全局查询结果项）：界面刷新后恢复运行状态用 */
+export interface RunningSession {
+  sessionId: string;
+  runId: string;
+}
