@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "./ipc";
-import { DRAFT_ID, samePath, type ApprovalReq, type ApprovalRule, type DataStatus, type Message, type Project, type QueuedItem, type Session, type Settings, type TempAlloc, type TempInfo, type ToolEvent } from "./types";
+import { DRAFT_ID, samePath, type ApprovalReq, type ApprovalRule, type DataStatus, type Message, type Project, type QueuedItem, type Session, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent } from "./types";
 
 export interface Toast {
   id: string;
@@ -46,6 +46,8 @@ interface Store {
   sessionSettingsId: string | null;
   /** 各对话的审批规则（会话级：仅对所属对话生效），按会话 id 缓存 */
   sessionRules: Record<string, ApprovalRule[]>;
+  /** 会话任务清单，按会话 id 缓存 */
+  sessionTodos: Record<string, TodoItem[]>;
   /** 程序数据目录状态；pending=true 时启动拦截对话框等待用户选择 */
   dataStatus: DataStatus | null;
   view: "list" | "project";
@@ -55,6 +57,8 @@ interface Store {
   refreshRunStatus: () => Promise<void>;
   /** 请求停止会话当前运行：乐观置为空闲，后端会补发 run:status 事件兜底 */
   stopRun: (sessionId: string) => void;
+  /** 手动关闭指定正在运行的控制台进程 */
+  killCommand: (eventId: string) => Promise<void>;
   refreshSessions: () => Promise<void>;
   refreshProjects: () => Promise<void>;
   setView: (v: "list" | "project") => void;
@@ -172,11 +176,13 @@ export const useStore = create<Store>((set, get) => ({
     providers: [],
     activeProviderId: null,
     activeModelId: null,
+    activeModel: null,
     globalAccessMode: "confirm",
     maxSteps: 30,
     commandTimeoutSecs: 120,
     contextTokenLimit: 28000,
     lastWorkspacePath: null,
+    disabledTools: [],
   },
   projects: [],
   sessions: [],
@@ -199,6 +205,7 @@ export const useStore = create<Store>((set, get) => ({
   projectSettingsId: null,
   sessionSettingsId: null,
   sessionRules: {},
+  sessionTodos: {},
   dataStatus: null,
   // 启动默认进入项目视图
   view: "project",
@@ -211,11 +218,13 @@ export const useStore = create<Store>((set, get) => ({
       // 状态获取失败不阻塞启动
     }
     try {
-      const [settings, sessions, projects] = await Promise.all([
+      const [rawSettings, sessions, projects] = await Promise.all([
         ipc.getSettings(),
         ipc.listSessions(),
         ipc.listProjects(),
       ]);
+      const activeModelId = rawSettings.activeModelId ?? rawSettings.activeModel ?? null;
+      const settings = { ...rawSettings, activeModelId, activeModel: activeModelId };
       set({ settings, sessions, projects, ready: true });
       // 恢复各会话的运行状态（运行状态不持久化在前端，以数据库为准）
       void get().refreshRunStatus();
@@ -252,6 +261,15 @@ export const useStore = create<Store>((set, get) => ({
     // 队列未空时后端会自动继续消费并重新进入运行态
     set((st) => ({ runStatus: { ...st.runStatus, [sessionId]: "idle" } }));
     void ipc.stopRun(sessionId).catch((e) => get().pushToast(String(e)));
+  },
+
+  async killCommand(eventId: string) {
+    try {
+      await ipc.killCommand(eventId);
+      get().pushToast("已终止控制台进程");
+    } catch (e) {
+      get().pushToast(String(e));
+    }
   },
 
   async refreshSessions() {
@@ -372,6 +390,12 @@ export const useStore = create<Store>((set, get) => ({
         const info = await ipc.getTempInfo(id);
         set((st) => ({ tempInfo: { ...st.tempInfo, [id]: info } }));
       }
+      // 拉取会话任务清单快照
+      ipc.getSessionTodos(id).then((val) => {
+        if (val && Array.isArray(val.todos)) {
+          set((st) => ({ sessionTodos: { ...st.sessionTodos, [id]: val.todos } }));
+        }
+      }).catch(() => {});
     } catch (e) {
       get().pushToast(String(e));
     }
@@ -435,12 +459,14 @@ export const useStore = create<Store>((set, get) => ({
     set((st) => ({ sessionRules: { ...st.sessionRules, [p.sessionId]: p.rules ?? [] } }));
   },
   setSettingsLocal(s) {
-    set({ settings: s });
+    const activeModelId = s.activeModelId ?? s.activeModel ?? null;
+    set({ settings: { ...s, activeModelId, activeModel: activeModelId } });
   },
 
   /** 后端设置变更时同步刷新缓存 */
   onSettingsChanged(s) {
-    set({ settings: s });
+    const activeModelId = s.activeModelId ?? s.activeModel ?? null;
+    set({ settings: { ...s, activeModelId, activeModel: activeModelId } });
   },
 
   pushToast(text) {
@@ -526,6 +552,12 @@ export const useStore = create<Store>((set, get) => ({
         delete outs[ev.id];
         return { toolOutputs: outs };
       });
+    }
+    // todo 工具更新时同步任务清单
+    if (ev.toolName === "todo" && ev.status === "success" && Array.isArray(ev.params?.todos)) {
+      set((st) => ({
+        sessionTodos: { ...st.sessionTodos, [p.sessionId]: ev.params.todos },
+      }));
     }
   },
 

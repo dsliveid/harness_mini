@@ -25,6 +25,11 @@ pub struct PendingApproval {
     pub tx: oneshot::Sender<Decision>,
 }
 
+pub struct RunningCommand {
+    pub session_id: String,
+    pub tx: tokio::sync::oneshot::Sender<()>,
+}
+
 pub struct AppState {
     pub db: Mutex<rusqlite::Connection>,
     /// 生效的数据目录；None = 程序目录不可写，等待用户选择（DB 为内存哨兵库）。
@@ -42,6 +47,7 @@ pub struct AppState {
     pub master_key: Mutex<[u8; 32]>,
     pub handles: Mutex<HashMap<String, SessionHandle>>,
     pub approvals: Mutex<HashMap<String, PendingApproval>>,
+    pub running_commands: Mutex<HashMap<String, RunningCommand>>,
     pub app: OnceLock<tauri::AppHandle>,
 }
 
@@ -131,6 +137,7 @@ pub fn run() {
                 db: Mutex::new(db),
                 handles: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
+                running_commands: Mutex::new(HashMap::new()),
                 app: OnceLock::new(),
                 data_dir: Mutex::new(data_dir),
                 data_pending: AtomicBool::new(pending),
@@ -180,6 +187,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,
             commands::set_settings,
+            commands::list_tools,
             commands::test_provider,
             commands::list_projects,
             commands::create_project,
@@ -205,6 +213,7 @@ pub fn run() {
             commands::guide_message,
             commands::delete_queued_message,
             commands::stop_run,
+            commands::kill_command,
             commands::list_running_sessions,
             commands::edit_and_resend,
             commands::respond_approval,

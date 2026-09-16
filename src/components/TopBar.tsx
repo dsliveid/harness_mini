@@ -213,7 +213,12 @@ export function TopBar() {
           onChange={async (e) => {
             const parsed = parseModelKey(e.target.value);
             if (!parsed) return;
-            const next = { ...settings, activeProviderId: parsed.providerId, activeModelId: parsed.model };
+            const next = {
+              ...settings,
+              activeProviderId: parsed.providerId,
+              activeModelId: parsed.model,
+              activeModel: parsed.model,
+            };
             setSettingsLocal(next);
             try {
               await ipc.setSettings(next);

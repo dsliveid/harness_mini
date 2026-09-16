@@ -50,7 +50,7 @@ const TOOL_LABELS: Record<string, string> = {
   temp_status: "临时空间状态",
   temp_changes: "临时空间变更",
   temp_diff: "临时空间 diff",
-  temp_snapshot: "临时空间快照",
+  temp_snapshot: "保存备份快照",
   temp_restore: "临时空间恢复",
   temp_merge: "合并到原目录",
 };

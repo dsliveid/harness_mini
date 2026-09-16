@@ -15,15 +15,29 @@ export interface ApprovalRule {
   createdAt: string;
 }
 
+export interface TodoItem {
+  content: string;
+  status: "pending" | "in_progress" | "done" | string;
+}
+
+export interface ToolInfo {
+  name: string;
+  description: string;
+  risk: "read" | "write" | "execute";
+  isTemp: boolean;
+}
+
 export interface Settings {
   providers: Provider[];
   activeProviderId?: string | null;
   activeModelId?: string | null; // 全局激活的模型，属于 activeProviderId 指向的厂商
+  activeModel?: string | null; // 兼容后端 activeModel 字段
   globalAccessMode: "confirm" | "full_access";
   maxSteps: number;
   commandTimeoutSecs: number;
   contextTokenLimit: number;
   lastWorkspacePath?: string | null;
+  disabledTools?: string[];
 }
 
 export interface Project {
@@ -231,9 +245,10 @@ export function resolveActiveModel(settings: Settings): { provider: Provider; mo
   const withModels = settings.providers.filter((p) => (p.models ?? []).length > 0);
   const provider = withModels.find((p) => p.id === settings.activeProviderId) ?? withModels[0];
   if (!provider) return null;
+  const active = settings.activeModelId ?? settings.activeModel;
   const model =
-    settings.activeModelId && provider.models.includes(settings.activeModelId)
-      ? settings.activeModelId
+    active && provider.models.includes(active)
+      ? active
       : provider.models[0];
   return { provider, model };
 }

@@ -1,9 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ApprovalRule, DataStatus, Message, MergeSummary, Project, ProjectLink, RunningSession, Session, Settings, TempAlloc, TempChanges, TempFileDiff, TempInfo, ToolEvent } from "./types";
+import type { ApprovalRule, DataStatus, Message, MergeSummary, Project, ProjectLink, RunningSession, Session, Settings, TempAlloc, TempChanges, TempFileDiff, TempInfo, ToolEvent, ToolInfo } from "./types";
 
 export const ipc = {
   getSettings: () => invoke<Settings>("get_settings"),
   setSettings: (settings: Settings) => invoke<void>("set_settings", { settings }),
+  listTools: () => invoke<ToolInfo[]>("list_tools"),
   testProvider: (provider: any) => invoke<string>("test_provider", { provider }),
 
   // 数据目录
@@ -67,6 +68,7 @@ export const ipc = {
   deleteQueuedMessage: (sessionId: string, messageId: string) =>
     invoke<void>("delete_queued_message", { sessionId, messageId }),
   stopRun: (sessionId: string) => invoke<void>("stop_run", { sessionId }),
+  killCommand: (eventId: string) => invoke<void>("kill_command", { eventId }),
   listRunningSessions: () => invoke<RunningSession[]>("list_running_sessions"),
   editAndResend: (sessionId: string, messageId: string, newText: string) =>
     invoke<void>("edit_and_resend", { sessionId, messageId, newText }),

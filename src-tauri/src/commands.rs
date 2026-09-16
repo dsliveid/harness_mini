@@ -56,6 +56,7 @@ pub fn set_settings(state: State<'_, crate::AppState>, settings: SettingsData) -
     let master = state.master_key.lock().unwrap();
     let old = store::get_settings(&db)?;
     let mut clean = settings.clone();
+    clean.normalize();
     for p in clean.providers.iter_mut() {
         if !p.api_key.is_empty() {
             // AES-GCM 加密后入 secrets 表，JSON 不落明文
@@ -74,6 +75,21 @@ pub fn set_settings(state: State<'_, crate::AppState>, settings: SettingsData) -
     drop(db);
     emit_settings_changed(&state);
     Ok(())
+}
+
+#[tauri::command]
+pub fn list_tools() -> Result<Vec<ToolInfo>, String> {
+    let specs = crate::tools::tool_specs();
+    let list = specs
+        .into_iter()
+        .map(|s| ToolInfo {
+            name: s.name.to_string(),
+            description: s.description.to_string(),
+            risk: s.risk.as_str().to_string(),
+            is_temp: crate::tools::TEMP_TOOL_NAMES.contains(&s.name),
+        })
+        .collect();
+    Ok(list)
 }
 
 #[tauri::command]
@@ -530,6 +546,16 @@ pub fn delete_queued_message(state: State<'_, crate::AppState>, app: AppHandle, 
 #[tauri::command]
 pub fn stop_run(app: AppHandle, session_id: String) -> Result<(), String> {
     agent::stop_session(&app, &session_id);
+    Ok(())
+}
+
+/// 手动关闭正在执行的控制台命令进程
+#[tauri::command]
+pub fn kill_command(state: State<'_, crate::AppState>, event_id: String) -> Result<(), String> {
+    let mut cmds = state.running_commands.lock().unwrap();
+    if let Some(rc) = cmds.remove(&event_id) {
+        let _ = rc.tx.send(());
+    }
     Ok(())
 }
 

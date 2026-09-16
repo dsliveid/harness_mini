@@ -28,8 +28,21 @@ pub struct ChangedFile {
 
 // ---------- git ----------
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+fn git_cmd() -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
 pub fn git_available() -> bool {
-    std::process::Command::new("git")
+    git_cmd()
         .arg("--version")
         .output()
         .map(|o| o.status.success())
@@ -37,7 +50,7 @@ pub fn git_available() -> bool {
 }
 
 fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = std::process::Command::new("git")
+    let out = git_cmd()
         .args(args)
         .current_dir(dir)
         .output()
@@ -78,7 +91,7 @@ pub fn git_baseline(dir: &Path) -> Result<String, String> {
 
 /// 基线提交中某文件的原始内容（基线中不存在时返回 None）
 fn read_baseline_blob(dir: &Path, baseline: &str, rel: &str) -> Option<Vec<u8>> {
-    let out = std::process::Command::new("git")
+    let out = git_cmd()
         .args(["cat-file", "-p", &format!("{baseline}:{rel}")])
         .current_dir(dir)
         .output()
@@ -872,6 +885,7 @@ pub async fn merge_space(
 
 /// Agent temp_* 工具的运行上下文：由 run_once 在 ensure_space 之后组装，
 /// 非临时空间会话为 None（temp_* 工具不可用，specs 也不下发）
+#[derive(Clone)]
 pub struct TempAgentCtx {
     pub manifest: TempManifest,
 }

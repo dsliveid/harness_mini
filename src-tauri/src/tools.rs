@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use tauri::Manager;
 use tokio::io::AsyncBufReadExt;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Risk {
     ReadOnly,
@@ -30,6 +33,7 @@ pub struct ToolSpec {
     pub risk: Risk,
 }
 
+#[derive(Clone)]
 pub struct ToolCtx {
     pub workspace: PathBuf,
     /// 路径越界判定用的沙箱根：临时空间会话为临时空间根目录（含主项目与关联项目副本）；
@@ -40,6 +44,8 @@ pub struct ToolCtx {
     pub temp: Option<crate::temp::TempAgentCtx>,
     /// 宿主上下文（AppState / AppHandle / 会话 id）：仅 run_once 运行期间存在
     pub host: Option<HostCtx>,
+    /// 当前正在执行的工具事件 ID（用于控制台进程注册与手动关闭）
+    pub event_id: Option<String>,
 }
 
 /// 把变更类型字符渲染为可读标记（工具输出用）
@@ -223,12 +229,12 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "temp_snapshot",
-            description: "为临时空间当前状态建立快照（完整拷贝全部项目副本）。做有风险的批量修改前建议先建快照作为恢复点。",
+            description: "仅用于临时空间内部：为当前临时空间的修改状态保存备份快照（恢复点）。【注意：本工具不是创建临时空间，临时空间由用户在界面左侧栏发起】。在临时空间中做高风险或批量修改前，可用它留存备份快照，后续可通过 temp_restore 回滚到该状态。",
             risk: Risk::Write,
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "label": {"type": "string", "description": "快照名称（建议简短英文/数字，如 before-refactor）"}
+                    "label": {"type": "string", "description": "快照/恢复点标签名（建议简短英文或数字，如 before-refactor）"}
                 }
             }),
         },
@@ -604,6 +610,9 @@ async fn edit_file(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     )))
 }
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 async fn run_command(
     args: &Value,
     ctx: &ToolCtx,
@@ -621,6 +630,7 @@ async fn run_command(
         let mut c = tokio::process::Command::new("cmd");
         c.arg("/C");
         c.raw_arg(format!("chcp 65001>nul 2>nul & {command}"));
+        c.creation_flags(CREATE_NO_WINDOW);
         c
     };
     #[cfg(not(windows))]
@@ -638,6 +648,19 @@ async fn run_command(
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
 
+    let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel::<()>();
+    let event_id_opt = ctx.event_id.clone();
+    if let (Some(host), Some(eid)) = (&ctx.host, &event_id_opt) {
+        let state = host.app.state::<crate::AppState>();
+        state.running_commands.lock().unwrap().insert(
+            eid.clone(),
+            crate::RunningCommand {
+                session_id: host.session_id.clone(),
+                tx: kill_tx,
+            },
+        );
+    }
+
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let tx_err = tx.clone();
     tokio::spawn(async move {
@@ -650,8 +673,21 @@ async fn run_command(
     let mut output = String::new();
     let deadline = tokio::time::Instant::now() + ctx.command_timeout;
     let mut timed_out = false;
+    let mut killed_by_user = false;
     loop {
         tokio::select! {
+            _ = &mut kill_rx => {
+                killed_by_user = true;
+                #[cfg(windows)]
+                if let Some(pid) = child.id() {
+                    let mut kill_cmd = std::process::Command::new("taskkill");
+                    kill_cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
+                    kill_cmd.creation_flags(CREATE_NO_WINDOW);
+                    let _ = kill_cmd.output();
+                }
+                let _ = child.start_kill();
+                break;
+            }
             line = rx.recv() => {
                 match line {
                     Some(l) => {
@@ -677,7 +713,15 @@ async fn run_command(
         }
     }
 
+    if let (Some(host), Some(eid)) = (&ctx.host, &event_id_opt) {
+        let state = host.app.state::<crate::AppState>();
+        state.running_commands.lock().unwrap().remove(eid);
+    }
+
     let status = child.wait().await;
+    if killed_by_user {
+        return Err(format!("{output}\n[控制台进程已由用户手动关闭]"));
+    }
     if timed_out {
         return Ok(truncate_result(&format!(
             "{output}\n[命令超时（{}s），已强制终止]",

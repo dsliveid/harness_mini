@@ -41,12 +41,23 @@ fn default_ctx_tokens() -> usize {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
+pub struct ToolInfo {
+    pub name: String,
+    pub description: String,
+    pub risk: String,
+    pub is_temp: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct SettingsData {
     #[serde(default)]
     pub providers: Vec<ProviderCfg>,
     #[serde(default)]
     pub active_provider_id: Option<String>,
     /// 全局激活的模型（属于 active_provider_id 指向的厂商），缺省时取该厂商第一个模型
+    #[serde(default)]
+    pub active_model_id: Option<String>,
     #[serde(default)]
     pub active_model: Option<String>,
     #[serde(default = "default_access_mode")]
@@ -59,6 +70,8 @@ pub struct SettingsData {
     pub context_token_limit: usize,
     #[serde(default)]
     pub last_workspace_path: Option<String>,
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
 }
 
 impl Default for SettingsData {
@@ -66,12 +79,14 @@ impl Default for SettingsData {
         Self {
             providers: vec![],
             active_provider_id: None,
+            active_model_id: None,
             active_model: None,
             global_access_mode: default_access_mode(),
             max_steps: default_max_steps(),
             command_timeout_secs: default_cmd_timeout(),
             context_token_limit: default_ctx_tokens(),
             last_workspace_path: None,
+            disabled_tools: vec![],
         }
     }
 }
@@ -85,6 +100,14 @@ impl SettingsData {
             }
         }
     }
+
+    /// 统一 active_model_id 与 active_model 两个字段，双向兼容
+    pub fn normalize(&mut self) {
+        self.migrate_legacy_model();
+        let m = self.active_model_id.clone().or_else(|| self.active_model.clone());
+        self.active_model_id = m.clone();
+        self.active_model = m;
+    }
 }
 
 /// 解析当前生效的 (厂商, 模型)：优先全局激活项，激活项缺失/失效时回落到第一个有模型的厂商
@@ -94,9 +117,11 @@ pub fn resolve_active_model(settings: &SettingsData) -> Option<(&ProviderCfg, &s
         .iter()
         .find(|p| Some(p.id.as_str()) == settings.active_provider_id.as_deref() && !p.models.is_empty())
         .or_else(|| settings.providers.iter().find(|p| !p.models.is_empty()))?;
-    let model = settings
-        .active_model
+    let active = settings
+        .active_model_id
         .as_deref()
+        .or(settings.active_model.as_deref());
+    let model = active
         .filter(|m| provider.models.iter().any(|x| x == m))
         .or_else(|| provider.models.first().map(|x| x.as_str()))?;
     Some((provider, model))
@@ -173,6 +198,29 @@ mod tests {
         assert!(resolve_active_model(&s).is_none());
         s.providers = vec![];
         assert!(resolve_active_model(&s).is_none());
+    }
+
+    #[test]
+    fn resolves_active_model_id_and_normalizes() {
+        let json = r#"{
+            "providers": [
+                {"id": "p1", "name": "厂商1", "baseUrl": "https://example.com", "models": ["m1", "m2"], "model": "", "apiKey": ""}
+            ],
+            "activeProviderId": "p1",
+            "activeModelId": "m2"
+        }"#;
+        let mut s: SettingsData = serde_json::from_str(json).unwrap();
+        assert_eq!(s.active_model_id.as_deref(), Some("m2"));
+        let (_p, m) = resolve_active_model(&s).unwrap();
+        assert_eq!(m, "m2");
+
+        s.normalize();
+        assert_eq!(s.active_model.as_deref(), Some("m2"));
+        assert_eq!(s.active_model_id.as_deref(), Some("m2"));
+
+        let serialized = serde_json::to_string(&s).unwrap();
+        assert!(serialized.contains(r#""activeModelId":"m2""#));
+        assert!(serialized.contains(r#""activeModel":"m2""#));
     }
 }
 

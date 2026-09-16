@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { currentMessages, currentSession, useStore } from "../store";
 import { DRAFT_ID } from "../types";
+import { FloatingTaskPanel } from "./FloatingTaskPanel";
 import { MessageItem } from "./MessageItem";
 
 export function ChatView() {
@@ -88,7 +89,8 @@ export function ChatView() {
   const lastUserMsgId = [...msgs].reverse().find((m) => m.role === "user" && !m.queued)?.id;
 
   return (
-    <div ref={boxRef} className="flex-1 overflow-y-auto" onScroll={onScroll}>
+    <div className="flex-1 overflow-y-auto relative" ref={boxRef} onScroll={onScroll}>
+      <FloatingTaskPanel />
       <div className="max-w-[820px] mx-auto px-4 py-6 flex flex-col gap-5">
         {hasMore && (
           <button className="self-center text-[12px] text-inkdim hover:text-ink px-3 py-1 rounded-lg hover:bg-panel2" onClick={() => void loadEarlier(currentId)}>

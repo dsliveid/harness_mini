@@ -194,7 +194,7 @@ pub fn get_settings(conn: &Connection) -> Result<SettingsData, String> {
         Some(s) => serde_json::from_str(&s).unwrap_or_default(),
         None => SettingsData::default(),
     };
-    data.migrate_legacy_model();
+    data.normalize();
     Ok(data)
 }
 
@@ -213,7 +213,8 @@ pub fn get_settings_with_secrets(conn: &Connection, master: &[u8; 32]) -> Result
 }
 
 pub fn save_settings(conn: &Connection, data: &SettingsData) -> Result<(), String> {
-    let clean = data.clone();
+    let mut clean = data.clone();
+    clean.normalize();
     let json = serde_json::to_string(&clean).map_err(|e| e.to_string())?;
     conn.execute(
         "INSERT INTO settings(key, value) VALUES(?1, ?2)

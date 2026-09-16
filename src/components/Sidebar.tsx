@@ -74,6 +74,8 @@ export function Sidebar() {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   // 项目视图顶部大分类（项目 / 对话）的收起状态
   const [groupCollapsed, setGroupCollapsed] = useState<{ projects?: boolean; chats?: boolean }>({});
+  // 项目下对话是否展开全部（默认只展示前5条，超出收进“更多”）
+  const [expandedMore, setExpandedMore] = useState<Record<string, boolean>>({});
 
   const createProjectByDialog = async () => {
     const picked = await open({ directory: true, multiple: false, title: "新建项目：选择目录" });
@@ -243,6 +245,9 @@ export function Sidebar() {
                     const children = sorted.filter((s) => s.projectId === p.id);
                     const isCollapsed = collapsed[p.id];
                     const isActive = currentId === DRAFT_ID && draft?.projectId === p.id;
+                    const isMoreExpanded = !!expandedMore[p.id];
+                    const hasMore = children.length > 5;
+                    const displayChildren = hasMore && !isMoreExpanded ? children.slice(0, 5) : children;
                     return (
                       <div key={p.id} className="mb-1">
                         <div
@@ -307,7 +312,27 @@ export function Sidebar() {
                           {menuFor === p.id && <ItemMenu items={projectMenu(p.id, p.pinned, p.path)} onClose={() => setMenuFor(null)} />}
                         </div>
                         {!isCollapsed &&
-                          children.map((s) => <SessionRow key={s.id} s={s} indent={true} />)}
+                          displayChildren.map((s) => <SessionRow key={s.id} s={s} indent={true} />)}
+                        {!isCollapsed && hasMore && (
+                          !isMoreExpanded ? (
+                            <div
+                              className="flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] text-inkdim hover:text-ink hover:bg-panel2 cursor-pointer mr-2 ml-4 select-none transition-colors"
+                              title={`共 ${children.length} 条对话，点击展开全部`}
+                              onClick={() => setExpandedMore((prev) => ({ ...prev, [p.id]: true }))}
+                            >
+                              <span>更多</span>
+                              <span className="text-[11px] text-inkdim">({children.length})</span>
+                            </div>
+                          ) : (
+                            <div
+                              className="flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] text-inkdim hover:text-ink hover:bg-panel2 cursor-pointer mr-2 ml-4 select-none transition-colors"
+                              title="收起对话"
+                              onClick={() => setExpandedMore((prev) => ({ ...prev, [p.id]: false }))}
+                            >
+                              <span>收起</span>
+                            </div>
+                          )
+                        )}
                         {!isCollapsed && children.length === 0 && (
                           <div className="ml-4 text-[12px] text-inkdim py-1">暂无对话</div>
                         )}

@@ -92,6 +92,20 @@ pub fn stop_session(app: &AppHandle, session_id: &str) {
         .lock()
         .unwrap()
         .retain(|_, p| p.session_id != session_id);
+    // 取消该会话中正在执行的控制台进程
+    {
+        let mut cmds = state.running_commands.lock().unwrap();
+        let to_cancel: Vec<String> = cmds
+            .iter()
+            .filter(|(_, rc)| rc.session_id == session_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in to_cancel {
+            if let Some(rc) = cmds.remove(&k) {
+                let _ = rc.tx.send(());
+            }
+        }
+    }
     if let Some(run_id) = aborted_run {
         // starting = 任务尚未拿到 run_id；无论哪种情况都把库中残留的 running 记录收尾，
         // 避免停止后数据库里留下永久“运行中”的 run（运行状态恢复以数据库为准）
@@ -264,11 +278,14 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
             app: app.clone(),
             session_id: session_id.to_string(),
         }),
+        event_id: None,
     };
     let specs: Vec<ToolSpec> = tools::tool_specs()
         .into_iter()
         // 临时空间专用工具仅对临时空间会话下发
         .filter(|s| session.is_temp || !tools::TEMP_TOOL_NAMES.contains(&s.name))
+        // 过滤设置中被禁用的工具
+        .filter(|s| !settings.disabled_tools.contains(&s.name.to_string()))
         .collect();
     // 标准 OpenAI tools 格式：function 必须含 name/description/parameters
     let schemas: Vec<Value> = specs
@@ -482,6 +499,7 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
                 &args,
                 &specs,
                 &tool_ctx,
+                &settings.disabled_tools,
             )
             .await;
             // 工具结果作为 tool 消息进入上下文
@@ -520,6 +538,7 @@ async fn handle_tool_call(
     args: &Value,
     specs: &[ToolSpec],
     ctx: &ToolCtx,
+    disabled_tools: &[String],
 ) -> (String, String) {
     let state = app.state::<crate::AppState>();
     let now = chrono::Utc::now().to_rfc3339();
@@ -538,7 +557,12 @@ async fn handle_tool_call(
     let spec = specs.iter().find(|s| s.name == tool_name);
     let Some(spec) = spec else {
         ev.status = "failed".into();
-        ev.result_text = Some(format!("未知工具: {tool_name}"));
+        let reason = if disabled_tools.iter().any(|t| t == tool_name) {
+            format!("工具已在设置中禁用: {tool_name}")
+        } else {
+            format!("未知工具: {tool_name}")
+        };
+        ev.result_text = Some(reason);
         {
             let db = state.db.lock().unwrap();
             let _ = store::insert_tool_event(&db, &ev);
@@ -704,7 +728,9 @@ async fn handle_tool_call(
     };
 
     let started = Instant::now();
-    let exec = tools::execute(tool_name, args, ctx, &on_partial).await;
+    let mut call_ctx = ctx.clone();
+    call_ctx.event_id = Some(ev.id.clone());
+    let exec = tools::execute(tool_name, args, &call_ctx, &on_partial).await;
     let elapsed = started.elapsed().as_millis() as u64;
 
     let (status, text) = match exec {
@@ -739,7 +765,7 @@ fn build_preview(tool_name: &str, args: &Value) -> String {
         }
         "temp_snapshot" => {
             let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("manual");
-            format!("为临时空间全部项目副本建立快照：{label}")
+            format!("为临时空间当前状态建立备份快照（恢复点）：{label}")
         }
         "temp_restore" => {
             let snap = args
