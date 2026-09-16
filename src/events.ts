@@ -29,6 +29,12 @@ export function useAppEvents() {
       listen<any>("projects:changed", () => s.onProjectsChanged()),
       listen<any>("temp:update", (e) => s.onTempUpdate(e.payload)),
       listen<any>("messages:changed", (e) => s.reloadMessages(e.payload?.sessionId)),
+      listen<any>("growth:proposed", (e) => s.onGrowthProposed(e.payload)),
+      listen<any>("growth:status", (e) => s.onGrowthStatus(e.payload)),
+      listen<any>("growth:updated", (e) => s.onGrowthUpdated(e.payload)),
+      listen<any>("growth:deleted", (e) => s.onGrowthDeleted(e.payload?.id)),
+      listen<any>("sop:status", (e) => s.onSopStatus(e.payload)),
+      listen<any>("tool:retry_guidance", (e) => s.onToolRetryGuidance(e.payload)),
       listen<any>("error", (ev) => s.onError(ev.payload)),
     ];
     Promise.all(regs).then((ls) => {

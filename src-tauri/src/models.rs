@@ -252,6 +252,16 @@ pub struct Project {
     /// 该项目下每个新对话都会把此内容注入 system prompt
     #[serde(default)]
     pub constraints: String,
+    /// 交付前自检 SOP 命令（如 cargo check, npm test 等）
+    #[serde(default)]
+    pub sop_verify_cmd: Option<String>,
+    /// 是否开启交付前自检
+    #[serde(default = "default_true")]
+    pub sop_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// 关联项目：当前项目对另一目录的引用 + 说明（Markdown）。
@@ -549,3 +559,57 @@ pub struct RunningSession {
     pub session_id: String,
     pub run_id: String,
 }
+
+/// Agent 成长条目（经验反思与沉淀）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GrowthItem {
+    pub id: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub session_title: Option<String>,
+    #[serde(default)]
+    pub message_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    pub trigger_type: String, // user_rejection | self_healed | user_taught | manual
+    pub trigger_context: String,
+    pub reflection_thought: String,
+    pub category: String, // command_rule | code_style | build_test | pitfall | workflow
+    pub title: String,
+    pub rule_content: String,
+    pub status: String, // proposed | accepted | rejected | disabled
+    #[serde(default)]
+    pub applied_count: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 工作区技能条目（.harness/skills/<name>/）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillItem {
+    pub name: String,
+    pub description: String,
+    pub script_type: String, // bat | ps1 | sh | py | js
+    pub path: String,
+    pub content: String,
+    pub updated_at: String,
+}
+
+/// 项目 SOP 交付自检配置
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSopInfo {
+    pub project_id: String,
+    pub project_name: String,
+    pub sop_verify_cmd: String,
+    pub sop_enabled: bool,
+    pub detected_stack: String,
+    pub detected_default_cmd: String,
+}
+
+

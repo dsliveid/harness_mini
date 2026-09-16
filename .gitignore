@@ -5,5 +5,3 @@ src-tauri/target/
 # 开发模式本地数据（SQLite + 主密钥，位于项目根目录，避开 tauri dev 文件监视）
 .dev-data/
 
-# tempctl（临时空间独立 CLI，用于 harness_mini 自举开发的隔离改动）构建产物
-tempctl/target/

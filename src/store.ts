@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "./ipc";
-import { DRAFT_ID, samePath, type ApprovalReq, type ApprovalRule, type DataStatus, type Message, type Project, type QueuedItem, type Session, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent } from "./types";
+import { DRAFT_ID, samePath, type ApprovalReq, type ApprovalRule, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent } from "./types";
 
 export interface Toast {
   id: string;
@@ -36,6 +36,16 @@ interface Store {
   readOnly: boolean;
   showSettings: boolean;
   showArchive: boolean;
+  /** 成长档案看板弹窗 */
+  showGrowthModal: boolean;
+  growthModalProjectId: string | null;
+  /** 经验反思提炼状态（按会话 id 记录） */
+  growthStatus: Record<string, { status: "idle" | "analyzing" | "proposed"; message: string }>;
+  /** 各会话产生的成长提案卡片，按会话 id 缓存 */
+  activeProposals: Record<string, GrowthItem[]>;
+  /** 所有的成长经验列表 */
+  growths: GrowthItem[];
+  growthsLoading: boolean;
   /** 临时空间变更列表弹窗（仅临时空间对话可用） */
   showChanges: boolean;
   /** 临时空间清空进行中：对话区显示「删除中」遮罩，期间屏蔽交互 */
@@ -61,6 +71,7 @@ interface Store {
   killCommand: (eventId: string) => Promise<void>;
   refreshSessions: () => Promise<void>;
   refreshProjects: () => Promise<void>;
+  toggleProjectPinned: (id: string) => Promise<void>;
   setView: (v: "list" | "project") => void;
   enterProject: (projectId: string) => void;
   newDraft: (projectId?: string | null, inherit?: boolean) => void;
@@ -75,6 +86,14 @@ interface Store {
   setCurrent: (id: string | null) => void;
   setShowSettings: (v: boolean) => void;
   setShowArchive: (v: boolean) => void;
+  setShowGrowthModal: (v: boolean, projectId?: string | null) => void;
+  loadGrowths: (projectId?: string | null, status?: string | null) => Promise<void>;
+  acceptGrowth: (id: string) => Promise<void>;
+  rejectGrowth: (id: string) => Promise<void>;
+  toggleGrowth: (id: string, enabled: boolean) => Promise<void>;
+  updateGrowthRule: (id: string, title: string, ruleContent: string, category: string) => Promise<void>;
+  deleteGrowth: (id: string) => Promise<void>;
+  triggerManualGrowth: (sessionId: string, userInstruction?: string) => Promise<void>;
   setShowChanges: (v: boolean) => void;
   setTempClearing: (v: boolean) => void;
   setProjectSettings: (id: string | null) => void;
@@ -101,6 +120,14 @@ interface Store {
   onSessionsChanged: (p?: { deleted?: string; archived?: string; unarchived?: string; created?: string }) => Promise<void>;
   onTempUpdate: (p: { sessionId: string; info: TempInfo }) => void;
   onProjectsChanged: () => Promise<void>;
+  onGrowthProposed: (item: GrowthItem) => void;
+  onGrowthStatus: (p: { sessionId: string; status: "idle" | "analyzing" | "proposed"; message?: string; growthId?: string }) => void;
+  onGrowthUpdated: (item: GrowthItem) => void;
+  onGrowthDeleted: (id: string) => void;
+  sopStatus: Record<string, { status: "checking" | "passed" | "failed" | "error"; command: string; output?: string }>;
+  onSopStatus: (p: { sessionId: string; status: "checking" | "passed" | "failed" | "error"; command: string; output?: string }) => void;
+  toolRetryStatus: Record<string, { toolName: string; attempt: number; maxRetries: number; active: boolean }>;
+  onToolRetryGuidance: (p: { sessionId: string; toolName: string; attempt: number; maxRetries: number; error: string }) => void;
   onError: (p: any) => void;
 }
 
@@ -200,6 +227,14 @@ export const useStore = create<Store>((set, get) => ({
   readOnly: false,
   showSettings: false,
   showArchive: false,
+  showGrowthModal: false,
+  growthModalProjectId: null,
+  growthStatus: {},
+  activeProposals: {},
+  growths: [],
+  growthsLoading: false,
+  sopStatus: {},
+  toolRetryStatus: {},
   showChanges: false,
   tempClearing: false,
   projectSettingsId: null,
@@ -258,8 +293,42 @@ export const useStore = create<Store>((set, get) => ({
 
   stopRun(sessionId: string) {
     // 乐观置为空闲（按钮立即恢复“发送”）；后端收到后补发 run:status(idle) 兜底，
-    // 队列未空时后端会自动继续消费并重新进入运行态
-    set((st) => ({ runStatus: { ...st.runStatus, [sessionId]: "idle" } }));
+    // 队列未空时后端会自动继续消费并重新进入运行态；同时收敛本地 running toolEvents 避免幽灵卡片残留
+    set((st) => {
+      const list = st.messages[sessionId];
+      let nextMessages = st.messages;
+      let nextOutputs = st.toolOutputs;
+      if (list) {
+        let changed = false;
+        const updatedList = list.map((m) => {
+          if (!m.toolEvents?.some((e) => e.status === "running" || e.status === "pending_approval")) return m;
+          changed = true;
+          return {
+            ...m,
+            toolEvents: m.toolEvents.map((e) =>
+              e.status === "running" || e.status === "pending_approval"
+                ? { ...e, status: "failed" as const, resultText: e.resultText ?? "[任务已终止]" }
+                : e
+            ),
+          };
+        });
+        if (changed) {
+          nextMessages = { ...st.messages, [sessionId]: updatedList };
+          const outs = { ...st.toolOutputs };
+          for (const m of list) {
+            m.toolEvents?.forEach((e) => {
+              if (e.status === "running") delete outs[e.id];
+            });
+          }
+          nextOutputs = outs;
+        }
+      }
+      return {
+        runStatus: { ...st.runStatus, [sessionId]: "idle" },
+        messages: nextMessages,
+        toolOutputs: nextOutputs,
+      };
+    });
     void ipc.stopRun(sessionId).catch((e) => get().pushToast(String(e)));
   },
 
@@ -267,6 +336,32 @@ export const useStore = create<Store>((set, get) => ({
     try {
       await ipc.killCommand(eventId);
       get().pushToast("已终止控制台进程");
+      // 乐观更新：将当前消息列表中的该 toolEvent 置为 failed 并清理输出，
+      // 确保界面列表中该进程立刻消失，避免残留可再次点击的困惑；
+      // 后续后端 tool:update 到达时会做最终状态与输出文本的对齐。
+      set((st) => {
+        let changed = false;
+        const nextMessages = { ...st.messages };
+        for (const [sid, list] of Object.entries(nextMessages)) {
+          const mIdx = list.findIndex((m) => m.toolEvents?.some((e) => e.id === eventId && e.status === "running"));
+          if (mIdx >= 0) {
+            const m = list[mIdx];
+            const nextEvents = m.toolEvents.map((e) =>
+              e.id === eventId && e.status === "running"
+                ? { ...e, status: "failed" as const, resultText: e.resultText ?? "[控制台进程已终止]" }
+                : e
+            );
+            const nextList = [...list];
+            nextList[mIdx] = { ...m, toolEvents: nextEvents };
+            nextMessages[sid] = nextList;
+            changed = true;
+          }
+        }
+        if (!changed) return st;
+        const nextOutputs = { ...st.toolOutputs };
+        delete nextOutputs[eventId];
+        return { messages: nextMessages, toolOutputs: nextOutputs };
+      });
     } catch (e) {
       get().pushToast(String(e));
     }
@@ -285,6 +380,25 @@ export const useStore = create<Store>((set, get) => ({
       set({ projects: await ipc.listProjects() });
     } catch (e) {
       get().pushToast(String(e));
+    }
+  },
+
+  async toggleProjectPinned(id: string) {
+    const target = get().projects.find((p) => p.id === id);
+    if (!target) return;
+    const nextPinned = !target.pinned;
+    // 乐观更新：本地立即切换，无需等后端 IPC 往返和刷新页面，界面瞬间呈现置顶效果
+    set((st) => ({
+      projects: st.projects.map((p) => (p.id === id ? { ...p, pinned: nextPinned } : p)),
+    }));
+    try {
+      await ipc.setProjectPinned(id, nextPinned);
+    } catch (e) {
+      // 失败回滚
+      set((st) => ({
+        projects: st.projects.map((p) => (p.id === id ? { ...p, pinned: target.pinned } : p)),
+      }));
+      get().pushToast(`置顶状态切换失败: ${e}`);
     }
   },
 
@@ -396,6 +510,13 @@ export const useStore = create<Store>((set, get) => ({
           set((st) => ({ sessionTodos: { ...st.sessionTodos, [id]: val.todos } }));
         }
       }).catch(() => {});
+      // 拉取该会话待审阅的成长提案
+      ipc.listGrowths(undefined, "proposed").then((list) => {
+        const forThis = list.filter((g) => g.sessionId === id);
+        if (forThis.length > 0) {
+          set((st) => ({ activeProposals: { ...st.activeProposals, [id]: forThis } }));
+        }
+      }).catch(() => {});
     } catch (e) {
       get().pushToast(String(e));
     }
@@ -433,6 +554,68 @@ export const useStore = create<Store>((set, get) => ({
   },
   setShowArchive(v) {
     set({ showArchive: v });
+  },
+  setShowGrowthModal(v, projectId) {
+    set({ showGrowthModal: v, growthModalProjectId: projectId ?? null });
+    if (v) void get().loadGrowths(projectId ?? undefined);
+  },
+  async loadGrowths(projectId, status) {
+    set({ growthsLoading: true });
+    try {
+      const list = await ipc.listGrowths(projectId, status);
+      set({ growths: list });
+    } catch (e) {
+      get().pushToast(String(e));
+    } finally {
+      set({ growthsLoading: false });
+    }
+  },
+  async acceptGrowth(id) {
+    try {
+      await ipc.updateGrowthStatus(id, "accepted");
+      get().pushToast("已采纳并固化为项目经验");
+    } catch (e) {
+      get().pushToast(String(e));
+    }
+  },
+  async rejectGrowth(id) {
+    try {
+      await ipc.updateGrowthStatus(id, "rejected");
+      get().pushToast("已忽略该经验");
+    } catch (e) {
+      get().pushToast(String(e));
+    }
+  },
+  async toggleGrowth(id, enabled) {
+    try {
+      await ipc.updateGrowthStatus(id, enabled ? "accepted" : "disabled");
+      get().pushToast(enabled ? "已启用该经验" : "已停用该经验");
+    } catch (e) {
+      get().pushToast(String(e));
+    }
+  },
+  async updateGrowthRule(id, title, ruleContent, category) {
+    try {
+      await ipc.updateGrowthRule(id, title, ruleContent, category);
+      get().pushToast("规则修改已保存");
+    } catch (e) {
+      get().pushToast(String(e));
+    }
+  },
+  async deleteGrowth(id) {
+    try {
+      await ipc.deleteGrowth(id);
+      get().pushToast("经验已删除");
+    } catch (e) {
+      get().pushToast(String(e));
+    }
+  },
+  async triggerManualGrowth(sessionId, userInstruction) {
+    try {
+      await ipc.triggerGrowthReflection(sessionId, userInstruction);
+    } catch (e) {
+      get().pushToast(String(e));
+    }
   },
   setShowChanges(v) {
     set({ showChanges: v });
@@ -580,9 +763,16 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   onRunStatus(p) {
-    set((st) => ({
-      runStatus: { ...st.runStatus, [p.sessionId]: p.status === "running" ? "running" : "idle" },
-    }));
+    set((st) => {
+      const nextRetry = { ...st.toolRetryStatus };
+      if (p.status !== "running") {
+        delete nextRetry[p.sessionId];
+      }
+      return {
+        runStatus: { ...st.runStatus, [p.sessionId]: p.status === "running" ? "running" : "idle" },
+        toolRetryStatus: nextRetry,
+      };
+    });
   },
 
   onQueueUpdate(p) {
@@ -640,6 +830,87 @@ export const useStore = create<Store>((set, get) => ({
 
   onTempUpdate(p) {
     set((st) => ({ tempInfo: { ...st.tempInfo, [p.sessionId]: p.info } }));
+  },
+
+  onGrowthProposed(item) {
+    const sid = item.sessionId ?? "";
+    set((st) => {
+      const currentList = st.activeProposals[sid] ?? [];
+      if (currentList.some((x) => x.id === item.id)) return st;
+      return {
+        activeProposals: {
+          ...st.activeProposals,
+          [sid]: [...currentList, item],
+        },
+        growths: [item, ...st.growths.filter((x) => x.id !== item.id)],
+      };
+    });
+  },
+
+  onGrowthStatus(p) {
+    set((st) => ({
+      growthStatus: {
+        ...st.growthStatus,
+        [p.sessionId]: { status: p.status, message: p.message ?? "" },
+      },
+    }));
+  },
+
+  onGrowthUpdated(item) {
+    const sid = item.sessionId ?? "";
+    set((st) => {
+      const sidProposals = (st.activeProposals[sid] ?? []).map((x) => (x.id === item.id ? item : x));
+      const nextGrowths = st.growths.map((x) => (x.id === item.id ? item : x));
+      return {
+        activeProposals: {
+          ...st.activeProposals,
+          [sid]: sidProposals,
+        },
+        growths: nextGrowths,
+      };
+    });
+  },
+
+  onGrowthDeleted(id) {
+    set((st) => {
+      const nextProposals: Record<string, GrowthItem[]> = {};
+      for (const [k, v] of Object.entries(st.activeProposals)) {
+        nextProposals[k] = v.filter((x) => x.id !== id);
+      }
+      return {
+        activeProposals: nextProposals,
+        growths: st.growths.filter((x) => x.id !== id),
+      };
+    });
+  },
+
+  onSopStatus(p) {
+    set((st) => ({
+      sopStatus: {
+        ...st.sopStatus,
+        [p.sessionId]: { status: p.status, command: p.command, output: p.output },
+      },
+    }));
+    if (p.status === "passed") {
+      get().pushToast(`🛡️ 交付前 SOP 自检通过 (${p.command})`);
+    } else if (p.status === "failed") {
+      get().pushToast(`🛡️ 交付前 SOP 自检未通过 (${p.command})，Agent 正在自愈修复...`);
+    }
+  },
+
+  onToolRetryGuidance(p) {
+    set((st) => ({
+      toolRetryStatus: {
+        ...st.toolRetryStatus,
+        [p.sessionId]: {
+          toolName: p.toolName,
+          attempt: p.attempt,
+          maxRetries: p.maxRetries,
+          active: true,
+        },
+      },
+    }));
+    get().pushToast(`🔄 工具 ${p.toolName} 执行受阻，Agent 正在自省排查并重试 (${p.attempt}/${p.maxRetries})...`);
   },
 
   onError(p) {

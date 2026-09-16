@@ -177,6 +177,36 @@ pub fn copy_project(src: &Path, dst: &Path) -> Result<usize, String> {
     Ok(count)
 }
 
+/// 在临时空间为前端项目创建 node_modules 目录链接（Windows 上使用 mklink /J，Unix 上使用 symlink）
+#[cfg(windows)]
+pub fn link_node_modules(src_workspace: &Path, temp_workspace: &Path) -> Result<(), String> {
+    let src_modules = src_workspace.join("node_modules");
+    let dst_modules = temp_workspace.join("node_modules");
+    if src_modules.exists() && !dst_modules.exists() {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.args([
+            "/C",
+            "mklink",
+            "/J",
+            &dst_modules.to_string_lossy(),
+            &src_modules.to_string_lossy(),
+        ]);
+        let _ = cmd.output();
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn link_node_modules(src_workspace: &Path, temp_workspace: &Path) -> Result<(), String> {
+    let src_modules = src_workspace.join("node_modules");
+    let dst_modules = temp_workspace.join("node_modules");
+    if src_modules.exists() && !dst_modules.exists() {
+        let _ = std::os::unix::fs::symlink(&src_modules, &dst_modules);
+    }
+    Ok(())
+}
+
 // ---------- alloc（生成计划，不落盘） ----------
 
 /// 为项目生成临时空间计划：唯一随机码 + 主项目/关联项目的临时路径。
@@ -282,15 +312,20 @@ pub fn ensure_space(state: &crate::AppState, app: &tauri::AppHandle, session: &S
     }
     let mut rebuilt = false;
     for p in manifest.projects.iter_mut() {
-        if Path::new(&p.temp).exists() {
+        let temp_path = Path::new(&p.temp);
+        let src = PathBuf::from(&p.source);
+        if temp_path.exists() {
+            if src.join("node_modules").exists() && !temp_path.join("node_modules").exists() {
+                let _ = link_node_modules(&src, temp_path);
+            }
             continue;
         }
-        let src = PathBuf::from(&p.source);
         if !src.exists() {
             return Err(format!("源目录不存在，无法拷贝到临时空间: {}", p.source));
         }
-        copy_project(&src, Path::new(&p.temp))?;
-        p.baseline = Some(git_baseline(Path::new(&p.temp))?);
+        copy_project(&src, temp_path)?;
+        p.baseline = Some(git_baseline(temp_path)?);
+        let _ = link_node_modules(&src, temp_path);
         rebuilt = true;
     }
     if rebuilt {
@@ -755,6 +790,22 @@ pub fn clear_space(state: &crate::AppState, app: &tauri::AppHandle, session_id: 
         validate_root(&root, &data_dir)?;
     }
     if root.exists() {
+        // 先解绑可能存在的 node_modules 目录联接（Junction），确保其宿主目录完全不受影响
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let p = entry.path().join("node_modules");
+                if p.exists() {
+                    #[cfg(windows)]
+                    {
+                        let _ = std::fs::remove_dir(&p);
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let _ = std::fs::remove_file(&p);
+                    }
+                }
+            }
+        }
         std::fs::remove_dir_all(&root).map_err(|e| format!("删除临时空间失败: {e}"))?;
     }
     {
@@ -1287,6 +1338,22 @@ pub fn build_prompt_section(conn: &rusqlite::Connection, session: &Session, mani
             }
         }
     }
+
+    // 检查是否为 harness_mini 自身的自举开发模式
+    let is_self_evolution = main.map(|m| {
+        let src = Path::new(&m.source);
+        src.join("src-tauri").join("Cargo.toml").exists()
+            && (src.join("package.json").exists() || src.join("src-tauri/src/agent.rs").exists())
+    }).unwrap_or(false);
+
+    if is_self_evolution {
+        s.push_str("\n## 🚀 harness_mini 自举开发守则（最高优先级）\n");
+        s.push_str("你当前正在 harness_mini 的安全隔离沙箱中为自身开发新特性或修复缺陷：\n");
+        s.push_str("1. 架构分工：后端在 `src-tauri/src/`（agent.rs 循环、tools.rs 工具集、store.rs 数据存储、growth.rs 反思、skills.rs 技能、sop.rs 自检、temp.rs 临时空间）；前端在 `src/`（React 18 + TailwindCSS，组件位于 `src/components/`）。\n");
+        s.push_str("2. 质量底线：修改后端必须保证现有全部单元测试（`cargo test` 55+ 测试）100% 通过；修改前端必须保证 `npm run build` 零类型错误与打包错误。\n");
+        s.push_str("3. 交付前要求：自检通过后再向用户汇报改动概要，并提示用户在界面工具栏审阅 Diff 并点击合并。\n");
+    }
+
     s
 }
 
@@ -1360,6 +1427,8 @@ mod tests {
             created_at: String::new(),
             last_activity_at: None,
             constraints: String::new(),
+            sop_verify_cmd: None,
+            sop_enabled: true,
         };
         let links = vec![
             ProjectLink { id: "l1".into(), project_id: "p1".into(), path: "D:\\libs\\core".into(), description: "工具库".into(), created_at: String::new() },
@@ -1518,5 +1587,25 @@ mod tests {
         assert!(file_diff(&entry, "nope.txt").is_err());
         std::fs::remove_dir_all(&src).ok();
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_link_node_modules() {
+        let root = temp_dir("link_nm");
+        let src = root.join("src");
+        let dst = root.join("dst");
+        std::fs::create_dir_all(src.join("node_modules")).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("node_modules/pkg.txt"), "hello").unwrap();
+
+        assert!(link_node_modules(&src, &dst).is_ok());
+        assert!(dst.join("node_modules").exists());
+        assert_eq!(std::fs::read_to_string(dst.join("node_modules/pkg.txt")).unwrap(), "hello");
+
+        #[cfg(windows)]
+        let _ = std::fs::remove_dir(dst.join("node_modules"));
+        #[cfg(not(windows))]
+        let _ = std::fs::remove_file(dst.join("node_modules"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -5,6 +5,7 @@ use std::path::Path;
 pub fn open_db(path: &Path) -> Result<Connection, String> {
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
     init_schema(&conn)?;
+    let _ = cleanup_orphaned_running_states(&conn);
     Ok(conn)
 }
 
@@ -30,7 +31,9 @@ fn init(conn: &Connection) -> Result<(), String> {
           path TEXT,
           pinned INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL,
-          constraints TEXT NOT NULL DEFAULT ''
+          constraints TEXT NOT NULL DEFAULT '',
+          sop_verify_cmd TEXT,
+          sop_enabled INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS project_links (
@@ -112,6 +115,26 @@ fn init(conn: &Connection) -> Result<(), String> {
           id TEXT PRIMARY KEY,
           enc TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS agent_growths (
+          id TEXT PRIMARY KEY,
+          project_id TEXT,
+          session_id TEXT,
+          message_id TEXT,
+          run_id TEXT,
+          trigger_type TEXT NOT NULL,
+          trigger_context TEXT NOT NULL,
+          reflection_thought TEXT NOT NULL,
+          category TEXT NOT NULL,
+          title TEXT NOT NULL,
+          rule_content TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'proposed',
+          applied_count INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_growths_project ON agent_growths(project_id, status);
+        CREATE INDEX IF NOT EXISTS idx_growths_session ON agent_growths(session_id);
         "#,
     )
     .map_err(|e| e.to_string())?;
@@ -139,9 +162,12 @@ fn init(conn: &Connection) -> Result<(), String> {
     // （规则不再跨对话生效，保留后又无法归属到具体对话，因此不迁移）
     conn.execute("DROP TABLE IF EXISTS approval_rules_t", [])
         .map_err(|e| e.to_string())?;
-    // 旧库迁移：projects 补 path / constraints 列（新建库的 CREATE TABLE 已含该列时跳过）
+    // 旧库迁移：projects 补 path / pinned / constraints 列（新建库的 CREATE TABLE 已含该列时跳过）
     ensure_column(conn, "projects", "path", "path TEXT")?;
+    ensure_column(conn, "projects", "pinned", "pinned INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "projects", "constraints", "constraints TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "projects", "sop_verify_cmd", "sop_verify_cmd TEXT")?;
+    ensure_column(conn, "projects", "sop_enabled", "sop_enabled INTEGER NOT NULL DEFAULT 1")?;
     // 临时空间对话字段
     ensure_column(conn, "sessions", "is_temp", "is_temp INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "sessions", "temp_code", "temp_code TEXT")?;
@@ -173,7 +199,7 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Re
     Ok(())
 }
 
-fn now() -> String {
+pub fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
@@ -321,6 +347,7 @@ pub fn list_projects(conn: &Connection) -> Result<Vec<Project>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT p.id, p.name, p.path, p.pinned, p.created_at, p.constraints,
+                    p.sop_verify_cmd, p.sop_enabled,
                     (SELECT MAX(s.last_message_at) FROM sessions s WHERE s.project_id = p.id)
              FROM projects p",
         )
@@ -331,10 +358,12 @@ pub fn list_projects(conn: &Connection) -> Result<Vec<Project>, String> {
                 id: r.get(0)?,
                 name: r.get(1)?,
                 path: r.get(2)?,
-                pinned: r.get::<_, i64>(3)? != 0,
+                pinned: r.get::<_, Option<i64>>(3)?.unwrap_or(0) != 0,
                 created_at: r.get(4)?,
                 constraints: r.get(5)?,
-                last_activity_at: r.get(6)?,
+                sop_verify_cmd: r.get(6)?,
+                sop_enabled: r.get::<_, Option<i64>>(7)?.unwrap_or(1) != 0,
+                last_activity_at: r.get(8)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -343,16 +372,18 @@ pub fn list_projects(conn: &Connection) -> Result<Vec<Project>, String> {
 
 pub fn get_project(conn: &Connection, id: &str) -> Result<Option<Project>, String> {
     conn.query_row(
-        "SELECT id, name, path, pinned, created_at, constraints FROM projects WHERE id = ?1",
+        "SELECT id, name, path, pinned, created_at, constraints, sop_verify_cmd, sop_enabled FROM projects WHERE id = ?1",
         params![id],
         |r| {
             Ok(Project {
                 id: r.get(0)?,
                 name: r.get(1)?,
                 path: r.get(2)?,
-                pinned: r.get::<_, i64>(3)? != 0,
+                pinned: r.get::<_, Option<i64>>(3)?.unwrap_or(0) != 0,
                 created_at: r.get(4)?,
                 constraints: r.get(5)?,
+                sop_verify_cmd: r.get(6)?,
+                sop_enabled: r.get::<_, Option<i64>>(7)?.unwrap_or(1) != 0,
                 last_activity_at: None,
             })
         },
@@ -370,9 +401,11 @@ pub fn create_project(conn: &Connection, name: &str, path: Option<&str>) -> Resu
         created_at: now(),
         last_activity_at: None,
         constraints: String::new(),
+        sop_verify_cmd: None,
+        sop_enabled: true,
     };
     conn.execute(
-        "INSERT INTO projects(id, name, path, pinned, created_at, constraints) VALUES(?1,?2,?3,0,?4,'')",
+        "INSERT INTO projects(id, name, path, pinned, created_at, constraints, sop_verify_cmd, sop_enabled) VALUES(?1,?2,?3,0,?4,'',NULL,1)",
         params![p.id, p.name, p.path, p.created_at],
     )
     .map_err(|e| e.to_string())?;
@@ -404,6 +437,22 @@ pub fn set_project_constraints(conn: &Connection, id: &str, constraints: &str) -
     conn.execute(
         "UPDATE projects SET constraints = ?2 WHERE id = ?1",
         params![id, constraints.trim()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 设置项目交付 SOP 自检命令与启用状态
+pub fn set_project_sop(
+    conn: &Connection,
+    id: &str,
+    verify_cmd: Option<&str>,
+    enabled: bool,
+) -> Result<(), String> {
+    let cmd = verify_cmd.map(|s| s.trim()).filter(|s| !s.is_empty());
+    conn.execute(
+        "UPDATE projects SET sop_verify_cmd = ?2, sop_enabled = ?3 WHERE id = ?1",
+        params![id, cmd, if enabled { 1 } else { 0 }],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -454,8 +503,83 @@ mod tests {
         .unwrap();
         ensure_column(&conn, "projects", "path", "path TEXT").unwrap();
         ensure_column(&conn, "projects", "constraints", "constraints TEXT NOT NULL DEFAULT ''").unwrap();
+        ensure_column(&conn, "projects", "sop_verify_cmd", "sop_verify_cmd TEXT").unwrap();
+        ensure_column(&conn, "projects", "sop_enabled", "sop_enabled INTEGER NOT NULL DEFAULT 1").unwrap();
         let p = create_project(&conn, "demo", Some("D:\\demo")).unwrap();
         assert_eq!(p.path.as_deref(), Some("D:\\demo"));
+    }
+
+    #[test]
+    fn test_project_sop_crud() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let p = create_project(&conn, "sop_demo", None).unwrap();
+        assert!(p.sop_enabled);
+        assert_eq!(p.sop_verify_cmd, None);
+
+        set_project_sop(&conn, &p.id, Some("cargo check"), true).unwrap();
+        let updated = get_project(&conn, &p.id).unwrap().unwrap();
+        assert_eq!(updated.sop_verify_cmd.as_deref(), Some("cargo check"));
+        assert!(updated.sop_enabled);
+
+        set_project_sop(&conn, &p.id, None, false).unwrap();
+        let updated2 = get_project(&conn, &p.id).unwrap().unwrap();
+        assert_eq!(updated2.sop_verify_cmd, None);
+        assert!(!updated2.sop_enabled);
+    }
+
+    #[test]
+    fn test_tool_event_lifecycle_and_cleanup() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let s = create_session(&conn, "D:\\ws", None, "test_session", "confirm").unwrap();
+        let m = new_message(&conn, &s.id, "assistant", Some("run".into()), false).unwrap();
+
+        let ev = ToolEvent {
+            id: "ev-1".into(),
+            message_id: m.id.clone(),
+            tool_name: "run_command".into(),
+            tool_call_id: None,
+            params: serde_json::json!({"command": "echo 1"}),
+            result_text: None,
+            status: "running".into(),
+            approval_scope: None,
+            created_at: now(),
+        };
+        insert_tool_event(&conn, &ev).unwrap();
+
+        // 测试根据 event_id 获取事件与关联 session_id
+        let fetched = get_tool_event_with_session(&conn, "ev-1").unwrap();
+        assert!(fetched.is_some());
+        let (found_ev, sid) = fetched.unwrap();
+        assert_eq!(found_ev.id, "ev-1");
+        assert_eq!(sid, s.id);
+
+        // 测试中止会话时的 fail_open_tool_events
+        let aborted = fail_open_tool_events(&conn, &s.id).unwrap();
+        assert_eq!(aborted.len(), 1);
+        assert_eq!(aborted[0].id, "ev-1");
+
+        let after_abort = get_tool_event_with_session(&conn, "ev-1").unwrap().unwrap().0;
+        assert_eq!(after_abort.status, "failed");
+
+        // 测试重启时的 cleanup_orphaned_running_states
+        let ev2 = ToolEvent {
+            id: "ev-2".into(),
+            message_id: m.id.clone(),
+            tool_name: "run_command".into(),
+            tool_call_id: None,
+            params: serde_json::json!({"command": "echo 2"}),
+            result_text: None,
+            status: "running".into(),
+            approval_scope: None,
+            created_at: now(),
+        };
+        insert_tool_event(&conn, &ev2).unwrap();
+        cleanup_orphaned_running_states(&conn).unwrap();
+
+        let after_cleanup = get_tool_event_with_session(&conn, "ev-2").unwrap().unwrap().0;
+        assert_eq!(after_cleanup.status, "failed");
     }
 
     #[test]
@@ -478,6 +602,33 @@ mod tests {
         let got = get_project(&conn, &p.id).unwrap().unwrap();
         assert_eq!(got.constraints, "使用 pnpm；禁止改 dist/");
         assert!(list_projects(&conn).unwrap().iter().any(|x| x.id == p.id));
+    }
+
+    #[test]
+    fn project_pinned_crud_and_legacy_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        // 模拟更早旧库：projects 连 pinned 列都没有
+        conn.execute_batch(
+            "CREATE TABLE projects (
+               id TEXT PRIMARY KEY,
+               name TEXT NOT NULL,
+               created_at TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        let p = create_project(&conn, "demo", None).unwrap();
+        assert!(!p.pinned);
+
+        // 设为固定
+        set_project_pinned(&conn, &p.id, true).unwrap();
+        let updated = get_project(&conn, &p.id).unwrap().unwrap();
+        assert!(updated.pinned);
+
+        // 取消固定
+        set_project_pinned(&conn, &p.id, false).unwrap();
+        let unpinned = get_project(&conn, &p.id).unwrap().unwrap();
+        assert!(!unpinned.pinned);
     }
 
     #[test]
@@ -758,11 +909,15 @@ pub fn remove_project(conn: &Connection, id: &str) -> Result<(), String> {
 }
 
 pub fn set_project_pinned(conn: &Connection, id: &str, pinned: bool) -> Result<(), String> {
-    conn.execute(
-        "UPDATE projects SET pinned = ?2 WHERE id = ?1",
-        params![id, pinned as i64],
-    )
-    .map_err(|e| e.to_string())?;
+    let affected = conn
+        .execute(
+            "UPDATE projects SET pinned = ?2 WHERE id = ?1",
+            params![id, pinned as i64],
+        )
+        .map_err(|e| e.to_string())?;
+    if affected == 0 {
+        return Err("项目不存在".to_string());
+    }
     Ok(())
 }
 
@@ -1426,6 +1581,98 @@ pub fn fail_open_runs(conn: &Connection, session_id: &str) -> Result<(), String>
     Ok(())
 }
 
+/// 会话退出运行或被中止时兜底：把该会话残留的 running / pending_approval 状态 tool_events 标记为 failed
+pub fn fail_open_tool_events(conn: &Connection, session_id: &str) -> Result<Vec<ToolEvent>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, message_id, tool_name, tool_call_id, params_json, result_text, status, approval_scope, created_at
+             FROM tool_events
+             WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)
+               AND status IN ('running', 'pending_approval')",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id], |r| {
+            let pj: String = r.get(4)?;
+            Ok(ToolEvent {
+                id: r.get(0)?,
+                message_id: r.get(1)?,
+                tool_name: r.get(2)?,
+                tool_call_id: r.get(3)?,
+                params: serde_json::from_str(&pj).unwrap_or(serde_json::Value::Null),
+                result_text: Some("[任务已终止]".to_string()),
+                status: "failed".to_string(),
+                approval_scope: r.get(7)?,
+                created_at: r.get(8)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let events: Vec<ToolEvent> = rows.filter_map(|r| r.ok()).collect();
+
+    conn.execute(
+        "UPDATE tool_events
+         SET status = 'failed',
+             result_text = COALESCE(result_text, '[任务已终止]')
+         WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)
+           AND status IN ('running', 'pending_approval')",
+        params![session_id],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(events)
+}
+
+/// 应用启动时兜底清理：将上一次运行遗留的 running 状态 run 与 tool_events 标记为中断/失败
+pub fn cleanup_orphaned_running_states(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "UPDATE runs SET status = 'interrupted', ended_at = ?1 WHERE status = 'running'",
+        params![now()],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE tool_events SET status = 'failed', result_text = COALESCE(result_text, '[应用重启，未完成的命令已终止]') WHERE status IN ('running', 'pending_approval')",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 获取单个工具事件及其关联的 session_id
+pub fn get_tool_event_with_session(conn: &Connection, event_id: &str) -> Result<Option<(ToolEvent, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT te.id, te.message_id, te.tool_name, te.tool_call_id, te.params_json, te.result_text, te.status, te.approval_scope, te.created_at, m.session_id
+             FROM tool_events te
+             JOIN messages m ON te.message_id = m.id
+             WHERE te.id = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query_map(params![event_id], |r| {
+            let pj: String = r.get(4)?;
+            let ev = ToolEvent {
+                id: r.get(0)?,
+                message_id: r.get(1)?,
+                tool_name: r.get(2)?,
+                tool_call_id: r.get(3)?,
+                params: serde_json::from_str(&pj).unwrap_or(serde_json::Value::Null),
+                result_text: r.get(5)?,
+                status: r.get(6)?,
+                approval_scope: r.get(7)?,
+                created_at: r.get(8)?,
+            };
+            let session_id: String = r.get(9)?;
+            Ok((ev, session_id))
+        })
+        .map_err(|e| e.to_string())?;
+
+    if let Some(r) = rows.next() {
+        r.map(Some).map_err(|e| e.to_string())
+    } else {
+        Ok(None)
+    }
+}
+
 /// 全部运行中的 run（跨会话）：前端界面刷新后据此恢复各会话的运行状态
 pub fn all_running_runs(conn: &Connection) -> Result<Vec<(String, String)>, String> {
     let mut stmt = conn
@@ -1564,3 +1811,214 @@ pub fn copy_settings_and_secrets(
     }
     Ok(())
 }
+
+// ---------- agent_growths ----------
+
+pub fn insert_growth(conn: &Connection, item: &GrowthItem) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO agent_growths (
+            id, project_id, session_id, message_id, run_id,
+            trigger_type, trigger_context, reflection_thought,
+            category, title, rule_content, status, applied_count,
+            created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![
+            item.id,
+            item.project_id,
+            item.session_id,
+            item.message_id,
+            item.run_id,
+            item.trigger_type,
+            item.trigger_context,
+            item.reflection_thought,
+            item.category,
+            item.title,
+            item.rule_content,
+            item.status,
+            item.applied_count,
+            item.created_at,
+            item.updated_at,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn update_growth_status(conn: &Connection, id: &str, status: &str) -> Result<(), String> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE agent_growths SET status = ?1, updated_at = ?2 WHERE id = ?3",
+        params![status, now, id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn update_growth_rule(
+    conn: &Connection,
+    id: &str,
+    title: &str,
+    rule_content: &str,
+    category: &str,
+) -> Result<(), String> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE agent_growths SET title = ?1, rule_content = ?2, category = ?3, updated_at = ?4 WHERE id = ?5",
+        params![title, rule_content, category, now, id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn delete_growth(conn: &Connection, id: &str) -> Result<(), String> {
+    conn.execute("DELETE FROM agent_growths WHERE id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn get_growth(conn: &Connection, id: &str) -> Result<Option<GrowthItem>, String> {
+    let sql = "SELECT g.id, g.project_id, g.session_id, s.title, g.message_id, g.run_id,
+                      g.trigger_type, g.trigger_context, g.reflection_thought,
+                      g.category, g.title, g.rule_content, g.status, g.applied_count,
+                      g.created_at, g.updated_at
+               FROM agent_growths g
+               LEFT JOIN sessions s ON g.session_id = s.id
+               WHERE g.id = ?1";
+    let res = conn
+        .query_row(sql, params![id], |r| {
+            Ok(GrowthItem {
+                id: r.get(0)?,
+                project_id: r.get(1)?,
+                session_id: r.get(2)?,
+                session_title: r.get(3)?,
+                message_id: r.get(4)?,
+                run_id: r.get(5)?,
+                trigger_type: r.get(6)?,
+                trigger_context: r.get(7)?,
+                reflection_thought: r.get(8)?,
+                category: r.get(9)?,
+                title: r.get(10)?,
+                rule_content: r.get(11)?,
+                status: r.get(12)?,
+                applied_count: r.get(13)?,
+                created_at: r.get(14)?,
+                updated_at: r.get(15)?,
+            })
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
+    Ok(res)
+}
+
+pub fn list_growths(
+    conn: &Connection,
+    project_id: Option<&str>,
+    status: Option<&str>,
+) -> Result<Vec<GrowthItem>, String> {
+    let mut sql = "SELECT g.id, g.project_id, g.session_id, s.title, g.message_id, g.run_id,
+                          g.trigger_type, g.trigger_context, g.reflection_thought,
+                          g.category, g.title, g.rule_content, g.status, g.applied_count,
+                          g.created_at, g.updated_at
+                   FROM agent_growths g
+                   LEFT JOIN sessions s ON g.session_id = s.id
+                   WHERE 1=1".to_string();
+    let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
+
+    if let Some(pid) = project_id {
+        if !pid.is_empty() {
+            sql.push_str(" AND (g.project_id = ? OR g.project_id IS NULL)");
+            params_vec.push(pid.to_string().into());
+        }
+    }
+
+    if let Some(st) = status {
+        if !st.is_empty() {
+            sql.push_str(" AND g.status = ?");
+            params_vec.push(st.to_string().into());
+        }
+    }
+
+    sql.push_str(" ORDER BY g.updated_at DESC, g.created_at DESC");
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let params_slice: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+
+    let rows = stmt
+        .query_map(params_slice.as_slice(), |r| {
+            Ok(GrowthItem {
+                id: r.get(0)?,
+                project_id: r.get(1)?,
+                session_id: r.get(2)?,
+                session_title: r.get(3)?,
+                message_id: r.get(4)?,
+                run_id: r.get(5)?,
+                trigger_type: r.get(6)?,
+                trigger_context: r.get(7)?,
+                reflection_thought: r.get(8)?,
+                category: r.get(9)?,
+                title: r.get(10)?,
+                rule_content: r.get(11)?,
+                status: r.get(12)?,
+                applied_count: r.get(13)?,
+                created_at: r.get(14)?,
+                updated_at: r.get(15)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    Ok(rows)
+}
+
+pub fn list_accepted_growths_for_project(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<Vec<GrowthItem>, String> {
+    let sql = "SELECT g.id, g.project_id, g.session_id, s.title, g.message_id, g.run_id,
+                      g.trigger_type, g.trigger_context, g.reflection_thought,
+                      g.category, g.title, g.rule_content, g.status, g.applied_count,
+                      g.created_at, g.updated_at
+               FROM agent_growths g
+               LEFT JOIN sessions s ON g.session_id = s.id
+               WHERE (g.project_id = ?1 OR g.project_id IS NULL) AND g.status = 'accepted'
+               ORDER BY g.applied_count DESC, g.created_at ASC";
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![project_id], |r| {
+            Ok(GrowthItem {
+                id: r.get(0)?,
+                project_id: r.get(1)?,
+                session_id: r.get(2)?,
+                session_title: r.get(3)?,
+                message_id: r.get(4)?,
+                run_id: r.get(5)?,
+                trigger_type: r.get(6)?,
+                trigger_context: r.get(7)?,
+                reflection_thought: r.get(8)?,
+                category: r.get(9)?,
+                title: r.get(10)?,
+                rule_content: r.get(11)?,
+                status: r.get(12)?,
+                applied_count: r.get(13)?,
+                created_at: r.get(14)?,
+                updated_at: r.get(15)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    Ok(rows)
+}
+
+pub fn increment_growth_applied_count(conn: &Connection, ids: &[String]) -> Result<(), String> {
+    for id in ids {
+        let _ = conn.execute(
+            "UPDATE agent_growths SET applied_count = applied_count + 1 WHERE id = ?1",
+            params![id],
+        );
+    }
+    Ok(())
+}
+

@@ -5,6 +5,22 @@ import { currentSession, useStore } from "../store";
 import { DRAFT_ID, dirName, type Session } from "../types";
 import { askConfirm, askPrompt } from "./PromptModal";
 
+import {
+  ChevronRight,
+  ChevronDown,
+  ChevronUp,
+  Plus,
+  MoreHorizontal,
+  Pin,
+  Sprout,
+  Archive,
+  Settings,
+  List,
+  FolderTree,
+  Wind,
+  MessageSquare,
+} from "./Icons";
+
 function timeLabel(iso?: string | null) {
   if (!iso) return "";
   const d = new Date(iso);
@@ -25,13 +41,24 @@ function ItemMenu({
 }) {
   return (
     <>
-      <div className="fixed inset-0 z-40" onMouseDown={onClose} />
-      <div className="absolute right-1 top-7 z-50 bg-panel2 border border-edge rounded-lg shadow-xl py-1 min-w-[130px]">
+      <div
+        className="fixed inset-0 z-40"
+        onMouseDown={(e) => {
+          e.stopPropagation();
+          onClose();
+        }}
+        onClick={(e) => e.stopPropagation()}
+      />
+      <div
+        className="absolute right-1 top-7 z-50 bg-panel2 border border-edge rounded-lg shadow-xl py-1 min-w-[130px] animate-in fade-in zoom-in-95 duration-100"
+        onClick={(e) => e.stopPropagation()}
+      >
         {items.map((it) => (
           <button
             key={it.label}
-            className={`w-full text-left px-3 py-1.5 text-[13px] hover:bg-panel3 ${it.danger ? "text-red-400" : "text-ink"}`}
-            onClick={() => {
+            className={`w-full text-left px-3 py-1.5 text-[13px] hover:bg-panel3 transition-colors ${it.danger ? "text-red-400" : "text-ink"}`}
+            onClick={(e) => {
+              e.stopPropagation();
               onClose();
               it.onClick();
             }}
@@ -44,12 +71,13 @@ function ItemMenu({
   );
 }
 
-/** 展开收起箭头：同一字形旋转 90°，避免 ▶/▼ 两个字符渲染大小不一致 */
+/** 展开收起箭头：平滑旋转 90° */
 function Chevron({ collapsed }: { collapsed?: boolean }) {
   return (
-    <span className={`inline-block text-[10px] leading-none transition-transform ${collapsed ? "" : "rotate-90"}`}>
-      ▶
-    </span>
+    <ChevronRight
+      size={13}
+      className={`transition-transform duration-150 text-inkdim shrink-0 ${collapsed ? "" : "rotate-90"}`}
+    />
   );
 }
 
@@ -67,8 +95,10 @@ export function Sidebar() {
   const draft = useStore((s) => s.draft);
   const setShowArchive = useStore((s) => s.setShowArchive);
   const setShowSettings = useStore((s) => s.setShowSettings);
+  const setShowGrowthModal = useStore((s) => s.setShowGrowthModal);
   const setProjectSettings = useStore((s) => s.setProjectSettings);
   const setSessionSettings = useStore((s) => s.setSessionSettings);
+  const toggleProjectPinned = useStore((s) => s.toggleProjectPinned);
   const pushToast = useStore((s) => s.pushToast);
   const [menuFor, setMenuFor] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
@@ -88,8 +118,12 @@ export function Sidebar() {
     (b.lastMessageAt ?? b.createdAt).localeCompare(a.lastMessageAt ?? a.createdAt)
   );
   const sortedProjects = [...projects].sort((a, b) => {
-    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-    return (b.lastActivityAt ?? b.createdAt).localeCompare(a.lastActivityAt ?? a.createdAt);
+    const aPin = Boolean(a.pinned);
+    const bPin = Boolean(b.pinned);
+    if (aPin !== bPin) return aPin ? -1 : 1;
+    const aTime = a.lastActivityAt || a.createdAt || "";
+    const bTime = b.lastActivityAt || b.createdAt || "";
+    return bTime.localeCompare(aTime);
   });
   // 未归入项目（纯对话）的会话
   const ungrouped = sorted.filter((s) => !s.projectId);
@@ -124,7 +158,8 @@ export function Sidebar() {
       ? [{ label: "打开目录", onClick: () => ipc.openDir(hasPath).catch((e) => pushToast(String(e))) }]
       : []),
     { label: "项目设置", onClick: () => setProjectSettings(pid) },
-    { label: pinned ? "取消固定" : "固定到顶部", onClick: () => ipc.setProjectPinned(pid, !pinned) },
+    { label: "成长记录", onClick: () => setShowGrowthModal(true, pid) },
+    { label: pinned ? "取消固定" : "固定到顶部", onClick: () => void toggleProjectPinned(pid) },
     { label: "移除项目", danger: true, onClick: async () => {
         if (await askConfirm("移除该项目？（项目下的对话将移回顶层，不会被删除）", "移除")) {
           await ipc.removeProject(pid);
@@ -136,13 +171,13 @@ export function Sidebar() {
     const isRunning = runStatus[s.id] === "running";
     return (
       <div
-        className={`group relative flex items-center gap-1 rounded-lg px-2 py-1.5 cursor-pointer mr-2 ${
-          currentId === s.id ? "bg-panel3" : "hover:bg-panel2"
+        className={`group relative flex items-center gap-1.5 rounded-lg px-2 py-1.5 cursor-pointer mr-2 transition-colors ${
+          currentId === s.id ? "bg-panel3 text-ink font-medium" : "hover:bg-panel2 text-ink/90"
         } ${indent ? "ml-4" : ""}`}
         onClick={() => selectSession(s.id)}
       >
         {isRunning && (
-          <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse shrink-0" title="Agent 运行中" />
+          <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse shrink-0 shadow-[0_0_8px_rgba(74,222,128,0.6)]" title="Agent 运行中" />
         )}
         <div className="flex-1 min-w-0">
           <div className="truncate text-[13px]" title={s.title}>
@@ -151,14 +186,15 @@ export function Sidebar() {
           <div className={`flex items-center gap-1.5 text-[11px] ${isRunning ? "text-green-400" : "text-inkdim"}`}>
             <span className="truncate">{isRunning ? "运行中…" : timeLabel(s.lastMessageAt ?? s.createdAt)}</span>
             {s.isTemp && (
-              <span className="shrink-0 px-1.5 py-[1px] rounded text-[10px] leading-none bg-amber-500/15 text-amber-400 border border-amber-500/30">
-                临时
+              <span className="shrink-0 inline-flex items-center gap-0.5 px-1.5 py-[1px] rounded text-[10px] leading-none bg-amber-500/15 text-amber-400 border border-amber-500/30">
+                <Wind size={9} />
+                <span>临时</span>
               </span>
             )}
           </div>
         </div>
         <button
-          className={`opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-inkdim ${
+          className={`opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-inkdim hover:text-ink transition-opacity ${
             menuFor === s.id ? "opacity-100" : ""
           }`}
           onClick={(e) => {
@@ -166,7 +202,7 @@ export function Sidebar() {
             setMenuFor(menuFor === s.id ? null : s.id);
           }}
         >
-          …
+          <MoreHorizontal size={14} />
         </button>
         {menuFor === s.id && <ItemMenu items={sessionMenu(s)} onClose={() => setMenuFor(null)} />}
       </div>
@@ -174,26 +210,35 @@ export function Sidebar() {
   };
 
   return (
-    <div className="w-[260px] shrink-0 h-full border-r border-edge bg-panel flex flex-col">
+    <div className="w-[260px] shrink-0 h-full border-r border-edge bg-panel flex flex-col select-none">
       {/* 顶部：视图切换 + 新会话 */}
       <div className="p-3 flex items-center gap-2">
         <div className="flex bg-panel2 rounded-lg p-0.5 border border-edge">
-          {(["list", "project"] as const).map((v) => (
-            <button
-              key={v}
-              className={`px-2.5 py-1 rounded-md text-[12px] ${view === v ? "bg-panel3 text-ink" : "text-inkdim hover:text-ink"}`}
-              onClick={() => setView(v)}
-            >
-              {v === "list" ? "列表" : "项目"}
-            </button>
-          ))}
+          <button
+            className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-[12px] transition-colors ${
+              view === "list" ? "bg-panel3 text-ink shadow-sm" : "text-inkdim hover:text-ink"
+            }`}
+            onClick={() => setView("list")}
+          >
+            <List size={13} />
+            <span>列表</span>
+          </button>
+          <button
+            className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-[12px] transition-colors ${
+              view === "project" ? "bg-panel3 text-ink shadow-sm" : "text-inkdim hover:text-ink"
+            }`}
+            onClick={() => setView("project")}
+          >
+            <FolderTree size={13} />
+            <span>项目</span>
+          </button>
         </div>
         <button
-          className="ml-auto w-7 h-7 rounded-lg bg-accent/15 text-accent hover:bg-accent/25 flex items-center justify-center text-lg leading-none"
+          className="ml-auto w-7 h-7 rounded-lg bg-accent/15 text-accent hover:bg-accent/25 flex items-center justify-center transition-colors"
           title="新建对话"
           onClick={() => newDraft(null)}
         >
-          +
+          <Plus size={16} strokeWidth={2.2} />
         </button>
       </div>
 
@@ -212,7 +257,7 @@ export function Sidebar() {
             {/* 项目大分类：收起/展开项目列表；悬停在尾部显示“新建项目” */}
             <div className="mb-1">
               <div
-                className="group relative flex items-center gap-1 rounded-lg px-2 py-1.5 cursor-pointer mr-2 hover:bg-panel2"
+                className="group relative flex items-center gap-1 rounded-lg px-2 py-1.5 cursor-pointer mr-2 hover:bg-panel2 transition-colors"
                 onClick={() => setGroupCollapsed({ ...groupCollapsed, projects: !groupCollapsed.projects })}
               >
                 <div className="flex-1 min-w-0 flex items-center gap-1">
@@ -229,14 +274,14 @@ export function Sidebar() {
                   </button>
                 </div>
                 <button
-                  className="opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-inkdim text-[15px] leading-none"
+                  className="opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-inkdim hover:text-ink transition-opacity"
                   title="新建项目（选择目录）"
                   onClick={(e) => {
                     e.stopPropagation();
                     void createProjectByDialog();
                   }}
                 >
-                  +
+                  <Plus size={14} strokeWidth={2} />
                 </button>
               </div>
               {!groupCollapsed.projects && (
@@ -251,7 +296,7 @@ export function Sidebar() {
                     return (
                       <div key={p.id} className="mb-1">
                         <div
-                          className={`group relative flex items-center gap-1 rounded-lg px-2 py-1.5 cursor-pointer mr-2 hover:bg-panel2 ${
+                          className={`group relative flex items-center gap-1 rounded-lg px-2 py-1.5 cursor-pointer mr-2 hover:bg-panel2 transition-colors ${
                             isActive ? "bg-panel3" : ""
                           }`}
                           onClick={() => {
@@ -261,7 +306,7 @@ export function Sidebar() {
                           }}
                         >
                           <button
-                            className="text-inkdim text-[11px] w-3 hover:text-ink"
+                            className="text-inkdim text-[11px] w-3.5 hover:text-ink flex items-center justify-center"
                             title={isCollapsed ? "展开" : "折叠"}
                             onClick={(e) => {
                               e.stopPropagation();
@@ -270,36 +315,36 @@ export function Sidebar() {
                           >
                             <Chevron collapsed={isCollapsed} />
                           </button>
-                          <div className="flex-1 min-w-0">
-                            <div className="truncate text-[13px] font-medium" title={p.path ?? p.name}>
-                              {p.pinned && <span className="text-accent mr-1">📌</span>}
+                          <div className="flex-1 min-w-0 flex items-center gap-1">
+                            {p.pinned && <Pin size={12} className="text-accent fill-accent shrink-0" />}
+                            <span className="truncate text-[13px] font-medium" title={p.path ?? p.name}>
                               {p.name}
-                            </div>
+                            </span>
                           </div>
                           {p.path && (
                             <button
-                              className="opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-[13px] leading-none"
+                              className="opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-amber-400 hover:text-amber-300 transition-opacity"
                               title="临时空间（拷贝项目到临时目录开新对话，原目录不受影响）"
                               onClick={(e) => {
                                 e.stopPropagation();
                                 void newTempDraft(p.id);
                               }}
                             >
-                              🌪
+                              <Wind size={13} />
                             </button>
                           )}
                           <button
-                            className="opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-inkdim text-[15px] leading-none"
+                            className="opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-inkdim hover:text-ink transition-opacity"
                             title="新建对话（归入该项目）"
                             onClick={(e) => {
                               e.stopPropagation();
                               newDraft(p.id);
                             }}
                           >
-                            +
+                            <Plus size={14} strokeWidth={2} />
                           </button>
                           <button
-                            className={`opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-inkdim ${
+                            className={`opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-inkdim hover:text-ink transition-opacity ${
                               menuFor === p.id ? "opacity-100" : ""
                             }`}
                             onClick={(e) => {
@@ -307,7 +352,7 @@ export function Sidebar() {
                               setMenuFor(menuFor === p.id ? null : p.id);
                             }}
                           >
-                            …
+                            <MoreHorizontal size={14} />
                           </button>
                           {menuFor === p.id && <ItemMenu items={projectMenu(p.id, p.pinned, p.path)} onClose={() => setMenuFor(null)} />}
                         </div>
@@ -320,6 +365,7 @@ export function Sidebar() {
                               title={`共 ${children.length} 条对话，点击展开全部`}
                               onClick={() => setExpandedMore((prev) => ({ ...prev, [p.id]: true }))}
                             >
+                              <ChevronDown size={12} className="text-inkdim" />
                               <span>更多</span>
                               <span className="text-[11px] text-inkdim">({children.length})</span>
                             </div>
@@ -329,6 +375,7 @@ export function Sidebar() {
                               title="收起对话"
                               onClick={() => setExpandedMore((prev) => ({ ...prev, [p.id]: false }))}
                             >
+                              <ChevronUp size={12} className="text-inkdim" />
                               <span>收起</span>
                             </div>
                           )
@@ -350,7 +397,7 @@ export function Sidebar() {
             {ungrouped.length > 0 && (
               <div className="mb-1">
                 <div
-                  className="group relative flex items-center gap-1 rounded-lg px-2 py-1.5 cursor-pointer mr-2 hover:bg-panel2"
+                  className="group relative flex items-center gap-1 rounded-lg px-2 py-1.5 cursor-pointer mr-2 hover:bg-panel2 transition-colors"
                   onClick={() => setGroupCollapsed({ ...groupCollapsed, chats: !groupCollapsed.chats })}
                 >
                   <div className="flex-1 min-w-0 flex items-center gap-1">
@@ -367,14 +414,14 @@ export function Sidebar() {
                     </button>
                   </div>
                   <button
-                    className="opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-inkdim text-[15px] leading-none"
+                    className="opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-inkdim hover:text-ink transition-opacity"
                     title="新建纯对话"
                     onClick={(e) => {
                       e.stopPropagation();
                       newDraft(null, false);
                     }}
                   >
-                    +
+                    <Plus size={14} strokeWidth={2} />
                   </button>
                 </div>
                 {!groupCollapsed.chats &&
@@ -385,19 +432,31 @@ export function Sidebar() {
         )}
       </div>
 
-      {/* 底部：归档 / 设置 */}
-      <div className="border-t border-edge p-2 flex items-center gap-1">
+      {/* 底部：成长 / 归档 / 设置 */}
+      <div className="border-t border-edge p-2 flex items-center gap-1 bg-panel/80">
         <button
-          className="flex-1 text-left px-3 py-2 rounded-lg hover:bg-panel2 text-[13px] text-inkdim hover:text-ink"
-          onClick={() => setShowArchive(true)}
+          className="flex-1 text-left px-2 py-1.5 rounded-lg hover:bg-panel2 text-[12px] text-inkdim hover:text-ink flex items-center gap-1.5 transition-colors"
+          onClick={() => setShowGrowthModal(true, null)}
+          title="查看与管理 Agent 的经验与成长记录"
         >
-          🗄 归档
+          <Sprout size={15} className="text-emerald-400 shrink-0" />
+          <span>成长</span>
         </button>
         <button
-          className="flex-1 text-left px-3 py-2 rounded-lg hover:bg-panel2 text-[13px] text-inkdim hover:text-ink"
-          onClick={() => setShowSettings(true)}
+          className="flex-1 text-left px-2 py-1.5 rounded-lg hover:bg-panel2 text-[12px] text-inkdim hover:text-ink flex items-center gap-1.5 transition-colors"
+          onClick={() => setShowArchive(true)}
+          title="查看已归档的会话记录"
         >
-          ⚙ 设置
+          <Archive size={15} className="shrink-0" />
+          <span>归档</span>
+        </button>
+        <button
+          className="flex-1 text-left px-2 py-1.5 rounded-lg hover:bg-panel2 text-[12px] text-inkdim hover:text-ink flex items-center gap-1.5 transition-colors"
+          onClick={() => setShowSettings(true)}
+          title="打开程序与模型设置"
+        >
+          <Settings size={15} className="shrink-0" />
+          <span>设置</span>
         </button>
       </div>
     </div>

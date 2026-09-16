@@ -4,14 +4,16 @@
  * - 底部统一操作条：取消（丢弃并关闭）/ 应用（只保存，不关闭）/ 保存（保存并关闭）
  */
 
+import { X } from "./Icons";
+
 export function ModalClose({ onClick, title = "关闭" }: { onClick: () => void; title?: string }) {
   return (
     <button
-      className="ml-auto shrink-0 w-7 h-7 rounded-lg hover:bg-panel3 text-inkdim hover:text-ink flex items-center justify-center text-[14px]"
+      className="ml-auto shrink-0 w-7 h-7 rounded-lg hover:bg-panel3 text-inkdim hover:text-ink flex items-center justify-center transition-colors"
       title={title}
       onClick={onClick}
     >
-      ✕
+      <X size={15} strokeWidth={2} />
     </button>
   );
 }

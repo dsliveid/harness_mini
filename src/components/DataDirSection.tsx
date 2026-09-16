@@ -4,6 +4,8 @@ import { ipc } from "../ipc";
 import { useStore } from "../store";
 import type { DataStatus } from "../types";
 
+import { Database, FolderOpen, RotateCcw } from "./Icons";
+
 /**
  * 数据目录设置区块：设置弹窗与启动拦截对话框共用。
  * 显示当前生效目录（支持选择自定义目录 / 恢复默认），切换时确认并自动迁移数据，
@@ -54,12 +56,13 @@ export function DataDirSection() {
   if (!status) return null;
 
   return (
-    <div className="flex flex-col gap-2 text-[13px]">
-      <label className="flex items-center gap-2 min-w-0">
-        <span className="text-inkdim shrink-0 w-24">当前数据目录</span>
-        <span className="font-mono text-[12px] flex-1 truncate" title={status.dataDir ?? ""}>
+    <div className="flex flex-col gap-2.5 text-[13px]">
+      <label className="flex items-center gap-2 min-w-0 bg-panel border border-edge rounded-lg p-2.5">
+        <Database size={15} className="text-inkdim shrink-0" />
+        <span className="text-inkdim shrink-0">当前数据目录:</span>
+        <span className="font-mono text-[12px] flex-1 truncate text-ink" title={status.dataDir ?? ""}>
           {status.dataDir ?? "（未就绪：等待选择数据目录）"}
-          {status.isCustom && <span className="text-inkdim">（已改用自定义目录）</span>}
+          {status.isCustom && <span className="text-inkdim ml-1">（已改用自定义目录）</span>}
         </span>
       </label>
       {!status.defaultWritable && (
@@ -69,20 +72,22 @@ export function DataDirSection() {
       )}
       <div className="flex gap-2 mt-1">
         <button
-          className="px-3 py-1.5 rounded-lg bg-panel3 hover:bg-edge text-ink hover:text-ink disabled:opacity-50"
+          className="px-3 py-1.5 rounded-lg bg-panel3 hover:bg-edge text-ink hover:text-ink disabled:opacity-50 flex items-center gap-1.5 text-[12px] transition-colors"
           disabled={busy}
           onClick={() => void choose()}
         >
-          选择数据目录…
+          <FolderOpen size={13} />
+          <span>选择数据目录…</span>
         </button>
         {status.isCustom && (
           <button
-            className="px-3 py-1.5 rounded-lg bg-panel3 hover:bg-edge text-inkdim hover:text-ink disabled:opacity-50"
+            className="px-3 py-1.5 rounded-lg bg-panel3 hover:bg-edge text-inkdim hover:text-ink disabled:opacity-50 flex items-center gap-1.5 text-[12px] transition-colors"
             title={`恢复到默认存放位置：${status.defaultDir}`}
             disabled={busy}
             onClick={() => void reset()}
           >
-            恢复默认目录
+            <RotateCcw size={13} />
+            <span>恢复默认目录</span>
           </button>
         )}
       </div>

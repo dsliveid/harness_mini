@@ -6,6 +6,7 @@ import { dirName, samePath, type Project, type ProjectLink } from "../types";
 import { askConfirm } from "./PromptModal";
 import { Markdown } from "./Markdown";
 import { ModalActions, ModalClose } from "./ModalActions";
+import { FileCode, Link2, Plus, Edit3, Trash2, Folder } from "./Icons";
 
 type Tab = "constraints" | "links";
 
@@ -133,10 +134,11 @@ function LinksPane({
           新对话会一并注入关联说明；与本项目约束冲突时，以关联项目为准
         </span>
         <button
-          className="ml-auto shrink-0 px-3 py-1.5 rounded-lg text-[12px] bg-accent/15 text-accent hover:bg-accent/25"
+          className="ml-auto shrink-0 px-3 py-1.5 rounded-lg text-[12px] bg-accent/15 text-accent hover:bg-accent/25 flex items-center gap-1.5 transition-colors"
           onClick={() => void startAdd()}
         >
-          + 添加关联项目
+          <Plus size={13} />
+          <span>添加关联项目</span>
         </button>
       </div>
 
@@ -198,6 +200,7 @@ function LinksPane({
         {links.map((l) => (
           <div key={l.id} className="border border-edge rounded-xl p-3 bg-panel">
             <div className="flex items-center gap-2">
+              <Folder size={14} className="text-inkdim shrink-0" />
               <span className="text-[13px] font-medium shrink-0">{dirName(l.path)}</span>
               <span className="text-[11px] text-inkdim font-mono truncate flex-1" title={l.path}>
                 {l.path}
@@ -208,13 +211,15 @@ function LinksPane({
                 </span>
               )}
               <button
-                className="text-[12px] text-inkdim hover:text-ink shrink-0"
+                className="text-[12px] text-inkdim hover:text-ink shrink-0 flex items-center gap-1 transition-colors"
                 onClick={() => setForm({ id: l.id, path: l.path, description: l.description })}
               >
-                编辑
+                <Edit3 size={11} />
+                <span>编辑</span>
               </button>
-              <button className="text-[12px] text-red-400 hover:underline shrink-0" onClick={() => void remove(l)}>
-                删除
+              <button className="text-[12px] text-red-400 hover:underline shrink-0 flex items-center gap-1 transition-colors" onClick={() => void remove(l)}>
+                <Trash2 size={11} />
+                <span>删除</span>
               </button>
             </div>
             {l.description.trim() && (
@@ -339,10 +344,16 @@ export function ProjectSettingsModal() {
         <div className="flex-1 flex min-h-0">
           <aside className="w-[150px] shrink-0 border-r border-edge p-2 flex flex-col gap-1">
             <button className={menuCls(tab === "constraints")} onClick={() => setTab("constraints")}>
-              📜 项目约束
+              <span className="flex items-center gap-2">
+                <FileCode size={15} />
+                <span>项目约束</span>
+              </span>
             </button>
             <button className={menuCls(tab === "links")} onClick={() => setTab("links")}>
-              🔗 关联项目
+              <span className="flex items-center gap-2">
+                <Link2 size={15} />
+                <span>关联项目</span>
+              </span>
             </button>
           </aside>
           <main className="flex-1 min-w-0 min-h-0 p-4">

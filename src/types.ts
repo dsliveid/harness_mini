@@ -50,6 +50,8 @@ export interface Project {
   lastActivityAt?: string | null;
   /** 项目约束（Markdown：规范 / 注意事项等）；空 = 未设置。该项目下每个新对话注入 system prompt */
   constraints?: string | null;
+  sopVerifyCmd?: string | null;
+  sopEnabled?: boolean;
 }
 
 /** 关联项目：对另一目录的引用 + 说明；对方项目实体存在且已设约束时，其约束一并注入 */
@@ -288,3 +290,57 @@ export interface RunningSession {
   sessionId: string;
   runId: string;
 }
+
+export interface GrowthItem {
+  id: string;
+  projectId?: string | null;
+  sessionId?: string | null;
+  sessionTitle?: string | null;
+  messageId?: string | null;
+  runId?: string | null;
+  triggerType: "user_rejection" | "self_healed" | "user_taught" | "manual" | string;
+  triggerContext: string;
+  reflectionThought: string;
+  category: "command_rule" | "code_style" | "build_test" | "pitfall" | "workflow" | string;
+  title: string;
+  ruleContent: string;
+  status: "proposed" | "accepted" | "rejected" | "disabled" | string;
+  appliedCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SkillItem {
+  name: string;
+  description: string;
+  scriptType: "bat" | "ps1" | "sh" | "py" | "js" | string;
+  path: string;
+  content: string;
+  updatedAt: string;
+}
+
+export interface ProjectSopInfo {
+  projectId: string;
+  projectName: string;
+  sopVerifyCmd: string;
+  sopEnabled: boolean;
+  detectedStack: string;
+  detectedDefaultCmd: string;
+}
+
+export interface SopStatusEvent {
+  sessionId: string;
+  status: "checking" | "passed" | "failed" | "error";
+  command: string;
+  output?: string;
+}
+
+export interface ToolRetryGuidanceEvent {
+  sessionId: string;
+  toolName: string;
+  attempt: number;
+  maxRetries: number;
+  error: string;
+}
+
+

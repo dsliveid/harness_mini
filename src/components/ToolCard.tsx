@@ -3,23 +3,66 @@ import { ipc } from "../ipc";
 import { useStore } from "../store";
 import type { ToolEvent } from "../types";
 import { Markdown } from "./Markdown";
+import {
+  FileText,
+  FileEdit,
+  Terminal,
+  Folder,
+  Search,
+  CheckSquare,
+  GitCompare,
+  GitMerge,
+  Wrench,
+  CheckCircle2,
+  Loader2,
+  Circle,
+  ChevronRight,
+  ShieldAlert,
+} from "./Icons";
 
 function statusBadge(status: string) {
   switch (status) {
     case "pending_approval":
-      return <span className="text-[11px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400">待审批</span>;
+      return <span className="text-[11px] px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/30 font-medium">待审批</span>;
     case "running":
-      return <span className="text-[11px] px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-400 animate-pulse">执行中</span>;
+      return <span className="text-[11px] px-2 py-0.5 rounded-full bg-blue-500/15 text-blue-400 border border-blue-500/30 animate-pulse font-medium">执行中</span>;
     case "success":
-      return <span className="text-[11px] px-1.5 py-0.5 rounded bg-green-500/15 text-green-400">完成</span>;
+      return <span className="text-[11px] px-2 py-0.5 rounded-full bg-green-500/15 text-green-400 border border-green-500/30">完成</span>;
     case "failed":
-      return <span className="text-[11px] px-1.5 py-0.5 rounded bg-red-500/15 text-red-400">失败</span>;
+      return <span className="text-[11px] px-2 py-0.5 rounded-full bg-red-500/15 text-red-400 border border-red-500/30">失败</span>;
     case "denied":
-      return <span className="text-[11px] px-1.5 py-0.5 rounded bg-zinc-500/20 text-zinc-400">已拒绝</span>;
+      return <span className="text-[11px] px-2 py-0.5 rounded-full bg-zinc-500/20 text-zinc-400 border border-zinc-500/30">已拒绝</span>;
     case "timeout":
-      return <span className="text-[11px] px-1.5 py-0.5 rounded bg-red-500/15 text-red-400">超时</span>;
+      return <span className="text-[11px] px-2 py-0.5 rounded-full bg-red-500/15 text-red-400 border border-red-500/30">超时</span>;
     default:
-      return <span className="text-[11px] px-1.5 py-0.5 rounded bg-panel3 text-inkdim">{status}</span>;
+      return <span className="text-[11px] px-2 py-0.5 rounded-full bg-panel3 text-inkdim">{status}</span>;
+  }
+}
+
+function ToolIcon({ name }: { name: string }) {
+  switch (name) {
+    case "read_file":
+      return <FileText size={14} className="text-blue-400 shrink-0" />;
+    case "write_file":
+    case "edit_file":
+      return <FileEdit size={14} className="text-amber-400 shrink-0" />;
+    case "run_command":
+      return <Terminal size={14} className="text-emerald-400 shrink-0" />;
+    case "list_dir":
+    case "glob":
+      return <Folder size={14} className="text-cyan-400 shrink-0" />;
+    case "grep":
+      return <Search size={14} className="text-indigo-400 shrink-0" />;
+    case "todo":
+      return <CheckSquare size={14} className="text-purple-400 shrink-0" />;
+    case "temp_status":
+    case "temp_changes":
+    case "temp_diff":
+      return <GitCompare size={14} className="text-amber-400 shrink-0" />;
+    case "temp_merge":
+      return <GitMerge size={14} className="text-green-400 shrink-0" />;
+    default:
+      return <Wrench size={14} className="text-inkdim shrink-0" />;
   }
 }
 
@@ -57,11 +100,17 @@ const TOOL_LABELS: Record<string, string> = {
 
 function TodoList({ todos }: { todos: any[] }) {
   return (
-    <div className="flex flex-col gap-1 py-1">
+    <div className="flex flex-col gap-1.5 py-1.5 pl-5">
       {todos.map((t, i) => (
         <div key={i} className="flex items-center gap-2 text-[13px]">
-          <span>{t.status === "done" ? "✅" : t.status === "in_progress" ? "🔄" : "⬜"}</span>
-          <span className={t.status === "done" ? "text-inkdim line-through" : ""}>{t.content}</span>
+          {t.status === "done" ? (
+            <CheckCircle2 size={14} className="text-green-400 shrink-0" />
+          ) : t.status === "in_progress" ? (
+            <Loader2 size={14} className="text-blue-400 animate-spin shrink-0" />
+          ) : (
+            <Circle size={14} className="text-inkdim/60 shrink-0" />
+          )}
+          <span className={t.status === "done" ? "text-inkdim line-through" : "text-ink"}>{t.content}</span>
         </div>
       ))}
     </div>
@@ -97,9 +146,12 @@ function ApprovalSection({ ev }: { ev: ToolEvent }) {
   };
 
   return (
-    <div className="mt-2 border border-amber-500/40 bg-amber-500/5 rounded-lg p-3">
-      <div className="text-[13px] font-medium text-amber-400 mb-1">需要你的确认：{riskLabel}</div>
-      <pre className="text-[12px] font-mono whitespace-pre-wrap bg-panel rounded-md p-2 max-h-48 overflow-y-auto text-ink">
+    <div className="mt-2.5 border border-amber-500/40 bg-amber-500/5 rounded-xl p-3 shadow-sm animate-in fade-in duration-150">
+      <div className="text-[13px] font-medium text-amber-400 mb-1.5 flex items-center gap-1.5">
+        <ShieldAlert size={16} className="shrink-0 text-amber-400" />
+        <span>需要你的确认：{riskLabel}</span>
+      </div>
+      <pre className="text-[12px] font-mono whitespace-pre-wrap bg-panel border border-edge/60 rounded-lg p-2.5 max-h-48 overflow-y-auto text-ink">
         {req.preview}
       </pre>
       {req.forceOnce && (
@@ -107,14 +159,14 @@ function ApprovalSection({ ev }: { ev: ToolEvent }) {
       )}
       <div className="flex items-center gap-2 mt-2 flex-wrap">
         <button
-          className="px-3 py-1.5 rounded-lg bg-green-600/90 hover:bg-green-500 text-white text-[13px]"
+          className="px-3 py-1.5 rounded-lg bg-green-600/90 hover:bg-green-500 text-white text-[13px] transition-colors shadow-sm font-medium"
           onClick={() => respond("allow_once")}
         >
           允许一次
         </button>
         {!req.forceOnce && (
           <button
-            className="px-3 py-1.5 rounded-lg bg-panel3 hover:bg-edge text-ink text-[13px]"
+            className="px-3 py-1.5 rounded-lg bg-panel3 hover:bg-edge text-ink text-[13px] transition-colors"
             title="记住该规则：仅对当前对话生效，重启后仍保留；可在会话设置中删除"
             onClick={() => respond("allow_session")}
           >
@@ -122,7 +174,7 @@ function ApprovalSection({ ev }: { ev: ToolEvent }) {
           </button>
         )}
         <button
-          className="px-3 py-1.5 rounded-lg bg-panel3 hover:bg-edge text-red-400 text-[13px]"
+          className="px-3 py-1.5 rounded-lg bg-panel3 hover:bg-edge text-red-400 text-[13px] transition-colors"
           onClick={() => setDenyOpen(!denyOpen)}
         >
           拒绝
@@ -131,7 +183,7 @@ function ApprovalSection({ ev }: { ev: ToolEvent }) {
       {denyOpen && (
         <div className="flex gap-2 mt-2">
           <input
-            className="flex-1 bg-panel border border-edge rounded-lg px-2 py-1.5 text-[13px] outline-none focus:border-accent"
+            className="flex-1 bg-panel border border-edge rounded-lg px-2.5 py-1.5 text-[13px] outline-none focus:border-accent"
             placeholder="拒绝原因（可选，将告知 Agent 以便调整方案）"
             value={reason}
             onChange={(e) => setReason(e.target.value)}
@@ -140,7 +192,7 @@ function ApprovalSection({ ev }: { ev: ToolEvent }) {
             }}
           />
           <button
-            className="px-3 py-1.5 rounded-lg bg-red-600/80 hover:bg-red-500 text-white text-[13px]"
+            className="px-3 py-1.5 rounded-lg bg-red-600/80 hover:bg-red-500 text-white text-[13px] transition-colors shadow-sm"
             onClick={() => respond("deny", reason || undefined)}
           >
             确认拒绝
@@ -163,7 +215,7 @@ function CollapsibleResult({ text }: { text: string }) {
         </div>
       </div>
       {lines > 20 && (
-        <button className="text-[12px] text-accent mt-1" onClick={() => setExpanded(!expanded)}>
+        <button className="text-[12px] text-accent mt-1 hover:underline" onClick={() => setExpanded(!expanded)}>
           {expanded ? "收起" : "展开全部"}
         </button>
       )}
@@ -173,36 +225,65 @@ function CollapsibleResult({ text }: { text: string }) {
 
 export function ToolCard({ ev }: { ev: ToolEvent }) {
   const output = useStore((s) => s.toolOutputs[ev.id]);
+  const killCommand = useStore((s) => s.killCommand);
+  const [terminating, setTerminating] = useState(false);
   const title = paramTitle(ev);
   const label = TOOL_LABELS[ev.toolName] ?? ev.toolName;
   // 默认收起为一行（标题 + 状态），点击展开查看命令输出/文件内容
   const [expanded, setExpanded] = useState(false);
+
+  const handleKill = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (terminating) return;
+    setTerminating(true);
+    try {
+      await killCommand(ev.id);
+    } catch {
+      setTerminating(false);
+    }
+  };
 
   const showOutput = ev.status === "running" && output !== undefined;
   const showResult = !!ev.resultText && (ev.status === "success" || ev.status === "failed" || ev.status === "timeout" || ev.status === "denied");
 
   return (
     <div
-      className={`border rounded-xl bg-panel2 px-3 py-2.5 ${
-        ev.status === "pending_approval" ? "border-amber-500/40" : "border-edge"
+      className={`border rounded-xl bg-panel2/80 hover:bg-panel2 px-3 py-2.5 transition-colors shadow-sm ${
+        ev.status === "pending_approval" ? "border-amber-500/50 ring-1 ring-amber-500/20" : "border-edge/80"
       }`}
     >
       <button
-        className="w-full flex items-center gap-2 text-left"
+        className="w-full flex items-center gap-2 text-left select-none"
         onClick={() => setExpanded(!expanded)}
         title={expanded ? "收起" : "展开"}
       >
-        <span className="text-[11px] text-inkdim w-3 shrink-0">{expanded ? "▾" : "▸"}</span>
-        <span className="text-[12px] text-inkdim shrink-0">🛠 {label}</span>
+        <ChevronRight
+          size={13}
+          className={`transition-transform duration-150 text-inkdim shrink-0 ${expanded ? "rotate-90" : ""}`}
+        />
+        <ToolIcon name={ev.toolName} />
+        <span className="text-[12px] text-ink font-medium shrink-0">{label}</span>
         {ev.toolName !== "todo" && (
-          <span className="text-[13px] font-mono truncate flex-1 min-w-0">{title}</span>
+          <span className="text-[12px] font-mono text-inkdim truncate flex-1 min-w-0">{title}</span>
         )}
-        {statusBadge(ev.status)}
-        {ev.approvalScope && ev.approvalScope !== "none" && ev.status !== "pending_approval" && (
-          <span className="text-[10px] text-inkdim shrink-0">
-            ({ev.approvalScope === "mode" ? "完全访问" : ev.approvalScope === "once" ? "一次放行" : "会话规则"})
-          </span>
-        )}
+        <div className="ml-auto flex items-center gap-1.5 shrink-0">
+          {ev.toolName === "run_command" && ev.status === "running" && (
+            <button
+              className="text-[10px] px-2 py-0.5 rounded bg-red-600/80 hover:bg-red-500 text-white disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+              title={terminating ? "正在终止进程…" : "终止进程"}
+              disabled={terminating}
+              onClick={handleKill}
+            >
+              {terminating ? "终止中…" : "终止"}
+            </button>
+          )}
+          {statusBadge(ev.status)}
+          {ev.approvalScope && ev.approvalScope !== "none" && ev.status !== "pending_approval" && (
+            <span className="text-[10px] text-inkdim shrink-0">
+              ({ev.approvalScope === "mode" ? "完全访问" : ev.approvalScope === "once" ? "一次放行" : "会话规则"})
+            </span>
+          )}
+        </div>
       </button>
 
       {ev.toolName === "todo" && Array.isArray(ev.params?.todos) && <TodoList todos={ev.params.todos} />}

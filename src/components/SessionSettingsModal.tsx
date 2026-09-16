@@ -3,6 +3,7 @@ import { ipc } from "../ipc";
 import { useStore } from "../store";
 import { ModalClose } from "./ModalActions";
 import { askConfirm } from "./PromptModal";
+import { KeyRound, Shield, Trash2 } from "./Icons";
 
 type Tab = "mode" | "rules";
 
@@ -83,10 +84,16 @@ export function SessionSettingsModal() {
         <div className="flex-1 flex min-h-0">
           <aside className="w-[150px] shrink-0 border-r border-edge p-2 flex flex-col gap-1">
             <button className={menuCls(tab === "mode")} onClick={() => setTab("mode")}>
-              🔐 访问模式
+              <span className="flex items-center gap-2">
+                <KeyRound size={15} />
+                <span>访问模式</span>
+              </span>
             </button>
             <button className={menuCls(tab === "rules")} onClick={() => setTab("rules")}>
-              🛡️ 审批规则
+              <span className="flex items-center gap-2">
+                <Shield size={15} />
+                <span>审批规则</span>
+              </span>
             </button>
           </aside>
 
@@ -138,10 +145,11 @@ export function SessionSettingsModal() {
                         {r.pattern}
                       </span>
                       <button
-                        className="text-[12px] text-red-400 hover:underline shrink-0"
+                        className="text-[12px] text-red-400 hover:text-red-300 hover:underline shrink-0 flex items-center gap-1 transition-colors"
                         onClick={() => void removeRule(r.id)}
                       >
-                        删除
+                        <Trash2 size={11} />
+                        <span>删除</span>
                       </button>
                     </div>
                   ))}

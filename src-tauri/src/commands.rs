@@ -158,9 +158,19 @@ pub fn remove_project(state: State<'_, crate::AppState>, app: AppHandle, id: Str
 }
 
 #[tauri::command]
-pub fn set_project_pinned(state: State<'_, crate::AppState>, id: String, pinned: bool) -> Result<(), String> {
-    let db = state.db.lock().unwrap();
-    store::set_project_pinned(&db, &id, pinned)
+pub fn set_project_pinned(
+    state: State<'_, crate::AppState>,
+    app: AppHandle,
+    id: String,
+    pinned: bool,
+) -> Result<(), String> {
+    let project = {
+        let db = state.db.lock().unwrap();
+        store::set_project_pinned(&db, &id, pinned)?;
+        store::get_project(&db, &id)?.ok_or("项目不存在")?
+    };
+    let _ = app.emit("projects:changed", &project);
+    Ok(())
 }
 
 // ---------- 项目设置（项目约束 / 关联项目） ----------
@@ -551,10 +561,37 @@ pub fn stop_run(app: AppHandle, session_id: String) -> Result<(), String> {
 
 /// 手动关闭正在执行的控制台命令进程
 #[tauri::command]
-pub fn kill_command(state: State<'_, crate::AppState>, event_id: String) -> Result<(), String> {
-    let mut cmds = state.running_commands.lock().unwrap();
-    if let Some(rc) = cmds.remove(&event_id) {
+pub fn kill_command(
+    app: AppHandle,
+    state: State<'_, crate::AppState>,
+    event_id: String,
+) -> Result<(), String> {
+    let rc_opt = {
+        let mut cmds = state.running_commands.lock().unwrap();
+        cmds.remove(&event_id)
+    };
+    if let Some(rc) = rc_opt {
+        if let Some(pid) = rc.pid {
+            crate::tools::kill_process_tree(pid);
+        }
         let _ = rc.tx.send(());
+    } else {
+        // 未在活跃进程表（如历史崩溃/重启遗留、已退出的孤立事件）：
+        // 兜底将数据库中的状态由 running 修正为 failed，并广播 tool:update 给前端移除卡片
+        let db = state.db.lock().unwrap();
+        if let Ok(Some((mut ev, session_id))) = store::get_tool_event_with_session(&db, &event_id) {
+            if ev.status == "running" || ev.status == "pending_approval" {
+                ev.status = "failed".to_string();
+                let msg = "[控制台进程未在运行，已清理状态]".to_string();
+                ev.result_text = Some(msg.clone());
+                let _ = store::update_tool_event(&db, &ev.id, "failed", Some(&msg), None);
+                drop(db);
+                let _ = app.emit(
+                    "tool:update",
+                    json!({"sessionId": session_id, "event": ev}),
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -898,3 +935,195 @@ pub fn reset_data_dir(state: State<'_, crate::AppState>, app: AppHandle) -> Resu
 pub fn exit_app(app: AppHandle) {
     app.exit(0);
 }
+
+// ---------- 成长演进 (agent_growths) ----------
+
+#[tauri::command]
+pub fn list_growths(
+    state: State<'_, crate::AppState>,
+    project_id: Option<String>,
+    status: Option<String>,
+) -> Result<Vec<GrowthItem>, String> {
+    let db = state.db.lock().unwrap();
+    store::list_growths(&db, project_id.as_deref(), status.as_deref())
+}
+
+#[tauri::command]
+pub fn update_growth_status(
+    state: State<'_, crate::AppState>,
+    app: AppHandle,
+    id: String,
+    status: String,
+) -> Result<(), String> {
+    let item = {
+        let db = state.db.lock().unwrap();
+        store::update_growth_status(&db, &id, &status)?;
+        store::get_growth(&db, &id)?
+    };
+    if let Some(item) = item {
+        let _ = app.emit("growth:updated", &item);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn update_growth_rule(
+    state: State<'_, crate::AppState>,
+    app: AppHandle,
+    id: String,
+    title: String,
+    rule_content: String,
+    category: String,
+) -> Result<(), String> {
+    let item = {
+        let db = state.db.lock().unwrap();
+        store::update_growth_rule(&db, &id, &title, &rule_content, &category)?;
+        store::get_growth(&db, &id)?
+    };
+    if let Some(item) = item {
+        let _ = app.emit("growth:updated", &item);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn delete_growth(
+    state: State<'_, crate::AppState>,
+    app: AppHandle,
+    id: String,
+) -> Result<(), String> {
+    {
+        let db = state.db.lock().unwrap();
+        store::delete_growth(&db, &id)?;
+    }
+    let _ = app.emit("growth:deleted", json!({ "id": id }));
+    Ok(())
+}
+
+#[tauri::command]
+pub fn trigger_growth_reflection(
+    app: AppHandle,
+    session_id: String,
+    user_instruction: Option<String>,
+) -> Result<(), String> {
+    crate::growth::trigger_manual_reflection(app, session_id, user_instruction);
+    Ok(())
+}
+
+// ==================== 技能工具 (Skills) ====================
+
+#[tauri::command]
+pub async fn list_project_skills(workspace_path: String) -> Result<Vec<SkillItem>, String> {
+    if workspace_path.is_empty() {
+        return Ok(Vec::new());
+    }
+    crate::skills::list_skills(Path::new(&workspace_path)).await
+}
+
+#[tauri::command]
+pub async fn save_project_skill(
+    workspace_path: String,
+    name: String,
+    description: String,
+    script_type: String,
+    content: String,
+) -> Result<SkillItem, String> {
+    if workspace_path.is_empty() {
+        return Err("缺少工作区路径".into());
+    }
+    crate::skills::save_skill(
+        Path::new(&workspace_path),
+        &name,
+        &description,
+        &script_type,
+        &content,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_project_skill(
+    workspace_path: String,
+    skill_name: String,
+) -> Result<(), String> {
+    if workspace_path.is_empty() {
+        return Err("缺少工作区路径".into());
+    }
+    crate::skills::delete_skill(Path::new(&workspace_path), &skill_name).await
+}
+
+// ==================== 交付自检 SOP ====================
+
+#[tauri::command]
+pub fn get_project_sop(
+    state: State<'_, crate::AppState>,
+    workspace_path: String,
+    project_id: Option<String>,
+) -> Result<ProjectSopInfo, String> {
+    let ws = Path::new(&workspace_path);
+    let (detected_stack, detected_default_cmd) = crate::sop::detect_project_stack(ws);
+
+    let db = state.db.lock().unwrap();
+    let project = if let Some(pid) = project_id.as_deref().filter(|s| !s.is_empty()) {
+        store::get_project(&db, pid)?
+    } else if !workspace_path.is_empty() {
+        store::find_project_by_path(&db, &workspace_path)?
+    } else {
+        None
+    };
+
+    if let Some(p) = project {
+        let verify_cmd = p.sop_verify_cmd.unwrap_or_default();
+        Ok(ProjectSopInfo {
+            project_id: p.id,
+            project_name: p.name,
+            sop_verify_cmd: verify_cmd,
+            sop_enabled: p.sop_enabled,
+            detected_stack,
+            detected_default_cmd,
+        })
+    } else {
+        Ok(ProjectSopInfo {
+            project_id: String::new(),
+            project_name: if workspace_path.is_empty() {
+                "未关联项目".into()
+            } else {
+                store::dir_name_of(&workspace_path)
+            },
+            sop_verify_cmd: String::new(),
+            sop_enabled: true,
+            detected_stack,
+            detected_default_cmd,
+        })
+    }
+}
+
+#[tauri::command]
+pub fn set_project_sop(
+    state: State<'_, crate::AppState>,
+    project_id: String,
+    verify_cmd: Option<String>,
+    enabled: bool,
+) -> Result<(), String> {
+    let db = state.db.lock().unwrap();
+    store::set_project_sop(&db, &project_id, verify_cmd.as_deref(), enabled)
+}
+
+#[tauri::command]
+pub async fn run_workspace_sop(
+    workspace_path: String,
+    cmd: String,
+) -> Result<String, String> {
+    let ws = Path::new(&workspace_path);
+    if !ws.exists() {
+        return Err("工作区目录不存在".into());
+    }
+    let (ok, out) = crate::sop::run_verify_cmd(ws, &cmd, std::time::Duration::from_secs(60)).await?;
+    if ok {
+        Ok(format!("✅ 自检通过：\n{}", out))
+    } else {
+        Err(format!("❌ 自检失败：\n{}", out))
+    }
+}
+
+

@@ -6,6 +6,7 @@ import { ChatView } from "./components/ChatView";
 import { Composer } from "./components/Composer";
 import { DataDirGate } from "./components/DataDirGate";
 import { DiffModal } from "./components/DiffModal";
+import { GrowthModal } from "./components/GrowthModal";
 import { PendingQueue } from "./components/PendingQueue";
 import { PromptHost } from "./components/PromptModal";
 import { ProjectSettingsModal } from "./components/ProjectSettingsModal";
@@ -57,6 +58,7 @@ export default function App() {
       <ProjectSettingsModal />
       <ArchiveModal />
       <DiffModal />
+      <GrowthModal />
       <PromptHost />
       <Toasts />
       <DataDirGate />

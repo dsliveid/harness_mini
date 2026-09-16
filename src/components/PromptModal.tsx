@@ -1,5 +1,6 @@
 import React from "react";
 import { create } from "zustand";
+import { AlertTriangle } from "./Icons";
 
 interface PromptOpts {
   title: string;
@@ -82,12 +83,15 @@ export function PromptHost() {
 
   if (!open) return null;
   return (
-    <div className="fixed inset-0 z-[90] bg-black/50 flex items-center justify-center" onMouseDown={() => close(null)}>
+    <div className="fixed inset-0 z-[90] bg-black/50 flex items-center justify-center p-4" onMouseDown={() => close(null)}>
       <div
-        className="bg-panel2 border border-edge rounded-xl p-5 w-[400px] shadow-2xl"
+        className="bg-panel2 border border-edge rounded-2xl p-5 w-[420px] max-w-[92vw] shadow-2xl"
         onMouseDown={(e) => e.stopPropagation()}
       >
-        <div className="text-[15px] font-medium mb-3">{title}</div>
+        <div className="text-[15px] font-medium mb-3 flex items-center gap-2 text-ink">
+          {danger && <AlertTriangle size={18} className="text-red-400 shrink-0" />}
+          <span className="leading-snug">{title}</span>
+        </div>
         {withInput && (
           <input
             autoFocus

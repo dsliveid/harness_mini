@@ -196,6 +196,43 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "required": ["todos"]
             }),
         },
+        ToolSpec {
+            name: "list_skills",
+            description: "列出当前工作区已定义的所有项目技能（.harness/skills/）。执行复杂或高频任务前可先查询已有技能。",
+            risk: Risk::ReadOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        ToolSpec {
+            name: "save_skill",
+            description: "将高频或复杂的组合脚本固化为工作区技能（.harness/skills/<name>/），供后续重复调用。",
+            risk: Risk::Write,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "技能英文唯一标识（字母、数字、下划线、连字符，如 build-check）"},
+                    "description": {"type": "string", "description": "技能说明，明确其用途和调用时机"},
+                    "script_type": {"type": "string", "enum": ["bat", "ps1", "sh", "py", "js"], "description": "脚本类型：bat | ps1 | sh | py | js"},
+                    "script_content": {"type": "string", "description": "技能脚本源码"}
+                },
+                "required": ["name", "description", "script_type", "script_content"]
+            }),
+        },
+        ToolSpec {
+            name: "run_skill",
+            description: "执行工作区已存在的项目技能（.harness/skills/<name>/），返回执行输出。",
+            risk: Risk::Execute,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "要执行的技能名称"},
+                    "args": {"type": "string", "description": "传递给技能脚本的参数（可选）"}
+                },
+                "required": ["name"]
+            }),
+        },
         // ---------- 临时空间专用（普通会话不下发，见 agent.rs run_once 的 specs 过滤） ----------
         ToolSpec {
             name: "temp_status",
@@ -361,6 +398,9 @@ pub async fn execute(
         "edit_file" => edit_file(args, ctx).await,
         "run_command" => run_command(args, ctx, on_partial).await,
         "todo" => Ok("ok".to_string()),
+        "list_skills" => list_skills_tool(ctx).await,
+        "save_skill" => save_skill_tool(args, ctx).await,
+        "run_skill" => run_skill_tool(args, ctx, on_partial).await,
         "temp_status" => temp_status(ctx).await,
         "temp_changes" => temp_changes(args, ctx).await,
         "temp_diff" => temp_diff(args, ctx).await,
@@ -613,6 +653,52 @@ async fn edit_file(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+/// 强制杀死指定进程及其所有子进程树（跨平台安全强杀）
+pub fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let taskkill_bin = std::env::var("SystemRoot")
+            .map(|r| format!("{r}\\System32\\taskkill.exe"))
+            .unwrap_or_else(|_| "taskkill".into());
+        let mut kill_cmd = std::process::Command::new(taskkill_bin);
+        kill_cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
+        kill_cmd.creation_flags(CREATE_NO_WINDOW);
+        let _ = kill_cmd.output();
+    }
+    #[cfg(not(windows))]
+    {
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
+}
+
+/// 进程树生命周期守卫：协程被 abort / drop 时兜底强杀进程树
+struct ProcessTreeGuard {
+    pid: Option<u32>,
+    active: bool,
+}
+
+impl ProcessTreeGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid, active: true }
+    }
+    fn defuse(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        if self.active {
+            if let Some(pid) = self.pid {
+                kill_process_tree(pid);
+            }
+        }
+    }
+}
+
 async fn run_command(
     args: &Value,
     ctx: &ToolCtx,
@@ -645,6 +731,8 @@ async fn run_command(
         .kill_on_drop(true);
 
     let mut child = cmd.spawn().map_err(|e| format!("启动命令失败: {e}"))?;
+    let pid = child.id();
+    let mut tree_guard = ProcessTreeGuard::new(pid);
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
 
@@ -656,6 +744,7 @@ async fn run_command(
             eid.clone(),
             crate::RunningCommand {
                 session_id: host.session_id.clone(),
+                pid,
                 tx: kill_tx,
             },
         );
@@ -678,12 +767,8 @@ async fn run_command(
         tokio::select! {
             _ = &mut kill_rx => {
                 killed_by_user = true;
-                #[cfg(windows)]
-                if let Some(pid) = child.id() {
-                    let mut kill_cmd = std::process::Command::new("taskkill");
-                    kill_cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
-                    kill_cmd.creation_flags(CREATE_NO_WINDOW);
-                    let _ = kill_cmd.output();
+                if let Some(p) = pid {
+                    kill_process_tree(p);
                 }
                 let _ = child.start_kill();
                 break;
@@ -718,7 +803,15 @@ async fn run_command(
         state.running_commands.lock().unwrap().remove(eid);
     }
 
-    let status = child.wait().await;
+    let wait_res = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
+    let status = match wait_res {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = child.start_kill();
+            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "等待子进程退出超时"))
+        }
+    };
+    tree_guard.defuse();
     if killed_by_user {
         return Err(format!("{output}\n[控制台进程已由用户手动关闭]"));
     }
@@ -865,6 +958,44 @@ async fn temp_merge(ctx: &ToolCtx) -> Result<String, String> {
     let state = host.app.state::<crate::AppState>();
     let summary = crate::temp::merge_from_agent(&state, &host.app, &host.session_id).await?;
     Ok(truncate_result(&crate::temp::format_merge_summary(&summary)))
+}
+
+async fn list_skills_tool(ctx: &ToolCtx) -> Result<String, String> {
+    let skills = crate::skills::list_skills(&ctx.workspace).await?;
+    if skills.is_empty() {
+        return Ok("当前工作区尚未定义任何技能。可通过 save_skill 工具将常用流程或脚本固化为技能。".into());
+    }
+    let mut out = format!("当前工作区共有 {} 个技能：\n", skills.len());
+    for s in &skills {
+        out.push_str(&format!("- **{}** ({}): {}\n  路径: {}\n", s.name, s.script_type, s.description, s.path));
+    }
+    Ok(truncate_result(&out))
+}
+
+async fn save_skill_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let name = args.get("name").and_then(|v| v.as_str()).ok_or("缺少 name")?;
+    let description = args.get("description").and_then(|v| v.as_str()).ok_or("缺少 description")?;
+    let script_type = args.get("script_type").and_then(|v| v.as_str()).ok_or("缺少 script_type")?;
+    let script_content = args.get("script_content").and_then(|v| v.as_str()).ok_or("缺少 script_content")?;
+
+    let saved = crate::skills::save_skill(&ctx.workspace, name, description, script_type, script_content).await?;
+    Ok(format!("已成功将技能【{}】保存至 `{}`，后续可通过 `run_skill` 调用该技能。", saved.name, saved.path))
+}
+
+async fn run_skill_tool(
+    args: &Value,
+    ctx: &ToolCtx,
+    on_partial: PartialCb<'_>,
+) -> Result<String, String> {
+    let name = args.get("name").and_then(|v| v.as_str()).ok_or("缺少 name")?;
+    let skill_args = args.get("args").and_then(|v| v.as_str());
+
+    let (cmd, cwd) = crate::skills::build_skill_command(&ctx.workspace, name, skill_args)?;
+    let cmd_args = json!({
+        "command": cmd,
+        "cwd": cwd.to_string_lossy()
+    });
+    run_command(&cmd_args, ctx, on_partial).await
 }
 
 #[cfg(test)]

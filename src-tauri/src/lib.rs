@@ -2,10 +2,13 @@ mod agent;
 mod approval;
 mod commands;
 mod diffutil;
+mod growth;
 mod llm;
 mod models;
 mod paths;
 mod secrets;
+mod skills;
+mod sop;
 mod store;
 mod temp;
 mod tools;
@@ -27,6 +30,7 @@ pub struct PendingApproval {
 
 pub struct RunningCommand {
     pub session_id: String,
+    pub pid: Option<u32>,
     pub tx: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -231,6 +235,17 @@ pub fn run() {
             commands::set_data_dir,
             commands::reset_data_dir,
             commands::exit_app,
+            commands::list_growths,
+            commands::update_growth_status,
+            commands::update_growth_rule,
+            commands::delete_growth,
+            commands::trigger_growth_reflection,
+            commands::list_project_skills,
+            commands::save_project_skill,
+            commands::delete_project_skill,
+            commands::get_project_sop,
+            commands::set_project_sop,
+            commands::run_workspace_sop,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

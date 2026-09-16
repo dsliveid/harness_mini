@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import { ipc } from "../ipc";
 import { useStore } from "../store";
 import { DRAFT_ID } from "../types";
+import { ArrowUp, Square } from "./Icons";
 
 export function Composer() {
   const currentId = useStore((s) => s.currentId);
@@ -107,10 +108,10 @@ export function Composer() {
 
   return (
     <div className="p-3">
-      <div className="flex items-end gap-2 bg-panel2 border border-edge rounded-xl px-3 py-2 focus-within:border-accent/60">
+      <div className="flex items-end gap-2 bg-panel2/90 border border-edge rounded-2xl px-3.5 py-2.5 shadow-sm focus-within:border-accent/60 focus-within:ring-1 focus-within:ring-accent/20 transition-all">
         <textarea
           ref={taRef}
-          className="flex-1 bg-transparent outline-none resize-none text-[14px] leading-relaxed max-h-[200px] py-1 disabled:opacity-50"
+          className="flex-1 bg-transparent outline-none resize-none text-[14px] leading-relaxed max-h-[200px] py-1 disabled:opacity-50 placeholder:text-inkdim/60"
           rows={1}
           value={text}
           placeholder={placeholder}
@@ -123,25 +124,31 @@ export function Composer() {
         />
         {running ? (
           <button
-            className="shrink-0 w-9 h-9 rounded-lg bg-red-600/80 hover:bg-red-500 text-white flex items-center justify-center"
-            title="停止"
+            className="shrink-0 w-8 h-8 rounded-xl bg-red-600/90 hover:bg-red-500 text-white flex items-center justify-center transition-colors shadow-sm"
+            title="停止生成"
             onClick={() => currentId && useStore.getState().stopRun(currentId)}
           >
-            ■
+            <Square size={13} className="fill-current" />
           </button>
         ) : (
           <button
-            className="shrink-0 w-9 h-9 rounded-lg bg-accent hover:bg-blue-500 text-white flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed"
+            className="shrink-0 w-8 h-8 rounded-xl bg-accent hover:bg-blue-500 text-white flex items-center justify-center disabled:opacity-30 disabled:cursor-not-allowed transition-all shadow-sm"
             title="发送（Enter）"
             disabled={!canSend || !text.trim()}
             onClick={() => void doSend()}
           >
-            ▶
+            <ArrowUp size={16} strokeWidth={2.4} />
           </button>
         )}
       </div>
-      <div className="text-[11px] text-inkdim mt-1 px-1">
-        {effectiveWorkspace || "未绑定工作区 · 可直接对话（文件/命令工具不可用）"}
+      <div className="flex items-center justify-between text-[11px] text-inkdim mt-1.5 px-1 select-none">
+        <span className="truncate max-w-[460px]">
+          {effectiveWorkspace || "未绑定工作区 · 可直接对话（文件/命令工具不可用）"}
+        </span>
+        <span className="shrink-0 hidden sm:inline-block opacity-70">
+          <kbd className="px-1 py-0.5 rounded bg-panel3 border border-edge text-[10px]">Enter</kbd> 发送 ·{" "}
+          <kbd className="px-1 py-0.5 rounded bg-panel3 border border-edge text-[10px]">Shift+Enter</kbd> 换行
+        </span>
       </div>
     </div>
   );

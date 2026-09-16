@@ -2,6 +2,7 @@ import { ipc } from "../ipc";
 import { currentSession, useStore } from "../store";
 import { DRAFT_ID } from "../types";
 import { askConfirm } from "./PromptModal";
+import { GitCompare, FolderOpen, GitMerge, Trash2 } from "./Icons";
 
 /**
  * 临时空间浮动操作组：悬浮在输入框上方（左对齐），仅临时空间对话（含未落库草稿）显示。
@@ -63,19 +64,25 @@ export function TempActions() {
   };
 
   const cls = (disabled: boolean) =>
-    `px-2.5 py-1.5 rounded-lg text-[12px] border border-edge ${
-      disabled ? "opacity-40 cursor-not-allowed text-inkdim" : "text-ink hover:bg-panel3"
+    `px-2.5 py-1.5 rounded-lg text-[12px] border border-edge flex items-center gap-1.5 transition-colors ${
+      disabled ? "opacity-40 cursor-not-allowed text-inkdim" : "text-ink hover:bg-panel3 shadow-sm"
     }`;
 
   return (
-    <div className="absolute left-5 bottom-full mb-1.5 z-30 flex items-center gap-1.5 bg-panel/90 backdrop-blur border border-edge rounded-xl px-2 py-1.5 shadow-xl">
+    <div className="absolute left-5 bottom-full mb-1.5 z-30 flex items-center gap-1.5 bg-panel2/95 backdrop-blur-md border border-edge rounded-xl px-2 py-1.5 shadow-xl select-none animate-in fade-in slide-in-from-bottom-2 duration-150">
       <button
         className={cls(!exists || !hasChanges)}
         disabled={!exists || !hasChanges}
         title={hasChanges ? `查看变更列表（${info?.changedCount ?? 0} 个文件）` : "暂无变更内容"}
         onClick={() => setShowChanges(true)}
       >
-        Δ 变更
+        <GitCompare size={13} className="text-accent shrink-0" />
+        <span>变更</span>
+        {hasChanges && (
+          <span className="text-[10px] px-1 rounded-full bg-accent/20 text-accent font-medium">
+            {info?.changedCount ?? 0}
+          </span>
+        )}
       </button>
       <button
         className={cls(!exists)}
@@ -83,7 +90,8 @@ export function TempActions() {
         title={exists ? `打开临时空间目录\n${root}` : "临时空间尚未创建（发送首条消息后创建）"}
         onClick={() => ipc.openDir(root).catch((e) => pushToast(String(e)))}
       >
-        📁 临时目录
+        <FolderOpen size={13} className="text-amber-400 shrink-0" />
+        <span>临时目录</span>
       </button>
       <button
         className={cls(!exists || !hasChanges || mergedPending)}
@@ -97,15 +105,17 @@ export function TempActions() {
         }
         onClick={() => void onMerge()}
       >
-        ⇋ 合并
+        <GitMerge size={13} className="text-green-400 shrink-0" />
+        <span>合并</span>
       </button>
       <button
-        className={`${cls(!exists)} ${exists ? "text-red-400" : ""}`}
+        className={`${cls(!exists)} ${exists ? "text-red-400 hover:text-red-300" : ""}`}
         disabled={!exists}
         title={exists ? `删除临时空间：\n${root}` : "临时空间尚未创建"}
         onClick={() => void onClear()}
       >
-        🗑 清空空间
+        <Trash2 size={13} className="shrink-0" />
+        <span>清空空间</span>
       </button>
     </div>
   );

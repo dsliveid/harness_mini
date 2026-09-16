@@ -30,6 +30,60 @@ pub enum RunOutcome {
     Failed,
 }
 
+/// 工具级连续失败与自纠错追踪器
+#[derive(Default, Debug, Clone)]
+pub struct ToolErrorTracker {
+    pub consecutive_failures: HashMap<String, u32>,
+    pub max_retry_limit: u32,
+}
+
+impl ToolErrorTracker {
+    pub fn new(max_retry_limit: u32) -> Self {
+        Self {
+            consecutive_failures: HashMap::new(),
+            max_retry_limit,
+        }
+    }
+
+    pub fn record_success(&mut self, tool_name: &str) {
+        self.consecutive_failures.remove(tool_name);
+    }
+
+    pub fn record_failure(&mut self, tool_name: &str) -> (bool, u32) {
+        let count = self.consecutive_failures.entry(tool_name.to_string()).or_insert(0);
+        *count += 1;
+        (*count <= self.max_retry_limit, *count)
+    }
+}
+
+pub fn build_tool_reflexion_prompt(
+    tool_name: &str,
+    error_msg: &str,
+    attempt: u32,
+    max_retries: u32,
+) -> String {
+    let advice = match tool_name {
+        "edit_file" => {
+            "【自纠建议】: 目标文本未匹配到。请务必先调用 `read_file` 重新读取该文件相关代码行，获取准确的缩进、换行与上下文后再发起编辑。"
+        }
+        "read_file" | "glob" | "list_dir" => {
+            "【自纠建议】: 文件或路径不存在。请检查路径拼写，或先使用 `glob` 搜索工作区以确认真实相对路径。"
+        }
+        "run_command" | "run_skill" => {
+            "【自纠建议】: 命令执行报错。请仔细阅读错误流（stderr），检查命令参数或 Windows PowerShell 语法兼容性。"
+        }
+        _ => "【自纠建议】: 请检查工具参数是否符合规范，修正后重新尝试。",
+    };
+
+    format!(
+        "{error_msg}\n\n\
+         【⚠️ 工具调用错误自纠提示（第 {attempt}/{max_retries} 次尝试）】\n\
+         工具 `{tool_name}` 执行遇到问题。\n\
+         {advice}\n\
+         请根据上述原因，自主分析并修正参数后再次调用；严禁不作分析直接重复调用相同参数！"
+    )
+}
+
 pub fn is_run_active(state: &crate::AppState, session_id: &str) -> bool {
     state
         .handles
@@ -77,22 +131,7 @@ pub fn spawn_session_task(app: AppHandle, session_id: String, trigger: Option<St
 /// 中断当前运行；根据文档约定，待执行队列不受影响，继续自动依次执行
 pub fn stop_session(app: &AppHandle, session_id: &str) {
     let state = app.state::<crate::AppState>();
-    let aborted_run = {
-        let handles = state.handles.lock().unwrap();
-        let Some(h) = handles.get(session_id) else { return };
-        let run = h.active_run.lock().unwrap().take();
-        if let Some(jh) = h.abort.lock().unwrap().take() {
-            jh.abort();
-        }
-        run
-    };
-    // 清理该会话挂起的审批
-    state
-        .approvals
-        .lock()
-        .unwrap()
-        .retain(|_, p| p.session_id != session_id);
-    // 取消该会话中正在执行的控制台进程
+    // 1. 优先强杀该会话下全部正在运行的控制台进程树（必须在 abort 协程前强杀，防止协程终止后子进程孤立遗留）
     {
         let mut cmds = state.running_commands.lock().unwrap();
         let to_cancel: Vec<String> = cmds
@@ -102,16 +141,46 @@ pub fn stop_session(app: &AppHandle, session_id: &str) {
             .collect();
         for k in to_cancel {
             if let Some(rc) = cmds.remove(&k) {
+                if let Some(pid) = rc.pid {
+                    crate::tools::kill_process_tree(pid);
+                }
                 let _ = rc.tx.send(());
             }
         }
     }
+
+    // 2. 清理该会话挂起的审批
+    state
+        .approvals
+        .lock()
+        .unwrap()
+        .retain(|_, p| p.session_id != session_id);
+
+    // 3. 中止 Agent 循环任务
+    let aborted_run = {
+        let handles = state.handles.lock().unwrap();
+        let Some(h) = handles.get(session_id) else { return };
+        let run = h.active_run.lock().unwrap().take();
+        if let Some(jh) = h.abort.lock().unwrap().take() {
+            jh.abort();
+        }
+        run
+    };
     if let Some(run_id) = aborted_run {
         // starting = 任务尚未拿到 run_id；无论哪种情况都把库中残留的 running 记录收尾，
         // 避免停止后数据库里留下永久“运行中”的 run（运行状态恢复以数据库为准）
         {
             let db = state.db.lock().unwrap();
             let _ = store::fail_open_runs(&db, session_id);
+            if let Ok(events) = store::fail_open_tool_events(&db, session_id) {
+                drop(db);
+                for ev in events {
+                    let _ = app.emit(
+                        "tool:update",
+                        json!({"sessionId": session_id, "event": ev}),
+                    );
+                }
+            }
         }
         let _ = app.emit(
             "run:status",
@@ -195,6 +264,15 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
     {
         let db = state.db.lock().unwrap();
         let _ = store::fail_open_runs(&db, &session_id);
+        if let Ok(events) = store::fail_open_tool_events(&db, &session_id) {
+            drop(db);
+            for ev in events {
+                let _ = app.emit(
+                    "tool:update",
+                    json!({"sessionId": session_id, "event": ev}),
+                );
+            }
+        }
     }
     let _ = app.emit(
         "queue:update",
@@ -322,6 +400,10 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
         }
     };
     let sys = system_prompt(&session, project_section.as_deref());
+    let mut files_modified = false;
+    let mut sop_retry_count = 0usize;
+    let mut sop_verified = false;
+    let mut tool_tracker = ToolErrorTracker::new(2);
     for _step in 0..max_steps {
         // ---- 步骤 1/2：组装上下文（含运行中被"引导"注入的新消息） ----
         let (messages, est_in) = {
@@ -429,7 +511,110 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
         let usage = json!({"inputEst": est_in, "outputEst": est_out});
 
         if result.tool_calls.is_empty() {
-            // ---- 步骤 4：纯文本回复，Run 结束 ----
+            // ---- 步骤 4：纯文本回复，交付前检查 SOP 自检 ----
+            if files_modified && !sop_verified && sop_retry_count < 2 {
+                let sop_opt = {
+                    let db = state.db.lock().unwrap();
+                    let proj = match &session.project_id {
+                        Some(pid) => store::get_project(&db, pid).ok().flatten(),
+                        None => if !session.workspace_path.is_empty() {
+                            store::find_project_by_path(&db, &session.workspace_path).ok().flatten()
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(p) = proj {
+                        if p.sop_enabled {
+                            let cmd = p.sop_verify_cmd.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| {
+                                let (_, def_cmd) = crate::sop::detect_project_stack(&workspace);
+                                def_cmd
+                            });
+                            if !cmd.trim().is_empty() {
+                                Some(cmd)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else if !session.workspace_path.is_empty() {
+                        let (_, def_cmd) = crate::sop::detect_project_stack(&workspace);
+                        if !def_cmd.trim().is_empty() {
+                            Some(def_cmd)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(cmd) = sop_opt {
+                    let _ = app.emit(
+                        "sop:status",
+                        json!({
+                            "sessionId": session_id,
+                            "status": "checking",
+                            "command": cmd,
+                        }),
+                    );
+
+                    let verify_res = crate::sop::run_verify_cmd(&workspace, &cmd, Duration::from_secs(60)).await;
+                    match verify_res {
+                        Ok((true, out)) => {
+                            sop_verified = true;
+                            let _ = app.emit(
+                                "sop:status",
+                                json!({
+                                    "sessionId": session_id,
+                                    "status": "passed",
+                                    "command": cmd,
+                                    "output": out,
+                                }),
+                            );
+                        }
+                        Ok((false, out)) => {
+                            sop_retry_count += 1;
+                            let _ = app.emit(
+                                "sop:status",
+                                json!({
+                                    "sessionId": session_id,
+                                    "status": "failed",
+                                    "command": cmd,
+                                    "output": out,
+                                }),
+                            );
+
+                            {
+                                let db = state.db.lock().unwrap();
+                                let _ = store::update_message_content(&db, &assistant_id, &result.content, Some(&usage));
+                                if !result.reasoning.is_empty() {
+                                    let _ = store::update_message_reasoning(&db, &assistant_id, &result.reasoning);
+                                }
+                                let err_prompt = format!(
+                                    "【🛡️ 交付前 SOP 自检未通过】\n自检命令：`{cmd}`\n执行输出：\n```\n{out}\n```\n检测到上述构建或测试报错。请分析原因并修改代码进行自愈修复，确保自检通过后再交付完成任务。"
+                                );
+                                let _ = store::new_message(&db, session_id, "user", Some(err_prompt), false);
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            let _ = app.emit(
+                                "sop:status",
+                                json!({
+                                    "sessionId": session_id,
+                                    "status": "error",
+                                    "command": cmd,
+                                    "output": e,
+                                }),
+                            );
+                            sop_verified = true;
+                        }
+                    }
+                }
+            }
+
+            // ---- 正常交付：文本消息落库并结束 run_once ----
             {
                 let db = state.db.lock().unwrap();
                 let _ = store::update_message_content(&db, &assistant_id, &result.content, Some(&usage));
@@ -451,6 +636,7 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
                     let _ = app.emit("session:update", &s);
                 }
             }
+            let _ = sop_verified;
             return RunOutcome::Done;
         }
 
@@ -490,7 +676,7 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
             let args: Value = serde_json::from_str(&tc.args).unwrap_or_else(|_| {
                 json!({"__parse_error": "工具参数不是有效 JSON"})
             });
-            let (status, result_text) = handle_tool_call(
+            let (status, mut result_text) = handle_tool_call(
                 app,
                 session_id,
                 &assistant_id,
@@ -502,6 +688,36 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
                 &settings.disabled_tools,
             )
             .await;
+
+            // 工具自动自纠错机制：非用户审批拒绝的执行失败触发内部微反思引导
+            if status == "failed" {
+                let (can_retry, count) = tool_tracker.record_failure(&tc.name);
+                if can_retry {
+                    let _ = app.emit(
+                        "tool:retry_guidance",
+                        json!({
+                            "sessionId": session_id,
+                            "toolName": tc.name,
+                            "attempt": count,
+                            "maxRetries": tool_tracker.max_retry_limit,
+                            "error": result_text,
+                        }),
+                    );
+                    result_text = build_tool_reflexion_prompt(
+                        &tc.name,
+                        &result_text,
+                        count,
+                        tool_tracker.max_retry_limit,
+                    );
+                } else {
+                    result_text = format!(
+                        "{result_text}\n\n【提示】: 工具 `{}` 已连续失败 {} 次（达到自纠错上限），请停止重复尝试，向用户如实陈述原因或尝试其他方案。",
+                        tc.name, tool_tracker.max_retry_limit
+                    );
+                }
+            } else if status == "success" {
+                tool_tracker.record_success(&tc.name);
+            }
             // 工具结果作为 tool 消息进入上下文
             let tool_msg = {
                 let db = state.db.lock().unwrap();
@@ -513,6 +729,10 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
             };
             if let Ok(m) = tool_msg {
                 let _ = app.emit("message:final", &m);
+            }
+            if (tc.name == "write_file" || tc.name == "edit_file") && status == "success" {
+                files_modified = true;
+                sop_verified = false;
             }
             let _ = status;
         }
@@ -668,6 +888,13 @@ async fn handle_tool_call(
         let decision = approval::request_approval(app, &state, req).await;
         match decision {
             Decision::Deny(reason) => {
+                crate::growth::trigger_reflection_on_denial(
+                    app.clone(),
+                    session_id.to_string(),
+                    tool_name.to_string(),
+                    args.clone(),
+                    reason.clone(),
+                );
                 let text = format!(
                     "用户拒绝了该操作。{}",
                     reason.map(|r| format!("原因：{r}")).unwrap_or_default()
@@ -909,27 +1136,80 @@ fn resolve_links(conn: &rusqlite::Connection, project_id: &str) -> Result<Vec<Re
     Ok(out)
 }
 
-/// 组装注入 system prompt 的「项目约束 + 关联项目」段；两者皆空时返回 None（不追加）
+/// 组装注入 system prompt 的「项目约束 + 演进经验 + 关联项目」段；全部为空时返回 None（不追加）
 fn build_project_section(
     conn: &rusqlite::Connection,
     project_id: &str,
 ) -> Result<Option<String>, String> {
-    let constraints = store::get_project(conn, project_id)?
-        .map(|p| p.constraints)
-        .unwrap_or_default();
+    let proj = store::get_project(conn, project_id)?;
+    let constraints = proj.as_ref().map(|p| p.constraints.clone()).unwrap_or_default();
+    let sop_cmd = proj.as_ref().and_then(|p| {
+        if p.sop_enabled {
+            if let Some(cmd) = p.sop_verify_cmd.as_ref().filter(|s| !s.trim().is_empty()) {
+                Some(cmd.clone())
+            } else if let Some(path) = p.path.as_deref().filter(|s| !s.trim().is_empty()) {
+                let (_, def_cmd) = crate::sop::detect_project_stack(std::path::Path::new(path));
+                if !def_cmd.trim().is_empty() {
+                    Some(def_cmd)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    });
     let links = resolve_links(conn, project_id)?;
-    if constraints.trim().is_empty() && links.is_empty() {
+    let growths = store::list_accepted_growths_for_project(conn, project_id).unwrap_or_default();
+    if !growths.is_empty() {
+        let ids: Vec<String> = growths.iter().map(|g| g.id.clone()).collect();
+        let _ = store::increment_growth_applied_count(conn, &ids);
+    }
+    if constraints.trim().is_empty() && links.is_empty() && growths.is_empty() && sop_cmd.is_none() {
         return Ok(None);
     }
-    Ok(Some(project_section(&constraints, &links)))
+    Ok(Some(project_section(&constraints, &links, &growths, sop_cmd.as_deref())))
 }
 
 /// 纯文本组装（无 IO，便于单测）
-fn project_section(constraints: &str, links: &[ResolvedLink]) -> String {
+fn project_section(
+    constraints: &str,
+    links: &[ResolvedLink],
+    growths: &[GrowthItem],
+    sop_cmd: Option<&str>,
+) -> String {
     let mut s = String::new();
     if !constraints.trim().is_empty() {
         s.push_str("## 项目约束（必须严格遵守）\n");
         s.push_str(constraints.trim());
+    }
+    if let Some(cmd) = sop_cmd {
+        if !s.is_empty() {
+            s.push_str("\n\n");
+        }
+        s.push_str("## 交付自检规范（SOP，必须严格遵守）：\n");
+        s.push_str(&format!("- 本项目已开启交付前自检命令：`{cmd}`\n"));
+        s.push_str("- 当你使用 write_file 或 edit_file 新增或修改了代码文件后，系统将在向用户交付前自动执行该自检命令。\n");
+        s.push_str("- 若自检失败，请根据错误输出进行排查和修复，直到自检通过后再交付。\n");
+    }
+    if !growths.is_empty() {
+        if !s.is_empty() {
+            s.push_str("\n\n");
+        }
+        s.push_str("## 项目演进经验（基于往期会话沉淀，必须严格遵守）：\n");
+        for (idx, g) in growths.iter().enumerate() {
+            let cat = match g.category.as_str() {
+                "command_rule" => "命令规范",
+                "code_style" => "代码规范",
+                "build_test" => "构建测试",
+                "pitfall" => "避坑防雷",
+                "workflow" => "工作流",
+                _ => &g.category,
+            };
+            s.push_str(&format!("{}. [{}] {}\n", idx + 1, cat, g.rule_content.trim()));
+        }
     }
     if !links.is_empty() {
         if !s.is_empty() {
@@ -1091,7 +1371,7 @@ mod tests {
     #[test]
     fn project_section_contains_links_and_precedence() {
         let links = vec![link("libx", "D:\\libx", "依赖其接口", Some("用 pnpm"))];
-        let s = project_section("用 npm", &links);
+        let s = project_section("用 npm", &links, &[], None);
         assert!(s.contains("用 npm"));
         assert!(s.contains("libx"));
         assert!(s.contains("D:\\libx"));
@@ -1103,18 +1383,50 @@ mod tests {
     fn project_section_skips_empty_parts() {
         // 无自身约束、仅关联 → 不出现约束标题，也不出现悬空的优先级声明
         let links = vec![link("tools", "D:\\c", "工具库", None)];
-        let s = project_section("", &links);
+        let s = project_section("", &links, &[], None);
         assert!(!s.contains("## 项目约束"));
         assert!(!s.contains("优先级"));
         assert!(s.contains("## 关联项目"));
 
         // 仅约束、无关联 → 不出现关联段
-        let s2 = project_section("规范", &[]);
+        let s2 = project_section("规范", &[], &[], None);
         assert!(s2.starts_with("## 项目约束"));
         assert!(!s2.contains("关联项目"));
 
         // 两者皆空的判定在 build_project_section，这里验证空串等价
-        assert_eq!(project_section("  ", &[]), "");
+        assert_eq!(project_section("  ", &[], &[], None), "");
+    }
+
+    #[test]
+    fn project_section_includes_growths() {
+        let growth = GrowthItem {
+            id: "g1".into(),
+            project_id: Some("p1".into()),
+            session_id: None,
+            session_title: None,
+            message_id: None,
+            run_id: None,
+            trigger_type: "user_rejection".into(),
+            trigger_context: "".into(),
+            reflection_thought: "".into(),
+            category: "command_rule".into(),
+            title: "清理规范".into(),
+            rule_content: "- 使用 cargo clean".into(),
+            status: "accepted".into(),
+            applied_count: 1,
+            created_at: "".into(),
+            updated_at: "".into(),
+        };
+        let s = project_section("约束", &[], &[growth], None);
+        assert!(s.contains("## 项目演进经验"));
+        assert!(s.contains("[命令规范] - 使用 cargo clean"));
+    }
+
+    #[test]
+    fn project_section_includes_sop() {
+        let s = project_section("约束", &[], &[], Some("cargo test"));
+        assert!(s.contains("## 交付自检规范"));
+        assert!(s.contains("cargo test"));
     }
 
     #[test]
@@ -1170,5 +1482,27 @@ mod tests {
         // 全空 → 不注入
         let c = store::create_project(&conn, "C", None).unwrap();
         assert!(build_project_section(&conn, &c.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_tool_error_tracker() {
+        let mut tracker = ToolErrorTracker::new(2);
+        assert_eq!(tracker.record_failure("edit_file"), (true, 1));
+        assert_eq!(tracker.record_failure("edit_file"), (true, 2));
+        assert_eq!(tracker.record_failure("edit_file"), (false, 3));
+
+        tracker.record_success("edit_file");
+        assert_eq!(tracker.record_failure("edit_file"), (true, 1));
+    }
+
+    #[test]
+    fn test_build_tool_reflexion_prompt() {
+        let p = build_tool_reflexion_prompt("edit_file", "未找到匹配文本", 1, 2);
+        assert!(p.contains("未找到匹配文本"));
+        assert!(p.contains("第 1/2 次尝试"));
+        assert!(p.contains("read_file"));
+
+        let p_cmd = build_tool_reflexion_prompt("run_command", "exit code 1", 2, 2);
+        assert!(p_cmd.contains("stderr"));
     }
 }

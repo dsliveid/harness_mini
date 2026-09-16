@@ -4,6 +4,18 @@ import { useStore } from "../store";
 import type { Provider, Settings, ToolInfo } from "../types";
 import { DataDirSection } from "./DataDirSection";
 import { ModalActions, ModalClose } from "./ModalActions";
+import {
+  Cpu,
+  Wrench,
+  Database,
+  Plus,
+  Eye,
+  EyeOff,
+  Copy,
+  Check,
+  Terminal,
+  Wind,
+} from "./Icons";
 
 type Tab = "models" | "tools" | "datadir";
 
@@ -308,15 +320,24 @@ export function SettingsModal() {
           <ModalClose onClick={() => setShow(false)} />
         </div>
         <div className="flex-1 flex min-h-0">
-          <aside className="w-[150px] shrink-0 border-r border-edge p-2 flex flex-col gap-1">
+          <aside className="w-[155px] shrink-0 border-r border-edge p-2 flex flex-col gap-1">
             <button className={menuCls(tab === "models")} onClick={() => setTab("models")}>
-              🤖 模型设置
+              <span className="flex items-center gap-2">
+                <Cpu size={15} />
+                <span>模型设置</span>
+              </span>
             </button>
             <button className={menuCls(tab === "tools")} onClick={() => setTab("tools")}>
-              🛠️ Agent 工具
+              <span className="flex items-center gap-2">
+                <Wrench size={15} />
+                <span>Agent 工具</span>
+              </span>
             </button>
             <button className={menuCls(tab === "datadir")} onClick={() => setTab("datadir")}>
-              📂 数据目录
+              <span className="flex items-center gap-2">
+                <Database size={15} />
+                <span>数据目录</span>
+              </span>
             </button>
           </aside>
           <main className="flex-1 min-w-0 min-h-0 overflow-y-auto p-4 text-[13px]">
@@ -326,8 +347,9 @@ export function SettingsModal() {
                 <section>
                   <div className="flex items-center mb-2">
                     <div className="font-medium">模型厂商（OpenAI 兼容）</div>
-                    <button className="ml-auto text-accent hover:underline" onClick={addProvider}>
-                      + 添加厂商
+                    <button className="ml-auto text-accent hover:underline flex items-center gap-1 text-[12px]" onClick={addProvider}>
+                      <Plus size={13} />
+                      <span>添加厂商</span>
                     </button>
                   </div>
                   <div className="flex flex-col gap-2.5">
@@ -415,16 +437,16 @@ export function SettingsModal() {
                                   onChange={(e) => updateProvider(p.id, { apiKey: e.target.value })}
                                 />
                                 <button
-                                  className="shrink-0 w-7 h-7 rounded-lg bg-panel3 hover:bg-edge flex items-center justify-center text-[13px] text-inkdim hover:text-ink"
+                                  className="shrink-0 w-7 h-7 rounded-lg bg-panel3 hover:bg-edge flex items-center justify-center text-inkdim hover:text-ink transition-colors"
                                   title={visibleKeys[p.id] ? "隐藏" : "明文显示"}
                                   onClick={() => setVisibleKeys((v) => ({ ...v, [p.id]: !v[p.id] }))}
                                 >
-                                  {visibleKeys[p.id] ? "🙈" : "👁"}
+                                  {visibleKeys[p.id] ? <EyeOff size={14} /> : <Eye size={14} />}
                                 </button>
                                 <button
-                                  className={`shrink-0 w-7 h-7 rounded-lg bg-panel3 hover:bg-edge flex items-center justify-center text-[13px] ${
-                                    copiedId === p.id ? "text-green-400" : "text-inkdim hover:text-ink"
-                                  } ${p.apiKey ? "" : "opacity-40 cursor-not-allowed"}`}
+                                  className={`shrink-0 w-7 h-7 rounded-lg bg-panel3 hover:bg-edge flex items-center justify-center ${
+                                    copiedId === p.id ? "text-emerald-400" : "text-inkdim hover:text-ink"
+                                  } ${p.apiKey ? "" : "opacity-40 cursor-not-allowed"} transition-colors`}
                                   title="复制 API Key"
                                   disabled={!p.apiKey}
                                   onClick={() => {
@@ -438,7 +460,7 @@ export function SettingsModal() {
                                     );
                                   }}
                                 >
-                                  {copiedId === p.id ? "✓" : "📋"}
+                                  {copiedId === p.id ? <Check size={14} /> : <Copy size={14} />}
                                 </button>
                               </div>
                               {/* 该厂商下的模型列表（可配置多个） */}
@@ -491,10 +513,11 @@ export function SettingsModal() {
                                     }}
                                   />
                                   <button
-                                    className="shrink-0 text-[12px] px-3 rounded-lg bg-panel3 hover:bg-edge text-inkdim hover:text-ink"
+                                    className="shrink-0 text-[12px] px-3 rounded-lg bg-panel3 hover:bg-edge text-inkdim hover:text-ink flex items-center gap-1.5 transition-colors"
                                     onClick={() => addModel(p.id)}
                                   >
-                                    + 添加模型
+                                    <Plus size={13} />
+                                    <span>添加模型</span>
                                   </button>
                                 </div>
                               </div>
@@ -627,7 +650,8 @@ export function SettingsModal() {
                       {/* 基础工具 */}
                       <div className="mt-4">
                         <div className="text-[12px] font-medium text-inkdim mb-2 flex items-center gap-1.5">
-                          <span>💻 基础工具</span>
+                          <Terminal size={14} className="text-blue-400" />
+                          <span>基础工具</span>
                           <span className="text-[11px] text-inkdim/60">
                             ({baseTools.filter((t) => isToolEnabled(t.name)).length}/{baseTools.length})
                           </span>
@@ -641,7 +665,8 @@ export function SettingsModal() {
                       {tempTools.length > 0 && (
                         <div className="mt-5">
                           <div className="text-[12px] font-medium text-inkdim mb-2 flex items-center gap-1.5">
-                            <span>🌪️ 临时空间专用工具</span>
+                            <Wind size={14} className="text-purple-400" />
+                            <span>临时空间专用工具</span>
                             <span className="text-[11px] text-inkdim/60">
                               ({tempTools.filter((t) => isToolEnabled(t.name)).length}/{tempTools.length})
                             </span>

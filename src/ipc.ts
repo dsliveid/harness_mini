@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ApprovalRule, DataStatus, Message, MergeSummary, Project, ProjectLink, RunningSession, Session, Settings, TempAlloc, TempChanges, TempFileDiff, TempInfo, ToolEvent, ToolInfo } from "./types";
+import type { ApprovalRule, DataStatus, GrowthItem, Message, MergeSummary, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, ToolEvent, ToolInfo } from "./types";
 
 export const ipc = {
   getSettings: () => invoke<Settings>("get_settings"),
@@ -94,6 +94,34 @@ export const ipc = {
 
   // 打开目录（系统文件管理器）
   openDir: (path: string) => invoke<void>("open_dir", { path }),
+
+  // 成长演进 (Growth)
+  listGrowths: (projectId?: string | null, status?: string | null) =>
+    invoke<GrowthItem[]>("list_growths", { projectId: projectId ?? null, status: status ?? null }),
+  updateGrowthStatus: (id: string, status: string) =>
+    invoke<void>("update_growth_status", { id, status }),
+  updateGrowthRule: (id: string, title: string, ruleContent: string, category: string) =>
+    invoke<void>("update_growth_rule", { id, title, ruleContent, category }),
+  deleteGrowth: (id: string) => invoke<void>("delete_growth", { id }),
+  triggerGrowthReflection: (sessionId: string, userInstruction?: string) =>
+    invoke<void>("trigger_growth_reflection", { sessionId, userInstruction: userInstruction ?? null }),
+
+  // 技能库 (Skills)
+  listProjectSkills: (workspacePath: string) =>
+    invoke<SkillItem[]>("list_project_skills", { workspacePath }),
+  saveProjectSkill: (workspacePath: string, name: string, description: string, scriptType: string, content: string) =>
+    invoke<SkillItem>("save_project_skill", { workspacePath, name, description, scriptType, content }),
+  deleteProjectSkill: (workspacePath: string, skillName: string) =>
+    invoke<void>("delete_project_skill", { workspacePath, skillName }),
+
+  // 交付自检 SOP
+  getProjectSop: (workspacePath: string, projectId?: string | null) =>
+    invoke<ProjectSopInfo>("get_project_sop", { workspacePath, projectId: projectId ?? null }),
+  setProjectSop: (projectId: string, verifyCmd: string | null, enabled: boolean) =>
+    invoke<void>("set_project_sop", { projectId, verifyCmd, enabled }),
+  runWorkspaceSop: (workspacePath: string, cmd: string) =>
+    invoke<string>("run_workspace_sop", { workspacePath, cmd }),
 };
 
-export type { Message, Session, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary };
+export type { Message, Session, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo };
+

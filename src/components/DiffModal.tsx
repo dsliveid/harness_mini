@@ -2,6 +2,7 @@ import { Fragment, useEffect, useState } from "react";
 import { ipc } from "../ipc";
 import { currentSession, useStore } from "../store";
 import type { DiffHunk, DiffLine, TempChangeFile, TempChanges, TempFileDiff } from "../types";
+import { RotateCcw, Package, X } from "./Icons";
 
 const CHANGE_BADGE: Record<string, { label: string; letter: string; badge: string; del?: string; add?: string }> = {
   added: { label: "新增", letter: "+", badge: "bg-green-500/15 text-green-400 border-green-500/30" },
@@ -205,13 +206,17 @@ export function DiffModal() {
             </span>
           )}
           <button
-            className="ml-auto text-[12px] px-2.5 py-1 rounded-lg text-inkdim hover:text-ink hover:bg-panel3"
+            className="ml-auto text-[12px] px-2.5 py-1 rounded-lg text-inkdim hover:text-ink hover:bg-panel3 flex items-center gap-1.5 transition-colors"
             title="重新扫描变更"
             onClick={() => void load()}
           >
-            ⟳ 刷新
+            <RotateCcw size={12} />
+            <span>刷新</span>
           </button>
-          <button className="text-[12px] px-2.5 py-1 rounded-lg text-inkdim hover:text-ink hover:bg-panel3" onClick={() => setShow(false)}>
+          <button
+            className="text-[12px] px-2.5 py-1 rounded-lg text-inkdim hover:text-ink hover:bg-panel3 transition-colors"
+            onClick={() => setShow(false)}
+          >
             关闭
           </button>
         </div>
@@ -226,7 +231,7 @@ export function DiffModal() {
             {data?.projects.map((p) => (
               <div key={p.key} className="mb-2">
                 <div className="px-3 py-1.5 text-[11px] text-inkdim flex items-center gap-1.5" title={p.source}>
-                  <span>📦</span>
+                  <Package size={13} className="text-inkdim shrink-0" />
                   <span className="truncate font-medium">{p.name}</span>
                   <span className="shrink-0">({p.files.length})</span>
                 </div>
