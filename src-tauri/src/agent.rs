@@ -5,7 +5,7 @@ use crate::store;
 use crate::tools::{self, Risk, ToolCtx, ToolSpec};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
@@ -45,8 +45,8 @@ impl ToolErrorTracker {
         }
     }
 
-    pub fn record_success(&mut self, tool_name: &str) {
-        self.consecutive_failures.remove(tool_name);
+    pub fn record_success(&mut self, tool_name: &str) -> bool {
+        self.consecutive_failures.remove(tool_name).is_some()
     }
 
     pub fn record_failure(&mut self, tool_name: &str) -> (bool, u32) {
@@ -167,6 +167,8 @@ pub fn stop_session(app: &AppHandle, session_id: &str) {
         run
     };
     if let Some(run_id) = aborted_run {
+        // 用户主动停止任务：收尾残留的 in_progress 任务为 pending，避免界面继续转圈
+        stop_session_todos(&state, app, session_id);
         // starting = 任务尚未拿到 run_id；无论哪种情况都把库中残留的 running 记录收尾，
         // 避免停止后数据库里留下永久“运行中”的 run（运行状态恢复以数据库为准）
         {
@@ -221,12 +223,17 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
                 }
             }
         };
-        let Some(_trigger_id) = trigger_id else { break };
+        let Some(trigger_id) = trigger_id else { break };
 
-        // 2. 创建 Run
+        // 2. 创建 Run 并记录开始时间与关联触发消息
+        let run_start_instant = Instant::now();
         let run_id = {
             let db = state.db.lock().unwrap();
-            store::create_run(&db, &session_id).ok()
+            let rid = store::create_run(&db, &session_id, Some(&trigger_id)).ok();
+            if let Some(ref r) = rid {
+                let _ = store::set_message_run_id(&db, &trigger_id, r);
+            }
+            rid
         };
         let Some(run_id) = run_id else { break };
         if let Some(h) = state.handles.lock().unwrap().get(&session_id) {
@@ -234,22 +241,50 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
         }
         let _ = app.emit(
             "run:status",
-            json!({"sessionId": session_id, "runId": run_id, "status": "running"}),
+            json!({
+                "sessionId": session_id,
+                "runId": run_id,
+                "status": "running",
+                "triggerId": trigger_id,
+                "startedAt": store::now(),
+            }),
         );
 
         // 3. 运行一次 Agent 主循环
-        let outcome = run_once(&app, &session_id, &run_id).await;
+        let (outcome, last_assistant_id, run_tokens) = run_once(&app, &session_id, &run_id).await;
+        let run_duration_ms = run_start_instant.elapsed().as_millis() as u64;
         let status = match outcome {
             RunOutcome::Done => "done",
             RunOutcome::Failed => "failed",
         };
         {
             let db = state.db.lock().unwrap();
-            let _ = store::finish_run(&db, &run_id, status);
+            let _ = store::finish_run(
+                &db,
+                &run_id,
+                status,
+                Some(run_duration_ms),
+                Some(run_tokens.total_tokens),
+                Some(run_tokens.prompt_tokens),
+                Some(run_tokens.completion_tokens),
+            );
+            if let Some(ref aid) = last_assistant_id {
+                let _ = store::update_message_turn_duration(&db, aid, run_duration_ms);
+                if let Ok(Some(m)) = store::get_message(&db, aid) {
+                    let _ = app.emit("message:final", &m);
+                }
+            }
         }
         let _ = app.emit(
             "run:status",
-            json!({"sessionId": session_id, "runId": run_id, "status": status}),
+            json!({
+                "sessionId": session_id,
+                "runId": run_id,
+                "status": status,
+                "durationMs": run_duration_ms,
+                "totalTokens": run_tokens.total_tokens,
+                "lastAssistantId": last_assistant_id,
+            }),
         );
         // 失败时不再自动消费队列，等待用户处理
         if outcome == RunOutcome::Failed {
@@ -290,7 +325,9 @@ fn queued_payload(state: &crate::AppState, session_id: &str) -> Vec<Value> {
 }
 
 /// Agent 单次运行主循环（§5.1）
-async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcome {
+async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcome, Option<String>, RunTokenMetrics) {
+    let mut last_assistant_id: Option<String> = None;
+    let mut run_tokens = RunTokenMetrics::default();
     let state = app.state::<crate::AppState>();
     let (session, settings) = {
         let db = state.db.lock().unwrap();
@@ -301,19 +338,28 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
             store::get_settings_with_secrets(&db, &master).unwrap_or_default(),
         )
     };
-    let Some(session) = session else { return RunOutcome::Failed };
-    let workspace = PathBuf::from(&session.workspace_path);
+    let Some(session) = session else { return (RunOutcome::Failed, None, run_tokens); };
+    let data_dir = state.data_dir.lock().unwrap().clone();
+    let workspace = if session.is_temp {
+        if let Some(d) = &data_dir {
+            crate::temp::adapt_temp_path(Path::new(&session.workspace_path), d)
+        } else {
+            PathBuf::from(&session.workspace_path)
+        }
+    } else {
+        PathBuf::from(&session.workspace_path)
+    };
     // 临时空间会话：每次运行前检查/重建临时空间（拷贝缺失的项目副本 + 基线提交）
     if session.is_temp {
         if let Err(e) = crate::temp::ensure_space(&state, app, &session) {
             emit_error(app, session_id, "temp", format!("临时空间准备失败: {e}"));
-            return RunOutcome::Failed;
+            return (RunOutcome::Failed, None, run_tokens);
         }
     }
     // 未绑定工作区（空字符串）的会话为纯对话模式，跳过存在性检查
     if !session.workspace_path.is_empty() && !workspace.exists() {
-        emit_error(app, session_id, "workspace", format!("工作区不存在: {}", session.workspace_path));
-        return RunOutcome::Failed;
+        emit_error(app, session_id, "workspace", format!("工作区不存在: {}", workspace.display()));
+        return (RunOutcome::Failed, None, run_tokens);
     }
 
     // 解析模型配置：全局激活的厂商 + 模型，失效时回落到第一个有模型的厂商
@@ -324,7 +370,7 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
             "no_model",
             "尚未配置模型厂商，请先在设置中添加厂商与模型并选择。".into(),
         );
-        return RunOutcome::Failed;
+        return (RunOutcome::Failed, None, run_tokens);
     };
     let cfg = LlmCfg {
         base_url: pc.base_url.clone(),
@@ -346,7 +392,13 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
         workspace: workspace.clone(),
         // 临时空间会话：沙箱为整个临时空间根目录（AI 可访问主项目与关联项目的临时副本）
         sandbox_root: if session.is_temp {
-            session.temp_root.as_ref().map(PathBuf::from)
+            session.temp_root.as_ref().map(|r| {
+                if let Some(d) = &data_dir {
+                    crate::temp::adapt_temp_path(Path::new(r), d)
+                } else {
+                    PathBuf::from(r)
+                }
+            })
         } else {
             None
         },
@@ -404,31 +456,54 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
     let mut sop_retry_count = 0usize;
     let mut sop_verified = false;
     let mut tool_tracker = ToolErrorTracker::new(2);
+    let mut has_checked_compaction = false;
     for _step in 0..max_steps {
+        // ---- 步骤 0：在首步或上下文逼近上限时检测是否触发自动压缩与确认 ----
+        if !has_checked_compaction {
+            let compacted = check_and_trigger_compaction(
+                app,
+                &state,
+                session_id,
+                &cfg,
+                &sys,
+                settings.context_token_limit,
+            )
+            .await;
+            if compacted {
+                let _ = app.emit("session:compacted", json!({ "sessionId": session_id }));
+            }
+            has_checked_compaction = true;
+        }
+
         // ---- 步骤 1/2：组装上下文（含运行中被"引导"注入的新消息） ----
-        let (messages, est_in) = {
+        let (messages, est_in, truncation_notice) = {
             let db = state.db.lock().unwrap();
             build_context(&db, session_id, &sys, settings.context_token_limit)
         };
+        if let Some(ref notice) = truncation_notice {
+            let _ = app.emit("context:truncated", notice);
+        }
         let messages = match messages {
             Ok(m) => m,
             Err(e) => {
                 emit_error(app, session_id, "context", e);
-                return RunOutcome::Failed;
+                return (RunOutcome::Failed, last_assistant_id, run_tokens);
             }
         };
 
         // ---- 步骤 3：流式调用 LLM（先预占 assistant 消息位，供增量事件引用） ----
+        let step_start = Instant::now();
         let assistant_id = {
             let db = state.db.lock().unwrap();
-            match store::new_message(&db, session_id, "assistant", Some(String::new()), false) {
+            match store::new_message_with_run(&db, session_id, "assistant", Some(String::new()), false, Some(run_id)) {
                 Ok(m) => m.id,
                 Err(e) => {
                     emit_error(app, session_id, "db", e);
-                    return RunOutcome::Failed;
+                    return (RunOutcome::Failed, last_assistant_id, run_tokens);
                 }
             }
         };
+        last_assistant_id = Some(assistant_id.clone());
         let app2 = app.clone();
         let sid2 = session_id.to_string();
         let mid2 = assistant_id.clone();
@@ -491,7 +566,7 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
             Ok(r) => r,
             Err(e) => {
                 emit_error(app, session_id, "llm", e);
-                return RunOutcome::Failed;
+                return (RunOutcome::Failed, last_assistant_id, run_tokens);
             }
         };
 
@@ -504,11 +579,50 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
                 "模型返回了空回复。请检查设置中的模型名称是否正确、该模型是否支持工具调用（function calling），或更换模型后重试。"
                     .into(),
             );
-            return RunOutcome::Done;
+            return (RunOutcome::Done, last_assistant_id, run_tokens);
         }
 
-        let est_out = estimate_tokens(&result.content);
-        let usage = json!({"inputEst": est_in, "outputEst": est_out});
+        let step_duration_ms = step_start.elapsed().as_millis() as u64;
+        let (prompt_tokens, completion_tokens, total_tokens) = match &result.usage {
+            Some(u) => {
+                let p = u
+                    .get("prompt_tokens")
+                    .or_else(|| u.get("promptTokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(est_in as u64);
+                let c = u
+                    .get("completion_tokens")
+                    .or_else(|| u.get("completionTokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_else(|| {
+                        (estimate_tokens(&result.content) + estimate_tokens(&result.reasoning)) as u64
+                    });
+                let t = u
+                    .get("total_tokens")
+                    .or_else(|| u.get("totalTokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(p + c);
+                (p, c, t)
+            }
+            None => {
+                let est_out = estimate_tokens(&result.content) + estimate_tokens(&result.reasoning);
+                (est_in as u64, est_out as u64, (est_in + est_out) as u64)
+            }
+        };
+
+        run_tokens.prompt_tokens += prompt_tokens;
+        run_tokens.completion_tokens += completion_tokens;
+        run_tokens.total_tokens += total_tokens;
+
+        let usage = json!({
+            "promptTokens": prompt_tokens,
+            "completionTokens": completion_tokens,
+            "totalTokens": total_tokens,
+            "inputEst": est_in,
+            "outputEst": estimate_tokens(&result.content),
+            "durationMs": step_duration_ms,
+            "model": &cfg.model,
+        });
 
         if result.tool_calls.is_empty() {
             // ---- 步骤 4：纯文本回复，交付前检查 SOP 自检 ----
@@ -636,8 +750,11 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
                     let _ = app.emit("session:update", &s);
                 }
             }
+            // 对话正常完成交付时，自动将任务清单中仍处于 in_progress 的任务标记为 done，
+            // 避免 Agent 执行完最后一步直接给出最终回复后遗留转圈状态
+            auto_finish_session_todos(&state, app, session_id);
             let _ = sop_verified;
-            return RunOutcome::Done;
+            return (RunOutcome::Done, last_assistant_id, run_tokens);
         }
 
         // ---- 步骤 5：工具调用 ----
@@ -659,6 +776,7 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
                 &assistant_id,
                 &Value::Array(tc_json),
                 &result.content,
+                Some(&usage),
             );
             if !result.reasoning.is_empty() {
                 let _ = store::update_message_reasoning(&db, &assistant_id, &result.reasoning);
@@ -670,6 +788,13 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
         };
         if let Some(m) = final_msg {
             let _ = app.emit("message:final", &m);
+        }
+        {
+            let db = state.db.lock().unwrap();
+            let _ = store::touch_session(&db, session_id);
+            if let Ok(Some(s)) = store::get_session(&db, session_id) {
+                let _ = app.emit("session:update", &s);
+            }
         }
 
         for tc in &tcs {
@@ -698,6 +823,7 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
                         json!({
                             "sessionId": session_id,
                             "toolName": tc.name,
+                            "status": "retrying",
                             "attempt": count,
                             "maxRetries": tool_tracker.max_retry_limit,
                             "error": result_text,
@@ -710,13 +836,37 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
                         tool_tracker.max_retry_limit,
                     );
                 } else {
+                    let _ = app.emit(
+                        "tool:retry_guidance",
+                        json!({
+                            "sessionId": session_id,
+                            "toolName": tc.name,
+                            "status": "failed",
+                            "attempt": count,
+                            "maxRetries": tool_tracker.max_retry_limit,
+                            "error": result_text,
+                            "message": format!("工具 `{}` 已连续失败 {} 次，达到自纠错上限", tc.name, tool_tracker.max_retry_limit),
+                        }),
+                    );
                     result_text = format!(
                         "{result_text}\n\n【提示】: 工具 `{}` 已连续失败 {} 次（达到自纠错上限），请停止重复尝试，向用户如实陈述原因或尝试其他方案。",
                         tc.name, tool_tracker.max_retry_limit
                     );
                 }
             } else if status == "success" {
-                tool_tracker.record_success(&tc.name);
+                if tool_tracker.record_success(&tc.name) {
+                    let _ = app.emit(
+                        "tool:retry_guidance",
+                        json!({
+                            "sessionId": session_id,
+                            "toolName": tc.name,
+                            "status": "success",
+                            "attempt": 0,
+                            "maxRetries": tool_tracker.max_retry_limit,
+                            "message": format!("工具 `{}` 内部自纠修正成功，已恢复正常执行", tc.name),
+                        }),
+                    );
+                }
             }
             // 工具结果作为 tool 消息进入上下文
             let tool_msg = {
@@ -745,7 +895,7 @@ async fn run_once(app: &AppHandle, session_id: &str, _run_id: &str) -> RunOutcom
         "max_steps",
         format!("已达到最大步数（{max_steps}），任务中止。可在设置中调整 maxSteps。"),
     );
-    RunOutcome::Done
+    (RunOutcome::Done, last_assistant_id, run_tokens)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -978,6 +1128,66 @@ async fn handle_tool_call(
     (status, text)
 }
 
+/// 对话正常完成交付时调用：将任务清单中仍处于 in_progress 的任务标记为 done 并持久化，同时广播更新
+pub fn auto_finish_session_todos(state: &crate::AppState, app: &AppHandle, session_id: &str) {
+    let db = state.db.lock().unwrap();
+    let raw: Option<String> = store::get_kv(&db, session_id, "todos").ok().flatten();
+    let Some(raw_str) = raw else { return };
+    let Ok(mut val) = serde_json::from_str::<Value>(&raw_str) else { return };
+    let Some(todos_arr) = val.get_mut("todos").and_then(|v| v.as_array_mut()) else { return };
+
+    let mut changed = false;
+    for item in todos_arr.iter_mut() {
+        if item.get("status").and_then(|s| s.as_str()) == Some("in_progress") {
+            item["status"] = json!("done");
+            changed = true;
+        }
+    }
+    if changed {
+        let new_raw = val.to_string();
+        let _ = store::set_kv(&db, session_id, "todos", &new_raw);
+        if let Some(todos) = val.get("todos") {
+            let _ = app.emit(
+                "session:todos",
+                json!({
+                    "sessionId": session_id,
+                    "todos": todos
+                }),
+            );
+        }
+    }
+}
+
+/// 用户手动停止会话时调用：将仍处于 in_progress 的任务重置为 pending 并持久化，同时广播更新
+pub fn stop_session_todos(state: &crate::AppState, app: &AppHandle, session_id: &str) {
+    let db = state.db.lock().unwrap();
+    let raw: Option<String> = store::get_kv(&db, session_id, "todos").ok().flatten();
+    let Some(raw_str) = raw else { return };
+    let Ok(mut val) = serde_json::from_str::<Value>(&raw_str) else { return };
+    let Some(todos_arr) = val.get_mut("todos").and_then(|v| v.as_array_mut()) else { return };
+
+    let mut changed = false;
+    for item in todos_arr.iter_mut() {
+        if item.get("status").and_then(|s| s.as_str()) == Some("in_progress") {
+            item["status"] = json!("pending");
+            changed = true;
+        }
+    }
+    if changed {
+        let new_raw = val.to_string();
+        let _ = store::set_kv(&db, session_id, "todos", &new_raw);
+        if let Some(todos) = val.get("todos") {
+            let _ = app.emit(
+                "session:todos",
+                json!({
+                    "sessionId": session_id,
+                    "todos": todos
+                }),
+            );
+        }
+    }
+}
+
 fn build_preview(tool_name: &str, args: &Value) -> String {
     match tool_name {
         "run_command" => args
@@ -1023,16 +1233,219 @@ fn build_preview(tool_name: &str, args: &Value) -> String {
     }
 }
 
+fn truncate_preview(s: &str, max_chars: usize) -> String {
+    let s = s.trim().replace(['\r', '\n'], " ");
+    let mut chars = s.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+async fn check_and_trigger_compaction(
+    app: &AppHandle,
+    state: &crate::AppState,
+    session_id: &str,
+    cfg: &crate::llm::LlmCfg,
+    sys: &str,
+    token_limit: usize,
+) -> bool {
+    let (need_compact, candidate_msgs, candidate_tokens) = {
+        let db = state.db.lock().unwrap();
+        let compactions = store::list_session_compactions(&db, session_id).unwrap_or_default();
+        let max_compacted_seq = compactions.iter().map(|c| c.end_seq).max().unwrap_or(0);
+        let msgs = store::all_messages(&db, session_id).unwrap_or_default();
+        let uncompacted: Vec<_> = msgs
+            .into_iter()
+            .filter(|m| !m.queued && m.seq > max_compacted_seq)
+            .collect();
+
+        // 寻找最后一个 user 消息（当前活跃轮次起点）
+        let last_user_idx = uncompacted.iter().rposition(|m| m.role == "user");
+        if let Some(idx) = last_user_idx {
+            // 至少有 2 条往期消息（即至少存在 1 轮前序已完成的对话）
+            if idx >= 2 {
+                let candidate = uncompacted[..idx].to_vec();
+                let tokens: usize = candidate
+                    .iter()
+                    .map(|m| {
+                        estimate_tokens(m.content.as_deref().unwrap_or(""))
+                            + m.tool_calls.as_ref().map(crate::models::estimate_value_tokens).unwrap_or(0)
+                    })
+                    .sum();
+                let est_total = estimate_tokens(sys) + tokens;
+                // 当总消耗达到上限的 75% 或候选历史消耗较大时触发自动压缩
+                let trigger = est_total >= token_limit * 75 / 100 || tokens >= token_limit / 2;
+                (trigger, candidate, tokens)
+            } else {
+                (false, vec![], 0)
+            }
+        } else {
+            (false, vec![], 0)
+        }
+    };
+
+    if !need_compact || candidate_msgs.is_empty() {
+        return false;
+    }
+
+    // 格式化待压缩的历史对话文本
+    let mut history_str = String::new();
+    for m in &candidate_msgs {
+        let role_name = match m.role.as_str() {
+            "user" => "【用户】",
+            "assistant" => "【助手】",
+            "tool" => "【工具返回】",
+            _ => "【系统】",
+        };
+        let c = m.content.as_deref().unwrap_or("");
+        if !c.is_empty() {
+            let truncated = if c.len() > 800 {
+                let safe_len = c.char_indices().nth(800).map(|(i, _)| i).unwrap_or(c.len());
+                format!("{}...[已截断]", &c[..safe_len])
+            } else {
+                c.to_string()
+            };
+            history_str.push_str(&format!("{role_name}: {truncated}\n\n"));
+        }
+    }
+
+    let summary_prompt = format!(
+        r#"你是一个专业的编码项目备忘助手。请将以下对话历史进行结构化精炼总结，提炼为一份高质量 Markdown 格式的上下文备忘录。
+该备忘录将在后续对话中替换这段历史，帮助你与用户保持关键记忆。
+
+待压缩的对话历史：
+---
+{}
+---
+
+请严格按以下结构输出 Markdown（语言简洁干练，重点保留技术决策与代码变更，剔除无用寒暄）：
+### 🎯 任务背景与核心目标
+（简要说明用户最初的诉求与技术背景）
+### 🔑 关键技术决策与约定
+（架构设计、技术选型、接口约定或不可违背的约束）
+### 📁 涉及文件与修改记录
+（已读取、创建或编辑的文件列表及主要变更点）
+### 📌 历史遗留与注意事项
+（之前步骤中发现的坑、未决问题或后续需要注意的事项）"#,
+        history_str
+    );
+
+    // 调用 LLM 生成初版 Markdown 摘要
+    let summary_messages = vec![
+        json!({"role": "system", "content": "你是一个严谨客观的技术项目总结助手，擅长提取代码开发对话中的关键事实。"}),
+        json!({"role": "user", "content": summary_prompt}),
+    ];
+
+    let summary_res = crate::llm::chat_stream(
+        cfg,
+        &summary_messages,
+        &[],
+        |_| {},
+        |_| {},
+    )
+    .await;
+
+    let initial_summary = match summary_res {
+        Ok(r) if !r.content.trim().is_empty() => r.content,
+        _ => return false,
+    };
+
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
+    let start_seq = candidate_msgs.first().map(|m| m.seq).unwrap_or(0);
+    let end_seq = candidate_msgs.last().map(|m| m.seq).unwrap_or(0);
+    let start_preview = truncate_preview(candidate_msgs.first().and_then(|m| m.content.as_deref()).unwrap_or(""), 40);
+    let end_preview = truncate_preview(candidate_msgs.last().and_then(|m| m.content.as_deref()).unwrap_or(""), 40);
+
+    let timeout_secs = 30u64;
+
+    let req = crate::models::CompactionRequest {
+        event_id: event_id.clone(),
+        session_id: session_id.to_string(),
+        start_seq,
+        end_seq,
+        start_preview,
+        end_preview,
+        message_count: candidate_msgs.len(),
+        tokens_before: candidate_tokens,
+        summary: initial_summary.clone(),
+        timeout_seconds: timeout_secs,
+    };
+
+    state.compactions.lock().unwrap().insert(
+        event_id.clone(),
+        crate::PendingCompaction {
+            session_id: session_id.to_string(),
+            tx,
+        },
+    );
+
+    let _ = app.emit("compaction:request", &req);
+
+    // 等待用户在前端查看、补充并确认（默认阻塞等待 30 秒；若 30 秒无操作，则自动应用压缩并继续后续流程）
+    let decision = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+        Ok(Ok(d)) => d,
+        _ => {
+            // 超时 30 秒无操作：从待处理 map 中移除，触发超时事件以通知前端（通知保持展示供查阅，但不提供继续执行按钮）
+            state.compactions.lock().unwrap().remove(&event_id);
+            let _ = app.emit(
+                "compaction:timeout",
+                &serde_json::json!({
+                    "eventId": event_id,
+                    "sessionId": session_id,
+                    "autoApplied": true,
+                }),
+            );
+            crate::models::CompactionDecision {
+                approved: true,
+                final_summary: initial_summary.clone(),
+            }
+        }
+    };
+
+    if decision.approved {
+        let final_markdown = if decision.final_summary.trim().is_empty() {
+            initial_summary
+        } else {
+            decision.final_summary
+        };
+        let compaction = crate::models::SessionCompaction {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            start_seq,
+            end_seq,
+            summary_markdown: final_markdown,
+            tokens_before: candidate_tokens,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        {
+            let db = state.db.lock().unwrap();
+            let _ = store::create_session_compaction(&db, &compaction);
+        }
+        let _ = app.emit("compaction:applied", &compaction);
+        true
+    } else {
+        false
+    }
+}
+
 fn build_context(
     conn: &rusqlite::Connection,
     session_id: &str,
     system: &str,
     token_limit: usize,
-) -> (Result<Vec<Value>, String>, usize) {
+) -> (Result<Vec<Value>, String>, usize, Option<crate::models::TruncationNotice>) {
     let msgs = match store::all_messages(conn, session_id) {
         Ok(m) => m,
-        Err(e) => return (Err(e), 0),
+        Err(e) => return (Err(e), 0, None),
     };
+    let compactions = store::list_session_compactions(conn, session_id).unwrap_or_default();
+    let max_compacted_seq = compactions.iter().map(|c| c.end_seq).max().unwrap_or(0);
+
     // tool_call_id -> 结果文本
     let mut tool_results: HashMap<String, String> = HashMap::new();
     for m in &msgs {
@@ -1045,14 +1458,38 @@ fn build_context(
 
     let mut out = vec![json!({"role": "system", "content": system})];
     let mut est = estimate_tokens(system);
+
+    // 如果存在已压缩的历史，将结构化备忘录作为上下文前置背景注入
+    if max_compacted_seq > 0 && !compactions.is_empty() {
+        let mut summaries = Vec::new();
+        for c in &compactions {
+            summaries.push(format!(
+                "### 历史阶段备忘（第 {} ~ {} 条消息已压缩）\n{}",
+                c.start_seq, c.end_seq, c.summary_markdown.trim()
+            ));
+        }
+        let merged_summary = summaries.join("\n\n---\n\n");
+        let memo_prompt = format!(
+            "【系统历史对话结构化备忘录（以下为前文执行进展与关键信息归纳，已由用户确认并压缩替换早期消息）】:\n{}",
+            merged_summary
+        );
+        est += estimate_tokens(&memo_prompt);
+        out.push(json!({"role": "user", "content": memo_prompt}));
+        let ack = "已掌握前文核心背景、技术约定及历史执行进展，我将在此基础上继续完成后续任务。";
+        est += estimate_tokens(ack);
+        out.push(json!({"role": "assistant", "content": ack}));
+    }
+
+    // 处理未被压缩的消息
     for m in &msgs {
-        if m.queued {
-            continue; // 待执行列表中的消息不进入上下文
+        if m.queued || m.seq <= max_compacted_seq {
+            continue; // 待执行列表中的消息以及已被压缩历史不作为原始消息进入上下文
         }
         match m.role.as_str() {
             "user" => {
-                out.push(json!({"role": "user", "content": m.content.clone().unwrap_or_default()}));
-                est += estimate_tokens(m.content.as_deref().unwrap_or(""));
+                let content = m.content.clone().unwrap_or_default();
+                est += estimate_tokens(&content);
+                out.push(json!({"role": "user", "content": content}));
             }
             "assistant" => {
                 let mut obj = json!({"role": "assistant"});
@@ -1063,15 +1500,21 @@ fn build_context(
                             obj["content"] = Value::String(content.clone());
                         }
                         obj["tool_calls"] = tcs.clone();
-                        est += estimate_tokens(&content);
+                        est += estimate_tokens(&content) + crate::models::estimate_value_tokens(tcs);
                         out.push(obj);
                         // 紧随其后补齐每个调用的 tool 结果（缺失则合成，避免协议错误）
                         if let Some(arr) = tcs.as_array() {
                             for tc in arr {
                                 let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
-                                let text = tool_results
+                                let mut text = tool_results
                                     .remove(&id)
                                     .unwrap_or_else(|| "(执行被中断，无结果)".into());
+                                // 历史较长工具结果折叠瘦身 (Tool Result Pruning)：
+                                // 超过 2048 字符时截取首部并保留折叠提示，节省上下文且不丢失语义
+                                if text.len() > 2048 {
+                                    let safe_len = text.char_indices().nth(400).map(|(i, _)| i).unwrap_or(text.len());
+                                    text = format!("{}\n\n...(中间大段输出已在后续步骤处理，为节省上下文已折叠)...", &text[..safe_len]);
+                                }
                                 est += estimate_tokens(&text);
                                 out.push(json!({"role": "tool", "tool_call_id": id, "content": text}));
                             }
@@ -1090,25 +1533,73 @@ fn build_context(
         }
     }
 
-    // 截断：超限时丢弃最早的普通消息，但保留最后一条用户消息及其后内容
+    // 轮次级原子截断防护（Turn-based Atomic Pruning）：
+    // 当即使折叠与压缩后仍超限时，按「完整轮次（Turn）」进行成对丢弃，
+    // 杜绝单条推进破坏 assistant(tool_calls) 与 tool 结果的成对关系导致 400 报错。
+    let mut notice: Option<crate::models::TruncationNotice> = None;
     if est > token_limit {
-        let last_user = out
+        let est_before = est;
+        let mut user_indices: Vec<usize> = out
             .iter()
-            .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-            .unwrap_or(1);
-        let mut drop_from = 1usize;
-        while est > token_limit && drop_from < last_user {
-            let dropped = estimate_tokens(
-                out[drop_from].get("content").and_then(|c| c.as_str()).unwrap_or(""),
-            );
-            est -= dropped;
-            drop_from += 1;
+            .enumerate()
+            .filter(|(idx, m)| *idx > 0 && m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .map(|(idx, _)| idx)
+            .collect();
+
+        let mut dropped_turns = 0usize;
+        let mut dropped_messages = 0usize;
+        let mut total_dropped_tokens = 0usize;
+        let mut first_preview = String::new();
+
+        while est > token_limit && user_indices.len() > 1 {
+            let turn_start = user_indices[0];
+            let turn_end = user_indices[1];
+            if first_preview.is_empty() {
+                let first_c = out[turn_start].get("content").and_then(|v| v.as_str()).unwrap_or("");
+                first_preview = truncate_preview(first_c, 50);
+            }
+            // 计算被剔除轮次的 token 消耗
+            let dropped_tokens: usize = out[turn_start..turn_end]
+                .iter()
+                .map(|m| {
+                    let c = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    let tc = m.get("tool_calls").map(crate::models::estimate_value_tokens).unwrap_or(0);
+                    estimate_tokens(c) + tc
+                })
+                .sum();
+            dropped_turns += 1;
+            dropped_messages += turn_end - turn_start;
+            total_dropped_tokens += dropped_tokens;
+
+            est = est.saturating_sub(dropped_tokens);
+            out.drain(turn_start..turn_end);
+
+            // 重新计算 user 索引
+            user_indices = out
+                .iter()
+                .enumerate()
+                .filter(|(idx, m)| *idx > 0 && m.get("role").and_then(|r| r.as_str()) == Some("user"))
+                .map(|(idx, _)| idx)
+                .collect();
         }
-        if drop_from > 1 {
-            out.drain(1..drop_from);
+
+        if dropped_turns > 0 {
+            notice = Some(crate::models::TruncationNotice {
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                dropped_turns,
+                dropped_messages,
+                dropped_tokens: total_dropped_tokens,
+                token_limit,
+                est_tokens_before: est_before,
+                est_tokens_after: est,
+                first_preview,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            });
         }
     }
-    (Ok(out), est)
+
+    (Ok(out), est, notice)
 }
 
 /// 关联条目解析结果：说明必带；对方项目能按路径解析到且已设置自身约束时一并带上
@@ -1262,7 +1753,7 @@ fn system_prompt(session: &Session, project_section: Option<&str>) -> String {
 3. 修改完成后，尽量用 run_command 运行构建或测试来验证改动。
 4. 所有路径相对于工作区根目录，不要访问工作区之外的路径。
 5. 不要执行破坏性命令（如递归删除、格式化磁盘等），它们会被强制要求用户确认。
-6. 接到多步任务时，先用 todo 工具列出计划，并随进展更新各项状态。
+6. 接到多步任务时，先用 todo 工具列出计划，并随进展更新各项状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done（切勿遗留 in_progress 状态）。
 7. 全程使用简体中文与用户交流；最终回复简洁总结：做了什么、改了哪些文件、验证结果如何。"#,
             path = session.workspace_path,
             os = os
@@ -1348,15 +1839,100 @@ mod tests {
             &a.id,
             &json!([{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]),
             "",
+            None,
         )
         .unwrap();
         let _ = u;
-        let (msgs, _) = build_context(&conn, &s.id, sys, 28000);
+        let (msgs, _, _) = build_context(&conn, &s.id, sys, 28000);
         let msgs = msgs.unwrap();
         // system + user + assistant(tool_calls) + 合成 tool
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[3]["role"], "tool");
         assert_eq!(msgs[3]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn test_build_context_with_compactions() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        store::init_schema(&conn).unwrap();
+        let s = store::create_session(&conn, ".", None, "test", "confirm").unwrap();
+
+        // 创建 3 条历史消息
+        let _ = store::new_message(&conn, &s.id, "user", Some("轮次1问题".into()), false).unwrap();
+        let _ = store::new_message(&conn, &s.id, "assistant", Some("轮次1回答".into()), false).unwrap();
+        let _ = store::new_message(&conn, &s.id, "user", Some("轮次2问题".into()), false).unwrap();
+
+        // 插入压缩记录（压缩了 seq 1 到 2）
+        let comp = crate::models::SessionCompaction {
+            id: "comp_1".into(),
+            session_id: s.id.clone(),
+            start_seq: 1,
+            end_seq: 2,
+            summary_markdown: "### 核心目标\n开发功能A".into(),
+            tokens_before: 500,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store::create_session_compaction(&conn, &comp).unwrap();
+
+        let (msgs, _, _) = build_context(&conn, &s.id, "sys prompt", 10000);
+        let msgs = msgs.unwrap();
+
+        // 应包含：
+        // 0: system
+        // 1: user (备忘录)
+        // 2: assistant (确认备忘)
+        // 3: user (轮次2问题)
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[1]["role"], "user");
+        assert!(msgs[1]["content"].as_str().unwrap().contains("开发功能A"));
+        assert_eq!(msgs[3]["content"].as_str().unwrap(), "轮次2问题");
+    }
+
+    #[test]
+    fn test_atomic_turn_drop_no_orphaned_tools() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        store::init_schema(&conn).unwrap();
+        let s = store::create_session(&conn, ".", None, "test", "confirm").unwrap();
+
+        // 第一轮：带工具调用的复杂轮次
+        let _ = store::new_message(&conn, &s.id, "user", Some("第一轮指令".into()), false).unwrap();
+        let a1 = store::new_message(&conn, &s.id, "assistant", Some(String::new()), false).unwrap();
+        store::update_message_tool_calls(
+            &conn,
+            &a1.id,
+            &json!([{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]),
+            "",
+            None,
+        ).unwrap();
+        let t1 = store::new_message(&conn, &s.id, "tool", Some("很多文件内容xxxxxxxxxxxxxxx".into()), false).unwrap();
+        store::set_message_tool_call_id(&conn, &t1.id, "call_1").unwrap();
+        let _ = store::new_message(&conn, &s.id, "assistant", Some("读完了".into()), false).unwrap();
+
+        // 第二轮：当前轮
+        let _ = store::new_message(&conn, &s.id, "user", Some("第二轮最新指令".into()), false).unwrap();
+
+        // 设定非常小的 token_limit（强制触发截断淘汰第一轮）
+        let (msgs, _, notice) = build_context(&conn, &s.id, "sys", 30);
+        let msgs = msgs.unwrap();
+
+        // 验证截断通知
+        assert!(notice.is_some());
+        let n = notice.unwrap();
+        assert_eq!(n.dropped_turns, 1);
+        assert!(n.dropped_messages >= 3);
+        assert!(n.dropped_tokens > 0);
+
+        // 验证淘汰后：第一轮被成对淘汰，绝对不能遗留孤立的 tool 消息！
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"].as_str().unwrap(), "第二轮最新指令");
+        // 确保没有孤立的 tool 消息
+        for (i, m) in msgs.iter().enumerate() {
+            if m["role"] == "tool" {
+                assert!(i > 0 && msgs[i - 1]["role"] == "assistant");
+            }
+        }
     }
 
     fn link(name: &str, path: &str, description: &str, constraints: Option<&str>) -> ResolvedLink {
@@ -1447,6 +2023,9 @@ mod tests {
             source_workspace: None,
             merged_seq: None,
             merged_pending: false,
+            completion_tokens: Some(0),
+            prompt_tokens: Some(0),
+            total_tokens: Some(0),
         };
         let with = system_prompt(&session, Some("## 项目约束\nX"));
         assert!(with.contains("工作区根目录：D:\\ws"));

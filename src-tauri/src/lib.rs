@@ -28,6 +28,12 @@ pub struct PendingApproval {
     pub tx: oneshot::Sender<Decision>,
 }
 
+/// 等待用户确认的上下文自动压缩挂起请求
+pub struct PendingCompaction {
+    pub session_id: String,
+    pub tx: oneshot::Sender<crate::models::CompactionDecision>,
+}
+
 pub struct RunningCommand {
     pub session_id: String,
     pub pid: Option<u32>,
@@ -51,6 +57,7 @@ pub struct AppState {
     pub master_key: Mutex<[u8; 32]>,
     pub handles: Mutex<HashMap<String, SessionHandle>>,
     pub approvals: Mutex<HashMap<String, PendingApproval>>,
+    pub compactions: Mutex<HashMap<String, PendingCompaction>>,
     pub running_commands: Mutex<HashMap<String, RunningCommand>>,
     pub app: OnceLock<tauri::AppHandle>,
 }
@@ -85,6 +92,8 @@ fn init_real_db(dir: &Path, legacy_dir: Option<&Path>) -> Result<([u8; 32], rusq
     let db = store::open_db(&dir.join("harness_mini.db"))?;
     // 旧版本 keyring 凭据一次性迁入加密 secrets 表
     let _ = store::migrate_secrets_from_keyring(&db, &master);
+    // 启动时自适应校准临时空间路径至当前数据目录（支持程序/数据迁移后自动重定位）
+    let _ = temp::rebase_temp_storage(&db, dir);
     Ok((master, db))
 }
 
@@ -141,6 +150,7 @@ pub fn run() {
                 db: Mutex::new(db),
                 handles: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
+                compactions: Mutex::new(HashMap::new()),
                 running_commands: Mutex::new(HashMap::new()),
                 app: OnceLock::new(),
                 data_dir: Mutex::new(data_dir),
@@ -221,6 +231,8 @@ pub fn run() {
             commands::list_running_sessions,
             commands::edit_and_resend,
             commands::respond_approval,
+            commands::respond_compaction,
+            commands::list_session_compactions,
             commands::list_session_rules,
             commands::delete_session_rule,
             commands::get_session_todos,
@@ -246,6 +258,7 @@ pub fn run() {
             commands::get_project_sop,
             commands::set_project_sop,
             commands::run_workspace_sop,
+            commands::get_token_stats,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

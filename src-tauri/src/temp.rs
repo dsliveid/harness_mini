@@ -129,6 +129,169 @@ pub fn validate_root(root: &Path, data_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 从任意路径（绝对或相对）中提取以 `temp-project` 开头的相对路径。
+/// 例如：
+/// - "D:\\old\\data\\temp-project\\7e76ceaabd53\\main" -> Some(PathBuf::from("temp-project\\7e76ceaabd53\\main"))
+/// - "temp-project/7e76ceaabd53" -> Some(PathBuf::from("temp-project/7e76ceaabd53"))
+/// - "D:\\workspace\\other_proj" -> None
+pub fn rel_temp_path(path: &Path) -> Option<PathBuf> {
+    let mut matched = false;
+    let mut rel = PathBuf::new();
+    for comp in path.components() {
+        let name = comp.as_os_str().to_string_lossy();
+        if !matched {
+            if name.eq_ignore_ascii_case("temp-project") {
+                matched = true;
+                rel.push("temp-project");
+            }
+        } else {
+            rel.push(comp.as_os_str());
+        }
+    }
+    if matched {
+        Some(rel)
+    } else {
+        None
+    }
+}
+
+/// 把临时空间相关的路径自适应解析到当前数据目录下。
+/// 若路径包含 temp-project，则将其自适应重定向到 `<data_dir>\temp-project\...`；
+/// 否则原样返回。
+pub fn adapt_temp_path(path: &Path, data_dir: &Path) -> PathBuf {
+    if let Some(rel) = rel_temp_path(path) {
+        data_dir.join(rel)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// 从 SQLite 连接探测数据库所在的目录（内存库返回 None）
+pub fn data_dir_of_db(conn: &rusqlite::Connection) -> Option<PathBuf> {
+    let path: String = conn.query_row("PRAGMA database_list", [], |r| r.get(2)).ok()?;
+    if path.trim().is_empty() {
+        None
+    } else {
+        Path::new(&path).parent().map(|p| p.to_path_buf())
+    }
+}
+
+/// 自适应重新定位数据库中所有临时空间路径至当前数据目录：
+/// 1. 更新 sessions 表中 is_temp = 1 的 temp_root 与 workspace_path
+/// 2. 更新 session_kv 表中 key = 'temp_manifest' 的 root 与各项目 temp 路径
+pub fn rebase_temp_storage(conn: &rusqlite::Connection, data_dir: &Path) -> Result<usize, String> {
+    let mut updated = 0usize;
+
+    // 1. sessions 表
+    let mut stmt = conn
+        .prepare("SELECT id, temp_code, temp_root, workspace_path FROM sessions WHERE is_temp = 1")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    for (id, code, root, ws) in rows {
+        let new_root = if let Some(r) = root.as_deref() {
+            adapt_temp_path(Path::new(r), data_dir)
+        } else if let Some(c) = code.as_deref() {
+            data_dir.join("temp-project").join(c)
+        } else {
+            continue;
+        };
+        let new_ws = adapt_temp_path(Path::new(&ws), data_dir);
+
+        let new_root_str = new_root.to_string_lossy().to_string();
+        let new_ws_str = new_ws.to_string_lossy().to_string();
+
+        let need_update = root.as_deref() != Some(&new_root_str) || ws != new_ws_str;
+        if need_update {
+            conn.execute(
+                "UPDATE sessions SET temp_root = ?1, workspace_path = ?2 WHERE id = ?3",
+                rusqlite::params![new_root_str, new_ws_str, id],
+            )
+            .map_err(|e| e.to_string())?;
+            updated += 1;
+        }
+    }
+
+    // 2. session_kv 中的 temp_manifest
+    let mut stmt = conn
+        .prepare("SELECT session_id, value FROM session_kv WHERE key = ?1")
+        .map_err(|e| e.to_string())?;
+    let manifests = stmt
+        .query_map([MANIFEST_KEY], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    for (sid, val) in manifests {
+        if let Ok(mut m) = serde_json::from_str::<TempManifest>(&val) {
+            let mut changed = false;
+            let new_root = adapt_temp_path(Path::new(&m.root), data_dir);
+            let new_root_str = new_root.to_string_lossy().to_string();
+            if m.root != new_root_str {
+                m.root = new_root_str;
+                changed = true;
+            }
+            for p in &mut m.projects {
+                let new_temp = adapt_temp_path(Path::new(&p.temp), data_dir);
+                let new_temp_str = new_temp.to_string_lossy().to_string();
+                if p.temp != new_temp_str {
+                    p.temp = new_temp_str;
+                    changed = true;
+                }
+            }
+            if changed {
+                let s = serde_json::to_string(&m).map_err(|e| e.to_string())?;
+                store::set_kv(conn, &sid, MANIFEST_KEY, &s)?;
+                updated += 1;
+            }
+        }
+    }
+
+    Ok(updated)
+}
+
+/// 在切换数据目录时，若源数据目录下存在 temp-project 且目标目录下不存在，
+/// 将其完整拷贝至目标数据目录
+pub fn copy_temp_projects_dir(src_data_dir: &Path, dst_data_dir: &Path) -> Result<(), String> {
+    let src = src_data_dir.join("temp-project");
+    let dst = dst_data_dir.join("temp-project");
+    if src.exists() && !dst.exists() {
+        copy_dir_all(&src, &dst)?;
+    }
+    Ok(())
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("创建目录失败: {e}"))?;
+    for entry in std::fs::read_dir(src).map_err(|e| format!("读取目录失败: {e}"))? {
+        let entry = entry.map_err(|e| format!("读取目录项失败: {e}"))?;
+        let ft = entry.file_type().map_err(|e| format!("读取文件类型失败: {e}"))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ft.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else if ft.is_symlink() {
+            continue;
+        } else if ft.is_file() {
+            std::fs::copy(&from, &to).map_err(|e| format!("拷贝文件失败: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// 递归拷贝项目目录到目标（目标须不存在）。
 /// 排除 COPY_EXCLUDE_DIRS 与 .gitignore 规则命中的文件；require_git(false) 使
 /// 非仓库目录也应用 .gitignore；符号链接不拷贝，避免越界引用。返回拷贝的文件数。
@@ -268,8 +431,23 @@ pub fn alloc(data_dir: &Path, project: &Project, links: &[ProjectLink]) -> Resul
 // ---------- manifest ----------
 
 pub fn load_manifest(conn: &rusqlite::Connection, session_id: &str) -> Result<Option<TempManifest>, String> {
-    Ok(store::get_kv(conn, session_id, MANIFEST_KEY)?
-        .and_then(|s| serde_json::from_str(&s).ok()))
+    let raw = store::get_kv(conn, session_id, MANIFEST_KEY)?;
+    let Some(s) = raw else { return Ok(None) };
+    let mut m = match serde_json::from_str::<TempManifest>(&s) {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    if let Some(data_dir) = data_dir_of_db(conn) {
+        m.root = adapt_temp_path(Path::new(&m.root), &data_dir)
+            .to_string_lossy()
+            .to_string();
+        for p in &mut m.projects {
+            p.temp = adapt_temp_path(Path::new(&p.temp), &data_dir)
+                .to_string_lossy()
+                .to_string();
+        }
+    }
+    Ok(Some(m))
 }
 
 pub fn save_manifest(conn: &rusqlite::Connection, session_id: &str, m: &TempManifest) -> Result<(), String> {
@@ -285,21 +463,20 @@ pub fn ensure_space(state: &crate::AppState, app: &tauri::AppHandle, session: &S
     if !session.is_temp {
         return Ok(());
     }
-    let root = PathBuf::from(
+    let data_dir = state
+        .data_dir
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("数据目录不可用")?;
+    let raw_root = PathBuf::from(
         session
             .temp_root
             .as_deref()
             .ok_or("临时会话缺少 temp_root")?,
     );
-    {
-        let data_dir = state
-            .data_dir
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or("数据目录不可用")?;
-        validate_root(&root, &data_dir)?;
-    }
+    let root = adapt_temp_path(&raw_root, &data_dir);
+    validate_root(&root, &data_dir)?;
     if !git_available() {
         return Err("未检测到 Git（git 命令不可用），无法准备临时空间".into());
     }
@@ -784,11 +961,10 @@ pub fn clear_space(state: &crate::AppState, app: &tauri::AppHandle, session_id: 
     if crate::agent::is_run_active(state, session_id) {
         return Err("Agent 正在运行，请先停止后再清空临时空间".into());
     }
-    let root = PathBuf::from(session.temp_root.clone().ok_or("临时空间缺失")?);
-    {
-        let data_dir = state.data_dir.lock().unwrap().clone().ok_or("数据目录不可用")?;
-        validate_root(&root, &data_dir)?;
-    }
+    let data_dir = state.data_dir.lock().unwrap().clone().ok_or("数据目录不可用")?;
+    let raw_root = PathBuf::from(session.temp_root.clone().ok_or("临时空间缺失")?);
+    let root = adapt_temp_path(&raw_root, &data_dir);
+    validate_root(&root, &data_dir)?;
     if root.exists() {
         // 先解绑可能存在的 node_modules 目录联接（Junction），确保其宿主目录完全不受影响
         if let Ok(entries) = std::fs::read_dir(&root) {
@@ -821,10 +997,17 @@ pub fn clear_space(state: &crate::AppState, app: &tauri::AppHandle, session_id: 
 
 pub fn temp_info(db: &rusqlite::Connection, session: &Session) -> TempInfo {
     let manifest = load_manifest(db, &session.id).ok().flatten();
-    let exists = session
-        .temp_root
+    let data_dir = data_dir_of_db(db);
+    let resolved_root = session.temp_root.as_deref().map(|r| {
+        if let Some(d) = &data_dir {
+            adapt_temp_path(Path::new(r), d)
+        } else {
+            PathBuf::from(r)
+        }
+    });
+    let exists = resolved_root
         .as_deref()
-        .map(|r| Path::new(r).exists())
+        .map(|r| r.exists())
         .unwrap_or(false);
     let mut count = 0usize;
     if exists {
@@ -844,7 +1027,7 @@ pub fn temp_info(db: &rusqlite::Connection, session: &Session) -> TempInfo {
         merged: session.merged_seq.is_some(),
         merged_pending: session.merged_pending,
         merged_seq: session.merged_seq,
-        temp_root: session.temp_root.clone(),
+        temp_root: resolved_root.map(|p| p.to_string_lossy().to_string()),
         source_workspace: session.source_workspace.clone(),
     }
 }
@@ -895,11 +1078,10 @@ pub async fn merge_space(
     if session.merged_pending {
         return Err("本次变更已合并，请先清空临时空间后再发起新的修改".into());
     }
-    let root = PathBuf::from(session.temp_root.clone().ok_or("临时空间缺失")?);
-    {
-        let data_dir = state.data_dir.lock().unwrap().clone().ok_or("数据目录不可用")?;
-        validate_root(&root, &data_dir)?;
-    }
+    let data_dir = state.data_dir.lock().unwrap().clone().ok_or("数据目录不可用")?;
+    let raw_root = PathBuf::from(session.temp_root.clone().ok_or("临时空间缺失")?);
+    let root = adapt_temp_path(&raw_root, &data_dir);
+    validate_root(&root, &data_dir)?;
     if !root.exists() {
         return Err("临时空间目录不存在，无法合并".into());
     }
@@ -1199,11 +1381,10 @@ pub async fn merge_from_agent(
     if session.merged_pending {
         return Err("本次变更已合并，请等待用户清空临时空间后再发起新的修改".into());
     }
-    let root = PathBuf::from(session.temp_root.clone().ok_or("临时空间缺失")?);
-    {
-        let data_dir = state.data_dir.lock().unwrap().clone().ok_or("数据目录不可用")?;
-        validate_root(&root, &data_dir)?;
-    }
+    let data_dir = state.data_dir.lock().unwrap().clone().ok_or("数据目录不可用")?;
+    let raw_root = PathBuf::from(session.temp_root.clone().ok_or("临时空间缺失")?);
+    let root = adapt_temp_path(&raw_root, &data_dir);
+    validate_root(&root, &data_dir)?;
     if !root.exists() {
         return Err("临时空间目录不存在，无法合并".into());
     }
@@ -1607,5 +1788,77 @@ mod tests {
         #[cfg(not(windows))]
         let _ = std::fs::remove_file(dst.join("node_modules"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_rel_temp_path_and_adapt() {
+        let p1 = PathBuf::from("D:\\old\\path\\temp-project\\7e76ceaabd53\\sub");
+        let rel1 = rel_temp_path(&p1).unwrap();
+        assert_eq!(rel1, PathBuf::from("temp-project").join("7e76ceaabd53").join("sub"));
+
+        let p2 = PathBuf::from("temp-project/7e76ceaabd53");
+        let rel2 = rel_temp_path(&p2).unwrap();
+        assert_eq!(rel2, PathBuf::from("temp-project").join("7e76ceaabd53"));
+
+        let p3 = PathBuf::from("D:\\workspace\\regular_project");
+        assert!(rel_temp_path(&p3).is_none());
+
+        let new_data = PathBuf::from("E:\\new_data");
+        let adapted = adapt_temp_path(&p1, &new_data);
+        assert_eq!(adapted, new_data.join("temp-project").join("7e76ceaabd53").join("sub"));
+
+        let unchanged = adapt_temp_path(&p3, &new_data);
+        assert_eq!(unchanged, p3);
+    }
+
+    #[test]
+    fn test_rebase_temp_storage() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        store::init_schema(&conn).unwrap();
+
+        let s = store::create_session(&conn, "D:\\old\\data\\temp-project\\abc123\\main", None, "t", "confirm").unwrap();
+        store::set_session_temp(
+            &conn,
+            &s.id,
+            "abc123",
+            "D:\\old\\data\\temp-project\\abc123",
+            "D:\\source\\main",
+        )
+        .unwrap();
+
+        let manifest = TempManifest {
+            code: "abc123".into(),
+            root: "D:\\old\\data\\temp-project\\abc123".into(),
+            projects: vec![TempProjectEntry {
+                key: "main".into(),
+                name: "main".into(),
+                source: "D:\\source\\main".into(),
+                temp: "D:\\old\\data\\temp-project\\abc123\\main".into(),
+                description: "主项目".into(),
+                baseline: None,
+            }],
+        };
+        save_manifest(&conn, &s.id, &manifest).unwrap();
+
+        let new_data = temp_dir("new_data");
+        let updated = rebase_temp_storage(&conn, &new_data).unwrap();
+        assert!(updated >= 2); // 1 session + 1 manifest
+
+        let updated_session = store::get_session(&conn, &s.id).unwrap().unwrap();
+        let expected_root = new_data.join("temp-project").join("abc123");
+        let expected_ws = expected_root.join("main");
+        assert_eq!(updated_session.temp_root.as_deref(), Some(expected_root.to_string_lossy().as_ref()));
+        assert_eq!(updated_session.workspace_path, expected_ws.to_string_lossy());
+
+        let raw_manifest = store::get_kv(&conn, &s.id, MANIFEST_KEY).unwrap().unwrap();
+        let updated_manifest: TempManifest = serde_json::from_str(&raw_manifest).unwrap();
+        assert_eq!(updated_manifest.root, expected_root.to_string_lossy());
+        assert_eq!(updated_manifest.projects[0].temp, expected_ws.to_string_lossy());
+
+        // 重复调用应为幂等（无需更新任何记录）
+        let updated_again = rebase_temp_storage(&conn, &new_data).unwrap();
+        assert_eq!(updated_again, 0);
+
+        let _ = std::fs::remove_dir_all(&new_data);
     }
 }

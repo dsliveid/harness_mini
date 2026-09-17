@@ -280,13 +280,18 @@ pub fn archive_session(state: State<'_, crate::AppState>, app: AppHandle, id: St
 fn ensure_temp_cleared(state: &crate::AppState, id: &str) -> Result<(), String> {
     let db = state.db.lock().unwrap();
     if let Some(s) = store::get_session(&db, id)? {
-        if s.is_temp
-            && s.temp_root
-                .as_deref()
-                .map(|r| Path::new(r).exists())
-                .unwrap_or(false)
-        {
-            return Err("该对话存在临时空间，请先清空临时空间后再删除/归档".into());
+        if s.is_temp {
+            if let Some(r) = s.temp_root.as_deref() {
+                let data_dir = state.data_dir.lock().unwrap().clone();
+                let p = if let Some(d) = data_dir.as_ref() {
+                    crate::temp::adapt_temp_path(Path::new(r), d)
+                } else {
+                    PathBuf::from(r)
+                };
+                if p.exists() {
+                    return Err("该对话存在临时空间，请先清空临时空间后再删除/归档".into());
+                }
+            }
         }
     }
     Ok(())
@@ -672,7 +677,38 @@ pub fn respond_approval(
 }
 
 #[tauri::command]
+pub fn respond_compaction(
+    state: State<'_, crate::AppState>,
+    app: AppHandle,
+    event_id: String,
+    approved: bool,
+    final_summary: String,
+) -> Result<(), String> {
+    let tx = state.compactions.lock().unwrap().remove(&event_id).map(|p| p.tx);
+    if let Some(tx) = tx {
+        let _ = tx.send(crate::models::CompactionDecision {
+            approved,
+            final_summary,
+        });
+        let _ = app.emit("compaction:resolved", json!({ "eventId": event_id, "approved": approved }));
+        Ok(())
+    } else {
+        Err("压缩请求不存在或已处理".into())
+    }
+}
+
+#[tauri::command]
+pub fn list_session_compactions(
+    state: State<'_, crate::AppState>,
+    session_id: String,
+) -> Result<Vec<crate::models::SessionCompaction>, String> {
+    let db = state.db.lock().unwrap();
+    crate::store::list_session_compactions(&db, &session_id)
+}
+
+#[tauri::command]
 pub fn get_session_todos(state: State<'_, crate::AppState>, session_id: String) -> Result<Value, String> {
+    let running = is_run_active(&state, &session_id);
     let db = state.db.lock().unwrap();
     let raw: Option<String> = db
         .query_row(
@@ -681,7 +717,40 @@ pub fn get_session_todos(state: State<'_, crate::AppState>, session_id: String) 
             |r| r.get(0),
         )
         .ok();
-    Ok(raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null))
+    let mut val: Value = raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
+
+    // 会话当前若未在执行，检查最近一次运行结果；若正常完成（或无记录），自愈修复遗留的 in_progress 任务为 done
+    if !running {
+        let last_run_status: Option<String> = db
+            .query_row(
+                "SELECT status FROM runs WHERE session_id = ?1 ORDER BY started_at DESC LIMIT 1",
+                rusqlite::params![session_id],
+                |r| r.get(0),
+            )
+            .ok();
+        let should_mark_done = match last_run_status.as_deref() {
+            Some("done") | None => true,
+            _ => false,
+        };
+        if let Some(todos_arr) = val.get_mut("todos").and_then(|v| v.as_array_mut()) {
+            let mut changed = false;
+            for item in todos_arr.iter_mut() {
+                if item.get("status").and_then(|s| s.as_str()) == Some("in_progress") {
+                    item["status"] = if should_mark_done {
+                        serde_json::json!("done")
+                    } else {
+                        serde_json::json!("pending")
+                    };
+                    changed = true;
+                }
+            }
+            if changed {
+                let _ = store::set_kv(&db, &session_id, "todos", &val.to_string());
+            }
+        }
+    }
+
+    Ok(val)
 }
 
 // ---------- 临时空间 ----------
@@ -781,31 +850,65 @@ pub async fn clear_temp_space(app: AppHandle, session_id: String) -> Result<(), 
 
 // ---------- 打开目录 ----------
 
-/// 在系统文件管理器中打开目录
+/// 在系统文件管理器中打开目录或定位文件
 #[tauri::command]
-pub fn open_dir(path: String) -> Result<(), String> {
-    let p = PathBuf::from(path.trim());
-    if !p.is_dir() {
-        return Err(format!("目录不存在: {}", p.display()));
+pub fn open_dir(state: State<'_, crate::AppState>, path: String) -> Result<(), String> {
+    let raw_trimmed = path.trim();
+    let raw_path = Path::new(raw_trimmed);
+    let resolved = if raw_path.is_relative() {
+        if let Some(d) = state.data_dir.lock().unwrap().as_ref() {
+            d.join(raw_path)
+        } else {
+            PathBuf::from(raw_trimmed)
+        }
+    } else if !raw_path.exists() && crate::temp::rel_temp_path(raw_path).is_some() {
+        if let Some(d) = state.data_dir.lock().unwrap().as_ref() {
+            crate::temp::adapt_temp_path(raw_path, d)
+        } else {
+            PathBuf::from(raw_trimmed)
+        }
+    } else {
+        PathBuf::from(raw_trimmed)
+    };
+    let mut p = resolved.clone();
+    // 若目标路径不存在，自动向上寻找最近存在的父目录
+    while !p.exists() {
+        match p.parent() {
+            Some(parent) if parent != p => p = parent.to_path_buf(),
+            _ => return Err(format!("目录不存在: {}", resolved.display())),
+        }
     }
+
+    let target_dir = if p.is_file() {
+        p.parent().unwrap_or(&p)
+    } else {
+        &p
+    };
+
     #[cfg(windows)]
     {
-        std::process::Command::new("explorer")
-            .arg(&p)
-            .spawn()
-            .map_err(|e| format!("打开目录失败: {e}"))?;
+        let win_path = target_dir.to_string_lossy().replace('/', "\\");
+        let res = std::process::Command::new("explorer")
+            .arg(&win_path)
+            .spawn();
+        if let Err(e) = res {
+            std::process::Command::new("cmd")
+                .args(["/c", "start", "", &win_path])
+                .spawn()
+                .map_err(|e2| format!("打开目录失败: {e}; 备用启动亦失败: {e2}"))?;
+        }
     }
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
-            .arg(&p)
+            .arg(target_dir)
             .spawn()
             .map_err(|e| format!("打开目录失败: {e}"))?;
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         std::process::Command::new("xdg-open")
-            .arg(&p)
+            .arg(target_dir)
             .spawn()
             .map_err(|e| format!("打开目录失败: {e}"))?;
     }
@@ -870,6 +973,7 @@ fn switch_data_dir(
         let _ = std::fs::remove_file(target.join("secret.key"));
         if let Some(cur) = state.data_dir.lock().unwrap().clone() {
             let _ = crate::secrets::copy_key_file(&cur, target);
+            let _ = crate::temp::copy_temp_projects_dir(&cur, target);
         }
     }
     let new_master = crate::secrets::load_or_create_master_key(target)?;
@@ -887,6 +991,7 @@ fn switch_data_dir(
         store::copy_settings_and_secrets(&db, &new_db, &master, &new_master)?;
         new_db
     };
+    let _ = crate::temp::rebase_temp_storage(&new_conn, target);
     *db = new_conn; // 旧连接随之关闭，旧目录数据保留为备份
     *master = new_master;
     drop(db);
@@ -1124,6 +1229,16 @@ pub async fn run_workspace_sop(
     } else {
         Err(format!("❌ 自检失败：\n{}", out))
     }
+}
+
+#[tauri::command]
+pub fn get_token_stats(
+    state: State<'_, crate::AppState>,
+    project_id: Option<String>,
+    days: Option<u32>,
+) -> Result<TokenStatsReport, String> {
+    let db = state.db.lock().unwrap();
+    store::get_token_stats(&db, project_id.as_deref(), days)
 }
 
 

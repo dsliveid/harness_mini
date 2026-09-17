@@ -15,6 +15,9 @@ import {
   Check,
   Terminal,
   Wind,
+  Zap,
+  Sparkles,
+  BarChart2,
 } from "./Icons";
 
 type Tab = "models" | "tools" | "datadir";
@@ -28,6 +31,9 @@ const TOOL_TITLES: Record<string, string> = {
   edit_file: "编辑文件",
   run_command: "执行命令",
   todo: "任务清单",
+  list_skills: "查询技能库",
+  save_skill: "固化项目技能",
+  run_skill: "执行项目技能",
   temp_status: "空间状态",
   temp_changes: "变更列表",
   temp_diff: "变更对比",
@@ -35,6 +41,90 @@ const TOOL_TITLES: Record<string, string> = {
   temp_restore: "恢复状态",
   temp_merge: "合并回原目录",
 };
+
+interface ModelContextPreset {
+  id: string;
+  name: string;
+  category: string;
+  windowTokens: number;
+  recommendedLimit: number;
+  desc: string;
+}
+
+const MODEL_PRESETS: ModelContextPreset[] = [
+  {
+    id: "deepseek",
+    name: "DeepSeek V3 / R1",
+    category: "主流云端",
+    windowTokens: 64_000,
+    recommendedLimit: 56_000,
+    desc: "窗口 64K · 推荐安全上限 56,000",
+  },
+  {
+    id: "claude-3-5",
+    name: "Claude 3.5 Sonnet / Haiku",
+    category: "主流云端",
+    windowTokens: 200_000,
+    recommendedLimit: 180_000,
+    desc: "窗口 200K · 推荐安全上限 180,000",
+  },
+  {
+    id: "gpt-4o",
+    name: "GPT-4o / GPT-4o-mini",
+    category: "主流云端",
+    windowTokens: 128_000,
+    recommendedLimit: 110_000,
+    desc: "窗口 128K · 推荐安全上限 110,000",
+  },
+  {
+    id: "qwen-2-5",
+    name: "通义千问 Qwen 2.5 / Plus",
+    category: "国内厂商",
+    windowTokens: 128_000,
+    recommendedLimit: 110_000,
+    desc: "窗口 128K · 推荐安全上限 110,000",
+  },
+  {
+    id: "glm-4",
+    name: "智谱 GLM-4 / Plus",
+    category: "国内厂商",
+    windowTokens: 128_000,
+    recommendedLimit: 110_000,
+    desc: "窗口 128K · 推荐安全上限 110,000",
+  },
+  {
+    id: "kimi-moonshot",
+    name: "Kimi / Moonshot",
+    category: "国内厂商",
+    windowTokens: 200_000,
+    recommendedLimit: 180_000,
+    desc: "窗口 200K · 推荐安全上限 180,000",
+  },
+  {
+    id: "gemini-2",
+    name: "Gemini 1.5 / 2.0",
+    category: "超长上下文",
+    windowTokens: 1_000_000,
+    recommendedLimit: 200_000,
+    desc: "窗口 1M+ · 推荐安全上限 200,000+",
+  },
+  {
+    id: "ollama-32k",
+    name: "本地 32K (Ollama / Mistral)",
+    category: "本地模型",
+    windowTokens: 32_000,
+    recommendedLimit: 28_000,
+    desc: "窗口 32K · 推荐安全上限 28,000",
+  },
+  {
+    id: "ollama-8k",
+    name: "本地 8K (Llama 3 8B 默认)",
+    category: "本地模型",
+    windowTokens: 8_192,
+    recommendedLimit: 7_000,
+    desc: "窗口 8K · 推荐安全上限 7,000",
+  },
+];
 
 function renderRiskBadge(risk: string) {
   switch (risk) {
@@ -71,6 +161,7 @@ export function SettingsModal() {
   const storeSettings = useStore((s) => s.settings);
   const setSettingsLocal = useStore((s) => s.setSettingsLocal);
   const pushToast = useStore((s) => s.pushToast);
+  const setShowTokenStatsModal = useStore((s) => s.setShowTokenStatsModal);
   const [tab, setTab] = useState<Tab>("models");
   const [local, setLocal] = useState<Settings>(storeSettings);
   const [toolList, setToolList] = useState<ToolInfo[]>([]);
@@ -250,9 +341,34 @@ export function SettingsModal() {
     setLocal((cur) => ({ ...cur, disabledTools: [] }));
   };
 
-  const baseTools = toolList.filter((t) => !t.isTemp);
+  const isSkillTool = (name: string) => ["list_skills", "save_skill", "run_skill"].includes(name);
+
+  const coreTools = toolList.filter((t) => !t.isTemp && !isSkillTool(t.name));
+  const evolutionTools = toolList.filter((t) => isSkillTool(t.name));
   const tempTools = toolList.filter((t) => t.isTemp);
   const disabledCount = (local.disabledTools ?? []).length;
+
+  const renderCategoryBadge = (name: string, isTemp: boolean) => {
+    if (isTemp) {
+      return (
+        <span className="text-[11px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 border border-amber-500/30 font-medium">
+          临时空间
+        </span>
+      );
+    }
+    if (isSkillTool(name)) {
+      return (
+        <span className="text-[11px] px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-400 border border-purple-500/30 font-medium">
+          自演化引擎
+        </span>
+      );
+    }
+    return (
+      <span className="text-[11px] px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-400 border border-blue-500/30 font-medium">
+        系统内置
+      </span>
+    );
+  };
 
   const renderToolItem = (t: ToolInfo) => {
     const enabled = isToolEnabled(t.name);
@@ -271,11 +387,7 @@ export function SettingsModal() {
             </code>
             {title && <span className="text-[12px] text-ink font-medium">{title}</span>}
             {renderRiskBadge(t.risk)}
-            {t.isTemp && (
-              <span className="text-[11px] px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-400 border border-purple-500/20">
-                临时空间
-              </span>
-            )}
+            {renderCategoryBadge(t.name, t.isTemp)}
           </div>
           <div className="text-[12px] text-inkdim mt-1.5 leading-relaxed">{t.description}</div>
         </div>
@@ -315,7 +427,7 @@ export function SettingsModal() {
   return (
     <div className="fixed inset-0 z-[80] bg-black/50 flex items-center justify-center">
       <div className="bg-panel2 border border-edge rounded-2xl w-[860px] h-[560px] max-w-[92vw] max-h-[86vh] flex flex-col shadow-2xl">
-        <div className="px-5 py-4 border-b border-edge font-medium flex items-center gap-2 shrink-0">
+        <div className="h-12 px-5 border-b border-edge/60 font-medium flex items-center gap-2 shrink-0">
           <span>程序设置</span>
           <ModalClose onClick={() => setShow(false)} />
         </div>
@@ -337,6 +449,16 @@ export function SettingsModal() {
               <span className="flex items-center gap-2">
                 <Database size={15} />
                 <span>数据目录</span>
+              </span>
+            </button>
+            <div className="border-t border-edge/40 my-1" />
+            <button
+              className="w-full text-left px-3 py-2 rounded-lg text-[13px] text-inkdim hover:text-ink hover:bg-panel2"
+              onClick={() => { setShow(false); setShowTokenStatsModal(true); }}
+            >
+              <span className="flex items-center gap-2">
+                <BarChart2 size={15} className="text-amber-400" />
+                <span>Token 统计</span>
               </span>
             </button>
           </aside>
@@ -603,17 +725,84 @@ export function SettingsModal() {
                       />
                     </label>
                   </div>
-                  <label className="flex flex-col gap-1 mt-3">
-                    <span className="text-inkdim">上下文 token 上限（估算，超出自动丢弃最早消息）</span>
-                    <input
-                      className={inputCls}
-                      type="number"
-                      min={4000}
-                      max={200000}
-                      value={local.contextTokenLimit}
-                      onChange={(e) => setLocal({ ...local, contextTokenLimit: Number(e.target.value) || 28000 })}
-                    />
-                  </label>
+                  <div className="flex flex-col gap-2.5 mt-4 p-3.5 rounded-xl bg-panel3/50 border border-edge/60">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <div className="text-[13px] font-medium text-ink">上下文 Token 上限</div>
+                        <div className="text-[11px] text-inkdim mt-0.5">
+                          单次会话可容纳的历史 Token 阈值。当未压缩历史达到此上限约 75% 时，将自动提炼 Markdown 备忘录并等待您确认后执行压缩。
+                        </div>
+                      </div>
+                      <span className="text-[12px] font-mono text-accent font-medium shrink-0 ml-2">
+                        {local.contextTokenLimit?.toLocaleString()} tokens
+                      </span>
+                    </div>
+
+                    {/* 各模型上下文规格预设选择器 */}
+                    <div className="flex flex-col gap-2 mt-1">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-[11px] text-inkdim shrink-0">选择模型规格预设：</span>
+                        <select
+                          className={`${inputCls} text-[12px] py-1 flex-1`}
+                          value=""
+                          onChange={(e) => {
+                            const val = Number(e.target.value);
+                            if (val) setLocal({ ...local, contextTokenLimit: val });
+                          }}
+                        >
+                          <option value="" disabled>
+                            从主流模型规格列表中选择快速填充...
+                          </option>
+                          {["主流云端", "国内厂商", "超长上下文", "本地模型"].map((cat) => (
+                            <optgroup key={cat} label={cat}>
+                              {MODEL_PRESETS.filter((p) => p.category === cat).map((p) => (
+                                <option key={p.id} value={p.recommendedLimit}>
+                                  {p.name}（{p.desc}）
+                                </option>
+                              ))}
+                            </optgroup>
+                          ))}
+                        </select>
+                      </div>
+
+                      {/* 常用规格快捷标签 */}
+                      <div className="flex flex-wrap gap-1.5 pt-0.5">
+                        {MODEL_PRESETS.map((p) => {
+                          const isCurrent = local.contextTokenLimit === p.recommendedLimit;
+                          return (
+                            <button
+                              key={p.id}
+                              type="button"
+                              className={`px-2 py-1 rounded-md text-[11px] transition-colors border ${
+                                isCurrent
+                                  ? "bg-accent/15 border-accent text-accent font-medium shadow-xs"
+                                  : "bg-panel border-edge hover:border-accent/40 text-inkdim hover:text-ink"
+                              }`}
+                              onClick={() => setLocal({ ...local, contextTokenLimit: p.recommendedLimit })}
+                              title={`${p.name}: ${p.desc}，点击应用推荐安全阈值`}
+                            >
+                              {p.name.split(" ")[0]} ({p.recommendedLimit >= 10000 ? `${p.recommendedLimit / 1000}k` : p.recommendedLimit})
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* 手动微调数值 */}
+                    <div className="flex items-center gap-2 mt-2 pt-2.5 border-t border-edge/40">
+                      <span className="text-[12px] text-inkdim shrink-0">自由手动微调：</span>
+                      <input
+                        className={`${inputCls} flex-1 font-mono text-[13px]`}
+                        type="number"
+                        min={2000}
+                        max={2000000}
+                        step={1000}
+                        value={local.contextTokenLimit}
+                        onChange={(e) => setLocal({ ...local, contextTokenLimit: Number(e.target.value) || 64000 })}
+                      />
+                      <span className="text-[12px] text-inkdim shrink-0">tokens</span>
+                    </div>
+                  </div>
                 </section>
               </div>
             )}
@@ -643,33 +832,71 @@ export function SettingsModal() {
                     </div>
                   </div>
 
+                  {/* 架构与自演化说明卡片 */}
+                  <div className="p-3 rounded-xl border border-edge/80 bg-panel3/40 flex items-start gap-3 mt-1 mb-2 text-[12px] leading-relaxed">
+                    <Sparkles size={16} className="text-accent shrink-0 mt-0.5" />
+                    <div className="flex flex-col gap-1">
+                      <div className="font-medium text-ink">工具体系与自成长架构说明</div>
+                      <div className="text-inkdim leading-relaxed">
+                        <span className="text-blue-400 font-medium">1. 系统内置工具</span>：平台底座原生提供的文件读写、代码搜索与命令行执行能力；<br />
+                        <span className="text-purple-400 font-medium">2. 自演化引擎工具</span>：Agent 发现多步任务规律并将其固化为复用技能的内置元工具；<br />
+                        <span className="text-emerald-400 font-medium">3. 项目自成长技能</span>：Agent 或用户自动沉淀的项目定制技能脚本，存储于项目的 <code className="bg-panel2 px-1 rounded text-accent font-mono">.harness/skills/</code> 目录。可在顶栏 <b className="text-ink">「🌱 成长中心」</b> 的「⚡ 技能工具库」中查看与管理。
+                      </div>
+                    </div>
+                  </div>
+
                   {toolList.length === 0 ? (
                     <div className="text-inkdim py-8 text-center">正在加载工具列表…</div>
                   ) : (
                     <>
-                      {/* 基础工具 */}
+                      {/* 系统内置基础工具 */}
                       <div className="mt-4">
-                        <div className="text-[12px] font-medium text-inkdim mb-2 flex items-center gap-1.5">
-                          <Terminal size={14} className="text-blue-400" />
-                          <span>基础工具</span>
-                          <span className="text-[11px] text-inkdim/60">
-                            ({baseTools.filter((t) => isToolEnabled(t.name)).length}/{baseTools.length})
-                          </span>
+                        <div className="text-[12px] font-medium text-inkdim mb-2 flex items-center justify-between">
+                          <div className="flex items-center gap-1.5">
+                            <Terminal size={14} className="text-blue-400" />
+                            <span className="text-ink">系统内置基础工具</span>
+                            <span className="text-[11px] text-inkdim/60">
+                              ({coreTools.filter((t) => isToolEnabled(t.name)).length}/{coreTools.length})
+                            </span>
+                          </div>
+                          <span className="text-[11px] text-inkdim/60">文件读写 · 代码检索 · 终端交互 · 任务管理</span>
                         </div>
                         <div className="flex flex-col gap-2">
-                          {baseTools.map(renderToolItem)}
+                          {coreTools.map(renderToolItem)}
                         </div>
                       </div>
+
+                      {/* 自演化技能引擎工具 */}
+                      {evolutionTools.length > 0 && (
+                        <div className="mt-5">
+                          <div className="text-[12px] font-medium text-inkdim mb-2 flex items-center justify-between">
+                            <div className="flex items-center gap-1.5">
+                              <Zap size={14} className="text-purple-400" />
+                              <span className="text-ink">自演化技能引擎工具</span>
+                              <span className="text-[11px] text-inkdim/60">
+                                ({evolutionTools.filter((t) => isToolEnabled(t.name)).length}/{evolutionTools.length})
+                              </span>
+                            </div>
+                            <span className="text-[11px] text-purple-400/80">用于 Agent 编写并沉淀项目自演化脚本</span>
+                          </div>
+                          <div className="flex flex-col gap-2">
+                            {evolutionTools.map(renderToolItem)}
+                          </div>
+                        </div>
+                      )}
 
                       {/* 临时空间工具 */}
                       {tempTools.length > 0 && (
                         <div className="mt-5">
-                          <div className="text-[12px] font-medium text-inkdim mb-2 flex items-center gap-1.5">
-                            <Wind size={14} className="text-purple-400" />
-                            <span>临时空间专用工具</span>
-                            <span className="text-[11px] text-inkdim/60">
-                              ({tempTools.filter((t) => isToolEnabled(t.name)).length}/{tempTools.length})
-                            </span>
+                          <div className="text-[12px] font-medium text-inkdim mb-2 flex items-center justify-between">
+                            <div className="flex items-center gap-1.5">
+                              <Wind size={14} className="text-amber-400" />
+                              <span className="text-ink">临时空间专用工具</span>
+                              <span className="text-[11px] text-inkdim/60">
+                                ({tempTools.filter((t) => isToolEnabled(t.name)).length}/{tempTools.length})
+                              </span>
+                            </div>
+                            <span className="text-[11px] text-amber-400/80">仅在临时空间对话中下发</span>
                           </div>
                           <div className="flex flex-col gap-2">
                             {tempTools.map(renderToolItem)}

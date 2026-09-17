@@ -33,7 +33,7 @@ export function ArchiveModal() {
         className="bg-panel2 border border-edge rounded-2xl w-[580px] max-h-[72vh] flex flex-col shadow-2xl overflow-hidden"
         onMouseDown={(e) => e.stopPropagation()}
       >
-        <div className="px-5 py-4 border-b border-edge font-medium flex items-center justify-between shrink-0">
+        <div className="h-12 px-5 border-b border-edge/60 font-medium flex items-center justify-between shrink-0">
           <div className="flex items-center gap-2">
             <Archive size={16} className="text-amber-400" />
             <span>归档的对话</span>

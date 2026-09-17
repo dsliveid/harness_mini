@@ -33,7 +33,7 @@ export function ModalActions({
   busy: boolean;
 }) {
   return (
-    <div className="px-5 py-3.5 border-t border-edge flex justify-end gap-2 shrink-0">
+    <div className="h-12 px-5 border-t border-edge/60 flex items-center justify-end gap-2 shrink-0">
       <button className="px-4 py-1.5 rounded-lg text-inkdim hover:bg-panel3" onClick={onCancel}>
         取消
       </button>

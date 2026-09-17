@@ -334,19 +334,19 @@ export function GrowthModal() {
         onMouseDown={(e) => e.stopPropagation()}
       >
         {/* 顶部标题栏 */}
-        <div className="px-6 py-4 border-b border-edge flex items-center justify-between shrink-0 bg-panel">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400 shrink-0">
-              <Sprout size={18} />
+        <div className="px-5 py-3 border-b border-edge/60 flex items-center justify-between shrink-0 bg-panel">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-lg bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400 shrink-0">
+              <Sprout size={16} />
             </div>
             <div>
-              <div className="font-medium text-[16px] text-ink flex items-center gap-2">
+              <div className="font-medium text-[15px] text-ink flex items-center gap-2">
                 <span>Agent 自我成长中心</span>
                 <span className="text-[11px] px-2 py-0.5 rounded-full bg-panel3 text-inkdim border border-edge font-normal">
                   三阶演进体系
                 </span>
               </div>
-              <div className="text-[12px] text-inkdim mt-0.5">
+              <div className="text-[11px] text-inkdim mt-0.5">
                 经验记忆反思 · 工具能力自扩充 · 行为范式交付自检
               </div>
             </div>
@@ -365,18 +365,18 @@ export function GrowthModal() {
               </button>
             )}
             <button
-              className="w-8 h-8 rounded-lg hover:bg-panel3 flex items-center justify-center text-inkdim hover:text-ink transition-colors"
+              className="w-7 h-7 rounded-lg hover:bg-panel3 flex items-center justify-center text-inkdim hover:text-ink transition-colors"
               onClick={() => setShow(false)}
             >
-              <X size={16} />
+              <X size={15} />
             </button>
           </div>
         </div>
 
         {/* 阶梯三选项卡导航 */}
-        <div className="px-6 border-b border-edge bg-panel flex items-center gap-4 shrink-0">
+        <div className="px-5 border-b border-edge/60 bg-panel flex items-center gap-4 shrink-0">
           <button
-            className={`py-3 px-1 text-[13px] font-medium border-b-2 transition-all flex items-center gap-2 ${
+            className={`py-2.5 px-1 text-[13px] font-medium border-b-2 transition-all flex items-center gap-2 ${
               activeTab === "reflexion"
                 ? "border-accent text-accent"
                 : "border-transparent text-inkdim hover:text-ink"
@@ -384,7 +384,10 @@ export function GrowthModal() {
             onClick={() => setActiveTab("reflexion")}
           >
             <Sprout size={15} />
-            <span>经验规则库 (Reflexion)</span>
+            <span>经验规则库</span>
+            <span className="text-[10px] px-1.5 py-[1px] rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+              自成长·经验
+            </span>
             <span className="text-[11px] px-1.5 py-0.5 rounded-full bg-panel3 text-inkdim">
               {stats.accepted}
             </span>
@@ -398,7 +401,10 @@ export function GrowthModal() {
             onClick={() => setActiveTab("skills")}
           >
             <Zap size={15} />
-            <span>技能工具库 (Dynamic Skills)</span>
+            <span>技能工具库</span>
+            <span className="text-[10px] px-1.5 py-[1px] rounded bg-purple-500/15 text-purple-400 border border-purple-500/30">
+              自成长·工具
+            </span>
             <span className="text-[11px] px-1.5 py-0.5 rounded-full bg-panel3 text-inkdim">
               {skills.length}
             </span>
@@ -412,7 +418,10 @@ export function GrowthModal() {
             onClick={() => setActiveTab("sop")}
           >
             <ShieldCheck size={15} />
-            <span>交付自检 SOP (Pre-flight Check)</span>
+            <span>交付自检 SOP</span>
+            <span className="text-[10px] px-1.5 py-[1px] rounded bg-blue-500/15 text-blue-400 border border-blue-500/30">
+              系统全局内置
+            </span>
             {sopInfo?.sopEnabled && (
               <span className="w-2 h-2 rounded-full bg-emerald-400" title="已开启自检" />
             )}
@@ -527,6 +536,14 @@ export function GrowthModal() {
 
             {/* 规则列表滚动区 */}
             <div className="flex-1 overflow-y-auto px-6 py-4 flex flex-col gap-3">
+              {/* 模块属性与作用说明 */}
+              <div className="p-3 rounded-xl border border-emerald-500/25 bg-emerald-500/10 text-[12px] text-emerald-300 flex items-start gap-2.5">
+                <Sprout size={15} className="text-emerald-400 shrink-0 mt-0.5" />
+                <div className="leading-relaxed">
+                  <span className="font-semibold text-emerald-200">【自成长·避坑经验库】</span>
+                  当你在敏感操作审批中点击「拒绝」并给出理由，或点击右上角「复盘当前会话」时，Agent 将自动反思提炼出一条工程避坑规则。采纳后将持久化注入系统提示词第 0 位指导后续所有对话。
+                </div>
+              </div>
               {filteredGrowths.map((g) => {
                 const isEditing = editingId === g.id;
                 const isAccepted = g.status === "accepted";
@@ -745,6 +762,15 @@ export function GrowthModal() {
         {/* ============================================================ */}
         {activeTab === "skills" && (
           <div className="flex-1 overflow-y-auto px-6 py-4 flex flex-col gap-4">
+            {/* 模块属性与作用说明 */}
+            <div className="p-3.5 rounded-xl border border-purple-500/25 bg-purple-500/10 text-[12px] text-purple-300 flex items-start gap-2.5">
+              <Zap size={16} className="text-purple-400 shrink-0 mt-0.5" />
+              <div className="leading-relaxed">
+                <span className="font-semibold text-purple-200">【自成长·项目专属技能工具】</span>
+                此处展示当前项目在自演化过程中沉淀的可执行技能（存放于项目根目录的 <code className="bg-panel px-1.5 py-0.5 rounded text-accent font-mono">.harness/skills/</code> 目录）。当 Agent 识别出多步骤的高频复杂任务时，可调用内置的 <code className="bg-panel px-1.5 py-0.5 rounded text-accent font-mono">save_skill</code> 工具自动生成脚本，你也可以随时在此手动编写新技能。
+              </div>
+            </div>
+
             {/* 项目选择与操作栏 */}
             <div className="flex items-center justify-between bg-panel p-3 rounded-xl border border-edge">
               <div className="flex items-center gap-2">
@@ -895,6 +921,15 @@ export function GrowthModal() {
               <div className="py-16 text-center text-inkdim text-[13px]">请先选择已绑定本地目录的项目。</div>
             ) : (
               <div className="flex flex-col gap-4">
+                {/* 模块属性与作用说明 */}
+                <div className="p-3.5 rounded-xl border border-blue-500/25 bg-blue-500/10 text-[12px] text-blue-300 flex items-start gap-2.5">
+                  <ShieldCheck size={16} className="text-blue-400 shrink-0 mt-0.5" />
+                  <div className="leading-relaxed">
+                    <span className="font-semibold text-blue-200">【系统全局内置守卫功能】</span>
+                    本功能为 harness_mini 架构内置的工程质量交付守卫，并非由项目运行时自动生成的外部脚本工具。系统会自动识别项目技术栈，当代码被修改时，在向你交差前自动运行构建/测试；若发现语法或编译错误，将直接拦截并驱动 Agent 就地修复，避免交付破损代码。
+                  </div>
+                </div>
+
                 {/* 状态与开关卡片 */}
                 <div className="p-4 rounded-xl border border-edge bg-panel flex flex-col gap-3">
                   <div className="flex items-center justify-between">

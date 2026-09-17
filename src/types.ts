@@ -79,6 +79,9 @@ export interface Session {
   sourceWorkspace?: string | null;
   mergedSeq?: number | null; // 最近一次合并的消息序号边界，之前的消息不可编辑
   mergedPending: boolean; // 已合并且临时空间未清空：禁止继续发送
+  totalTokens?: number;
+  promptTokens?: number;
+  completionTokens?: number;
 }
 
 /** 临时空间中被拷贝的单个项目条目（主项目 key="main"，关联项目 key="link:<id>"） */
@@ -207,12 +210,113 @@ export interface Message {
   usage?: any;
   createdAt: string;
   toolEvents: ToolEvent[];
+  durationMs?: number;
+  turnDurationMs?: number;
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
 }
 
 export interface QueuedItem {
   id: string;
   content: string;
   createdAt: string;
+}
+
+export interface TurnMetrics {
+  isTurnEnd: boolean;
+  turnDurationMs: number | null;
+  turnTokens: number;
+  turnPromptTokens?: number;
+  turnCompletionTokens?: number;
+  turnStepCount: number;
+  stepIndex?: number;
+  turnStartTime: number;
+  isCurrentRunningTurn: boolean;
+}
+
+/**
+ * 按轮次分组计算对话消息的耗时和 Token 指标。
+ * 一轮对话以 user 消息发起，以该 user 后的最后一条 assistant 消息结束。
+ */
+export function computeTurnMetrics(messages: Message[], running: boolean): Map<string, TurnMetrics> {
+  const map = new Map<string, TurnMetrics>();
+
+  let currentTurnUser: Message | null = null;
+  let currentTurnAssistants: Message[] = [];
+
+  const flushTurn = (isLastTurn: boolean) => {
+    if (currentTurnAssistants.length === 0) return;
+
+    const rawUserTime = currentTurnUser?.createdAt ? new Date(currentTurnUser.createdAt).getTime() : NaN;
+    const rawAsstTime = currentTurnAssistants[0]?.createdAt ? new Date(currentTurnAssistants[0].createdAt).getTime() : NaN;
+    const turnStartTime = !isNaN(rawUserTime) ? rawUserTime : (!isNaN(rawAsstTime) ? rawAsstTime : Date.now());
+
+    const totalSteps = currentTurnAssistants.length;
+    const isCurrentRunning = isLastTurn && running;
+
+    // 累计整个轮次的 token
+    let turnTokens = 0;
+    let turnPromptTokens = 0;
+    let turnCompletionTokens = 0;
+    for (const a of currentTurnAssistants) {
+      const tt = a.totalTokens ?? (a.usage?.totalTokens || (a.usage?.inputEst || 0) + (a.usage?.outputEst || 0)) ?? 0;
+      const pt = a.promptTokens ?? (a.usage?.promptTokens || a.usage?.inputEst) ?? 0;
+      const ct = a.completionTokens ?? (a.usage?.completionTokens || a.usage?.outputEst) ?? 0;
+      turnTokens += Number(tt) || 0;
+      turnPromptTokens += Number(pt) || 0;
+      turnCompletionTokens += Number(ct) || 0;
+    }
+
+    // 遍历本轮所有 assistant 消息
+    for (let i = 0; i < totalSteps; i++) {
+      const a = currentTurnAssistants[i];
+      const isTurnEnd = i === totalSteps - 1;
+
+      let turnDurationMs: number | null = null;
+      if (isTurnEnd) {
+        if (isCurrentRunning) {
+          turnDurationMs = null;
+        } else if (a.turnDurationMs != null && a.turnDurationMs > 0) {
+          turnDurationMs = a.turnDurationMs;
+        } else {
+          // 历史数据兜底
+          const aTime = new Date(a.createdAt).getTime();
+          const durationFallback = aTime >= turnStartTime ? aTime - turnStartTime + (a.durationMs ?? 0) : (a.durationMs ?? 0);
+          const sumSteps = currentTurnAssistants.reduce((sum, item) => sum + (item.durationMs ?? 0), 0);
+          turnDurationMs = Math.max(durationFallback, sumSteps) || (a.durationMs ?? null);
+        }
+      }
+
+      map.set(a.id, {
+        isTurnEnd,
+        turnDurationMs,
+        turnTokens,
+        turnPromptTokens,
+        turnCompletionTokens,
+        turnStepCount: totalSteps,
+        stepIndex: i + 1,
+        turnStartTime,
+        isCurrentRunningTurn: isCurrentRunning && isTurnEnd,
+      });
+    }
+  };
+
+  for (const m of messages) {
+    if (m.role === "tool" || m.queued) continue;
+    if (m.role === "user") {
+      flushTurn(false);
+      currentTurnUser = m;
+      currentTurnAssistants = [];
+    } else if (m.role === "assistant") {
+      currentTurnAssistants.push(m);
+    }
+  }
+
+  // 最后一轮
+  flushTurn(true);
+
+  return map;
 }
 
 export interface ApprovalReq {
@@ -223,6 +327,60 @@ export interface ApprovalReq {
   risk: string; // write | execute | path
   preview: string;
   forceOnce: boolean;
+}
+
+/** 上下文自动压缩挂起请求（等待用户确认/补充） */
+export interface CompactionReq {
+  eventId: string;
+  sessionId: string;
+  startSeq: number;
+  endSeq: number;
+  startPreview: string;
+  endPreview: string;
+  messageCount: number;
+  tokensBefore: number;
+  summary: string;
+  /** 超时阻塞等待秒数（默认 30s） */
+  timeoutSeconds?: number;
+  /** 请求创建本地时间戳（毫秒） */
+  createdAt?: number;
+  /** 是否已超时无操作并自动应用（此时保持展示卡片供查看，但不提供继续下一步按钮） */
+  timedOut?: boolean;
+}
+
+/** 会话历史已压缩记录 */
+export interface SessionCompaction {
+  id: string;
+  sessionId: string;
+  startSeq: number;
+  endSeq: number;
+  summaryMarkdown: string;
+  tokensBefore: number;
+  createdAt: string;
+}
+
+/** 模型上下文预设规格 */
+export interface ModelContextPreset {
+  id: string;
+  name: string;
+  category: string;
+  windowTokens: number;
+  recommendedLimit: number;
+  desc: string;
+}
+
+/** 上下文硬截断提醒（原子轮次丢弃通知） */
+export interface TruncationNotice {
+  id: string;
+  sessionId: string;
+  droppedTurns: number;
+  droppedMessages: number;
+  droppedTokens: number;
+  tokenLimit: number;
+  estTokensBefore: number;
+  estTokensAfter: number;
+  firstPreview: string;
+  createdAt: string;
 }
 
 /** 程序数据目录状态（后端 get_data_status） */
@@ -338,9 +496,73 @@ export interface SopStatusEvent {
 export interface ToolRetryGuidanceEvent {
   sessionId: string;
   toolName: string;
+  attempt?: number;
+  maxRetries?: number;
+  status?: "retrying" | "success" | "failed";
+  error?: string;
+  message?: string;
+}
+
+export interface ToolRetryStatus {
+  toolName: string;
   attempt: number;
   maxRetries: number;
-  error: string;
+  status: "retrying" | "success" | "failed" | "cancelled";
+  error?: string;
+  message?: string;
+  dismissed?: boolean;
+}
+
+// ---------- Token 消耗统计 ----------
+
+export interface TokenStatsSummary {
+  totalPromptTokens: number;
+  totalCompletionTokens: number;
+  totalTokens: number;
+  todayPromptTokens: number;
+  todayCompletionTokens: number;
+  todayTokens: number;
+  totalSessions: number;
+  totalMessages: number;
+}
+
+export interface ProjectTokenStats {
+  projectId?: string | null;
+  projectName: string;
+  projectPath?: string | null;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  sessionCount: number;
+  messageCount: number;
+  lastUsedAt?: string | null;
+}
+
+export interface DailyTokenStats {
+  date: string; // YYYY-MM-DD
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  messageCount: number;
+}
+
+export interface SessionTokenStats {
+  sessionId: string;
+  title: string;
+  projectId?: string | null;
+  projectName?: string | null;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  messageCount: number;
+  lastMessageAt?: string | null;
+}
+
+export interface TokenStatsReport {
+  summary: TokenStatsSummary;
+  byProject: ProjectTokenStats[];
+  byTime: DailyTokenStats[];
+  bySession: SessionTokenStats[];
 }
 
 

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ApprovalRule, DataStatus, GrowthItem, Message, MergeSummary, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, ToolEvent, ToolInfo } from "./types";
+import type { ApprovalRule, DataStatus, GrowthItem, Message, MergeSummary, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionCompaction, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo } from "./types";
 
 export const ipc = {
   getSettings: () => invoke<Settings>("get_settings"),
@@ -76,6 +76,12 @@ export const ipc = {
   respondApproval: (eventId: string, decision: string, reason?: string) =>
     invoke<void>("respond_approval", { eventId, decision, reason: reason ?? null }),
 
+  respondCompaction: (eventId: string, approved: boolean, finalSummary: string) =>
+    invoke<void>("respond_compaction", { eventId, approved, finalSummary }),
+
+  listSessionCompactions: (sessionId: string) =>
+    invoke<SessionCompaction[]>("list_session_compactions", { sessionId }),
+
   // 审批规则（会话级：仅对所属对话生效）
   listSessionRules: (sessionId: string) =>
     invoke<ApprovalRule[]>("list_session_rules", { sessionId }),
@@ -121,7 +127,9 @@ export const ipc = {
     invoke<void>("set_project_sop", { projectId, verifyCmd, enabled }),
   runWorkspaceSop: (workspacePath: string, cmd: string) =>
     invoke<string>("run_workspace_sop", { workspacePath, cmd }),
+  getTokenStats: (projectId?: string | null, days?: number | null) =>
+    invoke<TokenStatsReport>("get_token_stats", { projectId: projectId ?? null, days: days ?? null }),
 };
 
-export type { Message, Session, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo };
+export type { Message, Session, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport };
 

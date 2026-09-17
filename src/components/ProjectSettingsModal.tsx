@@ -333,7 +333,7 @@ export function ProjectSettingsModal() {
   return (
     <div className="fixed inset-0 z-[80] bg-black/50 flex items-center justify-center">
       <div className="bg-panel2 border border-edge rounded-2xl w-[860px] h-[560px] max-w-[92vw] max-h-[86vh] flex flex-col shadow-2xl">
-        <div className="px-5 py-4 border-b border-edge font-medium flex items-center gap-2 shrink-0">
+        <div className="h-12 px-5 border-b border-edge/60 font-medium flex items-center gap-2 shrink-0">
           <span>项目设置</span>
           <span className="text-[13px] text-inkdim font-normal truncate">
             · {project.name}

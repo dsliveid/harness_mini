@@ -1,11 +1,21 @@
+import { useState } from "react";
 import { ipc } from "../ipc";
 import { currentSession, useStore } from "../store";
 import { DRAFT_ID } from "../types";
 import { askConfirm } from "./PromptModal";
-import { GitCompare, FolderOpen, GitMerge, Trash2 } from "./Icons";
+import {
+  GitCompare,
+  FolderOpen,
+  GitMerge,
+  Trash2,
+  Wind,
+  ChevronRight,
+  ChevronLeft,
+} from "./Icons";
 
 /**
  * 临时空间浮动操作组：悬浮在输入框上方（左对齐），仅临时空间对话（含未落库草稿）显示。
+ * 支持收起/展开，收起时仅展示紧凑标签，避免遮挡聊天内容。
  * - 变更：查看变更列表（相对基线），无变更 / 目录不存在时禁用
  * - 临时目录：打开临时空间根目录，目录不存在时禁用
  * - 合并：把本次变更写回原项目目录；无变更 / 已合并时禁用
@@ -18,6 +28,23 @@ export function TempActions() {
   const tempInfo = useStore((s) => s.tempInfo);
   const setShowChanges = useStore((s) => s.setShowChanges);
   const pushToast = useStore((s) => s.pushToast);
+
+  const [collapsed, setCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem("harness:temp-actions-collapsed") === "1";
+    } catch {
+      return false;
+    }
+  });
+
+  const toggleCollapsed = (next: boolean) => {
+    setCollapsed(next);
+    try {
+      localStorage.setItem("harness:temp-actions-collapsed", next ? "1" : "0");
+    } catch {
+      // ignore
+    }
+  };
 
   const isTempDraft = currentId === DRAFT_ID && !!draft?.temp;
   if (!isTempDraft && !session?.isTemp) return null;
@@ -68,8 +95,37 @@ export function TempActions() {
       disabled ? "opacity-40 cursor-not-allowed text-inkdim" : "text-ink hover:bg-panel3 shadow-sm"
     }`;
 
+  // 收起态：紧凑胶囊标签，对齐输入框左边界 (left-3)
+  if (collapsed) {
+    return (
+      <div className="absolute left-3 bottom-full mb-1.5 z-30 select-none animate-in fade-in duration-150">
+        <button
+          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-panel2/95 backdrop-blur-md border border-edge shadow-lg hover:bg-panel3 text-[12px] text-ink select-none transition-all group cursor-pointer"
+          onClick={() => toggleCollapsed(false)}
+          title="展开临时空间操作按钮"
+        >
+          <Wind size={13} className="text-amber-400 shrink-0" />
+          <span className="font-medium">临时空间</span>
+          {hasChanges && (
+            <span className="text-[10px] px-1 rounded-full bg-accent/20 text-accent font-medium">
+              {info?.changedCount ?? 0}
+            </span>
+          )}
+          <span className="text-[11px] text-inkdim group-hover:text-ink transition-colors flex items-center gap-0.5 ml-0.5">
+            <span>展开</span>
+            <ChevronRight
+              size={12}
+              className="text-inkdim group-hover:text-accent transition-transform duration-150 group-hover:translate-x-0.5 shrink-0"
+            />
+          </span>
+        </button>
+      </div>
+    );
+  }
+
+  // 展开态：对齐输入框左边界 (left-3)，末尾提供收起按钮
   return (
-    <div className="absolute left-5 bottom-full mb-1.5 z-30 flex items-center gap-1.5 bg-panel2/95 backdrop-blur-md border border-edge rounded-xl px-2 py-1.5 shadow-xl select-none animate-in fade-in slide-in-from-bottom-2 duration-150">
+    <div className="absolute left-3 bottom-full mb-1.5 z-30 flex items-center gap-1.5 bg-panel2/95 backdrop-blur-md border border-edge rounded-xl px-2 py-1.5 shadow-xl select-none animate-in fade-in slide-in-from-bottom-2 duration-150">
       <button
         className={cls(!exists || !hasChanges)}
         disabled={!exists || !hasChanges}
@@ -116,6 +172,15 @@ export function TempActions() {
       >
         <Trash2 size={13} className="shrink-0" />
         <span>清空空间</span>
+      </button>
+      <div className="w-[1px] h-3.5 bg-edge mx-0.5" />
+      <button
+        className="px-2 py-1.5 rounded-lg text-[12px] border border-transparent text-inkdim hover:text-ink hover:bg-panel3 flex items-center gap-1 transition-colors cursor-pointer"
+        onClick={() => toggleCollapsed(true)}
+        title="收起临时空间操作按钮"
+      >
+        <ChevronLeft size={12} className="shrink-0" />
+        <span>收起</span>
       </button>
     </div>
   );

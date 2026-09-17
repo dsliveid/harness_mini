@@ -1,10 +1,13 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useMemo } from "react";
 import { currentMessages, currentSession, useStore } from "../store";
-import { DRAFT_ID } from "../types";
+import { DRAFT_ID, computeTurnMetrics } from "../types";
 import { FloatingTaskPanel } from "./FloatingTaskPanel";
 import { GrowthCard } from "./GrowthCard";
 import { MessageItem } from "./MessageItem";
-import { Bot, Plus, Sprout, ShieldCheck, AlertTriangle, Loader2, RefreshCw } from "./Icons";
+import { ToolRetryBanner } from "./ToolRetryBanner";
+import { CompactionBanner, CompactedHistoryCard } from "./CompactionBanner";
+import { TruncationNoticeList } from "./TruncationNoticeCard";
+import { Bot, Plus, Sprout, ShieldCheck, AlertTriangle, Loader2 } from "./Icons";
 
 export function ChatView() {
   const currentId = useStore((s) => s.currentId);
@@ -22,12 +25,15 @@ export function ChatView() {
   const proposals = useStore((s) => (s.currentId ? s.activeProposals[s.currentId] ?? [] : []));
   const currentGrowthStatus = useStore((s) => (s.currentId ? s.growthStatus[s.currentId] : null));
   const currentSopStatus = useStore((s) => (s.currentId ? s.sopStatus[s.currentId] : null));
-  const currentToolRetry = useStore((s) => (s.currentId ? s.toolRetryStatus[s.currentId] : null));
+  const compactions = useStore((s) => (s.currentId ? s.sessionCompactions[s.currentId] ?? [] : []));
   // 临时空间对话：合并点（含）之前的消息永久不可编辑重发
   const mergedBoundary = session?.mergedSeq ?? null;
 
   const boxRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
+
+  // ⚠️ 所有 hooks 必须在任何条件 return 之前调用
+  const turnMetricsMap = useMemo(() => computeTurnMetrics(msgs, running), [msgs, running]);
 
   useEffect(() => {
     const el = boxRef.current;
@@ -96,19 +102,27 @@ export function ChatView() {
   }
 
   const lastUserMsgId = [...msgs].reverse().find((m) => m.role === "user" && !m.queued)?.id;
+  const isTempConv = !!session?.isTemp || (currentId === DRAFT_ID && !!draft?.temp);
 
   return (
-    <div className="flex-1 min-h-0 relative flex flex-col">
+    <div className="flex-1 min-h-0 relative z-0 flex flex-col">
       <FloatingTaskPanel />
+      <ToolRetryBanner />
+      <CompactionBanner />
+      <TruncationNoticeList />
       <div className="flex-1 overflow-y-auto" ref={boxRef} onScroll={onScroll}>
-        <div className="max-w-[820px] mx-auto px-4 py-6 flex flex-col gap-5">
+        <div className={`max-w-[820px] mx-auto px-4 pt-6 ${isTempConv ? "pb-16" : "pb-6"} flex flex-col gap-5`}>
           {hasMore && (
             <button className="self-center text-[12px] text-inkdim hover:text-ink px-3 py-1 rounded-lg hover:bg-panel2" onClick={() => void loadEarlier(currentId)}>
               加载更早的消息
             </button>
           )}
+          {/* 已压缩历史折叠备忘录卡片 */}
+          {compactions.map((c) => (
+            <CompactedHistoryCard key={c.id} compaction={c} />
+          ))}
           {msgs
-            .filter((m) => m.role !== "tool")
+            .filter((m) => m.role !== "tool" && m.seq > compactions.reduce((max, c) => Math.max(max, c.endSeq), 0))
             .map((m) => (
               <MessageItem
                 key={m.id}
@@ -118,6 +132,7 @@ export function ChatView() {
                 readOnly={readOnly}
                 running={running}
                 editBlocked={mergedBoundary != null && m.seq <= mergedBoundary}
+                turnMetrics={turnMetricsMap.get(m.id)}
               />
             ))}
           {/* 当前会话待审阅的成长提案卡片 */}
@@ -155,22 +170,10 @@ export function ChatView() {
               <span>交付前 SOP 自检已通过 (<code className="bg-panel2 px-1.5 py-0.5 rounded text-[12px] font-mono text-emerald-300 border border-emerald-500/20">{currentSopStatus.command}</code>)</span>
             </div>
           )}
-          {/* 工具报错自动自纠错状态指示 */}
-          {currentToolRetry && running && currentToolRetry.active && (
-            <div className="rounded-xl border border-purple-500/30 bg-purple-500/10 p-3 flex items-center justify-between text-[13px] text-purple-300 shadow-sm animate-in fade-in duration-200">
-              <div className="flex items-center gap-2.5">
-                <RefreshCw size={15} className="shrink-0 text-purple-400 animate-spin" />
-                <span className="font-medium">
-                  工具 <code className="bg-panel2 px-1.5 py-0.5 rounded text-[12px] font-mono border border-purple-500/20 text-purple-200">{currentToolRetry.toolName}</code> 执行遇阻，Agent 正在内部自纠修正重试 ({currentToolRetry.attempt}/{currentToolRetry.maxRetries})...
-                </span>
-              </div>
-              <span className="text-[11px] text-purple-300/70 hidden sm:inline">自动自愈中</span>
-            </div>
-          )}
-          {running && msgs.length === 0 && (
-            <div className="text-inkdim text-[13px] flex items-center gap-2 py-2">
+          {running && (msgs.length === 0 || msgs[msgs.length - 1]?.role === "user") && (
+            <div className="text-inkdim text-[13px] flex items-center gap-2 py-2 px-1 animate-in fade-in duration-150">
               <Loader2 size={15} className="animate-spin text-accent" />
-              <span>Agent 正在思考…</span>
+              <span>Agent 正在思考并制定执行计划…</span>
             </div>
           )}
         </div>

@@ -1,10 +1,27 @@
 import { useEffect, useState } from "react";
 import { ipc } from "../ipc";
 import { useStore } from "../store";
-import type { Message, ToolEvent } from "../types";
+import type { Message, ToolEvent, TurnMetrics } from "../types";
 import { Markdown } from "./Markdown";
 import { ToolCard } from "./ToolCard";
-import { Brain, ChevronRight, Pencil, Copy, Check } from "./Icons";
+import { Brain, ChevronRight, Pencil, Copy, Check, Clock, Zap } from "./Icons";
+
+function formatDuration(ms?: number | null): string {
+  if (ms == null || isNaN(ms)) return "";
+  if (ms < 0) ms = 0;
+  if (ms < 1000) return `${(ms / 1000).toFixed(1)}s`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const mins = Math.floor(ms / 60_000);
+  const secs = Math.floor((ms % 60_000) / 1000);
+  return `${mins}分${secs}秒`;
+}
+
+function formatTokens(n?: number | null): string {
+  if (n == null || isNaN(n)) return "0";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 10_000) return `${(n / 1_000).toFixed(1)}k`;
+  return n.toLocaleString("zh-CN");
+}
 
 /** 工具事件按 assistant 消息中 tool_calls 的顺序排列 */
 function orderedEvents(msg: Message): ToolEvent[] {
@@ -69,6 +86,7 @@ export function MessageItem({
   readOnly,
   running,
   editBlocked,
+  turnMetrics,
 }: {
   msg: Message;
   isLastUser: boolean;
@@ -77,11 +95,38 @@ export function MessageItem({
   running: boolean;
   /** 临时空间对话：合并点（含）之前的消息不可编辑重发 */
   editBlocked?: boolean;
+  turnMetrics?: TurnMetrics;
 }) {
   const pushToast = useStore((s) => s.pushToast);
+  const setShowTokenStatsModal = useStore((s) => s.setShowTokenStatsModal);
   const [editing, setEditing] = useState(false);
   const [editText, setEditText] = useState("");
   const [copied, setCopied] = useState(false);
+  const [streamDuration, setStreamDuration] = useState<number>(0);
+  const [liveTurnDuration, setLiveTurnDuration] = useState<number>(0);
+
+  useEffect(() => {
+    if (!streaming) return;
+    const start = Date.now();
+    const timer = setInterval(() => {
+      setStreamDuration(Date.now() - start);
+    }, 100);
+    return () => clearInterval(timer);
+  }, [streaming]);
+
+  // 整轮执行耗时实时计时（从用户发消息起持续计时，包含工具执行、测试命令与多步骤直至结束）
+  useEffect(() => {
+    if (!turnMetrics?.isCurrentRunningTurn || !turnMetrics.turnStartTime) {
+      setLiveTurnDuration(0);
+      return;
+    }
+    const update = () => {
+      setLiveTurnDuration(Math.max(0, Date.now() - turnMetrics.turnStartTime));
+    };
+    update();
+    const timer = setInterval(update, 100);
+    return () => clearInterval(timer);
+  }, [turnMetrics?.isCurrentRunningTurn, turnMetrics?.turnStartTime]);
 
   if (msg.role === "tool") return null; // 工具结果已由 ToolCard 呈现
 
@@ -166,6 +211,23 @@ export function MessageItem({
     const events = orderedEvents(msg);
     const hasContent = !!msg.content;
     const hasReasoning = !!msg.reasoning;
+
+    const isRunningTurn = !!turnMetrics?.isCurrentRunningTurn;
+    const isTurnEnd = turnMetrics?.isTurnEnd ?? true;
+    const stepCount = turnMetrics?.turnStepCount ?? 1;
+    const stepIndex = turnMetrics?.stepIndex ?? 1;
+    const stepDuration = msg.durationMs ?? msg.usage?.durationMs ?? null;
+    const turnDuration = turnMetrics?.turnDurationMs ?? stepDuration;
+    const totalTokens = msg.totalTokens ?? (msg.usage?.totalTokens || (msg.usage?.inputEst || 0) + (msg.usage?.outputEst || 0)) ?? 0;
+    const promptTokens = msg.promptTokens ?? (msg.usage?.promptTokens || msg.usage?.inputEst) ?? 0;
+    const completionTokens = msg.completionTokens ?? (msg.usage?.completionTokens || msg.usage?.outputEst) ?? 0;
+    const turnTokens = turnMetrics?.turnTokens ?? totalTokens;
+
+    const hasTokens = (isTurnEnd ? turnTokens : totalTokens) > 0;
+    const hasTurnDuration = isTurnEnd && turnDuration != null && turnDuration > 0;
+    const hasStepDuration = !isTurnEnd && stepDuration != null && stepDuration > 0;
+    const showDuration = isRunningTurn || streaming || hasTurnDuration || hasStepDuration;
+
     return (
       <div className="flex flex-col gap-2">
         {events.map((ev) => (
@@ -176,9 +238,15 @@ export function MessageItem({
           <div className="group relative">
             <Markdown content={msg.content!} />
             {streaming && <span className="stream-cursor" />}
+          </div>
+        )}
+
+        {/* 对话状态与指标栏：复制、耗时（整轮与单步）、Token 消耗 */}
+        {(hasContent || hasTokens || showDuration || isRunningTurn || streaming) && (
+          <div className="flex items-center gap-2.5 text-[11px] text-inkdim select-none mt-0.5 px-0.5">
             {!streaming && hasContent && (
               <button
-                className="opacity-0 group-hover:opacity-100 text-[11px] text-inkdim hover:text-ink mt-1.5 inline-flex items-center gap-1 transition-opacity select-none px-2 py-0.5 rounded hover:bg-panel2"
+                className="inline-flex items-center gap-1 transition-opacity select-none px-1.5 py-0.5 rounded hover:bg-panel2 hover:text-ink"
                 onClick={() => {
                   navigator.clipboard.writeText(msg.content ?? "").then(
                     () => {
@@ -189,10 +257,84 @@ export function MessageItem({
                     () => pushToast("复制失败")
                   );
                 }}
+                title="复制回复正文"
               >
                 {copied ? <Check size={12} className="text-green-400" /> : <Copy size={12} />}
                 <span>{copied ? "已复制" : "复制"}</span>
               </button>
+            )}
+
+            {/* 耗时显示：区分整轮执行总耗时与单步耗时，正在执行中持续跳动 */}
+            {isRunningTurn ? (
+              <span
+                className="inline-flex items-center gap-1 text-accent font-mono cursor-default select-none animate-pulse"
+                title="整轮执行持续耗时：从发送消息起，持续跨越所有工具执行与计划步骤"
+              >
+                <Clock size={12} className="animate-spin text-accent" />
+                <span>正在执行... {formatDuration(liveTurnDuration) || "0.1s"}</span>
+              </span>
+            ) : streaming ? (
+              <span className="inline-flex items-center gap-1 text-accent font-mono">
+                <Clock size={12} className="animate-spin" />
+                <span>{formatDuration(streamDuration) || "0.1s"}</span>
+              </span>
+            ) : isTurnEnd && hasTurnDuration ? (
+              <span
+                className="inline-flex items-center gap-1 text-inkdim/90 hover:text-ink transition-colors font-mono cursor-default select-none"
+                title={`本次完整处理耗时: ${turnDuration} ms\n从用户发送消息到计划全部执行完毕${stepCount > 1 ? `\n包含 ${stepCount} 个执行步骤` : ""}\n本次总消耗: ${(Number(turnTokens) || 0).toLocaleString()} tokens`}
+              >
+                <Clock size={12} className="text-emerald-400/90" />
+                <span className="font-medium text-ink/90">总耗时 {formatDuration(turnDuration)}</span>
+                {stepCount > 1 && (
+                  <span className="text-inkdim text-[10px] opacity-75">({stepCount}步)</span>
+                )}
+              </span>
+            ) : !isTurnEnd && hasStepDuration ? (
+              <span
+                className="inline-flex items-center gap-1 text-inkdim/70 hover:text-ink transition-colors font-mono cursor-default select-none"
+                title={`第 ${stepIndex} 步耗时: ${stepDuration} ms\n本步骤消耗: ${(Number(totalTokens) || 0).toLocaleString()} tokens`}
+              >
+                <Clock size={12} className="text-inkdim/60" />
+                <span>步骤 {formatDuration(stepDuration)}</span>
+              </span>
+            ) : null}
+
+            {/* Token 用量显示：轮次结束展示整轮累计 Token，中间步骤展示单步 Token */}
+            {!isRunningTurn && !streaming && (
+              isTurnEnd ? (
+                turnTokens > 0 && (
+                  <span
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setShowTokenStatsModal(true)}
+                    className="inline-flex items-center gap-1 text-inkdim/80 hover:text-ink transition-colors font-mono cursor-pointer select-none"
+                    title={`本次对话累计消耗: ${(Number(turnTokens) || 0).toLocaleString()} tokens${
+                      (turnMetrics?.turnPromptTokens ?? 0) > 0 || (turnMetrics?.turnCompletionTokens ?? 0) > 0
+                        ? `\n输入: ${(Number(turnMetrics?.turnPromptTokens ?? promptTokens) || 0).toLocaleString()} · 输出: ${(Number(turnMetrics?.turnCompletionTokens ?? completionTokens) || 0).toLocaleString()}`
+                        : ""
+                    }${stepCount > 1 ? `\n(已汇总本轮全部 ${stepCount} 个步骤)` : ""}\n点击打开 Token 消耗统计看板`}
+                  >
+                    <Zap size={12} className="text-amber-400/80 shrink-0" />
+                    <span>{formatTokens(turnTokens)} tokens</span>
+                    {stepCount > 1 && (
+                      <span className="text-inkdim text-[10px] opacity-75">累计</span>
+                    )}
+                  </span>
+                )
+              ) : (
+                totalTokens > 0 && (
+                  <span
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setShowTokenStatsModal(true)}
+                    className="inline-flex items-center gap-1 text-inkdim/70 hover:text-ink transition-colors font-mono cursor-pointer select-none"
+                    title={`本步骤消耗: ${(Number(totalTokens) || 0).toLocaleString()} tokens\n输入: ${(Number(promptTokens) || 0).toLocaleString()} · 输出: ${(Number(completionTokens) || 0).toLocaleString()}\n点击打开 Token 消耗统计看板`}
+                  >
+                    <Zap size={12} className="text-amber-400/60 shrink-0" />
+                    <span>{formatTokens(totalTokens)} tokens</span>
+                  </span>
+                )
+              )
             )}
           </div>
         )}

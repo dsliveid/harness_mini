@@ -27,6 +27,8 @@ export {
   ChevronUp,
   ChevronLeft,
   X,
+  Minus,
+  Maximize2,
   Check,
   CheckCheck,
 
@@ -55,6 +57,7 @@ export {
   ExternalLink,
   Link,
   Link2,
+  Scissors,
 
   // AI & 状态
   Brain,
@@ -89,4 +92,9 @@ export {
   Package,
   Globe,
   Scroll,
+  BarChart2,
+  BarChart3,
+  TrendingUp,
+  Coins,
+  Flame,
 } from "lucide-react";

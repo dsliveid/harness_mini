@@ -32,6 +32,13 @@ function timeLabel(iso?: string | null) {
   return d.toLocaleDateString("zh-CN");
 }
 
+function formatTokens(n?: number): string {
+  if (n == null || isNaN(n)) return "0";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 10_000) return `${(n / 1_000).toFixed(1)}k`;
+  return n.toLocaleString("zh-CN");
+}
+
 function ItemMenu({
   items,
   onClose,
@@ -185,6 +192,14 @@ export function Sidebar() {
           </div>
           <div className={`flex items-center gap-1.5 text-[11px] ${isRunning ? "text-green-400" : "text-inkdim"}`}>
             <span className="truncate">{isRunning ? "运行中…" : timeLabel(s.lastMessageAt ?? s.createdAt)}</span>
+            {s.totalTokens != null && s.totalTokens > 0 && (
+              <span
+                className="shrink-0 font-mono text-[10px] text-inkdim/75"
+                title={`会话累计消耗: ${(Number(s.totalTokens) || 0).toLocaleString()} tokens`}
+              >
+                · {formatTokens(s.totalTokens)} tokens
+              </span>
+            )}
             {s.isTemp && (
               <span className="shrink-0 inline-flex items-center gap-0.5 px-1.5 py-[1px] rounded text-[10px] leading-none bg-amber-500/15 text-amber-400 border border-amber-500/30">
                 <Wind size={9} />
@@ -211,8 +226,8 @@ export function Sidebar() {
 
   return (
     <div className="w-[260px] shrink-0 h-full border-r border-edge bg-panel flex flex-col select-none">
-      {/* 顶部：视图切换 + 新会话 */}
-      <div className="p-3 flex items-center gap-2">
+      {/* 顶部：视图切换 + 新会话（对齐顶栏基线 h-12） */}
+      <div className="h-12 border-b border-edge/60 px-3 flex items-center gap-2 shrink-0">
         <div className="flex bg-panel2 rounded-lg p-0.5 border border-edge">
           <button
             className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-[12px] transition-colors ${
@@ -236,7 +251,12 @@ export function Sidebar() {
         <button
           className="ml-auto w-7 h-7 rounded-lg bg-accent/15 text-accent hover:bg-accent/25 flex items-center justify-center transition-colors"
           title="新建对话"
-          onClick={() => newDraft(null)}
+          onClick={() => {
+            // 继承当前会话所属项目的工作区（含临时空间对话的项目上下文）
+            const curSession = currentId && currentId !== DRAFT_ID ? sessions.find((s) => s.id === currentId) : null;
+            const projectId = curSession?.projectId ?? draft?.projectId ?? null;
+            newDraft(projectId);
+          }}
         >
           <Plus size={16} strokeWidth={2.2} />
         </button>
@@ -432,7 +452,7 @@ export function Sidebar() {
         )}
       </div>
 
-      {/* 底部：成长 / 归档 / 设置 */}
+      {/* 底部：成长 / 统计 / 归档 / 设置 */}
       <div className="border-t border-edge p-2 flex items-center gap-1 bg-panel/80">
         <button
           className="flex-1 text-left px-2 py-1.5 rounded-lg hover:bg-panel2 text-[12px] text-inkdim hover:text-ink flex items-center gap-1.5 transition-colors"

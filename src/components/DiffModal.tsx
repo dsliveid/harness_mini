@@ -1,8 +1,8 @@
 import { Fragment, useEffect, useState } from "react";
 import { ipc } from "../ipc";
 import { currentSession, useStore } from "../store";
-import type { DiffHunk, DiffLine, TempChangeFile, TempChanges, TempFileDiff } from "../types";
-import { RotateCcw, Package, X } from "./Icons";
+import type { DiffHunk, DiffLine, TempChangeFile, TempChangeProject, TempChanges, TempFileDiff } from "../types";
+import { RotateCcw, Package, Folder, FolderOpen, MoreHorizontal, Copy } from "./Icons";
 
 const CHANGE_BADGE: Record<string, { label: string; letter: string; badge: string; del?: string; add?: string }> = {
   added: { label: "新增", letter: "+", badge: "bg-green-500/15 text-green-400 border-green-500/30" },
@@ -123,6 +123,162 @@ function SplitView({ diff }: { diff: TempFileDiff }) {
   );
 }
 
+function getFileDir(relativePath: string): string {
+  const norm = relativePath.replace(/\\/g, "/");
+  const lastSlash = norm.lastIndexOf("/");
+  if (lastSlash === -1) return "";
+  return norm.slice(0, lastSlash);
+}
+
+function resolveFullPath(baseDir: string, relativePath: string): string {
+  const isWin = /^[a-zA-Z]:/.test(baseDir) || baseDir.includes("\\");
+  const sep = isWin ? "\\" : "/";
+  const cleanBase = baseDir.replace(/[/\\]+$/, "");
+  const cleanRel = relativePath.replace(/^[/\\]+/, "");
+  if (!cleanRel) return isWin ? cleanBase.replace(/\//g, "\\") : cleanBase.replace(/\\/g, "/");
+  const formattedRel = isWin ? cleanRel.replace(/\//g, "\\") : cleanRel.replace(/\\/g, "/");
+  return `${cleanBase}${sep}${formattedRel}`;
+}
+
+interface MenuState {
+  anchor: { x: number; y: number };
+  project: TempChangeProject;
+  file: TempChangeFile;
+}
+
+function FileActionMenu({
+  state,
+  onClose,
+  onOpenDir,
+  onCopy,
+}: {
+  state: MenuState;
+  onClose: () => void;
+  onOpenDir: (path: string) => void;
+  onCopy: (text: string, label: string) => void;
+}) {
+  const { anchor, project, file } = state;
+  const fileDir = getFileDir(file.path);
+  const sourceDir = resolveFullPath(project.source, fileDir);
+  const tempDir = resolveFullPath(project.temp, fileDir);
+  const sourceFile = resolveFullPath(project.source, file.path);
+  const tempFile = resolveFullPath(project.temp, file.path);
+
+  // 计算菜单位置，避免溢出屏幕
+  const menuWidth = 280;
+  let left = anchor.x - menuWidth + 24;
+  if (left < 10) left = 10;
+  if (left + menuWidth > window.innerWidth - 10) {
+    left = window.innerWidth - menuWidth - 10;
+  }
+
+  const menuHeight = 230;
+  let top = anchor.y + 6;
+  if (top + menuHeight > window.innerHeight - 10) {
+    top = Math.max(10, anchor.y - menuHeight - 30);
+  }
+
+  return (
+    <>
+      <div
+        className="fixed inset-0 z-[100]"
+        onMouseDown={(e) => {
+          e.stopPropagation();
+          onClose();
+        }}
+        onClick={(e) => {
+          e.stopPropagation();
+          onClose();
+        }}
+      />
+      <div
+        style={{ left: `${left}px`, top: `${top}px` }}
+        className="fixed z-[101] w-[280px] bg-panel2/98 backdrop-blur-md border border-edge rounded-xl shadow-2xl py-1.5 text-[12px] animate-in fade-in zoom-in-95 duration-100 select-none overflow-hidden"
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-3 py-1 text-[11px] text-inkdim border-b border-edge/60 truncate font-mono" title={file.path}>
+          {file.name}
+        </div>
+
+        <div className="py-1">
+          <button
+            className="w-full px-3 py-1.5 text-left hover:bg-panel3 flex items-start gap-2 text-ink transition-colors group cursor-pointer"
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpenDir(sourceDir);
+              onClose();
+            }}
+            title={`在文件管理器中打开文件所在目录:\n${sourceDir}`}
+          >
+            <Folder size={14} className="text-blue-400 shrink-0 mt-0.5 group-hover:scale-110 transition-transform" />
+            <div className="min-w-0 flex-1">
+              <div className="font-medium text-[12px] text-ink">打开文件所在目录</div>
+              <div className="text-[10px] text-inkdim font-mono truncate" title={sourceDir}>{sourceDir}</div>
+            </div>
+          </button>
+
+          <button
+            className="w-full px-3 py-1.5 text-left hover:bg-panel3 flex items-start gap-2 text-ink transition-colors group cursor-pointer"
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpenDir(tempDir);
+              onClose();
+            }}
+            title={`在文件管理器中打开临时空间对应目录:\n${tempDir}`}
+          >
+            <FolderOpen size={14} className="text-amber-400 shrink-0 mt-0.5 group-hover:scale-110 transition-transform" />
+            <div className="min-w-0 flex-1">
+              <div className="font-medium text-[12px] text-ink">打开临时空间目录</div>
+              <div className="text-[10px] text-inkdim font-mono truncate" title={tempDir}>{tempDir}</div>
+            </div>
+          </button>
+        </div>
+
+        <div className="border-t border-edge/60 my-1" />
+
+        <div className="py-0.5">
+          <button
+            className="w-full px-3 py-1 text-left hover:bg-panel3 flex items-center gap-2 text-inkdim hover:text-ink transition-colors text-[12px] cursor-pointer"
+            onClick={(e) => {
+              e.stopPropagation();
+              onCopy(sourceDir, "文件目录路径");
+              onClose();
+            }}
+          >
+            <Copy size={13} className="shrink-0" />
+            <span>复制文件目录路径</span>
+          </button>
+
+          <button
+            className="w-full px-3 py-1 text-left hover:bg-panel3 flex items-center gap-2 text-inkdim hover:text-ink transition-colors text-[12px] cursor-pointer"
+            onClick={(e) => {
+              e.stopPropagation();
+              onCopy(sourceFile, "文件完整路径");
+              onClose();
+            }}
+          >
+            <Copy size={13} className="shrink-0" />
+            <span>复制文件完整路径</span>
+          </button>
+
+          <button
+            className="w-full px-3 py-1 text-left hover:bg-panel3 flex items-center gap-2 text-inkdim hover:text-ink transition-colors text-[12px] cursor-pointer"
+            onClick={(e) => {
+              e.stopPropagation();
+              onCopy(file.path, "相对路径");
+              onClose();
+            }}
+          >
+            <Copy size={13} className="shrink-0" />
+            <span>复制相对路径</span>
+          </button>
+        </div>
+      </div>
+    </>
+  );
+}
+
 /**
  * 临时空间变更列表弹窗：左侧为按项目分组的变更文件列表（文件名 + 路径 + 增删统计），
  * 右侧为文件内容与变更点展示，支持「统一视图 / 并排对比（变更前 | 变更后）」切换。
@@ -138,6 +294,8 @@ export function DiffModal() {
   const [diffLoading, setDiffLoading] = useState(false);
   const [mode, setMode] = useState<ViewMode>("split");
 
+  const [menuState, setMenuState] = useState<MenuState | null>(null);
+
   const sessionId = session?.id;
 
   const load = async () => {
@@ -145,11 +303,24 @@ export function DiffModal() {
     setData(null);
     setSelected(null);
     setDiff(null);
+    setMenuState(null);
     try {
       setData(await ipc.listTempChanges(sessionId));
     } catch (e) {
       pushToast(String(e));
     }
+  };
+
+  const handleOpenDir = (path: string) => {
+    if (!path) return;
+    ipc.openDir(path).catch((e) => pushToast(String(e)));
+  };
+
+  const handleCopy = (text: string, label: string) => {
+    navigator.clipboard.writeText(text).then(
+      () => pushToast(`已复制${label}`),
+      (e) => pushToast(`复制失败: ${e}`)
+    );
   };
 
   useEffect(() => {
@@ -191,13 +362,18 @@ export function DiffModal() {
   })();
 
   return (
-    <div className="fixed inset-0 z-[80] bg-black/50 flex items-center justify-center" onMouseDown={() => setShow(false)}>
+    <div
+      className="fixed inset-0 z-[80] bg-black/50 flex items-center justify-center"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) setShow(false);
+      }}
+    >
       <div
         className="bg-panel2 border border-edge rounded-2xl w-[960px] max-w-[94vw] h-[78vh] flex flex-col shadow-2xl overflow-hidden"
         onMouseDown={(e) => e.stopPropagation()}
       >
         {/* 头部 */}
-        <div className="px-5 py-3.5 border-b border-edge flex items-center gap-3 shrink-0">
+        <div className="h-12 px-5 border-b border-edge/60 flex items-center gap-3 shrink-0">
           <div className="font-medium">变更列表</div>
           {data && (
             <span className="text-[12px] text-inkdim">
@@ -230,21 +406,37 @@ export function DiffModal() {
             )}
             {data?.projects.map((p) => (
               <div key={p.key} className="mb-2">
-                <div className="px-3 py-1.5 text-[11px] text-inkdim flex items-center gap-1.5" title={p.source}>
+                <div
+                  className="px-3 py-1.5 text-[11px] text-inkdim flex items-center gap-1.5 select-none"
+                  title={`项目: ${p.name}\n原项目目录: ${p.source}\n临时空间目录: ${p.temp}`}
+                >
                   <Package size={13} className="text-inkdim shrink-0" />
-                  <span className="truncate font-medium">{p.name}</span>
-                  <span className="shrink-0">({p.files.length})</span>
+                  <span className="truncate font-medium text-ink/90 flex-1 min-w-0" title={p.name}>
+                    {p.name}
+                  </span>
+                  <span
+                    className="ml-auto shrink-0 text-[10px] px-1.5 py-[2px] rounded-full bg-panel3 border border-edge/80 text-inkdim font-medium leading-none"
+                    title={`包含 ${p.files.length} 个变更文件`}
+                  >
+                    {p.files.length} 个文件
+                  </span>
                 </div>
                 {p.files.map((f) => {
                   const active = `${p.key}\n${f.path}` === selected;
                   const b = badge(f.change);
+                  const fileDir = getFileDir(f.path);
+                  const sourceDir = resolveFullPath(p.source, fileDir);
+                  const tempDir = resolveFullPath(p.temp, fileDir);
+                  const isMenuOpen = menuState?.project.key === p.key && menuState?.file.path === f.path;
+
                   return (
-                    <button
+                    <div
                       key={f.path}
-                      className={`w-full text-left px-3 py-1.5 flex items-start gap-2 ${
+                      className={`group relative w-full text-left px-3 py-1.5 flex items-start gap-2 cursor-pointer transition-colors select-none ${
                         active ? "bg-panel3" : "hover:bg-panel"
                       }`}
                       onClick={() => void openFile(p.key, f)}
+                      title={`变更文件: ${f.name}\n文件目录: ${sourceDir}\n相对路径: ${f.path}`}
                     >
                       <span
                         className={`shrink-0 mt-[1px] w-[18px] h-[18px] rounded flex items-center justify-center text-[11px] leading-none border ${b.badge}`}
@@ -253,19 +445,43 @@ export function DiffModal() {
                         {b.letter}
                       </span>
                       <span className="flex-1 min-w-0">
-                        <span className="block truncate text-[13px]">{f.name}</span>
-                        <span className="block truncate text-[11px] text-inkdim" title={f.path}>
+                        <span className="block truncate text-[13px] text-ink">{f.name}</span>
+                        <span
+                          className="block truncate text-[11px] text-inkdim font-mono"
+                          title={`相对位置: ${f.path}\n文件所在目录: ${sourceDir}`}
+                        >
                           {f.path}
                         </span>
                       </span>
                       {!f.binary && !f.tooLarge && (f.added > 0 || f.removed > 0) && (
-                        <span className="shrink-0 mt-[2px] text-[11px] font-mono">
+                        <span className="shrink-0 mt-[2px] text-[11px] font-mono group-hover:opacity-40 transition-opacity">
                           {f.added > 0 && <span className="text-green-400">+{f.added}</span>}
                           {f.added > 0 && f.removed > 0 && " "}
                           {f.removed > 0 && <span className="text-red-400">−{f.removed}</span>}
                         </span>
                       )}
-                    </button>
+                      <button
+                        className={`shrink-0 mt-[1px] w-6 h-6 rounded flex items-center justify-center text-inkdim hover:text-ink hover:bg-panel border border-transparent hover:border-edge transition-all cursor-pointer ${
+                          isMenuOpen ? "opacity-100 bg-panel border-edge text-ink" : "opacity-0 group-hover:opacity-100"
+                        }`}
+                        title="更多操作（打开文件目录 / 复制路径）"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (isMenuOpen) {
+                            setMenuState(null);
+                          } else {
+                            const rect = e.currentTarget.getBoundingClientRect();
+                            setMenuState({
+                              anchor: { x: rect.right, y: rect.bottom },
+                              project: p,
+                              file: f,
+                            });
+                          }
+                        }}
+                      >
+                        <MoreHorizontal size={14} />
+                      </button>
+                    </div>
                   );
                 })}
               </div>
@@ -276,17 +492,17 @@ export function DiffModal() {
           <div className="flex-1 flex flex-col min-w-0">
             {selFile ? (
               <>
-                <div className="px-4 py-2.5 border-b border-edge flex items-center gap-2 shrink-0">
+                <div className="h-12 px-4 border-b border-edge flex items-center gap-3 shrink-0 bg-panel2">
                   <span
                     className={`shrink-0 px-1.5 py-[1px] rounded text-[11px] border ${badge(selFile.change).badge}`}
                   >
                     {badge(selFile.change).label}
                   </span>
-                  <div className="min-w-0 flex-1">
-                    <div className="text-[13px] truncate">{selFile.name}</div>
-                    <div className="text-[11px] text-inkdim truncate" title={selFile.path}>
+                  <div className="min-w-0 flex-1 flex items-baseline gap-2">
+                    <span className="text-[13px] font-medium truncate text-ink">{selFile.name}</span>
+                    <span className="text-[11px] text-inkdim font-mono truncate" title={selFile.path}>
                       {selFile.path}
-                    </div>
+                    </span>
                   </div>
                   {!selFile.binary && !selFile.tooLarge && (
                     <span className="shrink-0 text-[12px] font-mono">
@@ -337,6 +553,15 @@ export function DiffModal() {
           </div>
         </div>
       </div>
+
+      {menuState && (
+        <FileActionMenu
+          state={menuState}
+          onClose={() => setMenuState(null)}
+          onOpenDir={handleOpenDir}
+          onCopy={handleCopy}
+        />
+      )}
     </div>
   );
 }

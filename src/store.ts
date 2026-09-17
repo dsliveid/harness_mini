@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "./ipc";
-import { DRAFT_ID, samePath, type ApprovalReq, type ApprovalRule, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent } from "./types";
+import { DRAFT_ID, samePath, type ApprovalReq, type ApprovalRule, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice } from "./types";
 
 export interface Toast {
   id: string;
@@ -31,11 +31,17 @@ interface Store {
   queues: Record<string, QueuedItem[]>;
   runStatus: Record<string, "idle" | "running">;
   approvals: Record<string, ApprovalReq>;
+  pendingCompactions: Record<string, CompactionReq>;
+  sessionCompactions: Record<string, SessionCompaction[]>;
+  /** 上下文硬截断提醒列表（不阻塞对话，用户可手动逐条关闭或批量关闭） */
+  truncationNotices: TruncationNotice[];
   toolOutputs: Record<string, string>;
   toasts: Toast[];
   readOnly: boolean;
   showSettings: boolean;
   showArchive: boolean;
+  /** Token 消耗统计看板弹窗 */
+  showTokenStatsModal: boolean;
   /** 成长档案看板弹窗 */
   showGrowthModal: boolean;
   growthModalProjectId: string | null;
@@ -86,6 +92,7 @@ interface Store {
   setCurrent: (id: string | null) => void;
   setShowSettings: (v: boolean) => void;
   setShowArchive: (v: boolean) => void;
+  setShowTokenStatsModal: (v: boolean) => void;
   setShowGrowthModal: (v: boolean, projectId?: string | null) => void;
   loadGrowths: (projectId?: string | null, status?: string | null) => Promise<void>;
   acceptGrowth: (id: string) => Promise<void>;
@@ -114,11 +121,21 @@ interface Store {
   onToolOutput: (p: any) => void;
   onApprovalRequest: (r: ApprovalReq) => void;
   approvalDone: (eventId: string) => void;
+  onCompactionRequest: (r: CompactionReq) => void;
+  compactionDone: (eventId: string) => void;
+  onCompactionTimeout: (eventId: string) => void;
+  onCompactionApplied: (c: SessionCompaction) => void;
+  onSessionCompacted: (sessionId?: string) => Promise<void>;
+  refreshSessionCompactions: (sessionId: string) => Promise<void>;
+  onTruncationNotice: (notice: TruncationNotice) => void;
+  dismissTruncationNotice: (id: string) => void;
+  clearSessionTruncationNotices: (sessionId: string) => void;
   onRunStatus: (p: any) => void;
   onQueueUpdate: (p: any) => void;
   onSessionUpdate: (s: Session) => void;
   onSessionsChanged: (p?: { deleted?: string; archived?: string; unarchived?: string; created?: string }) => Promise<void>;
   onTempUpdate: (p: { sessionId: string; info: TempInfo }) => void;
+  onSessionTodos: (p: { sessionId: string; todos: TodoItem[] }) => void;
   onProjectsChanged: () => Promise<void>;
   onGrowthProposed: (item: GrowthItem) => void;
   onGrowthStatus: (p: { sessionId: string; status: "idle" | "analyzing" | "proposed"; message?: string; growthId?: string }) => void;
@@ -126,8 +143,9 @@ interface Store {
   onGrowthDeleted: (id: string) => void;
   sopStatus: Record<string, { status: "checking" | "passed" | "failed" | "error"; command: string; output?: string }>;
   onSopStatus: (p: { sessionId: string; status: "checking" | "passed" | "failed" | "error"; command: string; output?: string }) => void;
-  toolRetryStatus: Record<string, { toolName: string; attempt: number; maxRetries: number; active: boolean }>;
-  onToolRetryGuidance: (p: { sessionId: string; toolName: string; attempt: number; maxRetries: number; error: string }) => void;
+  toolRetryStatus: Record<string, ToolRetryStatus>;
+  dismissToolRetry: (sessionId: string) => void;
+  onToolRetryGuidance: (p: ToolRetryGuidanceEvent) => void;
   onError: (p: any) => void;
 }
 
@@ -207,7 +225,7 @@ export const useStore = create<Store>((set, get) => ({
     globalAccessMode: "confirm",
     maxSteps: 30,
     commandTimeoutSecs: 120,
-    contextTokenLimit: 28000,
+    contextTokenLimit: 64000,
     lastWorkspacePath: null,
     disabledTools: [],
   },
@@ -222,11 +240,15 @@ export const useStore = create<Store>((set, get) => ({
   queues: {},
   runStatus: {},
   approvals: {},
+  pendingCompactions: {},
+  sessionCompactions: {},
+  truncationNotices: [],
   toolOutputs: {},
   toasts: [],
   readOnly: false,
   showSettings: false,
   showArchive: false,
+  showTokenStatsModal: false,
   showGrowthModal: false,
   growthModalProjectId: null,
   growthStatus: {},
@@ -510,6 +532,8 @@ export const useStore = create<Store>((set, get) => ({
           set((st) => ({ sessionTodos: { ...st.sessionTodos, [id]: val.todos } }));
         }
       }).catch(() => {});
+      // 拉取会话历史压缩记录
+      void get().refreshSessionCompactions(id);
       // 拉取该会话待审阅的成长提案
       ipc.listGrowths(undefined, "proposed").then((list) => {
         const forThis = list.filter((g) => g.sessionId === id);
@@ -554,6 +578,9 @@ export const useStore = create<Store>((set, get) => ({
   },
   setShowArchive(v) {
     set({ showArchive: v });
+  },
+  setShowTokenStatsModal(v) {
+    set({ showTokenStatsModal: v });
   },
   setShowGrowthModal(v, projectId) {
     set({ showGrowthModal: v, growthModalProjectId: projectId ?? null });
@@ -719,7 +746,36 @@ export const useStore = create<Store>((set, get) => ({
     if (m.queued) return; // 待执行列表消息由 queue:update 呈现
     set((st) => {
       const list = st.messages[m.sessionId] ?? [];
-      return { messages: { ...st.messages, [m.sessionId]: upsertMessage(list, m) } };
+      const updatedList = upsertMessage(list, m);
+
+      // 同步更新所属会话的累计 token
+      let nextSessions = st.sessions;
+      const sIdx = st.sessions.findIndex((x) => x.id === m.sessionId);
+      if (sIdx >= 0) {
+        let total = 0;
+        let prompt = 0;
+        let completion = 0;
+        for (const msg of updatedList) {
+          const tt = msg.totalTokens ?? (msg.usage?.totalTokens || (msg.usage?.inputEst || 0) + (msg.usage?.outputEst || 0)) ?? 0;
+          const pt = msg.promptTokens ?? (msg.usage?.promptTokens || msg.usage?.inputEst) ?? 0;
+          const ct = msg.completionTokens ?? (msg.usage?.completionTokens || msg.usage?.outputEst) ?? 0;
+          total += Number(tt) || 0;
+          prompt += Number(pt) || 0;
+          completion += Number(ct) || 0;
+        }
+        nextSessions = st.sessions.slice();
+        nextSessions[sIdx] = {
+          ...st.sessions[sIdx],
+          totalTokens: total,
+          promptTokens: prompt,
+          completionTokens: completion,
+        };
+      }
+
+      return {
+        messages: { ...st.messages, [m.sessionId]: updatedList },
+        sessions: nextSessions,
+      };
     });
   },
 
@@ -762,15 +818,123 @@ export const useStore = create<Store>((set, get) => ({
     });
   },
 
+  onCompactionRequest(r) {
+    set((st) => ({
+      pendingCompactions: {
+        ...st.pendingCompactions,
+        [r.eventId]: {
+          ...r,
+          timeoutSeconds: r.timeoutSeconds ?? 30,
+          createdAt: r.createdAt ?? Date.now(),
+          timedOut: false,
+        },
+      },
+    }));
+  },
+
+  compactionDone(eventId) {
+    set((st) => {
+      const a = { ...st.pendingCompactions };
+      delete a[eventId];
+      return { pendingCompactions: a };
+    });
+  },
+
+  onCompactionTimeout(eventId) {
+    set((st) => {
+      const existing = st.pendingCompactions[eventId];
+      if (!existing) return {};
+      return {
+        pendingCompactions: {
+          ...st.pendingCompactions,
+          [eventId]: {
+            ...existing,
+            timedOut: true,
+          },
+        },
+      };
+    });
+  },
+
+  onCompactionApplied(c) {
+    set((st) => {
+      const list = st.sessionCompactions[c.sessionId] ?? [];
+      const nextList = [...list.filter((x) => x.id !== c.id), c].sort((a, b) => a.startSeq - b.startSeq);
+      return {
+        sessionCompactions: { ...st.sessionCompactions, [c.sessionId]: nextList },
+      };
+    });
+  },
+
+  async onSessionCompacted(sessionId) {
+    if (!sessionId) return;
+    await get().refreshSessionCompactions(sessionId);
+    await get().reloadMessages(sessionId);
+  },
+
+  async refreshSessionCompactions(sessionId) {
+    try {
+      const list = await ipc.listSessionCompactions(sessionId);
+      set((st) => ({
+        sessionCompactions: { ...st.sessionCompactions, [sessionId]: list },
+      }));
+    } catch {
+      // 容错
+    }
+  },
+
+  onTruncationNotice(notice) {
+    set((st) => ({
+      truncationNotices: [notice, ...st.truncationNotices.filter((n) => n.id !== notice.id)],
+    }));
+  },
+
+  dismissTruncationNotice(id) {
+    set((st) => ({
+      truncationNotices: st.truncationNotices.filter((n) => n.id !== id),
+    }));
+  },
+
+  clearSessionTruncationNotices(sessionId) {
+    set((st) => ({
+      truncationNotices: st.truncationNotices.filter((n) => n.sessionId !== sessionId),
+    }));
+  },
+
+  onSessionTodos(p) {
+    if (!p?.sessionId || !Array.isArray(p.todos)) return;
+    set((st) => ({
+      sessionTodos: { ...st.sessionTodos, [p.sessionId]: p.todos },
+    }));
+  },
+
   onRunStatus(p) {
     set((st) => {
       const nextRetry = { ...st.toolRetryStatus };
       if (p.status !== "running") {
-        delete nextRetry[p.sessionId];
+        if (nextRetry[p.sessionId] && nextRetry[p.sessionId].status === "retrying") {
+          nextRetry[p.sessionId] = {
+            ...nextRetry[p.sessionId],
+            status: "cancelled",
+            message: "会话运行结束，自纠已中止",
+          };
+        }
+      }
+      let nextTodos = st.sessionTodos;
+      // 运行完成时增加双重兜底：若任务清单仍有 in_progress，将其自动置为 done
+      if (p.status === "done" && st.sessionTodos[p.sessionId]) {
+        const cur = st.sessionTodos[p.sessionId];
+        if (cur.some((t) => t.status === "in_progress")) {
+          nextTodos = {
+            ...st.sessionTodos,
+            [p.sessionId]: cur.map((t) => (t.status === "in_progress" ? { ...t, status: "done" } : t)),
+          };
+        }
       }
       return {
         runStatus: { ...st.runStatus, [p.sessionId]: p.status === "running" ? "running" : "idle" },
         toolRetryStatus: nextRetry,
+        sessionTodos: nextTodos,
       };
     });
   },
@@ -898,19 +1062,41 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
+  dismissToolRetry(sessionId) {
+    set((st) => {
+      const nextRetry = { ...st.toolRetryStatus };
+      if (nextRetry[sessionId]) {
+        nextRetry[sessionId] = { ...nextRetry[sessionId], dismissed: true };
+      }
+      return { toolRetryStatus: nextRetry };
+    });
+  },
+
   onToolRetryGuidance(p) {
+    const status = p.status ?? "retrying";
+    const attempt = p.attempt ?? 1;
+    const maxRetries = p.maxRetries ?? 2;
     set((st) => ({
       toolRetryStatus: {
         ...st.toolRetryStatus,
         [p.sessionId]: {
           toolName: p.toolName,
-          attempt: p.attempt,
-          maxRetries: p.maxRetries,
-          active: true,
+          attempt,
+          maxRetries,
+          status,
+          error: p.error,
+          message: p.message,
+          dismissed: false,
         },
       },
     }));
-    get().pushToast(`🔄 工具 ${p.toolName} 执行受阻，Agent 正在自省排查并重试 (${p.attempt}/${p.maxRetries})...`);
+    if (status === "retrying") {
+      get().pushToast(`🔄 工具 ${p.toolName} 执行受阻，Agent 正在自省排查并重试 (${attempt}/${maxRetries})...`);
+    } else if (status === "success") {
+      get().pushToast(`✅ 工具 ${p.toolName} 自纠成功，已恢复执行`);
+    } else if (status === "failed") {
+      get().pushToast(`❌ 工具 ${p.toolName} 自纠未果（已达重试上限）`);
+    }
   },
 
   onError(p) {

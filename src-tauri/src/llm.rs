@@ -53,6 +53,7 @@ pub async fn chat_stream(
         "model": cfg.model,
         "messages": messages,
         "stream": true,
+        "stream_options": { "include_usage": true },
     });
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools.to_vec());

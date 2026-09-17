@@ -28,7 +28,7 @@ function useRunningCommands(): ToolEvent[] {
   return result;
 }
 
-function TodoSection({ todos }: { todos: TodoItem[] }) {
+function TodoSection({ todos, isRunning }: { todos: TodoItem[]; isRunning: boolean }) {
   const done = todos.filter((t) => t.status === "done").length;
   const total = todos.length;
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
@@ -50,7 +50,7 @@ function TodoSection({ todos }: { todos: TodoItem[] }) {
             <span className="shrink-0 mt-0.5">
               {t.status === "done" ? (
                 <CheckCircle2 size={13} className="text-green-400" />
-              ) : t.status === "in_progress" ? (
+              ) : t.status === "in_progress" && isRunning ? (
                 <Loader2 size={13} className="text-blue-400 animate-spin" />
               ) : (
                 <Circle size={13} className="text-inkdim/50" />
@@ -114,9 +114,15 @@ function RunningCommandCard({ ev }: { ev: ToolEvent }) {
 
 export function FloatingTaskPanel() {
   const currentId = useStore((s) => s.currentId);
-  const todos: TodoItem[] = useStore((s) => (s.currentId ? s.sessionTodos[s.currentId] ?? [] : []));
+  const isRunning = useStore((s) => (s.currentId ? s.runStatus[s.currentId] === "running" : false));
+  const rawTodos: TodoItem[] = useStore((s) => (s.currentId ? s.sessionTodos[s.currentId] ?? [] : []));
   const runningCmds = useRunningCommands();
   const [collapsed, setCollapsed] = useState(false);
+
+  // 会话处于空闲/结束态时，自动将历史遗留未收尾的 in_progress 任务视为已完成
+  const todos = isRunning
+    ? rawTodos
+    : rawTodos.map((t) => (t.status === "in_progress" ? { ...t, status: "done" } : t));
 
   const hasTodos = todos.length > 0;
   const hasCmds = runningCmds.length > 0;
@@ -211,7 +217,7 @@ export function FloatingTaskPanel() {
         {hasCmds && hasTodos && <div className="border-t border-edge" />}
 
         {/* 任务清单 */}
-        {hasTodos && <TodoSection todos={todos} />}
+        {hasTodos && <TodoSection todos={todos} isRunning={isRunning} />}
       </div>
     </div>
   );

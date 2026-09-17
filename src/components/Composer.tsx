@@ -2,7 +2,14 @@ import { useRef, useState } from "react";
 import { ipc } from "../ipc";
 import { useStore } from "../store";
 import { DRAFT_ID } from "../types";
-import { ArrowUp, Square } from "./Icons";
+import { ArrowUp, Square, Coins } from "./Icons";
+
+function formatTokens(n?: number | null): string {
+  if (n == null || isNaN(n)) return "0";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 10_000) return `${(n / 1_000).toFixed(1)}k`;
+  return n.toLocaleString("zh-CN");
+}
 
 export function Composer() {
   const currentId = useStore((s) => s.currentId);
@@ -13,6 +20,7 @@ export function Composer() {
   const tempInfo = useStore((s) => s.tempInfo);
   const selectSession = useStore((s) => s.selectSession);
   const pushToast = useStore((s) => s.pushToast);
+  const setShowTokenStatsModal = useStore((s) => s.setShowTokenStatsModal);
 
   const [text, setText] = useState("");
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -141,14 +149,56 @@ export function Composer() {
           </button>
         )}
       </div>
-      <div className="flex items-center justify-between text-[11px] text-inkdim mt-1.5 px-1 select-none">
-        <span className="truncate max-w-[460px]">
-          {effectiveWorkspace || "未绑定工作区 · 可直接对话（文件/命令工具不可用）"}
-        </span>
-        <span className="shrink-0 hidden sm:inline-block opacity-70">
-          <kbd className="px-1 py-0.5 rounded bg-panel3 border border-edge text-[10px]">Enter</kbd> 发送 ·{" "}
-          <kbd className="px-1 py-0.5 rounded bg-panel3 border border-edge text-[10px]">Shift+Enter</kbd> 换行
-        </span>
+      <div className="flex items-center justify-between text-[11px] text-inkdim mt-2 px-1 select-none gap-3">
+        <div className="flex items-center gap-2 min-w-0 flex-1">
+          <span className="truncate max-w-[320px] md:max-w-[440px]" title={effectiveWorkspace || undefined}>
+            {effectiveWorkspace || "未绑定工作区 · 可直接对话（文件/命令工具不可用）"}
+          </span>
+        </div>
+
+        <div className="flex items-center gap-2.5 shrink-0">
+          {/* 会话 Token 消耗徽章（点击直达统计看板） */}
+          {session ? (
+            <button
+              type="button"
+              className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-[11px] transition-all group font-mono cursor-pointer border ${
+                (session.totalTokens ?? 0) > 0
+                  ? "bg-panel2/80 hover:bg-panel3 border-edge/80 hover:border-amber-400/40 text-ink shadow-xs"
+                  : "hover:bg-panel2 text-inkdim hover:text-ink border-transparent hover:border-edge/50"
+              }`}
+              onClick={() => setShowTokenStatsModal(true)}
+              title={`该会话累计消耗: ${(session.totalTokens ?? 0).toLocaleString()} tokens\n输入: ${(session.promptTokens ?? 0).toLocaleString()} · 输出: ${(session.completionTokens ?? 0).toLocaleString()}\n点击打开 Token 消耗统计看板`}
+            >
+              <Coins
+                size={12}
+                className={
+                  (session.totalTokens ?? 0) > 0
+                    ? "text-amber-400 group-hover:scale-110 transition-transform shrink-0"
+                    : "text-inkdim group-hover:text-amber-400 transition-colors shrink-0"
+                }
+              />
+              <span className={(session.totalTokens ?? 0) > 0 ? "font-medium text-ink" : "text-inkdim"}>
+                {formatTokens(session.totalTokens ?? 0)}
+              </span>
+              <span className="text-[10px] text-inkdim">tokens</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md hover:bg-panel2 text-[11px] text-inkdim hover:text-ink transition-colors font-mono cursor-pointer border border-transparent hover:border-edge/50"
+              onClick={() => setShowTokenStatsModal(true)}
+              title="点击打开 Token 消耗统计看板"
+            >
+              <Coins size={12} className="text-inkdim group-hover:text-amber-400 transition-colors shrink-0" />
+              <span>Token 统计</span>
+            </button>
+          )}
+
+          <span className="hidden sm:inline-block opacity-65">
+            <kbd className="px-1 py-0.5 rounded bg-panel3 border border-edge text-[10px]">Enter</kbd> 发送 ·{" "}
+            <kbd className="px-1 py-0.5 rounded bg-panel3 border border-edge text-[10px]">Shift+Enter</kbd> 换行
+          </span>
+        </div>
       </div>
     </div>
   );

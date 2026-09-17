@@ -36,7 +36,7 @@ fn default_cmd_timeout() -> u64 {
     120
 }
 fn default_ctx_tokens() -> usize {
-    280000
+    64000
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -308,6 +308,13 @@ pub struct Session {
     /// 已合并且临时空间尚未清空：期间禁止继续发送消息（清空后解除）
     #[serde(default)]
     pub merged_pending: bool,
+    /// 统计：该会话消耗的累积总 Token
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
+    #[serde(default)]
+    pub prompt_tokens: Option<u64>,
+    #[serde(default)]
+    pub completion_tokens: Option<u64>,
 }
 
 /// 临时空间中被拷贝的单个项目条目（主项目 key="main"，关联项目 key="link:<id>"）
@@ -499,6 +506,26 @@ pub struct Message {
     pub created_at: String,
     #[serde(default)]
     pub tool_events: Vec<ToolEvent>,
+    /// 本步单次推理耗时（毫秒）
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    /// 本次对话完整耗时（从发送消息到该计划执行完毕，毫秒）
+    #[serde(default)]
+    pub turn_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub prompt_tokens: Option<u64>,
+    #[serde(default)]
+    pub completion_tokens: Option<u64>,
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RunTokenMetrics {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -536,6 +563,81 @@ pub fn estimate_tokens(s: &str) -> usize {
         }
     }
     (cjk as f64 * 0.7) as usize + other / 4
+}
+
+/// 估算 JSON 结构体（例如 tool_calls、参数或 schema）的 token 开销
+pub fn estimate_value_tokens(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Null => 1,
+        serde_json::Value::Bool(_) => 1,
+        serde_json::Value::Number(_) => 1,
+        serde_json::Value::String(s) => estimate_tokens(s),
+        serde_json::Value::Array(arr) => {
+            arr.iter().map(estimate_value_tokens).sum::<usize>() + 2
+        }
+        serde_json::Value::Object(obj) => {
+            obj.iter()
+                .map(|(k, val)| estimate_tokens(k) + estimate_value_tokens(val) + 2)
+                .sum::<usize>() + 2
+        }
+    }
+}
+
+fn default_compaction_timeout() -> u64 {
+    30
+}
+
+/// 上下文自动压缩挂起请求（推送给前端展示可视化卡片并等待用户确认/补充）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionRequest {
+    pub event_id: String,
+    pub session_id: String,
+    pub start_seq: i64,
+    pub end_seq: i64,
+    pub start_preview: String,
+    pub end_preview: String,
+    pub message_count: usize,
+    pub tokens_before: usize,
+    pub summary: String,
+    #[serde(default = "default_compaction_timeout")]
+    pub timeout_seconds: u64,
+}
+
+/// 用户对压缩请求的确认决定（包含用户可能补充或编辑后的 Markdown 内容）
+#[derive(Clone, Debug)]
+pub struct CompactionDecision {
+    pub approved: bool,
+    pub final_summary: String,
+}
+
+/// 会话上下文压缩记录（持久化实体）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCompaction {
+    pub id: String,
+    pub session_id: String,
+    pub start_seq: i64,
+    pub end_seq: i64,
+    pub summary_markdown: String,
+    pub tokens_before: usize,
+    pub created_at: String,
+}
+
+/// 上下文硬截断提醒（推送给前端展示提醒卡片，待用户手动关闭）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TruncationNotice {
+    pub id: String,
+    pub session_id: String,
+    pub dropped_turns: usize,
+    pub dropped_messages: usize,
+    pub dropped_tokens: usize,
+    pub token_limit: usize,
+    pub est_tokens_before: usize,
+    pub est_tokens_after: usize,
+    pub first_preview: String,
+    pub created_at: String,
 }
 
 /// 工具结果上限
@@ -610,6 +712,68 @@ pub struct ProjectSopInfo {
     pub sop_enabled: bool,
     pub detected_stack: String,
     pub detected_default_cmd: String,
+}
+
+// ---------- Token 统计数据结构 ----------
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenStatsSummary {
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub total_tokens: u64,
+    pub today_prompt_tokens: u64,
+    pub today_completion_tokens: u64,
+    pub today_tokens: u64,
+    pub total_sessions: u64,
+    pub total_messages: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectTokenStats {
+    pub project_id: Option<String>,
+    pub project_name: String,
+    pub project_path: Option<String>,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub session_count: u64,
+    pub message_count: u64,
+    pub last_used_at: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DailyTokenStats {
+    pub date: String, // YYYY-MM-DD
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub message_count: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTokenStats {
+    pub session_id: String,
+    pub title: String,
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub message_count: u64,
+    pub last_message_at: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenStatsReport {
+    pub summary: TokenStatsSummary,
+    pub by_project: Vec<ProjectTokenStats>,
+    pub by_time: Vec<DailyTokenStats>,
+    pub by_session: Vec<SessionTokenStats>,
 }
 
 

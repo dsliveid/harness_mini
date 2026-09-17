@@ -135,6 +135,17 @@ fn init(conn: &Connection) -> Result<(), String> {
         );
         CREATE INDEX IF NOT EXISTS idx_growths_project ON agent_growths(project_id, status);
         CREATE INDEX IF NOT EXISTS idx_growths_session ON agent_growths(session_id);
+
+        CREATE TABLE IF NOT EXISTS session_compactions (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          start_seq INTEGER NOT NULL,
+          end_seq INTEGER NOT NULL,
+          summary_markdown TEXT NOT NULL,
+          tokens_before INTEGER NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_compactions_session ON session_compactions(session_id);
         "#,
     )
     .map_err(|e| e.to_string())?;
@@ -177,6 +188,18 @@ fn init(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "sessions", "merged_pending", "merged_pending INTEGER NOT NULL DEFAULT 0")?;
     // 旧库迁移：messages 补 reasoning 列（模型思考过程）
     ensure_column(conn, "messages", "reasoning", "reasoning TEXT")?;
+    // Token 消耗与耗时统计字段
+    ensure_column(conn, "messages", "prompt_tokens", "prompt_tokens INTEGER DEFAULT 0")?;
+    ensure_column(conn, "messages", "completion_tokens", "completion_tokens INTEGER DEFAULT 0")?;
+    ensure_column(conn, "messages", "total_tokens", "total_tokens INTEGER DEFAULT 0")?;
+    ensure_column(conn, "messages", "duration_ms", "duration_ms INTEGER DEFAULT 0")?;
+    ensure_column(conn, "messages", "turn_duration_ms", "turn_duration_ms INTEGER DEFAULT 0")?;
+    ensure_column(conn, "runs", "trigger_message_id", "trigger_message_id TEXT")?;
+    ensure_column(conn, "runs", "duration_ms", "duration_ms INTEGER DEFAULT 0")?;
+    ensure_column(conn, "runs", "total_tokens", "total_tokens INTEGER DEFAULT 0")?;
+    ensure_column(conn, "runs", "prompt_tokens", "prompt_tokens INTEGER DEFAULT 0")?;
+    ensure_column(conn, "runs", "completion_tokens", "completion_tokens INTEGER DEFAULT 0")?;
+    let _ = backfill_message_tokens(conn);
     Ok(())
 }
 
@@ -196,6 +219,57 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Re
     drop(stmt);
     conn.execute(&format!("ALTER TABLE {} ADD COLUMN {}", table, decl), [])
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 兼容回填：解析既有消息中的 usage_json 并填入结构化 token / duration 列
+fn backfill_message_tokens(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, usage_json FROM messages \
+             WHERE (total_tokens IS NULL OR total_tokens = 0) \
+               AND usage_json IS NOT NULL \
+               AND usage_json != ''",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for (id, uj) in rows {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&uj) {
+            let pt = v
+                .get("promptTokens")
+                .or_else(|| v.get("prompt_tokens"))
+                .or_else(|| v.get("inputEst"))
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
+            let ct = v
+                .get("completionTokens")
+                .or_else(|| v.get("completion_tokens"))
+                .or_else(|| v.get("outputEst"))
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
+            let tt = v
+                .get("totalTokens")
+                .or_else(|| v.get("total_tokens"))
+                .and_then(|x| x.as_u64())
+                .unwrap_or(pt + ct);
+            let dur = v
+                .get("durationMs")
+                .or_else(|| v.get("duration_ms"))
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
+            if tt > 0 || dur > 0 {
+                let _ = conn.execute(
+                    "UPDATE messages SET prompt_tokens = ?2, completion_tokens = ?3, total_tokens = ?4, duration_ms = ?5 WHERE id = ?1",
+                    params![id, pt, ct, tt, dur],
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1051,6 +1125,9 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         source_workspace: r.get(12)?,
         merged_seq: r.get(13)?,
         merged_pending: r.get::<_, i64>(14)? != 0,
+        total_tokens: None,
+        prompt_tokens: None,
+        completion_tokens: None,
     })
 }
 
@@ -1058,14 +1135,83 @@ const SESSION_COLS: &str =
     "id, title, workspace_path, access_mode, project_id, status, last_message_at, created_at, updated_at, \
      is_temp, temp_code, temp_root, source_workspace, merged_seq, merged_pending";
 
+fn attach_session_tokens(conn: &Connection, sessions: &mut [Session]) -> Result<(), String> {
+    if sessions.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT session_id, \
+                    COALESCE(SUM(total_tokens), 0), \
+                    COALESCE(SUM(prompt_tokens), 0), \
+                    COALESCE(SUM(completion_tokens), 0) \
+             FROM messages \
+             GROUP BY session_id",
+        )
+        .map_err(|e| e.to_string())?;
+    let map: std::collections::HashMap<String, (u64, u64, u64)> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, i64>(2)? as u64,
+                    r.get::<_, i64>(3)? as u64,
+                ),
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for s in sessions.iter_mut() {
+        if let Some((tt, pt, ct)) = map.get(&s.id) {
+            s.total_tokens = Some(*tt);
+            s.prompt_tokens = Some(*pt);
+            s.completion_tokens = Some(*ct);
+        } else {
+            s.total_tokens = Some(0);
+            s.prompt_tokens = Some(0);
+            s.completion_tokens = Some(0);
+        }
+    }
+    Ok(())
+}
+
 pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>, String> {
-    conn.query_row(
-        &format!("SELECT {SESSION_COLS} FROM sessions WHERE id = ?1"),
-        params![id],
-        row_to_session,
-    )
-    .optional()
-    .map_err(|e| e.to_string())
+    let mut s = conn
+        .query_row(
+            &format!("SELECT {SESSION_COLS} FROM sessions WHERE id = ?1"),
+            params![id],
+            row_to_session,
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    if let Some(ref mut session) = s {
+        let tokens: Option<(u64, u64, u64)> = conn
+            .query_row(
+                "SELECT COALESCE(SUM(total_tokens), 0), \
+                        COALESCE(SUM(prompt_tokens), 0), \
+                        COALESCE(SUM(completion_tokens), 0) \
+                 FROM messages WHERE session_id = ?1",
+                params![id],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+
+        if let Some((tt, pt, ct)) = tokens {
+            session.total_tokens = Some(tt);
+            session.prompt_tokens = Some(pt);
+            session.completion_tokens = Some(ct);
+        } else {
+            session.total_tokens = Some(0);
+            session.prompt_tokens = Some(0);
+            session.completion_tokens = Some(0);
+        }
+    }
+    Ok(s)
 }
 
 pub fn list_sessions(conn: &Connection, status: &str) -> Result<Vec<Session>, String> {
@@ -1077,7 +1223,9 @@ pub fn list_sessions(conn: &Connection, status: &str) -> Result<Vec<Session>, St
     let rows = stmt
         .query_map(params![status], row_to_session)
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    let mut sessions = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    attach_session_tokens(conn, &mut sessions)?;
+    Ok(sessions)
 }
 
 pub fn create_session(
@@ -1105,6 +1253,9 @@ pub fn create_session(
         source_workspace: None,
         merged_seq: None,
         merged_pending: false,
+        total_tokens: Some(0),
+        prompt_tokens: Some(0),
+        completion_tokens: Some(0),
     };
     conn.execute(
         "INSERT INTO sessions(id, title, workspace_path, access_mode, project_id, status, last_message_at, created_at, updated_at)
@@ -1230,8 +1381,8 @@ pub fn next_seq(conn: &Connection, session_id: &str) -> Result<i64, String> {
 
 pub fn insert_message(conn: &Connection, m: &Message) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO messages(id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        "INSERT INTO messages(id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
         params![
             m.id,
             m.session_id,
@@ -1244,8 +1395,39 @@ pub fn insert_message(conn: &Connection, m: &Message) -> Result<(), String> {
             m.tool_call_id,
             m.queued as i64,
             m.usage.as_ref().and_then(|v| serde_json::to_string(v).ok()),
-            m.created_at
+            m.created_at,
+            m.prompt_tokens.unwrap_or(0) as i64,
+            m.completion_tokens.unwrap_or(0) as i64,
+            m.total_tokens.unwrap_or(0) as i64,
+            m.duration_ms.unwrap_or(0) as i64,
+            m.turn_duration_ms.unwrap_or(0) as i64,
         ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn update_message_turn_duration(
+    conn: &Connection,
+    id: &str,
+    turn_duration_ms: u64,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE messages SET turn_duration_ms = ?2 WHERE id = ?1",
+        params![id, turn_duration_ms as i64],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn set_message_run_id(
+    conn: &Connection,
+    message_id: &str,
+    run_id: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE messages SET run_id = ?2 WHERE id = ?1",
+        params![message_id, run_id],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -1258,11 +1440,22 @@ pub fn new_message(
     content: Option<String>,
     queued: bool,
 ) -> Result<Message, String> {
+    new_message_with_run(conn, session_id, role, content, queued, None)
+}
+
+pub fn new_message_with_run(
+    conn: &Connection,
+    session_id: &str,
+    role: &str,
+    content: Option<String>,
+    queued: bool,
+    run_id: Option<&str>,
+) -> Result<Message, String> {
     let seq = next_seq(conn, session_id)?;
     let m = Message {
         id: uuid::Uuid::new_v4().to_string(),
         session_id: session_id.to_string(),
-        run_id: None,
+        run_id: run_id.map(|s| s.to_string()),
         seq,
         role: role.to_string(),
         content,
@@ -1273,6 +1466,11 @@ pub fn new_message(
         usage: None,
         created_at: now(),
         tool_events: vec![],
+        duration_ms: None,
+        turn_duration_ms: None,
+        prompt_tokens: None,
+        completion_tokens: None,
+        total_tokens: None,
     };
     insert_message(conn, &m)?;
     Ok(m)
@@ -1284,9 +1482,33 @@ pub fn update_message_content(
     content: &str,
     usage: Option<&serde_json::Value>,
 ) -> Result<(), String> {
+    let (pt, ct, tt, dur) = if let Some(u) = usage {
+        let pt = u.get("promptTokens").or_else(|| u.get("prompt_tokens")).or_else(|| u.get("inputEst")).and_then(|v| v.as_u64()).unwrap_or(0);
+        let ct = u.get("completionTokens").or_else(|| u.get("completion_tokens")).or_else(|| u.get("outputEst")).and_then(|v| v.as_u64()).unwrap_or(0);
+        let tt = u.get("totalTokens").or_else(|| u.get("total_tokens")).and_then(|v| v.as_u64()).unwrap_or(pt + ct);
+        let dur = u.get("durationMs").or_else(|| u.get("duration_ms")).and_then(|v| v.as_u64()).unwrap_or(0);
+        (pt, ct, tt, dur)
+    } else {
+        (0, 0, 0, 0)
+    };
     conn.execute(
-        "UPDATE messages SET content = ?2, usage_json = COALESCE(?3, usage_json) WHERE id = ?1",
-        params![id, content, usage.and_then(|v| serde_json::to_string(v).ok())],
+        "UPDATE messages SET
+            content = ?2,
+            usage_json = COALESCE(?3, usage_json),
+            prompt_tokens = CASE WHEN ?4 > 0 THEN ?4 ELSE prompt_tokens END,
+            completion_tokens = CASE WHEN ?5 > 0 THEN ?5 ELSE completion_tokens END,
+            total_tokens = CASE WHEN ?6 > 0 THEN ?6 ELSE total_tokens END,
+            duration_ms = CASE WHEN ?7 > 0 THEN ?7 ELSE duration_ms END
+         WHERE id = ?1",
+        params![
+            id,
+            content,
+            usage.and_then(|v| serde_json::to_string(v).ok()),
+            pt as i64,
+            ct as i64,
+            tt as i64,
+            dur as i64,
+        ],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -1307,10 +1529,37 @@ pub fn update_message_tool_calls(
     id: &str,
     tool_calls: &serde_json::Value,
     content: &str,
+    usage: Option<&serde_json::Value>,
 ) -> Result<(), String> {
+    let (pt, ct, tt, dur) = if let Some(u) = usage {
+        let pt = u.get("promptTokens").or_else(|| u.get("prompt_tokens")).or_else(|| u.get("inputEst")).and_then(|v| v.as_u64()).unwrap_or(0);
+        let ct = u.get("completionTokens").or_else(|| u.get("completion_tokens")).or_else(|| u.get("outputEst")).and_then(|v| v.as_u64()).unwrap_or(0);
+        let tt = u.get("totalTokens").or_else(|| u.get("total_tokens")).and_then(|v| v.as_u64()).unwrap_or(pt + ct);
+        let dur = u.get("durationMs").or_else(|| u.get("duration_ms")).and_then(|v| v.as_u64()).unwrap_or(0);
+        (pt, ct, tt, dur)
+    } else {
+        (0, 0, 0, 0)
+    };
     conn.execute(
-        "UPDATE messages SET tool_calls_json = ?2, content = ?3 WHERE id = ?1",
-        params![id, tool_calls.to_string(), content],
+        "UPDATE messages SET
+            tool_calls_json = ?2,
+            content = ?3,
+            usage_json = COALESCE(?4, usage_json),
+            prompt_tokens = CASE WHEN ?5 > 0 THEN ?5 ELSE prompt_tokens END,
+            completion_tokens = CASE WHEN ?6 > 0 THEN ?6 ELSE completion_tokens END,
+            total_tokens = CASE WHEN ?7 > 0 THEN ?7 ELSE total_tokens END,
+            duration_ms = CASE WHEN ?8 > 0 THEN ?8 ELSE duration_ms END
+         WHERE id = ?1",
+        params![
+            id,
+            tool_calls.to_string(),
+            content,
+            usage.and_then(|v| serde_json::to_string(v).ok()),
+            pt as i64,
+            ct as i64,
+            tt as i64,
+            dur as i64,
+        ],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -1324,7 +1573,7 @@ pub fn get_messages(
 ) -> Result<Vec<Message>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at
+            "SELECT id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms
              FROM messages WHERE session_id = ?1 AND seq < COALESCE(?2, 9223372036854775807)
              ORDER BY seq DESC LIMIT ?3",
         )
@@ -1333,6 +1582,11 @@ pub fn get_messages(
         .query_map(params![session_id, before_seq, limit], |r| {
             let tc: Option<String> = r.get(6)?;
             let usage: Option<String> = r.get(9)?;
+            let pt: Option<i64> = r.get(11)?;
+            let ct: Option<i64> = r.get(12)?;
+            let tt: Option<i64> = r.get(13)?;
+            let dur: Option<i64> = r.get(14)?;
+            let turn_dur: Option<i64> = r.get(15)?;
             Ok(Message {
                 id: r.get(0)?,
                 session_id: session_id.to_string(),
@@ -1347,6 +1601,11 @@ pub fn get_messages(
                 usage: usage.and_then(|s| serde_json::from_str(&s).ok()),
                 created_at: r.get(10)?,
                 tool_events: vec![],
+                duration_ms: dur.map(|v| v as u64),
+                turn_duration_ms: turn_dur.map(|v| v as u64),
+                prompt_tokens: pt.map(|v| v as u64),
+                completion_tokens: ct.map(|v| v as u64),
+                total_tokens: tt.map(|v| v as u64),
             })
         })
         .map_err(|e| e.to_string())?
@@ -1410,18 +1669,72 @@ pub fn delete_messages_after(conn: &Connection, session_id: &str, seq: i64) -> R
         params![session_id, seq],
     )
     .map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM session_compactions WHERE session_id = ?1 AND end_seq > ?2",
+        params![session_id, seq],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+pub fn create_session_compaction(conn: &Connection, comp: &SessionCompaction) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO session_compactions (id, session_id, start_seq, end_seq, summary_markdown, tokens_before, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            comp.id,
+            comp.session_id,
+            comp.start_seq,
+            comp.end_seq,
+            comp.summary_markdown,
+            comp.tokens_before as i64,
+            comp.created_at
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn list_session_compactions(conn: &Connection, session_id: &str) -> Result<Vec<SessionCompaction>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, start_seq, end_seq, summary_markdown, tokens_before, created_at
+             FROM session_compactions
+             WHERE session_id = ?1
+             ORDER BY start_seq ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id], |r| {
+            let tb: i64 = r.get(5)?;
+            Ok(SessionCompaction {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                start_seq: r.get(2)?,
+                end_seq: r.get(3)?,
+                summary_markdown: r.get(4)?,
+                tokens_before: tb.max(0) as usize,
+                created_at: r.get(6)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
 pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, String> {
     let opt = conn
         .query_row(
-            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at
+            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms
              FROM messages WHERE id = ?1",
             params![id],
             |r| {
                 let tc: Option<String> = r.get(7)?;
                 let usage: Option<String> = r.get(10)?;
+                let pt: Option<i64> = r.get(12)?;
+                let ct: Option<i64> = r.get(13)?;
+                let tt: Option<i64> = r.get(14)?;
+                let dur: Option<i64> = r.get(15)?;
+                let turn_dur: Option<i64> = r.get(16)?;
                 Ok(Message {
                     id: r.get(0)?,
                     session_id: r.get(1)?,
@@ -1436,6 +1749,11 @@ pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, Strin
                     usage: usage.and_then(|s| serde_json::from_str(&s).ok()),
                     created_at: r.get(11)?,
                     tool_events: vec![],
+                    duration_ms: dur.map(|v| v as u64),
+                    turn_duration_ms: turn_dur.map(|v| v as u64),
+                    prompt_tokens: pt.map(|v| v as u64),
+                    completion_tokens: ct.map(|v| v as u64),
+                    total_tokens: tt.map(|v| v as u64),
                 })
             },
         )
@@ -1449,7 +1767,7 @@ pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, Strin
 pub fn list_queued(conn: &Connection, session_id: &str) -> Result<Vec<Message>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at
+            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms
              FROM messages WHERE session_id = ?1 AND queued = 1 ORDER BY seq ASC",
         )
         .map_err(|e| e.to_string())?;
@@ -1457,6 +1775,11 @@ pub fn list_queued(conn: &Connection, session_id: &str) -> Result<Vec<Message>, 
         .query_map(params![session_id], |r| {
             let tc: Option<String> = r.get(7)?;
             let usage: Option<String> = r.get(10)?;
+            let pt: Option<i64> = r.get(12)?;
+            let ct: Option<i64> = r.get(13)?;
+            let tt: Option<i64> = r.get(14)?;
+            let dur: Option<i64> = r.get(15)?;
+            let turn_dur: Option<i64> = r.get(16)?;
             Ok(Message {
                 id: r.get(0)?,
                 session_id: r.get(1)?,
@@ -1471,6 +1794,11 @@ pub fn list_queued(conn: &Connection, session_id: &str) -> Result<Vec<Message>, 
                 usage: usage.and_then(|s| serde_json::from_str(&s).ok()),
                 created_at: r.get(11)?,
                 tool_events: vec![],
+                duration_ms: dur.map(|v| v as u64),
+                turn_duration_ms: turn_dur.map(|v| v as u64),
+                prompt_tokens: pt.map(|v| v as u64),
+                completion_tokens: ct.map(|v| v as u64),
+                total_tokens: tt.map(|v| v as u64),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1551,20 +1879,36 @@ pub fn update_tool_event(
 
 // ---------- runs ----------
 
-pub fn create_run(conn: &Connection, session_id: &str) -> Result<String, String> {
+pub fn create_run(conn: &Connection, session_id: &str, trigger_message_id: Option<&str>) -> Result<String, String> {
     let id = uuid::Uuid::new_v4().to_string();
     conn.execute(
-        "INSERT INTO runs(id, session_id, trigger_type, status, started_at) VALUES(?1,?2,'manual','running',?3)",
-        params![id, session_id, now()],
+        "INSERT INTO runs(id, session_id, trigger_message_id, trigger_type, status, started_at) VALUES(?1,?2,?3,'manual','running',?4)",
+        params![id, session_id, trigger_message_id, now()],
     )
     .map_err(|e| e.to_string())?;
     Ok(id)
 }
 
-pub fn finish_run(conn: &Connection, id: &str, status: &str) -> Result<(), String> {
+pub fn finish_run(
+    conn: &Connection,
+    id: &str,
+    status: &str,
+    duration_ms: Option<u64>,
+    total_tokens: Option<u64>,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+) -> Result<(), String> {
     conn.execute(
-        "UPDATE runs SET status = ?2, ended_at = ?3 WHERE id = ?1",
-        params![id, status, now()],
+        "UPDATE runs SET status = ?2, ended_at = ?3, duration_ms = ?4, total_tokens = ?5, prompt_tokens = ?6, completion_tokens = ?7 WHERE id = ?1",
+        params![
+            id,
+            status,
+            now(),
+            duration_ms.map(|v| v as i64),
+            total_tokens.map(|v| v as i64),
+            prompt_tokens.map(|v| v as i64),
+            completion_tokens.map(|v| v as i64),
+        ],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -2021,4 +2365,262 @@ pub fn increment_growth_applied_count(conn: &Connection, ids: &[String]) -> Resu
     }
     Ok(())
 }
+
+// ---------- Token 消耗统计 ----------
+
+pub fn get_token_stats(
+    conn: &Connection,
+    project_id: Option<&str>,
+    days: Option<u32>,
+) -> Result<TokenStatsReport, String> {
+    let now_str = now();
+    let today_prefix = if now_str.len() >= 10 {
+        &now_str[0..10]
+    } else {
+        ""
+    };
+
+    // 1. 全局概览汇总
+    let (tot_pt, tot_ct, tot_tt, tot_msgs): (i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT 
+                COALESCE(SUM(prompt_tokens), 0),
+                COALESCE(SUM(completion_tokens), 0),
+                COALESCE(SUM(total_tokens), 0),
+                COUNT(*)
+             FROM messages
+             WHERE role = 'assistant'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap_or((0, 0, 0, 0));
+
+    let (today_pt, today_ct, today_tt): (i64, i64, i64) = conn
+        .query_row(
+            "SELECT 
+                COALESCE(SUM(prompt_tokens), 0),
+                COALESCE(SUM(completion_tokens), 0),
+                COALESCE(SUM(total_tokens), 0)
+             FROM messages
+             WHERE role = 'assistant' AND substr(created_at, 1, 10) = ?1",
+            params![today_prefix],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap_or((0, 0, 0));
+
+    let tot_sessions: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT session_id) FROM messages WHERE total_tokens > 0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    let summary = TokenStatsSummary {
+        total_prompt_tokens: tot_pt as u64,
+        total_completion_tokens: tot_ct as u64,
+        total_tokens: tot_tt as u64,
+        today_prompt_tokens: today_pt as u64,
+        today_completion_tokens: today_ct as u64,
+        today_tokens: today_tt as u64,
+        total_sessions: tot_sessions as u64,
+        total_messages: tot_msgs as u64,
+    };
+
+    // 2. 按项目聚合
+    let all_projects = list_projects(conn)?;
+    let mut by_project: Vec<ProjectTokenStats> = Vec::new();
+
+    let mut proj_stmt = conn
+        .prepare(
+            "SELECT 
+                s.project_id,
+                COALESCE(SUM(m.prompt_tokens), 0),
+                COALESCE(SUM(m.completion_tokens), 0),
+                COALESCE(SUM(m.total_tokens), 0),
+                COUNT(DISTINCT s.id),
+                COUNT(m.id),
+                MAX(m.created_at)
+             FROM sessions s
+             JOIN messages m ON m.session_id = s.id
+             WHERE m.role = 'assistant'
+             GROUP BY s.project_id",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let proj_rows = proj_stmt
+        .query_map([], |r| {
+            let pid: Option<String> = r.get(0)?;
+            let pt: i64 = r.get(1)?;
+            let ct: i64 = r.get(2)?;
+            let tt: i64 = r.get(3)?;
+            let sc: i64 = r.get(4)?;
+            let mc: i64 = r.get(5)?;
+            let last_at: Option<String> = r.get(6)?;
+            Ok((pid, pt as u64, ct as u64, tt as u64, sc as u64, mc as u64, last_at))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut mapped_stats: std::collections::HashMap<
+        Option<String>,
+        (u64, u64, u64, u64, u64, Option<String>),
+    > = std::collections::HashMap::new();
+
+    for row in proj_rows.filter_map(|r| r.ok()) {
+        mapped_stats.insert(row.0, (row.1, row.2, row.3, row.4, row.5, row.6));
+    }
+
+    for p in &all_projects {
+        let stats = mapped_stats
+            .remove(&Some(p.id.clone()))
+            .unwrap_or((0, 0, 0, 0, 0, None));
+        by_project.push(ProjectTokenStats {
+            project_id: Some(p.id.clone()),
+            project_name: p.name.clone(),
+            project_path: p.path.clone(),
+            prompt_tokens: stats.0,
+            completion_tokens: stats.1,
+            total_tokens: stats.2,
+            session_count: stats.3,
+            message_count: stats.4,
+            last_used_at: stats.5.or_else(|| p.last_activity_at.clone()),
+        });
+    }
+
+    if let Some(stats) = mapped_stats.remove(&None) {
+        if stats.2 > 0 || stats.4 > 0 {
+            by_project.push(ProjectTokenStats {
+                project_id: None,
+                project_name: "未归类 / 纯对话".to_string(),
+                project_path: None,
+                prompt_tokens: stats.0,
+                completion_tokens: stats.1,
+                total_tokens: stats.2,
+                session_count: stats.3,
+                message_count: stats.4,
+                last_used_at: stats.5,
+            });
+        }
+    }
+
+    by_project.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+
+    // 3. 按时间聚合（每日趋势）
+    let day_limit_sql = if let Some(d) = days {
+        if d > 0 {
+            let cutoff = chrono::Utc::now() - chrono::Duration::days(d as i64);
+            format!("AND m.created_at >= '{}'", cutoff.to_rfc3339())
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let proj_filter_sql = if let Some(pid) = project_id {
+        if !pid.is_empty() {
+            if pid == "unassigned" {
+                "AND (s.project_id IS NULL OR s.project_id = '')".to_string()
+            } else {
+                format!("AND s.project_id = '{pid}'")
+            }
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let time_query = format!(
+        "SELECT 
+            substr(m.created_at, 1, 10) as day,
+            COALESCE(SUM(m.prompt_tokens), 0),
+            COALESCE(SUM(m.completion_tokens), 0),
+            COALESCE(SUM(m.total_tokens), 0),
+            COUNT(m.id)
+         FROM messages m
+         JOIN sessions s ON s.id = m.session_id
+         WHERE m.role = 'assistant' {day_limit_sql} {proj_filter_sql}
+         GROUP BY day
+         ORDER BY day ASC"
+    );
+
+    let mut time_stmt = conn.prepare(&time_query).map_err(|e| e.to_string())?;
+    let by_time: Vec<DailyTokenStats> = time_stmt
+        .query_map([], |r| {
+            let day: String = r.get(0)?;
+            let pt: i64 = r.get(1)?;
+            let ct: i64 = r.get(2)?;
+            let tt: i64 = r.get(3)?;
+            let mc: i64 = r.get(4)?;
+            Ok(DailyTokenStats {
+                date: day,
+                prompt_tokens: pt as u64,
+                completion_tokens: ct as u64,
+                total_tokens: tt as u64,
+                message_count: mc as u64,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // 4. 会话排行 (Top 50)
+    let session_query = format!(
+        "SELECT 
+            s.id,
+            s.title,
+            s.project_id,
+            p.name,
+            COALESCE(SUM(m.prompt_tokens), 0) as pt,
+            COALESCE(SUM(m.completion_tokens), 0) as ct,
+            COALESCE(SUM(m.total_tokens), 0) as tt,
+            COUNT(m.id) as mc,
+            MAX(m.created_at) as last_msg
+         FROM sessions s
+         LEFT JOIN projects p ON p.id = s.project_id
+         JOIN messages m ON m.session_id = s.id
+         WHERE m.role = 'assistant' {proj_filter_sql}
+         GROUP BY s.id
+         HAVING tt > 0
+         ORDER BY tt DESC
+         LIMIT 50"
+    );
+
+    let mut sess_stmt = conn.prepare(&session_query).map_err(|e| e.to_string())?;
+    let by_session: Vec<SessionTokenStats> = sess_stmt
+        .query_map([], |r| {
+            let sid: String = r.get(0)?;
+            let title: String = r.get(1)?;
+            let pid: Option<String> = r.get(2)?;
+            let pname: Option<String> = r.get(3)?;
+            let pt: i64 = r.get(4)?;
+            let ct: i64 = r.get(5)?;
+            let tt: i64 = r.get(6)?;
+            let mc: i64 = r.get(7)?;
+            let last_at: Option<String> = r.get(8)?;
+            Ok(SessionTokenStats {
+                session_id: sid,
+                title,
+                project_id: pid,
+                project_name: pname,
+                prompt_tokens: pt as u64,
+                completion_tokens: ct as u64,
+                total_tokens: tt as u64,
+                message_count: mc as u64,
+                last_message_at: last_at,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(TokenStatsReport {
+        summary,
+        by_project,
+        by_time,
+        by_session,
+    })
+}
+
 

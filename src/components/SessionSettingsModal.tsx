@@ -75,7 +75,7 @@ export function SessionSettingsModal() {
   return (
     <div className="fixed inset-0 z-[80] bg-black/50 flex items-center justify-center">
       <div className="bg-panel2 border border-edge rounded-2xl w-[720px] h-[460px] max-w-[92vw] max-h-[86vh] flex flex-col shadow-2xl">
-        <div className="px-5 py-4 border-b border-edge font-medium flex items-center gap-2 shrink-0">
+        <div className="h-12 px-5 border-b border-edge/60 font-medium flex items-center gap-2 shrink-0">
           <span>会话设置</span>
           <span className="text-[13px] text-inkdim font-normal truncate">· {session.title}</span>
           <ModalClose onClick={() => close(null)} />
@@ -165,7 +165,7 @@ export function SessionSettingsModal() {
           </main>
         </div>
 
-        <div className="px-5 py-3.5 border-t border-edge flex justify-end gap-2 shrink-0">
+        <div className="h-12 px-5 border-t border-edge/60 flex items-center justify-end gap-2 shrink-0">
           <button className="px-4 py-1.5 rounded-lg bg-panel3 hover:bg-edge text-ink" onClick={() => close(null)}>
             关闭
           </button>

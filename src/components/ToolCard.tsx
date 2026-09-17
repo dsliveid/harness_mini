@@ -18,6 +18,7 @@ import {
   Circle,
   ChevronRight,
   ShieldAlert,
+  Zap,
 } from "./Icons";
 
 function statusBadge(status: string) {
@@ -39,6 +40,28 @@ function statusBadge(status: string) {
   }
 }
 
+function toolCategoryBadge(name: string) {
+  if (name.startsWith("temp_")) {
+    return (
+      <span className="text-[10px] px-1.5 py-[0.5px] rounded bg-amber-500/10 text-amber-400 border border-amber-500/20 shrink-0">
+        临时空间
+      </span>
+    );
+  }
+  if (["list_skills", "save_skill", "run_skill"].includes(name)) {
+    return (
+      <span className="text-[10px] px-1.5 py-[0.5px] rounded bg-purple-500/10 text-purple-400 border border-purple-500/20 shrink-0">
+        自演化
+      </span>
+    );
+  }
+  return (
+    <span className="text-[10px] px-1.5 py-[0.5px] rounded bg-blue-500/10 text-blue-400 border border-blue-500/20 shrink-0">
+      内置
+    </span>
+  );
+}
+
 function ToolIcon({ name }: { name: string }) {
   switch (name) {
     case "read_file":
@@ -55,6 +78,10 @@ function ToolIcon({ name }: { name: string }) {
       return <Search size={14} className="text-indigo-400 shrink-0" />;
     case "todo":
       return <CheckSquare size={14} className="text-purple-400 shrink-0" />;
+    case "list_skills":
+    case "save_skill":
+    case "run_skill":
+      return <Zap size={14} className="text-purple-400 shrink-0" />;
     case "temp_status":
     case "temp_changes":
     case "temp_diff":
@@ -76,6 +103,11 @@ function paramTitle(ev: ToolEvent): string {
       return `${p.pattern ?? ""}${p.path ? `（${p.path}）` : ""}`;
     case "todo":
       return "任务清单";
+    case "run_skill":
+    case "save_skill":
+      return String(p.name ?? "");
+    case "list_skills":
+      return "技能工具库";
     default:
       return String(p.path ?? "");
   }
@@ -90,6 +122,9 @@ const TOOL_LABELS: Record<string, string> = {
   edit_file: "编辑文件",
   run_command: "执行命令",
   todo: "任务清单",
+  list_skills: "查询技能库",
+  save_skill: "固化项目技能",
+  run_skill: "执行项目技能",
   temp_status: "临时空间状态",
   temp_changes: "临时空间变更",
   temp_diff: "临时空间 diff",
@@ -98,21 +133,25 @@ const TOOL_LABELS: Record<string, string> = {
   temp_merge: "合并到原目录",
 };
 
-function TodoList({ todos }: { todos: any[] }) {
+function TodoList({ todos, isRunning }: { todos: any[]; isRunning: boolean }) {
   return (
     <div className="flex flex-col gap-1.5 py-1.5 pl-5">
-      {todos.map((t, i) => (
-        <div key={i} className="flex items-center gap-2 text-[13px]">
-          {t.status === "done" ? (
-            <CheckCircle2 size={14} className="text-green-400 shrink-0" />
-          ) : t.status === "in_progress" ? (
-            <Loader2 size={14} className="text-blue-400 animate-spin shrink-0" />
-          ) : (
-            <Circle size={14} className="text-inkdim/60 shrink-0" />
-          )}
-          <span className={t.status === "done" ? "text-inkdim line-through" : "text-ink"}>{t.content}</span>
-        </div>
-      ))}
+      {todos.map((t, i) => {
+        const isDone = t.status === "done" || (!isRunning && t.status === "in_progress");
+        const inProgress = t.status === "in_progress" && isRunning;
+        return (
+          <div key={i} className="flex items-center gap-2 text-[13px]">
+            {isDone ? (
+              <CheckCircle2 size={14} className="text-green-400 shrink-0" />
+            ) : inProgress ? (
+              <Loader2 size={14} className="text-blue-400 animate-spin shrink-0" />
+            ) : (
+              <Circle size={14} className="text-inkdim/60 shrink-0" />
+            )}
+            <span className={isDone ? "text-inkdim line-through" : "text-ink"}>{t.content}</span>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -226,6 +265,7 @@ function CollapsibleResult({ text }: { text: string }) {
 export function ToolCard({ ev }: { ev: ToolEvent }) {
   const output = useStore((s) => s.toolOutputs[ev.id]);
   const killCommand = useStore((s) => s.killCommand);
+  const isRunning = useStore((s) => (s.currentId ? s.runStatus[s.currentId] === "running" : false));
   const [terminating, setTerminating] = useState(false);
   const title = paramTitle(ev);
   const label = TOOL_LABELS[ev.toolName] ?? ev.toolName;
@@ -262,7 +302,10 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
           className={`transition-transform duration-150 text-inkdim shrink-0 ${expanded ? "rotate-90" : ""}`}
         />
         <ToolIcon name={ev.toolName} />
-        <span className="text-[12px] text-ink font-medium shrink-0">{label}</span>
+        <div className="flex items-center gap-1.5 shrink-0">
+          <span className="text-[12px] text-ink font-medium">{label}</span>
+          {toolCategoryBadge(ev.toolName)}
+        </div>
         {ev.toolName !== "todo" && (
           <span className="text-[12px] font-mono text-inkdim truncate flex-1 min-w-0">{title}</span>
         )}
@@ -286,7 +329,9 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
         </div>
       </button>
 
-      {ev.toolName === "todo" && Array.isArray(ev.params?.todos) && <TodoList todos={ev.params.todos} />}
+      {ev.toolName === "todo" && Array.isArray(ev.params?.todos) && (
+        <TodoList todos={ev.params.todos} isRunning={isRunning} />
+      )}
 
       {/* 审批条是交互入口，保持常显 */}
       {ev.status === "pending_approval" && <ApprovalSection ev={ev} />}

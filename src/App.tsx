@@ -15,7 +15,9 @@ import { SessionSettingsModal } from "./components/SessionSettingsModal";
 import { Sidebar } from "./components/Sidebar";
 import { TempActions } from "./components/TempActions";
 import { Toasts } from "./components/Toasts";
+import { TokenStatsModal } from "./components/TokenStatsModal";
 import { TopBar } from "./components/TopBar";
+import { WindowHeader } from "./components/WindowHeader";
 
 export default function App() {
   useAppEvents();
@@ -29,11 +31,18 @@ export default function App() {
   }, []);
 
   if (!ready) {
-    return <div className="h-full flex items-center justify-center text-inkdim">加载中…</div>;
+    return (
+      <div className="h-full flex flex-col text-[14px]">
+        <WindowHeader />
+        <div className="flex-1 flex items-center justify-center text-inkdim">加载中…</div>
+      </div>
+    );
   }
 
   return (
-    <div className="h-full flex text-[14px]">
+    <div className="h-full flex flex-col text-[14px]">
+      <WindowHeader />
+      <div className="flex-1 min-h-0 flex">
       <Sidebar />
       <div className="flex-1 flex flex-col min-w-0 relative">
         <TopBar />
@@ -53,12 +62,14 @@ export default function App() {
           </div>
         )}
       </div>
+      </div>
       <SettingsModal />
       <SessionSettingsModal />
       <ProjectSettingsModal />
       <ArchiveModal />
       <DiffModal />
       <GrowthModal />
+      <TokenStatsModal />
       <PromptHost />
       <Toasts />
       <DataDirGate />
