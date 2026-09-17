@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ApprovalRule, DataStatus, GrowthItem, Message, MergeSummary, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionCompaction, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo } from "./types";
+import type { ApprovalRule, DataStatus, GrowthItem, Message, MergeSummary, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo } from "./types";
 
 export const ipc = {
   getSettings: () => invoke<Settings>("get_settings"),
@@ -129,7 +129,9 @@ export const ipc = {
     invoke<string>("run_workspace_sop", { workspacePath, cmd }),
   getTokenStats: (projectId?: string | null, days?: number | null) =>
     invoke<TokenStatsReport>("get_token_stats", { projectId: projectId ?? null, days: days ?? null }),
+  getSessionActiveState: (sessionId: string) =>
+    invoke<SessionActiveState>("get_session_active_state", { sessionId }),
 };
 
-export type { Message, Session, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport };
+export type { Message, Session, SessionActiveState, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport };
 

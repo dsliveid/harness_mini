@@ -9,6 +9,47 @@ export interface Toast {
 
 /** 记住上次查看的会话 id：页面重载（如开发热更新）后回到原位，而不是跳到列表第一个 */
 const LAST_SESSION_KEY = "harness_mini.lastSessionId";
+const SESSION_DRAFTS_KEY = "harness_mini.sessionDrafts";
+
+function loadSessionDrafts(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(SESSION_DRAFTS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+let saveDraftsTimer: any = null;
+function persistSessionDrafts(drafts: Record<string, string>) {
+  if (saveDraftsTimer) clearTimeout(saveDraftsTimer);
+  saveDraftsTimer = setTimeout(() => {
+    try {
+      const cleaned: Record<string, string> = {};
+      for (const [k, v] of Object.entries(drafts)) {
+        if (v && v.trim().length > 0) {
+          cleaned[k] = v;
+        }
+      }
+      localStorage.setItem(SESSION_DRAFTS_KEY, JSON.stringify(cleaned));
+    } catch {}
+  }, 300);
+}
+
+function persistSessionDraftsImmediate(drafts: Record<string, string>) {
+  if (saveDraftsTimer) clearTimeout(saveDraftsTimer);
+  try {
+    const cleaned: Record<string, string> = {};
+    for (const [k, v] of Object.entries(drafts)) {
+      if (v && v.trim().length > 0) {
+        cleaned[k] = v;
+      }
+    }
+    localStorage.setItem(SESSION_DRAFTS_KEY, JSON.stringify(cleaned));
+  } catch {}
+}
 
 interface Store {
   ready: boolean;
@@ -16,6 +57,9 @@ interface Store {
   projects: Project[];
   sessions: Session[];
   currentId: string | null; // 会话 id 或 DRAFT_ID
+  /** 各会话的未发送输入草稿，按会话 id 或 DRAFT_ID 隔离 */
+  sessionDrafts: Record<string, string>;
+  setSessionDraft: (id: string, text: string) => void;
   draft: {
     projectId: string | null;
     workspacePath: string | null;
@@ -71,6 +115,8 @@ interface Store {
   bootstrap: () => Promise<void>;
   /** 拉取全局运行中的会话，恢复各会话的“运行中”状态显示（启动/界面刷新后调用） */
   refreshRunStatus: () => Promise<void>;
+  /** 同步会话的实时快照（流式文字、思考流、活跃工具事件、待审批），支持刷新重连无缝恢复 */
+  syncSessionActiveState: (sessionId: string) => Promise<void>;
   /** 请求停止会话当前运行：乐观置为空闲，后端会补发 run:status 事件兜底 */
   stopRun: (sessionId: string) => void;
   /** 手动关闭指定正在运行的控制台进程 */
@@ -232,6 +278,7 @@ export const useStore = create<Store>((set, get) => ({
   projects: [],
   sessions: [],
   currentId: null,
+  sessionDrafts: loadSessionDrafts(),
   draft: null,
   tempInfo: {},
   currentProjectId: null,
@@ -308,8 +355,105 @@ export const useStore = create<Store>((set, get) => ({
       const running: Record<string, "running"> = {};
       for (const r of runs) running[r.sessionId] = "running";
       set((st) => ({ runStatus: { ...st.runStatus, ...running } }));
+      const cur = get().currentId;
+      if (cur && (running[cur] || get().runStatus[cur] === "running")) {
+        void get().syncSessionActiveState(cur);
+      }
     } catch (e) {
       get().pushToast(String(e));
+    }
+  },
+
+  async syncSessionActiveState(sessionId: string) {
+    try {
+      const activeState = await ipc.getSessionActiveState(sessionId);
+      if (!activeState) return;
+
+      set((st) => {
+        const nextRunStatus = { ...st.runStatus };
+        if (activeState.isRunning) {
+          nextRunStatus[sessionId] = "running";
+        }
+
+        let nextApprovals = st.approvals;
+        if (activeState.pendingApproval) {
+          nextApprovals = {
+            ...st.approvals,
+            [activeState.pendingApproval.eventId]: activeState.pendingApproval,
+          };
+        }
+
+        let nextCompactions = st.pendingCompactions;
+        if (activeState.pendingCompaction) {
+          nextCompactions = {
+            ...st.pendingCompactions,
+            [activeState.pendingCompaction.eventId]: activeState.pendingCompaction,
+          };
+        }
+
+        const list = st.messages[sessionId] ? [...st.messages[sessionId]] : [];
+        if (
+          activeState.streamingContent ||
+          activeState.streamingReasoning ||
+          (activeState.activeToolEvents && activeState.activeToolEvents.length > 0)
+        ) {
+          const lastMsg = list.length > 0 ? list[list.length - 1] : null;
+          if (
+            lastMsg &&
+            lastMsg.role === "assistant" &&
+            (!lastMsg.runId || !activeState.activeRunId || lastMsg.runId === activeState.activeRunId)
+          ) {
+            const updated = { ...lastMsg };
+            if (
+              activeState.streamingContent &&
+              (!updated.content || activeState.streamingContent.length >= updated.content.length)
+            ) {
+              updated.content = activeState.streamingContent;
+            }
+            if (
+              activeState.streamingReasoning &&
+              (!updated.reasoning || activeState.streamingReasoning.length >= updated.reasoning.length)
+            ) {
+              updated.reasoning = activeState.streamingReasoning;
+            }
+            if (activeState.activeToolEvents && activeState.activeToolEvents.length > 0) {
+              const mergedEvents = [...updated.toolEvents];
+              for (const ev of activeState.activeToolEvents) {
+                const idx = mergedEvents.findIndex((e) => e.id === ev.id);
+                if (idx >= 0) {
+                  mergedEvents[idx] = ev;
+                } else {
+                  mergedEvents.push(ev);
+                }
+              }
+              updated.toolEvents = mergedEvents;
+            }
+            list[list.length - 1] = updated;
+          } else if (activeState.isRunning) {
+            list.push({
+              id: activeState.currentMessageId ?? (activeState.activeRunId ? `active-${activeState.activeRunId}` : `active-${Date.now()}`),
+              sessionId,
+              runId: activeState.activeRunId ?? undefined,
+              seq: Number.MAX_SAFE_INTEGER,
+              role: "assistant",
+              content: activeState.streamingContent || "",
+              reasoning: activeState.streamingReasoning || null,
+              queued: false,
+              createdAt: new Date().toISOString(),
+              toolEvents: activeState.activeToolEvents || [],
+            });
+          }
+        }
+
+        return {
+          runStatus: nextRunStatus,
+          approvals: nextApprovals,
+          pendingCompactions: nextCompactions,
+          messages: { ...st.messages, [sessionId]: list },
+        };
+      });
+    } catch {
+      // 优雅降级，静默忽略快照获取失败
     }
   },
 
@@ -541,6 +685,8 @@ export const useStore = create<Store>((set, get) => ({
           set((st) => ({ activeProposals: { ...st.activeProposals, [id]: forThis } }));
         }
       }).catch(() => {});
+      // 即时拉取并恢复运行态快照（流式文字、思考流、活跃工具卡片、审批卡片）
+      void get().syncSessionActiveState(id);
     } catch (e) {
       get().pushToast(String(e));
     }
@@ -649,6 +795,11 @@ export const useStore = create<Store>((set, get) => ({
   },
   setTempClearing(v) {
     set({ tempClearing: v });
+  },
+  setSessionDraft(id, text) {
+    const next = { ...get().sessionDrafts, [id]: text };
+    set({ sessionDrafts: next });
+    persistSessionDrafts(next);
   },
   setProjectSettings(id) {
     set({ projectSettingsId: id });
@@ -970,15 +1121,19 @@ export const useStore = create<Store>((set, get) => ({
       const queues = { ...st.queues };
       const runStatus = { ...st.runStatus };
       const tempInfo = { ...st.tempInfo };
+      const sessionDrafts = { ...st.sessionDrafts };
       delete messages[deleted];
       delete queues[deleted];
       delete runStatus[deleted];
       delete tempInfo[deleted];
+      delete sessionDrafts[deleted];
+      persistSessionDraftsImmediate(sessionDrafts);
       return {
         messages,
         queues,
         runStatus,
         tempInfo,
+        sessionDrafts,
         ...(st.currentId === deleted ? { currentId: null, readOnly: false } : {}),
       };
     });

@@ -526,10 +526,9 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
                 move |delta| {
                     let mut b = buf2.lock().unwrap();
                     b.push_str(delta);
-                    let _ = tauri::Emitter::emit(
-                        &app_text,
+                    app_text.state::<crate::AppState>().emit(
                         "message:delta",
-                        json!({"sessionId": sid_text, "messageId": mid_text, "delta": delta}),
+                        &json!({"sessionId": sid_text, "messageId": mid_text, "delta": delta}),
                     );
                     // 周期性落库，防止崩溃丢失全部内容
                     if last_flush.elapsed() > Duration::from_millis(800) {
@@ -546,10 +545,9 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
                 move |delta| {
                     let mut b = rbuf2.lock().unwrap();
                     b.push_str(delta);
-                    let _ = tauri::Emitter::emit(
-                        &app_reason,
+                    app_reason.state::<crate::AppState>().emit(
                         "message:reasoning:delta",
-                        json!({"sessionId": sid_reason, "messageId": mid_reason, "delta": delta}),
+                        &json!({"sessionId": sid_reason, "messageId": mid_reason, "delta": delta}),
                     );
                     if reasoning_flush.elapsed() > Duration::from_millis(800) {
                         let st = app_reason.state::<crate::AppState>();

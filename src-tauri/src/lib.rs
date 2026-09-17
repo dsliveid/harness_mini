@@ -7,7 +7,10 @@ mod llm;
 mod models;
 mod paths;
 mod secrets;
+pub mod server;
+pub mod single_instance;
 mod skills;
+pub mod snapshot;
 mod sop;
 mod store;
 mod temp;
@@ -60,18 +63,95 @@ pub struct AppState {
     pub compactions: Mutex<HashMap<String, PendingCompaction>>,
     pub running_commands: Mutex<HashMap<String, RunningCommand>>,
     pub app: OnceLock<tauri::AppHandle>,
+    pub snapshot: snapshot::SnapshotStore,
+    pub event_bus: tokio::sync::broadcast::Sender<(String, serde_json::Value)>,
 }
 
 impl AppState {
     pub fn emit(&self, event: &str, payload: &impl serde::Serialize) {
+        if let Ok(val) = serde_json::to_value(payload) {
+            self.update_snapshot(event, &val);
+            let _ = self.event_bus.send((event.to_string(), val));
+        }
         if let Some(app) = self.app.get() {
             let _ = tauri::Emitter::emit(app, event, payload);
+        }
+    }
+
+    fn update_snapshot(&self, event: &str, payload: &serde_json::Value) {
+        match event {
+            "message:delta" => {
+                if let (Some(sid), Some(delta)) = (
+                    payload.get("sessionId").and_then(|v| v.as_str()),
+                    payload.get("delta").and_then(|v| v.as_str()),
+                ) {
+                    let mid = payload.get("messageId").and_then(|v| v.as_str());
+                    self.snapshot.append_content_delta(sid, delta, mid);
+                }
+            }
+            "message:reasoning:delta" => {
+                if let (Some(sid), Some(delta)) = (
+                    payload.get("sessionId").and_then(|v| v.as_str()),
+                    payload.get("delta").and_then(|v| v.as_str()),
+                ) {
+                    let mid = payload.get("messageId").and_then(|v| v.as_str());
+                    self.snapshot.append_reasoning_delta(sid, delta, mid);
+                }
+            }
+            "run:status" => {
+                if let (Some(sid), Some(status)) = (
+                    payload.get("sessionId").and_then(|v| v.as_str()),
+                    payload.get("status").and_then(|v| v.as_str()),
+                ) {
+                    if status == "running" {
+                        let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or("");
+                        self.snapshot.start_run(sid, run_id);
+                    } else if status == "done" || status == "failed" || status == "cancelled" || status == "idle" {
+                        self.snapshot.finish_run(sid);
+                    }
+                }
+            }
+            "tool:update" => {
+                if let (Some(sid), Some(ev_val)) = (
+                    payload.get("sessionId").and_then(|v| v.as_str()),
+                    payload.get("event"),
+                ) {
+                    if let Ok(ev) = serde_json::from_value::<crate::models::ToolEvent>(ev_val.clone()) {
+                        if ev.status == "running" || ev.status == "pending_approval" {
+                            self.snapshot.upsert_tool_event(sid, ev);
+                        } else {
+                            self.snapshot.remove_finished_tool_event(sid, &ev.id);
+                        }
+                    }
+                }
+            }
+            "approval:request" => {
+                if let Ok(req) = serde_json::from_value::<crate::models::ApprovalRequest>(payload.clone()) {
+                    self.snapshot.set_pending_approval(&req.session_id.clone(), Some(req));
+                }
+            }
+            "approval:resolved" => {
+                if let Some(sid) = payload.get("sessionId").and_then(|v| v.as_str()) {
+                    self.snapshot.set_pending_approval(sid, None);
+                }
+            }
+            "compaction:request" => {
+                if let Ok(req) = serde_json::from_value::<crate::models::CompactionRequest>(payload.clone()) {
+                    self.snapshot.set_pending_compaction(&req.session_id.clone(), Some(req));
+                }
+            }
+            "compaction:resolved" | "compaction:timeout" => {
+                if let Some(sid) = payload.get("sessionId").and_then(|v| v.as_str()) {
+                    self.snapshot.set_pending_compaction(sid, None);
+                }
+            }
+            _ => {}
         }
     }
 }
 
 /// 显示并聚焦主窗口
-fn show_main_window(app: &tauri::AppHandle) {
+pub fn show_main_window(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.unminimize();
         let _ = w.show();
@@ -132,9 +212,26 @@ fn resolve_and_open(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let dir_hash = single_instance::get_app_dir_hash();
+    let pipe_name = format!(r"\\.\pipe\harness_mini_{}", dir_hash);
+
+    // 1. 同目录单实例拦截：若已有实例正在运行，唤醒对方窗口并退出当前进程
+    if single_instance::try_wakeup_existing_instance(&pipe_name) {
+        std::process::exit(0);
+    }
+
+    // 2. 多目录实例隔离：为当前目录实例分配专属 WebView2 缓存目录，防止多开时白屏崩溃
+    single_instance::setup_webview_isolation(&dir_hash);
+
+    let pipe_name_for_listener = pipe_name.clone();
+    let dir_hash_for_tray = dir_hash.clone();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
+        .setup(move |app| {
+            // 3. 启动同目录单实例命名管道监听
+            single_instance::start_pipe_listener(app.handle().clone(), pipe_name_for_listener);
+
             use tauri::{
                 menu::{Menu, MenuItem},
                 tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -146,6 +243,7 @@ pub fn run() {
                 .unwrap_or_else(|| std::env::temp_dir().join("harness_mini_data"));
             let (data_dir, master_key, db, pending, unwritable_path) =
                 resolve_and_open(legacy_dir.as_deref(), custom_dir.as_deref(), &default_dir)?;
+            let (event_bus, _) = tokio::sync::broadcast::channel(2048);
             let state = AppState {
                 db: Mutex::new(db),
                 handles: Mutex::new(HashMap::new()),
@@ -153,22 +251,47 @@ pub fn run() {
                 compactions: Mutex::new(HashMap::new()),
                 running_commands: Mutex::new(HashMap::new()),
                 app: OnceLock::new(),
-                data_dir: Mutex::new(data_dir),
+                data_dir: Mutex::new(data_dir.clone()),
                 data_pending: AtomicBool::new(pending),
                 default_data_dir: default_dir,
                 unwritable_path,
                 is_custom_dir: AtomicBool::new(custom_dir.is_some()),
                 master_key: Mutex::new(master_key),
+                snapshot: snapshot::SnapshotStore::new(),
+                event_bus,
             };
             app.manage(state);
             let handle = app.handle().clone();
             let _ = app.state::<AppState>().app.set(handle);
 
+            // 启动本地守护服务（HTTP/WebSocket 网关，供多端连接与离线保活恢复）
+            let app_handle = app.handle().clone();
+            let data_dir_saved = data_dir.clone();
+            tauri::async_runtime::spawn(async move {
+                let (port_tx, port_rx) = tokio::sync::oneshot::channel();
+                let srv_handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = server::start_server(srv_handle, port_tx).await;
+                });
+                if let Ok(port) = port_rx.await {
+                    if let Some(ref d) = data_dir_saved {
+                        let _ = server::save_daemon_info(d, &server::DaemonInfo {
+                            pid: std::process::id(),
+                            port,
+                            token: uuid::Uuid::new_v4().to_string(),
+                            data_dir: d.to_string_lossy().to_string(),
+                            started_at: chrono::Local::now().to_rfc3339(),
+                        });
+                    }
+                }
+            });
+
             // 系统托盘：左键点击显示主窗口，右键弹出菜单（显示主窗口 / 退出）
             let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
-            TrayIconBuilder::with_id("main-tray")
+            let tray_id = format!("main-tray-{}", dir_hash_for_tray);
+            TrayIconBuilder::with_id(tray_id)
                 .icon(app.default_window_icon().expect("missing app icon").clone())
                 .tooltip("harness_mini")
                 .menu(&tray_menu)
@@ -259,6 +382,7 @@ pub fn run() {
             commands::set_project_sop,
             commands::run_workspace_sop,
             commands::get_token_stats,
+            commands::get_session_active_state,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

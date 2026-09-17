@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { ipc } from "../ipc";
 import { useStore } from "../store";
 import { DRAFT_ID } from "../types";
@@ -13,6 +13,9 @@ function formatTokens(n?: number | null): string {
 
 export function Composer() {
   const currentId = useStore((s) => s.currentId);
+  const activeId = currentId ?? DRAFT_ID;
+  const text = useStore((s) => s.sessionDrafts[activeId] ?? "");
+  const setSessionDraft = useStore((s) => s.setSessionDraft);
   const running = useStore((s) => (s.currentId ? s.runStatus[s.currentId] === "running" : false));
   const readOnly = useStore((s) => s.readOnly);
   const session = useStore((s) => (s.currentId && s.currentId !== DRAFT_ID ? s.sessions.find((x) => x.id === s.currentId) ?? null : null));
@@ -22,7 +25,6 @@ export function Composer() {
   const pushToast = useStore((s) => s.pushToast);
   const setShowTokenStatsModal = useStore((s) => s.setShowTokenStatsModal);
 
-  const [text, setText] = useState("");
   const taRef = useRef<HTMLTextAreaElement>(null);
 
   // 临时空间对话：已合并且临时空间未清空期间禁止发送（清空后可继续）
@@ -49,13 +51,17 @@ export function Composer() {
     ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
   };
 
+  useEffect(() => {
+    resize();
+  }, [activeId, text]);
+
   const insertNewline = () => {
     const ta = taRef.current;
     if (!ta) return;
     const start = ta.selectionStart;
     const end = ta.selectionEnd;
     const next = text.slice(0, start) + "\n" + text.slice(end);
-    setText(next);
+    setSessionDraft(activeId, next);
     requestAnimationFrame(() => {
       ta.selectionStart = ta.selectionEnd = start + 1;
       resize();
@@ -65,7 +71,8 @@ export function Composer() {
   const doSend = async () => {
     const t = text.trim();
     if (!t || !canSend) return;
-    setText("");
+    const targetId = activeId;
+    setSessionDraft(targetId, "");
     requestAnimationFrame(resize);
     try {
       const st = useStore.getState();
@@ -94,7 +101,7 @@ export function Composer() {
       }
     } catch (e) {
       pushToast(String(e));
-      setText(t); // 发送失败恢复内容
+      setSessionDraft(targetId, t); // 发送失败恢复原会话草稿内容
     }
   };
 
@@ -125,8 +132,7 @@ export function Composer() {
           placeholder={placeholder}
           disabled={!canSend}
           onChange={(e) => {
-            setText(e.target.value);
-            resize();
+            setSessionDraft(activeId, e.target.value);
           }}
           onKeyDown={onKeyDown}
         />

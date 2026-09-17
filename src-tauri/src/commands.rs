@@ -1241,4 +1241,13 @@ pub fn get_token_stats(
     store::get_token_stats(&db, project_id.as_deref(), days)
 }
 
+#[tauri::command]
+pub fn get_session_active_state(
+    state: State<'_, crate::AppState>,
+    session_id: String,
+) -> Result<crate::snapshot::SessionActiveState, String> {
+    Ok(state.snapshot.get(&session_id))
+}
+
+
 

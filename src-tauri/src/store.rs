@@ -4,8 +4,29 @@ use std::path::Path;
 
 pub fn open_db(path: &Path) -> Result<Connection, String> {
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA busy_timeout = 5000;
+         PRAGMA synchronous = NORMAL;",
+    )
+    .map_err(|e| e.to_string())?;
     init_schema(&conn)?;
-    let _ = cleanup_orphaned_running_states(&conn);
+    // 仅在无活跃后台守护进程时才执行遗留状态清理，避免误杀正在运行的 Agent
+    let is_daemon_alive = path.parent().and_then(|dir| {
+        let p = dir.join("daemon.json");
+        let s = std::fs::read_to_string(p).ok()?;
+        let info: serde_json::Value = serde_json::from_str(&s).ok()?;
+        let port = info.get("port")?.as_u64()? as u16;
+        let stream = std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            std::time::Duration::from_millis(200),
+        );
+        Some(stream.is_ok())
+    }).unwrap_or(false);
+
+    if !is_daemon_alive {
+        let _ = cleanup_orphaned_running_states(&conn);
+    }
     Ok(conn)
 }
 

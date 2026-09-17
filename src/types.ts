@@ -565,4 +565,17 @@ export interface TokenStatsReport {
   bySession: SessionTokenStats[];
 }
 
+export interface SessionActiveState {
+  sessionId: string;
+  isRunning: boolean;
+  activeRunId: string | null;
+  currentMessageId: string | null;
+  streamingContent: string;
+  streamingReasoning: string;
+  activeToolEvents: ToolEvent[];
+  pendingApproval: ApprovalReq | null;
+  pendingCompaction: CompactionReq | null;
+}
+
+
 
