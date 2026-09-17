@@ -151,11 +151,11 @@ export function TopBar() {
   return (
     <div className="relative z-30 h-12 shrink-0 border-b border-edge/60 bg-panel flex items-center gap-2.5 px-3.5 select-none">
       {/* 左侧：会话标题 + 面包屑导航 */}
-      <div className="flex items-center gap-2 min-w-0">
-        <div className="flex items-center gap-1.5 text-ink min-w-0">
+      <div className="flex items-center gap-2 min-w-0 flex-1 overflow-hidden">
+        <div className="flex items-center gap-1.5 text-ink min-w-0 shrink">
           <MessageSquare size={14} className="text-accent/80 shrink-0" />
           <span
-            className="font-medium text-[13px] truncate max-w-[200px]"
+            className="font-medium text-[13px] truncate max-w-[140px] lg:max-w-[180px]"
             title={session?.title ?? (currentId === DRAFT_ID ? "新对话（未保存）" : "harness_mini")}
           >
             {session?.title ?? (currentId === DRAFT_ID ? "新对话" : "harness_mini")}
@@ -167,13 +167,13 @@ export function TopBar() {
           )}
         </div>
 
-        <span className="text-inkdim/30 select-none text-[12px]">/</span>
+        <span className="text-inkdim/30 select-none text-[12px] shrink-0">/</span>
 
         {/* 工作区（工作区即项目：未保存草稿可选已有项目 / 目录 / 不选择；已保存与临时空间对话只读） */}
-        <div className="relative flex items-center gap-1 min-w-0">
+        <div className="relative flex items-center gap-1 min-w-0 shrink">
           {isSaved || isTempConv ? (
             <div
-              className="flex items-center gap-1.5 bg-panel2/50 border border-edge/50 rounded-lg px-2.5 py-1 text-[12px] text-inkdim max-w-[240px] cursor-default select-none shadow-sm"
+              className="flex items-center gap-1.5 bg-panel2/50 border border-edge/50 rounded-lg px-2.5 py-1 text-[12px] text-inkdim max-w-[160px] lg:max-w-[220px] cursor-default select-none shadow-sm shrink min-w-0"
               title={wsTitle}
             >
               {isTempConv ? (
@@ -185,14 +185,14 @@ export function TopBar() {
             </div>
           ) : (
             <button
-              className={`flex items-center gap-1.5 bg-panel2/60 hover:bg-panel2 border border-edge/60 hover:border-accent/40 rounded-lg px-2.5 py-1 text-[12px] text-inkdim hover:text-ink max-w-[240px] transition-all shadow-sm ${
+              className={`flex items-center gap-1.5 bg-panel2/60 hover:bg-panel2 border border-edge/60 hover:border-accent/40 rounded-lg px-2.5 py-1 text-[12px] text-inkdim hover:text-ink max-w-[160px] lg:max-w-[220px] transition-all shadow-sm shrink min-w-0 ${
                 openMenu === "ws" ? "border-accent/50 bg-panel2 ring-1 ring-accent/20" : ""
               }`}
               onClick={() => setOpenMenu(openMenu === "ws" ? null : "ws")}
               title={wsTitle}
             >
               <FolderOpen size={13} className="text-accent shrink-0" />
-              <span className="truncate">{wsLabel || "未选择工作区（可纯对话）"}</span>
+              <span className="truncate">{wsLabel || "未选择工作区"}</span>
               <ChevronDown size={11} className="opacity-60 shrink-0 ml-0.5" />
             </button>
           )}
@@ -260,11 +260,11 @@ export function TopBar() {
       </div>
 
       {/* 右侧：访问模式 + 模型选择 + 状态指示 */}
-      <div className="ml-auto flex items-center gap-2">
+      <div className="ml-auto flex items-center gap-1.5 shrink-0 select-none">
         {/* 访问模式选择器（自定义深色下拉） */}
-        <div className="relative">
+        <div className="relative shrink-0">
           <button
-            className={`flex items-center gap-1.5 bg-panel2/60 hover:bg-panel2 border border-edge/60 hover:border-accent/40 rounded-lg px-2.5 py-1 text-[12px] transition-all shadow-sm ${
+            className={`flex items-center gap-1 bg-panel2/60 hover:bg-panel2 border border-edge/60 hover:border-accent/40 rounded-lg px-2.5 py-1 text-[12px] whitespace-nowrap shrink-0 transition-all shadow-sm ${
               accessMode === "full_access" ? "text-amber-400 font-medium" : "text-ink"
             } ${openMenu === "mode" ? "border-accent/50 bg-panel2 ring-1 ring-accent/20" : ""}`}
             onClick={() => setOpenMenu(openMenu === "mode" ? null : "mode")}
@@ -275,7 +275,7 @@ export function TopBar() {
             ) : (
               <ShieldCheck size={13} className="text-accent shrink-0" />
             )}
-            <span>{selectModeLabel(accessMode)}</span>
+            <span className="truncate">{selectModeLabel(accessMode)}</span>
             <ChevronDown size={11} className="opacity-60 shrink-0 ml-0.5 text-inkdim" />
           </button>
 
@@ -332,9 +332,9 @@ export function TopBar() {
         </div>
 
         {/* 模型选择器（自定义深色下拉） */}
-        <div className="relative">
+        <div className="relative shrink-0">
           <button
-            className={`flex items-center gap-1.5 bg-panel2/60 hover:bg-panel2 border border-edge/60 hover:border-accent/40 rounded-lg px-2.5 py-1 text-[12px] text-ink transition-all shadow-sm max-w-[210px] ${
+            className={`flex items-center gap-1.5 bg-panel2/60 hover:bg-panel2 border border-edge/60 hover:border-accent/40 rounded-lg px-2.5 py-1 text-[12px] text-ink whitespace-nowrap shrink-0 transition-all shadow-sm max-w-[140px] lg:max-w-[180px] ${
               openMenu === "model" ? "border-accent/50 bg-panel2 ring-1 ring-accent/20" : ""
             }`}
             onClick={() => setOpenMenu(openMenu === "model" ? null : "model")}
@@ -395,7 +395,7 @@ export function TopBar() {
 
         {/* 状态指示 */}
         <div
-          className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[11px] select-none transition-all ${
+          className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full border text-[11px] whitespace-nowrap shrink-0 select-none transition-all ${
             running
               ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400 shadow-[0_0_12px_rgba(16,185,129,0.15)]"
               : "bg-panel2/50 border-edge/50 text-inkdim"
@@ -403,7 +403,7 @@ export function TopBar() {
           title={running ? "Agent 正在执行任务中" : "当前空闲"}
         >
           <span
-            className={`w-1.5 h-1.5 rounded-full ${
+            className={`w-1.5 h-1.5 rounded-full shrink-0 ${
               running ? "bg-emerald-400 animate-pulse shadow-[0_0_6px_rgba(52,211,153,0.8)]" : "bg-zinc-500"
             }`}
           />

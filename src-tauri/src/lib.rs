@@ -356,6 +356,7 @@ pub fn run() {
             commands::restart_subagent,
             commands::restart_all_subagents,
             commands::delete_subagent,
+            commands::report_subagent_to_parent,
             commands::kill_command,
             commands::list_running_sessions,
             commands::edit_and_resend,

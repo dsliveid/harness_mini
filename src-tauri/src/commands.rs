@@ -674,6 +674,63 @@ pub fn delete_subagent(app: AppHandle, state: State<'_, crate::AppState>, subage
     Ok(())
 }
 
+#[tauri::command]
+pub fn report_subagent_to_parent(
+    app: AppHandle,
+    state: State<'_, crate::AppState>,
+    subagent_id: String,
+) -> Result<String, String> {
+    let (parent_id, report_prompt) = {
+        let db = state.db.lock().unwrap();
+        let sub = store::get_session(&db, &subagent_id)?.ok_or("子 Agent 不存在")?;
+        let parent_id = sub.parent_session_id.ok_or("该会话不是子 Agent，没有父会话")?;
+        let msgs = store::get_messages(&db, &subagent_id, None, 50)?;
+        let last_reply = msgs
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant" && !m.content.as_deref().unwrap_or("").is_empty())
+            .and_then(|m| m.content.as_deref())
+            .unwrap_or("(子 Agent 未产生文本产出)");
+
+        let mut touched_files = std::collections::BTreeSet::new();
+        for m in &msgs {
+            for te in &m.tool_events {
+                if ["write_file", "edit_file", "apply_diff"].contains(&te.tool_name.as_str()) {
+                    if let Some(p) = te.params.get("path").and_then(|v| v.as_str()) {
+                        touched_files.insert(p.to_string());
+                    }
+                }
+            }
+        }
+        let touched_str = if touched_files.is_empty() {
+            String::new()
+        } else {
+            let list = touched_files.into_iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ");
+            format!("涉及改动文件：{}\n", list)
+        };
+
+        let role = sub.subagent_role.as_deref().unwrap_or("协作助手");
+        let prompt = format!(
+            "【子 Agent 成果汇报 - {} ({})】\n{}\n{}\n请主 Agent 审阅以上产出，进行集成检验并继续推进后续工作。",
+            sub.title, role, touched_str, last_reply
+        );
+        (parent_id, prompt)
+    };
+
+    send_message(
+        state,
+        app,
+        Some(parent_id),
+        report_prompt,
+        None,
+        None,
+        None,
+        None,
+    )?;
+
+    Ok("已成功将成果汇报发送至主会话并唤醒主 Agent！".into())
+}
+
 /// 手动关闭正在执行的控制台命令进程
 #[tauri::command]
 pub fn kill_command(

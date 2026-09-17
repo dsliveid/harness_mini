@@ -87,6 +87,8 @@ export const ipc = {
     invoke<number>("restart_all_subagents", { parentSessionId }),
   deleteSubagent: (subagentId: string) =>
     invoke<void>("delete_subagent", { subagentId }),
+  reportSubagentToParent: (subagentId: string) =>
+    invoke<string>("report_subagent_to_parent", { subagentId }),
   killCommand: (eventId: string) => invoke<void>("kill_command", { eventId }),
   listRunningSessions: () => invoke<RunningSession[]>("list_running_sessions"),
   editAndResend: (sessionId: string, messageId: string, newText: string) =>

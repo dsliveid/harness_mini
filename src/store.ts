@@ -210,8 +210,10 @@ interface Store {
   restartSubagent: (subagentId: string) => Promise<void>;
   restartAllSubagents: (parentSessionId: string) => Promise<void>;
   deleteSubagent: (subagentId: string) => Promise<void>;
-  onSubagentsChanged: (p: { parentSessionId: string; subagentId?: string }) => Promise<void>;
+  reportSubagentToParent: (subagentId: string) => Promise<void>;
+  onSubagentsChanged: (p: any) => Promise<void>;
   onSubagentCreated: (subagent: Session) => void;
+  onSubagentUpdate: (payload: any) => void;
   onError: (p: any) => void;
 }
 
@@ -333,7 +335,7 @@ export const useStore = create<Store>((set, get) => ({
   dataStatus: null,
   subagents: {},
   activeSubagentId: null,
-  subagentPanelWidth: Math.max(360, Number(localStorage.getItem(SUBAGENT_WIDTH_KEY)) || 560),
+  subagentPanelWidth: Math.max(360, Number(localStorage.getItem(SUBAGENT_WIDTH_KEY)) || 480),
   showCreateSubagentModal: false,
   // 启动默认进入项目视图
   view: "project",
@@ -1322,7 +1324,8 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   setSubagentPanelWidth(width: number) {
-    const clamped = Math.max(360, Math.min(width, Math.round(window.innerWidth * 0.75)));
+    const maxAllowed = Math.max(360, window.innerWidth - 240 - 500);
+    const clamped = Math.max(360, Math.min(width, maxAllowed));
     localStorage.setItem(SUBAGENT_WIDTH_KEY, String(clamped));
     set({ subagentPanelWidth: clamped });
   },
@@ -1409,31 +1412,63 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
+  async reportSubagentToParent(subagentId: string) {
+    try {
+      const res = await ipc.reportSubagentToParent(subagentId);
+      get().pushToast(res || "已向主 Agent 提交成果汇报");
+    } catch (e) {
+      get().pushToast(`汇报失败: ${e}`);
+    }
+  },
+
   async onSubagentsChanged(p) {
-    if (p.parentSessionId) {
-      await get().loadSubagents(p.parentSessionId);
+    const pid = p?.parentSessionId || p?.parentId;
+    if (pid) {
+      await get().loadSubagents(pid);
     }
   },
 
   onSubagentCreated(subagent) {
-    if (!subagent.parentSessionId) return;
+    const pid = subagent.parentSessionId || (subagent as any).parentId;
+    if (!pid) return;
     set((st) => {
-      const existing = st.subagents[subagent.parentSessionId!] ?? [];
+      const existing = st.subagents[pid] ?? [];
       if (existing.some((s) => s.id === subagent.id)) {
         return {
           subagents: {
             ...st.subagents,
-            [subagent.parentSessionId!]: existing.map((s) => (s.id === subagent.id ? subagent : s)),
+            [pid]: existing.map((s) => (s.id === subagent.id ? { ...s, ...subagent } : s)),
           },
         };
       }
       return {
         subagents: {
           ...st.subagents,
-          [subagent.parentSessionId!]: [subagent, ...existing],
+          [pid]: [subagent, ...existing],
         },
       };
     });
+  },
+
+  onSubagentUpdate(payload) {
+    const pid = payload?.parentSessionId || payload?.parentId;
+    const sid = payload?.subagentId || payload?.id;
+    if (!pid || !sid) return;
+    if (payload.status) {
+      set((st) => ({
+        runStatus: {
+          ...st.runStatus,
+          [sid]: payload.status === "running" ? "running" : "idle",
+        },
+        subagents: {
+          ...st.subagents,
+          [pid]: (st.subagents[pid] ?? []).map((s) =>
+            s.id === sid ? { ...s, status: payload.status } : s
+          ),
+        },
+      }));
+    }
+    void get().loadSubagents(pid);
   },
 
   onError(p) {

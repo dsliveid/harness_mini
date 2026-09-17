@@ -24,7 +24,7 @@ impl SessionHandle {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy, Eq, Debug)]
 pub enum RunOutcome {
     Done,
     Failed,
@@ -293,6 +293,7 @@ pub fn restart_all_subagents(app: &AppHandle, parent_session_id: &str) -> Result
 
 async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String>) {
     let state = app.state::<crate::AppState>();
+    let mut last_outcome = RunOutcome::Done;
     loop {
         // 1. 取触发消息：显式指定，或从待执行队列取出最早一条
         let trigger_id = match trigger.take() {
@@ -344,6 +345,7 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
 
         // 3. 运行一次 Agent 主循环
         let (outcome, last_assistant_id, run_tokens) = run_once(&app, &session_id, &run_id).await;
+        last_outcome = outcome;
         let run_duration_ms = run_start_instant.elapsed().as_millis() as u64;
         let status = match outcome {
             RunOutcome::Done => "done",
@@ -401,6 +403,32 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
             }
         }
     }
+
+    // 若当前会话属于子 Agent，将其执行结论持久化并广播给主会话和前端界面
+    {
+        let db = state.db.lock().unwrap();
+        if let Ok(Some(s)) = store::get_session(&db, &session_id) {
+            if s.session_type == "subagent" || s.parent_session_id.is_some() {
+                let parent_id = s.parent_session_id.clone().unwrap_or_default();
+                let sub_status = match last_outcome {
+                    RunOutcome::Done => "completed",
+                    RunOutcome::Failed => "failed",
+                };
+                let _ = store::set_session_status(&db, &session_id, sub_status);
+                let _ = app.emit("subagent:update", json!({
+                    "parentId": parent_id,
+                    "parentSessionId": parent_id,
+                    "subagentId": session_id,
+                    "status": sub_status,
+                }));
+                let _ = app.emit("subagents:changed", json!({
+                    "parentId": parent_id,
+                    "parentSessionId": parent_id,
+                }));
+            }
+        }
+    }
+
     let _ = app.emit(
         "queue:update",
         json!({"sessionId": session_id, "items": queued_payload(&state, &session_id)}),
@@ -1850,7 +1878,11 @@ fn system_prompt(session: &Session, project_section: Option<&str>) -> String {
 3. 动手前先用 glob / grep / list_dir 探索并理解代码结构。
 4. 修改完成后，尽量用 run_command 运行构建或测试来验证改动。
 5. 严禁再次创建子 Agent，直接使用现有工具高效完成分配的目标。
-6. 全程使用简体中文与用户交流；最终回复结构化总结：做了什么、改了哪些文件、验证结果如何。"#,
+6. 全程使用简体中文与用户交流；任务完成后，最终回复必须严格按以下结构化格式汇报成果，以便父 Agent 汇总整合：
+   - 🎯 任务完成状态（全部完成 / 部分完成 / 遇到阻碍）
+   - 📝 改动的文件清单（请列出准确相对路径）
+   - 💡 核心实现逻辑与技术改动说明
+   - 🧪 构建与测试验证结果"#,
             role = role,
             task = task,
             path = session.workspace_path,
@@ -1870,7 +1902,13 @@ fn system_prompt(session: &Session, project_section: Option<&str>) -> String {
 4. 所有路径相对于工作区根目录，不要访问工作区之外的路径。
 5. 不要执行破坏性命令（如递归删除、格式化磁盘等），它们会被强制要求用户确认。
 6. 接到多步任务时，先用 todo 工具列出计划，并随进展更新各项状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done（切勿遗留 in_progress 状态）。
-7. 当面对大型复杂需求（如同时进行前端开发和后端开发、多个模块独立开发、多任务并行处理等）时，可调用 spawn_subagent 工具创建子 Agent 进程并行协作，提高执行效率；并可调用 get_subagent_status 或 wait_subagents 获知进度与整合结果。
+7. 【子进程协作与总架构编排 (Orchestration)】：
+   - 触发场景：当用户提出复杂需求、多模块开发（如前端界面与后端接口、多个独立模块并行开发、测试与功能并行）或明确要求并行处理时，你作为总架构师，必须采用子进程协作模式提升效率与模块隔离度。
+   - 编排执行标准流程（SOP）：
+     ① 规划拆解：先用 todo 工具明确列出架构规划与各子模块任务分工；
+     ② 派生子进程：连续调用 spawn_subagent 工具，为各独立模块派生专属子 Agent（指定明确的 role、title、task 及 subpath）；
+     ③ 等待与汇聚：创建完相关子任务后，调用 wait_subagents 工具等待子进程执行完成，该工具将自动汇总并返回各子 Agent 的执行结论与产出；
+     ④ 整合验收：审阅子 Agent 成果并进行必要的全局验证或微调，最终向用户交付清晰完整的交付报告。
 8. 全程使用简体中文与用户交流；最终回复简洁总结：做了什么、改了哪些文件、验证结果如何。"#,
             path = session.workspace_path,
             os = os

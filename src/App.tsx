@@ -50,7 +50,7 @@ export default function App() {
       <WindowHeader />
       <div className="flex-1 min-h-0 flex">
         <Sidebar />
-        <div className="flex-1 flex flex-col min-w-0 relative">
+        <div className="flex-1 flex flex-col min-w-[500px] relative">
           <TopBar />
           <SubagentBar />
           <ChatView />

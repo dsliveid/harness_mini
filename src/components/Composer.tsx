@@ -48,7 +48,7 @@ export function Composer() {
     const ta = taRef.current;
     if (!ta) return;
     ta.style.height = "auto";
-    ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
+    ta.style.height = `${Math.max(32, Math.min(ta.scrollHeight, 200))}px`;
   };
 
   useEffect(() => {
@@ -126,7 +126,8 @@ export function Composer() {
       <div className="flex items-end gap-2 bg-panel2/90 border border-edge rounded-2xl px-3.5 py-2.5 shadow-sm focus-within:border-accent/60 focus-within:ring-1 focus-within:ring-accent/20 transition-all">
         <textarea
           ref={taRef}
-          className="flex-1 bg-transparent outline-none resize-none text-[14px] leading-relaxed max-h-[200px] py-1 disabled:opacity-50 placeholder:text-inkdim/60"
+          style={{ height: 32 }}
+          className="flex-1 bg-transparent outline-none resize-none text-[14px] leading-relaxed max-h-[200px] min-h-[32px] py-1 disabled:opacity-50 placeholder:text-inkdim/60"
           rows={1}
           value={text}
           placeholder={placeholder}
@@ -155,7 +156,7 @@ export function Composer() {
           </button>
         )}
       </div>
-      <div className="flex items-center justify-between text-[11px] text-inkdim mt-2 px-1 select-none gap-3">
+      <div className="h-6 flex items-center justify-between text-[11px] text-inkdim mt-2 px-1 select-none gap-3">
         <div className="flex items-center gap-2 min-w-0 flex-1">
           <span className="truncate max-w-[320px] md:max-w-[440px]" title={effectiveWorkspace || undefined}>
             {effectiveWorkspace || "未绑定工作区 · 可直接对话（文件/命令工具不可用）"}

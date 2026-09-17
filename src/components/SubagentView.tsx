@@ -1,4 +1,4 @@
-﻿import { useState, useRef, useEffect, useMemo } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import { useStore } from "../store";
 import { computeTurnMetrics } from "../types";
 import { ipc } from "../ipc";
@@ -16,6 +16,7 @@ import {
   Coins,
   Bot,
   Sparkles,
+  ArrowUp,
 } from "./Icons";
 
 function formatTokens(n?: number | null): string {
@@ -37,14 +38,28 @@ export function SubagentView({ subagentId }: { subagentId: string }) {
   const stopSubagent = useStore((s) => s.stopSubagent);
   const restartSubagent = useStore((s) => s.restartSubagent);
   const deleteSubagent = useStore((s) => s.deleteSubagent);
+  const reportSubagentToParent = useStore((s) => s.reportSubagentToParent);
   const pushToast = useStore((s) => s.pushToast);
 
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [reporting, setReporting] = useState(false);
   const boxRef = useRef<HTMLDivElement>(null);
+  const taRef = useRef<HTMLTextAreaElement>(null);
   const stickRef = useRef(true);
 
   const turnMetricsMap = useMemo(() => computeTurnMetrics(msgs, isRunning), [msgs, isRunning]);
+
+  const resize = () => {
+    const ta = taRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = `${Math.max(32, Math.min(ta.scrollHeight, 200))}px`;
+  };
+
+  useEffect(() => {
+    resize();
+  }, [subagentId, input]);
 
   useEffect(() => {
     const el = boxRef.current;
@@ -82,15 +97,27 @@ export function SubagentView({ subagentId }: { subagentId: string }) {
     const text = input.trim();
     if (!text || sending) return;
     setInput("");
+    requestAnimationFrame(resize);
     setSending(true);
     try {
       await ipc.sendMessage(subagentId, text);
     } catch (e) {
       pushToast(`发送失败: ${e}`);
       setInput(text);
+      requestAnimationFrame(resize);
     } finally {
       setSending(false);
     }
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key !== "Enter") return;
+    if ((e.nativeEvent as unknown as { isComposing?: boolean }).isComposing) return;
+    if (e.altKey || e.shiftKey) {
+      return;
+    }
+    e.preventDefault();
+    void handleSend();
   };
 
   const handleDelete = async () => {
@@ -100,6 +127,16 @@ export function SubagentView({ subagentId }: { subagentId: string }) {
     );
     if (confirmed) {
       await deleteSubagent(subagentId);
+    }
+  };
+
+  const handleReport = async () => {
+    if (reporting) return;
+    setReporting(true);
+    try {
+      await reportSubagentToParent(subagentId);
+    } finally {
+      setReporting(false);
     }
   };
 
@@ -177,6 +214,19 @@ export function SubagentView({ subagentId }: { subagentId: string }) {
             </button>
           )}
 
+          {/* Report Button */}
+          {!isRunning && (subagent.status === "completed" || msgs.some((m) => m.role === "assistant")) && (
+            <button
+              onClick={handleReport}
+              disabled={reporting}
+              className="flex items-center gap-1 px-2.5 py-1 rounded-md text-emerald-400 hover:bg-emerald-500/15 border border-emerald-500/30 text-[11px] font-medium transition-colors cursor-pointer"
+              title="一键将该子 Agent 的产出与文件改动总结汇报给主会话，并唤醒主 Agent 继续整合"
+            >
+              <Send size={11} />
+              <span>{reporting ? "汇报中…" : "汇报成果"}</span>
+            </button>
+          )}
+
           {/* Restart Button */}
           {!isRunning && (
             <button
@@ -238,47 +288,86 @@ export function SubagentView({ subagentId }: { subagentId: string }) {
         )}
       </div>
 
-      {/* Bottom Composer for Subagent */}
-      <div className="p-3 border-t border-edge bg-panel2/30">
-        <div className="relative flex items-end gap-2 bg-panel border border-edge rounded-xl p-1.5 focus-within:border-accent/80 transition-colors shadow-xs">
+      {/* Bottom Composer for Subagent - 与主会话 Composer 视觉与垂直基准完全对齐 */}
+      <div className="p-3">
+        <div className="flex items-end gap-2 bg-panel2/90 border border-edge rounded-2xl px-3.5 py-2.5 shadow-sm focus-within:border-accent/60 focus-within:ring-1 focus-within:ring-accent/20 transition-all">
           <textarea
+            ref={taRef}
             rows={1}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey && !e.altKey && !e.nativeEvent.isComposing) {
-                e.preventDefault();
-                handleSend();
-              }
+            onChange={(e) => {
+              setInput(e.target.value);
             }}
+            onKeyDown={onKeyDown}
             placeholder={
               isRunning
-                ? "子 Agent 运行中…输入消息追加指令"
+                ? "子 Agent 运行中…输入指令追加到待执行队列"
                 : "输入消息向子 Agent 发送补充指令，Enter 发送"
             }
-            className="flex-1 max-h-28 min-h-[32px] bg-transparent text-ink text-[13px] px-2 py-1 focus:outline-none resize-none placeholder:text-inkdim/60"
+            style={{ height: 32 }}
+            className="flex-1 bg-transparent outline-none resize-none text-[14px] leading-relaxed max-h-[200px] min-h-[32px] py-1 disabled:opacity-50 placeholder:text-inkdim/60"
           />
-          <div className="shrink-0 flex items-center gap-1">
-            {isRunning ? (
-              <button
-                type="button"
-                onClick={() => void stopSubagent(subagentId)}
-                className="w-8 h-8 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-400 flex items-center justify-center transition-colors"
-                title="停止子 Agent"
-              >
-                <Square size={13} fill="currentColor" />
-              </button>
-            ) : (
-              <button
-                type="button"
-                disabled={!input.trim() || sending}
-                onClick={handleSend}
-                className="w-8 h-8 rounded-lg bg-accent hover:bg-blue-500 disabled:opacity-40 text-white flex items-center justify-center transition-colors shadow-xs"
-                title="发送 (Enter)"
-              >
-                <Send size={13} />
-              </button>
-            )}
+          {isRunning ? (
+            <button
+              type="button"
+              onClick={() => void stopSubagent(subagentId)}
+              className="shrink-0 w-8 h-8 rounded-xl bg-red-600/90 hover:bg-red-500 text-white flex items-center justify-center transition-colors shadow-sm cursor-pointer"
+              title="停止子 Agent"
+            >
+              <Square size={13} className="fill-current" />
+            </button>
+          ) : (
+            <button
+              type="button"
+              disabled={!input.trim() || sending}
+              onClick={handleSend}
+              className="shrink-0 w-8 h-8 rounded-xl bg-accent hover:bg-blue-500 disabled:opacity-30 disabled:cursor-not-allowed text-white flex items-center justify-center transition-all shadow-sm cursor-pointer"
+              title="发送（Enter）"
+            >
+              <ArrowUp size={16} strokeWidth={2.4} />
+            </button>
+          )}
+        </div>
+
+        {/* 底部对齐辅助栏：与主会话 Composer 保持相同高度（h-6）与垂直视平线 */}
+        <div className="h-6 flex items-center justify-between text-[11px] text-inkdim mt-2 px-1 select-none gap-3">
+          <div className="flex items-center gap-2 min-w-0 flex-1">
+            <span className="truncate max-w-[240px]" title={subagent.workspacePath || "继承主项目工作区"}>
+              {subagent.workspacePath ? `工作区：${subagent.workspacePath}` : "继承主工作区"}
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2.5 shrink-0">
+            <button
+              type="button"
+              className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-[11px] transition-all font-mono border ${
+                (subagent.totalTokens ?? 0) > 0
+                  ? "bg-panel2/80 hover:bg-panel3 border-edge/80 text-ink shadow-xs"
+                  : "hover:bg-panel2 text-inkdim hover:text-ink border-transparent hover:border-edge/50"
+              }`}
+              title={
+                (subagent.totalTokens ?? 0) > 0
+                  ? `该子 Agent 累计消耗: ${(subagent.totalTokens ?? 0).toLocaleString()} tokens\n输入: ${(subagent.promptTokens ?? 0).toLocaleString()} · 输出: ${(subagent.completionTokens ?? 0).toLocaleString()}`
+                  : "子 Agent 独立会话消耗"
+              }
+            >
+              <Coins
+                size={12}
+                className={
+                  (subagent.totalTokens ?? 0) > 0
+                    ? "text-amber-400 shrink-0"
+                    : "text-inkdim group-hover:text-amber-400 transition-colors shrink-0"
+                }
+              />
+              <span className={(subagent.totalTokens ?? 0) > 0 ? "font-medium text-ink" : "text-inkdim"}>
+                {formatTokens(subagent.totalTokens ?? 0)}
+              </span>
+              <span className="text-[10px] text-inkdim">tokens</span>
+            </button>
+
+            <span className="hidden sm:inline-block opacity-65">
+              <kbd className="px-1 py-0.5 rounded bg-panel3 border border-edge text-[10px]">Enter</kbd> 发送
+            </span>
           </div>
         </div>
       </div>

@@ -11,6 +11,8 @@ import {
   ChevronUp,
   ChevronLeft,
   ChevronRight,
+  Copy,
+  Check,
 } from "./Icons";
 
 /** 从当前会话消息中提取所有正在执行的 run_command 工具事件 */
@@ -69,6 +71,8 @@ function TodoSection({ todos, isRunning }: { todos: TodoItem[]; isRunning: boole
 function RunningCommandCard({ ev }: { ev: ToolEvent }) {
   const output = useStore((s) => s.toolOutputs[ev.id]);
   const killCommand = useStore((s) => s.killCommand);
+  const pushToast = useStore((s) => s.pushToast);
+  const [copied, setCopied] = useState(false);
   const command = ev.params?.command ?? "";
   const lastLine = output?.trim().split("\n").pop() ?? "";
   const [terminating, setTerminating] = useState(false);
@@ -83,6 +87,18 @@ function RunningCommandCard({ ev }: { ev: ToolEvent }) {
     }
   };
 
+  const handleCopy = () => {
+    if (!command) return;
+    navigator.clipboard.writeText(command).then(
+      () => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+        pushToast("命令行已复制到剪贴板");
+      },
+      () => pushToast("复制失败")
+    );
+  };
+
   return (
     <div className="flex flex-col gap-1">
       <div className="flex items-center gap-1.5">
@@ -94,6 +110,13 @@ function RunningCommandCard({ ev }: { ev: ToolEvent }) {
         <span className="text-[11px] text-inkdim truncate flex-1 min-w-0 font-mono" title={command}>
           {command.length > 40 ? command.slice(0, 40) + "…" : command}
         </span>
+        <button
+          className="shrink-0 p-0.5 rounded hover:bg-panel3 text-inkdim hover:text-ink transition-colors"
+          title="复制命令行"
+          onClick={handleCopy}
+        >
+          {copied ? <Check size={11} className="text-green-400" /> : <Copy size={11} />}
+        </button>
         <button
           className="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-red-600/80 hover:bg-red-500 text-white disabled:opacity-50 disabled:cursor-not-allowed transition-all"
           title={terminating ? "正在终止进程…" : "终止进程"}

@@ -44,7 +44,7 @@ export function useAppEvents() {
       listen<any>("tool:retry_guidance", (e) => s.onToolRetryGuidance(e.payload)),
       listen<any>("subagents:changed", (e) => s.onSubagentsChanged(e.payload)),
       listen<Session>("subagent:created", (e) => s.onSubagentCreated(e.payload as Session)),
-      listen<Session>("subagent:update", (e) => s.onSubagentCreated(e.payload as Session)),
+      listen<any>("subagent:update", (e) => s.onSubagentUpdate(e.payload)),
       listen<any>("error", (ev) => s.onError(ev.payload)),
     ];
     Promise.all(regs).then((ls) => {

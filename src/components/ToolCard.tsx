@@ -19,6 +19,8 @@ import {
   ChevronRight,
   ShieldAlert,
   Zap,
+  Copy,
+  Check,
 } from "./Icons";
 
 function statusBadge(status: string) {
@@ -162,6 +164,7 @@ function ApprovalSection({ ev }: { ev: ToolEvent }) {
   const pushToast = useStore((s) => s.pushToast);
   const [denyOpen, setDenyOpen] = useState(false);
   const [reason, setReason] = useState("");
+  const [copied, setCopied] = useState(false);
 
   if (!req) return null;
   const riskLabel =
@@ -184,13 +187,36 @@ function ApprovalSection({ ev }: { ev: ToolEvent }) {
     }
   };
 
+  const handleCopy = () => {
+    const textToCopy = ev.params?.command ? String(ev.params.command) : req.preview.replace(/^\$\s*/, "");
+    navigator.clipboard.writeText(textToCopy).then(
+      () => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+        pushToast("已复制到剪贴板");
+      },
+      () => pushToast("复制失败")
+    );
+  };
+
   return (
     <div className="mt-2.5 border border-amber-500/40 bg-amber-500/5 rounded-xl p-3 shadow-sm animate-in fade-in duration-150">
-      <div className="text-[13px] font-medium text-amber-400 mb-1.5 flex items-center gap-1.5">
-        <ShieldAlert size={16} className="shrink-0 text-amber-400" />
-        <span>需要你的确认：{riskLabel}</span>
+      <div className="text-[13px] font-medium text-amber-400 mb-1.5 flex items-center justify-between gap-1.5">
+        <div className="flex items-center gap-1.5">
+          <ShieldAlert size={16} className="shrink-0 text-amber-400" />
+          <span>需要你的确认：{riskLabel}</span>
+        </div>
+        <button
+          type="button"
+          className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 transition-colors"
+          onClick={handleCopy}
+          title="复制命令内容"
+        >
+          {copied ? <Check size={12} className="text-green-400" /> : <Copy size={12} />}
+          <span>{copied ? "已复制" : "复制"}</span>
+        </button>
       </div>
-      <pre className="text-[12px] font-mono whitespace-pre-wrap bg-panel border border-edge/60 rounded-lg p-2.5 max-h-48 overflow-y-auto text-ink">
+      <pre className="text-[12px] font-mono whitespace-pre-wrap break-all bg-panel border border-edge/60 rounded-lg p-2.5 max-h-48 overflow-y-auto text-ink select-text">
         {req.preview}
       </pre>
       {req.forceOnce && (
@@ -265,12 +291,30 @@ function CollapsibleResult({ text }: { text: string }) {
 export function ToolCard({ ev }: { ev: ToolEvent }) {
   const output = useStore((s) => s.toolOutputs[ev.id]);
   const killCommand = useStore((s) => s.killCommand);
+  const pushToast = useStore((s) => s.pushToast);
   const isRunning = useStore((s) => (s.currentId ? s.runStatus[s.currentId] === "running" : false));
   const [terminating, setTerminating] = useState(false);
+  const [copied, setCopied] = useState(false);
   const title = paramTitle(ev);
   const label = TOOL_LABELS[ev.toolName] ?? ev.toolName;
+  const isCommandTool = ev.toolName === "run_command";
+  const commandText = isCommandTool ? String(ev.params?.command ?? "") : "";
   // 默认收起为一行（标题 + 状态），点击展开查看命令输出/文件内容
   const [expanded, setExpanded] = useState(false);
+
+  const handleCopyCommand = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const textToCopy = commandText || title;
+    if (!textToCopy) return;
+    navigator.clipboard.writeText(textToCopy).then(
+      () => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+        pushToast("命令行已复制到剪贴板");
+      },
+      () => pushToast("复制失败")
+    );
+  };
 
   const handleKill = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -292,9 +336,17 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
         ev.status === "pending_approval" ? "border-amber-500/50 ring-1 ring-amber-500/20" : "border-edge/80"
       }`}
     >
-      <button
-        className="w-full flex items-center gap-2 text-left select-none"
+      <div
+        role="button"
+        tabIndex={0}
+        className="w-full flex items-center gap-2 text-left select-none cursor-pointer"
         onClick={() => setExpanded(!expanded)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            setExpanded(!expanded);
+          }
+        }}
         title={expanded ? "收起" : "展开"}
       >
         <ChevronRight
@@ -307,11 +359,27 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
           {toolCategoryBadge(ev.toolName)}
         </div>
         {ev.toolName !== "todo" && (
-          <span className="text-[12px] font-mono text-inkdim truncate flex-1 min-w-0">{title}</span>
+          <span
+            className="text-[12px] font-mono text-inkdim truncate flex-1 min-w-0"
+            title={title}
+          >
+            {title}
+          </span>
         )}
         <div className="ml-auto flex items-center gap-1.5 shrink-0">
+          {isCommandTool && commandText && (
+            <button
+              type="button"
+              className="p-1 rounded hover:bg-panel3 text-inkdim hover:text-ink transition-colors"
+              title="复制命令行"
+              onClick={handleCopyCommand}
+            >
+              {copied ? <Check size={12} className="text-green-400" /> : <Copy size={12} />}
+            </button>
+          )}
           {ev.toolName === "run_command" && ev.status === "running" && (
             <button
+              type="button"
               className="text-[10px] px-2 py-0.5 rounded bg-red-600/80 hover:bg-red-500 text-white disabled:opacity-50 disabled:cursor-not-allowed transition-all"
               title={terminating ? "正在终止进程…" : "终止进程"}
               disabled={terminating}
@@ -327,7 +395,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
             </span>
           )}
         </div>
-      </button>
+      </div>
 
       {ev.toolName === "todo" && Array.isArray(ev.params?.todos) && (
         <TodoList todos={ev.params.todos} isRunning={isRunning} />
@@ -335,6 +403,30 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
 
       {/* 审批条是交互入口，保持常显 */}
       {ev.status === "pending_approval" && <ApprovalSection ev={ev} />}
+
+      {/* 展开时：若是执行命令，先展示完整的命令行（带复制按钮与完整换行支持） */}
+      {expanded && isCommandTool && commandText && (
+        <div className="mt-2.5 rounded-lg border border-edge/60 bg-[#111114] overflow-hidden">
+          <div className="flex items-center justify-between px-3 py-1.5 bg-panel3/40 border-b border-edge/40 text-[11px] text-inkdim select-none">
+            <span className="flex items-center gap-1.5 font-medium text-inkdim">
+              <Terminal size={12} className="text-emerald-400" />
+              <span>完整命令行</span>
+            </span>
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-panel3 hover:bg-edge hover:text-ink text-inkdim transition-colors text-[11px]"
+              onClick={handleCopyCommand}
+              title="复制命令行"
+            >
+              {copied ? <Check size={12} className="text-green-400" /> : <Copy size={12} />}
+              <span>{copied ? "已复制" : "复制"}</span>
+            </button>
+          </div>
+          <pre className="p-3 text-[12px] font-mono text-emerald-300/90 whitespace-pre-wrap break-all select-text max-h-48 overflow-y-auto selection:bg-emerald-500/30">
+            {commandText}
+          </pre>
+        </div>
+      )}
 
       {expanded && showOutput && (
         <pre className="mt-2 text-[12px] font-mono whitespace-pre-wrap bg-[#111114] rounded-md p-2 max-h-40 overflow-y-auto text-inkdim">

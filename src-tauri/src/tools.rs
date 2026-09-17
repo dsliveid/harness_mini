@@ -244,7 +244,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         // ---------- 子 Agent 进程协作工具集 ----------
         ToolSpec {
             name: "spawn_subagent",
-            description: "创建并启动一个独立的子 Agent 进程并行协作（如前端开发、后端开发、多模块开发等）。子 Agent 拥有独立上下文与工具环境，不污染主会话上下文。严禁子 Agent 递归嵌套调用本工具。",
+            description: "创建并启动一个独立的子 Agent 进程并行协作（如前端开发、后端开发、多模块开发等）。子 Agent 拥有独立上下文与工具环境，不污染主会话上下文。通常与 wait_subagents 配合使用：总架构师连续派生多个子任务后，应紧接着调用 wait_subagents 等待完成并汇总结果。严禁子 Agent 递归嵌套调用本工具。",
             risk: Risk::Write,
             schema: json!({
                 "type": "object",
@@ -270,7 +270,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "wait_subagents",
-            description: "等待一个或多个子 Agent 执行完毕并汇总获取它们的执行结论（包含所作改动与产出）。",
+            description: "等待一个或多个子 Agent 协作进程执行完毕，并自动获取汇总它们的执行结论、产出总结与改动文件清单。在调用 spawn_subagent 派生子任务后，应紧接着调用本工具等待汇聚。",
             risk: Risk::ReadOnly,
             schema: json!({
                 "type": "object",
@@ -1278,7 +1278,7 @@ async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
                 subagent_task: None,
             }
         });
-        let msgs = crate::store::get_messages(&db, id, None, 10).unwrap_or_default();
+        let msgs = crate::store::get_messages(&db, id, None, 50).unwrap_or_default();
         let last_reply = msgs
             .iter()
             .rev()
@@ -1286,12 +1286,30 @@ async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
             .and_then(|m| m.content.as_deref())
             .unwrap_or("(未产生文本回复)");
 
+        let mut touched_files = std::collections::BTreeSet::new();
+        for m in &msgs {
+            for te in &m.tool_events {
+                if ["write_file", "edit_file", "apply_diff"].contains(&te.tool_name.as_str()) {
+                    if let Some(p) = te.params.get("path").and_then(|v| v.as_str()) {
+                        touched_files.insert(p.to_string());
+                    }
+                }
+            }
+        }
+        let touched_line = if touched_files.is_empty() {
+            String::new()
+        } else {
+            let list = touched_files.into_iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ");
+            format!("- 涉及改动文件: {}\n", list)
+        };
+
         out.push_str(&format!(
-            "### 子 Agent: {} ({})\n- 状态: {}\n- Token: {}\n- 最终答复/成果：\n```markdown\n{}\n```\n\n",
+            "### 协同子 Agent: {} ({})\n- 状态: {}\n- Token 消耗: {}\n{}- 交付成果与回复：\n```markdown\n{}\n```\n\n",
             s.title,
-            s.subagent_role.as_deref().unwrap_or(""),
+            s.subagent_role.as_deref().unwrap_or("协作助手"),
             if is_running { "🟡 仍在运行" } else { "🟢 已完成" },
             s.total_tokens.unwrap_or(0),
+            touched_line,
             last_reply
         ));
     }
