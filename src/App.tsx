@@ -17,6 +17,10 @@ import { TempActions } from "./components/TempActions";
 import { Toasts } from "./components/Toasts";
 import { TokenStatsModal } from "./components/TokenStatsModal";
 import { TopBar } from "./components/TopBar";
+import { SubagentBar } from "./components/SubagentBar";
+import { SubagentView } from "./components/SubagentView";
+import { SubagentResizeHandle } from "./components/SubagentResizeHandle";
+import { CreateSubagentModal } from "./components/CreateSubagentModal";
 import { WindowHeader } from "./components/WindowHeader";
 
 export default function App() {
@@ -24,6 +28,8 @@ export default function App() {
   const bootstrap = useStore((s) => s.bootstrap);
   const ready = useStore((s) => s.ready);
   const tempClearing = useStore((s) => s.tempClearing);
+  const activeSubagentId = useStore((s) => s.activeSubagentId);
+  const subagentPanelWidth = useStore((s) => s.subagentPanelWidth);
 
   useEffect(() => {
     void bootstrap();
@@ -43,25 +49,37 @@ export default function App() {
     <div className="h-full flex flex-col text-[14px]">
       <WindowHeader />
       <div className="flex-1 min-h-0 flex">
-      <Sidebar />
-      <div className="flex-1 flex flex-col min-w-0 relative">
-        <TopBar />
-        <ChatView />
-        <PendingQueue />
-        <div className="relative">
-          <Composer />
-          {/* 临时空间操作（变更 / 临时目录 / 合并 / 清空空间）：悬浮在输入框上方左对齐 */}
-          <TempActions />
-        </div>
-        {tempClearing && (
-          <div className="absolute inset-0 z-40 bg-black/40 flex items-center justify-center">
-            <div className="bg-panel2 border border-edge rounded-xl px-6 py-5 flex flex-col items-center gap-3 shadow-xl">
-              <span className="w-6 h-6 rounded-full border-2 border-edge border-t-accent animate-spin" />
-              <span className="text-[13px] text-inkdim">正在删除临时空间…</span>
-            </div>
+        <Sidebar />
+        <div className="flex-1 flex flex-col min-w-0 relative">
+          <TopBar />
+          <SubagentBar />
+          <ChatView />
+          <PendingQueue />
+          <div className="relative">
+            <Composer />
+            {/* 临时空间操作（变更 / 临时目录 / 合并 / 清空空间）：悬浮在输入框上方左对齐 */}
+            <TempActions />
           </div>
+          {tempClearing && (
+            <div className="absolute inset-0 z-40 bg-black/40 flex items-center justify-center">
+              <div className="bg-panel2 border border-edge rounded-xl px-6 py-5 flex flex-col items-center gap-3 shadow-xl">
+                <span className="w-6 h-6 rounded-full border-2 border-edge border-t-accent animate-spin" />
+                <span className="text-[13px] text-inkdim">正在删除临时空间…</span>
+              </div>
+            </div>
+          )}
+        </div>
+        {activeSubagentId && (
+          <>
+            <SubagentResizeHandle />
+            <div
+              style={{ width: `${subagentPanelWidth}px` }}
+              className="shrink-0 flex flex-col min-h-0 overflow-hidden"
+            >
+              <SubagentView subagentId={activeSubagentId} />
+            </div>
+          </>
         )}
-      </div>
       </div>
       <SettingsModal />
       <SessionSettingsModal />
@@ -70,6 +88,7 @@ export default function App() {
       <DiffModal />
       <GrowthModal />
       <TokenStatsModal />
+      <CreateSubagentModal />
       <PromptHost />
       <Toasts />
       <DataDirGate />

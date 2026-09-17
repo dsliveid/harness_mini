@@ -82,6 +82,21 @@ export interface Session {
   totalTokens?: number;
   promptTokens?: number;
   completionTokens?: number;
+  /** 父会话 ID（子 Agent 进程非空） */
+  parentSessionId?: string | null;
+  /** 会话类型：main | subagent */
+  sessionType?: "main" | "subagent" | string;
+  /** 子 Agent 角色标签（前端开发 / 后端开发 / 测试 等） */
+  subagentRole?: string | null;
+  /** 子 Agent 初始分配的任务描述 */
+  subagentTask?: string | null;
+}
+
+export interface SubagentCreateInput {
+  role: string;
+  title: string;
+  task: string;
+  subpath?: string;
 }
 
 /** 临时空间中被拷贝的单个项目条目（主项目 key="main"，关联项目 key="link:<id>"） */

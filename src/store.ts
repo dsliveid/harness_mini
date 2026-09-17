@@ -10,6 +10,7 @@ export interface Toast {
 /** 记住上次查看的会话 id：页面重载（如开发热更新）后回到原位，而不是跳到列表第一个 */
 const LAST_SESSION_KEY = "harness_mini.lastSessionId";
 const SESSION_DRAFTS_KEY = "harness_mini.sessionDrafts";
+const SUBAGENT_WIDTH_KEY = "harness_mini.subagentPanelWidth";
 
 function loadSessionDrafts(): Record<string, string> {
   try {
@@ -110,6 +111,14 @@ interface Store {
   sessionTodos: Record<string, TodoItem[]>;
   /** 程序数据目录状态；pending=true 时启动拦截对话框等待用户选择 */
   dataStatus: DataStatus | null;
+  /** 子 Agent 进程列表，按父会话 ID 缓存 */
+  subagents: Record<string, Session[]>;
+  /** 当前在分屏中打开查看的子 Agent ID（null = 未打开） */
+  activeSubagentId: string | null;
+  /** 子 Agent 对话窗体宽度（px），支持拖动并持久化记忆 */
+  subagentPanelWidth: number;
+  /** 是否打开「创建子Agent」弹窗 */
+  showCreateSubagentModal: boolean;
   view: "list" | "project";
 
   bootstrap: () => Promise<void>;
@@ -192,6 +201,17 @@ interface Store {
   toolRetryStatus: Record<string, ToolRetryStatus>;
   dismissToolRetry: (sessionId: string) => void;
   onToolRetryGuidance: (p: ToolRetryGuidanceEvent) => void;
+  loadSubagents: (parentSessionId: string) => Promise<void>;
+  setActiveSubagentId: (id: string | null) => void;
+  setSubagentPanelWidth: (width: number) => void;
+  setShowCreateSubagentModal: (open: boolean) => void;
+  createSubagent: (input: { parentSessionId: string; role: string; taskPrompt: string; title?: string }) => Promise<Session | null>;
+  stopSubagent: (subagentId: string) => Promise<void>;
+  restartSubagent: (subagentId: string) => Promise<void>;
+  restartAllSubagents: (parentSessionId: string) => Promise<void>;
+  deleteSubagent: (subagentId: string) => Promise<void>;
+  onSubagentsChanged: (p: { parentSessionId: string; subagentId?: string }) => Promise<void>;
+  onSubagentCreated: (subagent: Session) => void;
   onError: (p: any) => void;
 }
 
@@ -311,6 +331,10 @@ export const useStore = create<Store>((set, get) => ({
   sessionRules: {},
   sessionTodos: {},
   dataStatus: null,
+  subagents: {},
+  activeSubagentId: null,
+  subagentPanelWidth: Math.max(360, Number(localStorage.getItem(SUBAGENT_WIDTH_KEY)) || 560),
+  showCreateSubagentModal: false,
   // 启动默认进入项目视图
   view: "project",
 
@@ -687,6 +711,16 @@ export const useStore = create<Store>((set, get) => ({
       }).catch(() => {});
       // 即时拉取并恢复运行态快照（流式文字、思考流、活跃工具卡片、审批卡片）
       void get().syncSessionActiveState(id);
+      // 拉取该会话的子 Agent 列表
+      void get().loadSubagents(id);
+      // 切换主会话时，如果分屏中的子 Agent 不属于当前会话，则关闭分屏
+      const curSubId = get().activeSubagentId;
+      if (curSubId) {
+        const subs = get().subagents[id] ?? [];
+        if (!subs.some((s) => s.id === curSubId)) {
+          set({ activeSubagentId: null });
+        }
+      }
     } catch (e) {
       get().pushToast(String(e));
     }
@@ -1252,6 +1286,154 @@ export const useStore = create<Store>((set, get) => ({
     } else if (status === "failed") {
       get().pushToast(`❌ 工具 ${p.toolName} 自纠未果（已达重试上限）`);
     }
+  },
+
+  async loadSubagents(parentSessionId: string) {
+    try {
+      const list = await ipc.listSubagents(parentSessionId);
+      set((st) => ({
+        subagents: { ...st.subagents, [parentSessionId]: list },
+      }));
+      const activeId = get().activeSubagentId;
+      if (activeId && list.some((s) => s.id === activeId)) {
+        if (!get().messages[activeId]) {
+          const msgs = await ipc.getMessages(activeId, undefined, 200);
+          set((st) => ({
+            messages: { ...st.messages, [activeId]: msgs },
+          }));
+        }
+      }
+    } catch (e) {
+      console.error("loadSubagents error", e);
+    }
+  },
+
+  setActiveSubagentId(id: string | null) {
+    set({ activeSubagentId: id });
+    if (id) {
+      ipc.getMessages(id, undefined, 200).then((msgs) => {
+        set((st) => ({
+          messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], msgs) },
+          hasMore: { ...st.hasMore, [id]: msgs.length >= 200 },
+        }));
+      }).catch((e) => get().pushToast(String(e)));
+      void get().syncSessionActiveState(id);
+    }
+  },
+
+  setSubagentPanelWidth(width: number) {
+    const clamped = Math.max(360, Math.min(width, Math.round(window.innerWidth * 0.75)));
+    localStorage.setItem(SUBAGENT_WIDTH_KEY, String(clamped));
+    set({ subagentPanelWidth: clamped });
+  },
+
+  setShowCreateSubagentModal(open: boolean) {
+    set({ showCreateSubagentModal: open });
+  },
+
+  async createSubagent(input) {
+    try {
+      const created = await ipc.spawnSubagent(input);
+      set((st) => {
+        const existing = st.subagents[input.parentSessionId] ?? [];
+        const nextList = [created, ...existing.filter((s) => s.id !== created.id)];
+        return {
+          subagents: { ...st.subagents, [input.parentSessionId]: nextList },
+          activeSubagentId: created.id,
+          showCreateSubagentModal: false,
+        };
+      });
+      get().pushToast(`子 Agent「${created.title}」已创建并开始运行`);
+      void get().syncSessionActiveState(created.id);
+      return created;
+    } catch (e) {
+      get().pushToast(`创建子 Agent 失败: ${e}`);
+      return null;
+    }
+  },
+
+  async stopSubagent(subagentId: string) {
+    try {
+      set((st) => ({
+        runStatus: { ...st.runStatus, [subagentId]: "idle" },
+      }));
+      await ipc.stopSubagent(subagentId);
+      get().pushToast("已停止子 Agent");
+    } catch (e) {
+      get().pushToast(`停止子 Agent 失败: ${e}`);
+    }
+  },
+
+  async restartSubagent(subagentId: string) {
+    try {
+      set((st) => ({
+        runStatus: { ...st.runStatus, [subagentId]: "running" },
+      }));
+      await ipc.restartSubagent(subagentId);
+      get().pushToast("子 Agent 已重启");
+      void get().syncSessionActiveState(subagentId);
+    } catch (e) {
+      get().pushToast(`重启子 Agent 失败: ${e}`);
+    }
+  },
+
+  async restartAllSubagents(parentSessionId: string) {
+    try {
+      await ipc.restartAllSubagents(parentSessionId);
+      get().pushToast("已发起所有子 Agent 重启");
+      const list = get().subagents[parentSessionId] ?? [];
+      for (const s of list) {
+        void get().syncSessionActiveState(s.id);
+      }
+    } catch (e) {
+      get().pushToast(`批量重启子 Agent 失败: ${e}`);
+    }
+  },
+
+  async deleteSubagent(subagentId: string) {
+    try {
+      await ipc.deleteSubagent(subagentId);
+      set((st) => {
+        const nextSubagents: Record<string, Session[]> = {};
+        for (const [pid, list] of Object.entries(st.subagents)) {
+          nextSubagents[pid] = list.filter((s) => s.id !== subagentId);
+        }
+        return {
+          subagents: nextSubagents,
+          activeSubagentId: st.activeSubagentId === subagentId ? null : st.activeSubagentId,
+        };
+      });
+      get().pushToast("已删除子 Agent");
+    } catch (e) {
+      get().pushToast(`删除子 Agent 失败: ${e}`);
+    }
+  },
+
+  async onSubagentsChanged(p) {
+    if (p.parentSessionId) {
+      await get().loadSubagents(p.parentSessionId);
+    }
+  },
+
+  onSubagentCreated(subagent) {
+    if (!subagent.parentSessionId) return;
+    set((st) => {
+      const existing = st.subagents[subagent.parentSessionId!] ?? [];
+      if (existing.some((s) => s.id === subagent.id)) {
+        return {
+          subagents: {
+            ...st.subagents,
+            [subagent.parentSessionId!]: existing.map((s) => (s.id === subagent.id ? subagent : s)),
+          },
+        };
+      }
+      return {
+        subagents: {
+          ...st.subagents,
+          [subagent.parentSessionId!]: [subagent, ...existing],
+        },
+      };
+    });
   },
 
   onError(p) {

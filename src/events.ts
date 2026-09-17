@@ -42,6 +42,9 @@ export function useAppEvents() {
       listen<any>("growth:deleted", (e) => s.onGrowthDeleted(e.payload?.id)),
       listen<any>("sop:status", (e) => s.onSopStatus(e.payload)),
       listen<any>("tool:retry_guidance", (e) => s.onToolRetryGuidance(e.payload)),
+      listen<any>("subagents:changed", (e) => s.onSubagentsChanged(e.payload)),
+      listen<Session>("subagent:created", (e) => s.onSubagentCreated(e.payload as Session)),
+      listen<Session>("subagent:update", (e) => s.onSubagentCreated(e.payload as Session)),
       listen<any>("error", (ev) => s.onError(ev.payload)),
     ];
     Promise.all(regs).then((ls) => {

@@ -68,6 +68,25 @@ export const ipc = {
   deleteQueuedMessage: (sessionId: string, messageId: string) =>
     invoke<void>("delete_queued_message", { sessionId, messageId }),
   stopRun: (sessionId: string) => invoke<void>("stop_run", { sessionId }),
+  // 子 Agent 进程协作
+  listSubagents: (parentSessionId: string) =>
+    invoke<Session[]>("list_subagents", { parentSessionId }),
+  spawnSubagent: (input: { parentSessionId: string; role: string; taskPrompt: string; title?: string; subpath?: string | null }) =>
+    invoke<Session>("spawn_subagent", {
+      parentSessionId: input.parentSessionId,
+      role: input.role,
+      title: input.title ?? `${input.role}任务`,
+      task: input.taskPrompt,
+      subpath: input.subpath ?? null,
+    }),
+  stopSubagent: (subagentId: string) =>
+    invoke<void>("stop_subagent", { subagentId }),
+  restartSubagent: (subagentId: string) =>
+    invoke<void>("restart_subagent", { subagentId }),
+  restartAllSubagents: (parentSessionId: string) =>
+    invoke<number>("restart_all_subagents", { parentSessionId }),
+  deleteSubagent: (subagentId: string) =>
+    invoke<void>("delete_subagent", { subagentId }),
   killCommand: (eventId: string) => invoke<void>("kill_command", { eventId }),
   listRunningSessions: () => invoke<RunningSession[]>("list_running_sessions"),
   editAndResend: (sessionId: string, messageId: string, newText: string) =>

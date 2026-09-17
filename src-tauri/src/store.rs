@@ -220,6 +220,11 @@ fn init(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "runs", "total_tokens", "total_tokens INTEGER DEFAULT 0")?;
     ensure_column(conn, "runs", "prompt_tokens", "prompt_tokens INTEGER DEFAULT 0")?;
     ensure_column(conn, "runs", "completion_tokens", "completion_tokens INTEGER DEFAULT 0")?;
+    // 子 Agent 会话关联与角色任务字段
+    ensure_column(conn, "sessions", "parent_session_id", "parent_session_id TEXT")?;
+    ensure_column(conn, "sessions", "session_type", "session_type TEXT NOT NULL DEFAULT 'main'")?;
+    ensure_column(conn, "sessions", "subagent_role", "subagent_role TEXT")?;
+    ensure_column(conn, "sessions", "subagent_task", "subagent_task TEXT")?;
     let _ = backfill_message_tokens(conn);
     Ok(())
 }
@@ -1149,12 +1154,17 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         total_tokens: None,
         prompt_tokens: None,
         completion_tokens: None,
+        parent_session_id: r.get(15)?,
+        session_type: r.get::<_, Option<String>>(16)?.unwrap_or_else(|| "main".into()),
+        subagent_role: r.get(17)?,
+        subagent_task: r.get(18)?,
     })
 }
 
 const SESSION_COLS: &str =
     "id, title, workspace_path, access_mode, project_id, status, last_message_at, created_at, updated_at, \
-     is_temp, temp_code, temp_root, source_workspace, merged_seq, merged_pending";
+     is_temp, temp_code, temp_root, source_workspace, merged_seq, merged_pending, \
+     parent_session_id, session_type, subagent_role, subagent_task";
 
 fn attach_session_tokens(conn: &Connection, sessions: &mut [Session]) -> Result<(), String> {
     if sessions.is_empty() {
@@ -1238,11 +1248,25 @@ pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>, Strin
 pub fn list_sessions(conn: &Connection, status: &str) -> Result<Vec<Session>, String> {
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT {SESSION_COLS} FROM sessions WHERE status = ?1 ORDER BY COALESCE(last_message_at, created_at) DESC"
+            "SELECT {SESSION_COLS} FROM sessions WHERE status = ?1 AND (parent_session_id IS NULL OR parent_session_id = '') ORDER BY COALESCE(last_message_at, created_at) DESC"
         ))
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(params![status], row_to_session)
+        .map_err(|e| e.to_string())?;
+    let mut sessions = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    attach_session_tokens(conn, &mut sessions)?;
+    Ok(sessions)
+}
+
+pub fn list_subagents(conn: &Connection, parent_session_id: &str) -> Result<Vec<Session>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {SESSION_COLS} FROM sessions WHERE parent_session_id = ?1 ORDER BY created_at ASC"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![parent_session_id], row_to_session)
         .map_err(|e| e.to_string())?;
     let mut sessions = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
     attach_session_tokens(conn, &mut sessions)?;
@@ -1277,10 +1301,17 @@ pub fn create_session(
         total_tokens: Some(0),
         prompt_tokens: Some(0),
         completion_tokens: Some(0),
+        parent_session_id: None,
+        session_type: "main".into(),
+        subagent_role: None,
+        subagent_task: None,
     };
     conn.execute(
-        "INSERT INTO sessions(id, title, workspace_path, access_mode, project_id, status, last_message_at, created_at, updated_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        "INSERT INTO sessions(
+            id, title, workspace_path, access_mode, project_id, status, 
+            last_message_at, created_at, updated_at, 
+            parent_session_id, session_type, subagent_role, subagent_task
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,'main',NULL,NULL)",
         params![
             s.id,
             s.title,
@@ -1291,6 +1322,68 @@ pub fn create_session(
             s.last_message_at,
             s.created_at,
             s.updated_at
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(s)
+}
+
+pub fn create_subagent_session(
+    conn: &Connection,
+    parent_session_id: &str,
+    role: &str,
+    title: &str,
+    task: &str,
+    workspace_path: &str,
+    access_mode: Option<&str>,
+    project_id: Option<&str>,
+) -> Result<Session, String> {
+    let t = now();
+    let norm_mode = access_mode.map(normalize_access_mode).unwrap_or_else(|| "confirm".into());
+    let s = Session {
+        id: uuid::Uuid::new_v4().to_string(),
+        title: title.to_string(),
+        workspace_path: workspace_path.to_string(),
+        access_mode: Some(norm_mode),
+        project_id: project_id.map(|s| s.to_string()),
+        status: "active".into(),
+        last_message_at: Some(t.clone()),
+        created_at: t.clone(),
+        updated_at: t,
+        is_temp: false,
+        temp_code: None,
+        temp_root: None,
+        source_workspace: None,
+        merged_seq: None,
+        merged_pending: false,
+        total_tokens: Some(0),
+        prompt_tokens: Some(0),
+        completion_tokens: Some(0),
+        parent_session_id: Some(parent_session_id.to_string()),
+        session_type: "subagent".into(),
+        subagent_role: Some(role.to_string()),
+        subagent_task: Some(task.to_string()),
+    };
+    conn.execute(
+        "INSERT INTO sessions(
+            id, title, workspace_path, access_mode, project_id, status, 
+            last_message_at, created_at, updated_at, 
+            parent_session_id, session_type, subagent_role, subagent_task
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        params![
+            s.id,
+            s.title,
+            s.workspace_path,
+            s.access_mode,
+            s.project_id,
+            s.status,
+            s.last_message_at,
+            s.created_at,
+            s.updated_at,
+            s.parent_session_id,
+            s.session_type,
+            s.subagent_role,
+            s.subagent_task,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -1317,6 +1410,17 @@ pub fn rename_session(conn: &Connection, id: &str, title: &str) -> Result<(), St
 }
 
 pub fn delete_session(conn: &Connection, id: &str) -> Result<(), String> {
+    // 级联删除其下的子 Agent 会话
+    if let Ok(mut stmt) = conn.prepare("SELECT id FROM sessions WHERE parent_session_id = ?1") {
+        let sub_ids: Vec<String> = stmt
+            .query_map(params![id], |r| r.get(0))
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+        for sub_id in sub_ids {
+            let _ = delete_session(conn, &sub_id);
+        }
+    }
     conn.execute("DELETE FROM tool_events WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)", params![id]).map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM messages WHERE session_id = ?1", params![id])
         .map_err(|e| e.to_string())?;

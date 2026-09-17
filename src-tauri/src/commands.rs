@@ -564,6 +564,116 @@ pub fn stop_run(app: AppHandle, session_id: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+pub fn list_subagents(state: State<'_, crate::AppState>, parent_session_id: String) -> Result<Vec<Session>, String> {
+    let db = state.db.lock().unwrap();
+    store::list_subagents(&db, &parent_session_id)
+}
+
+#[tauri::command]
+pub fn spawn_subagent(
+    app: AppHandle,
+    state: State<'_, crate::AppState>,
+    parent_session_id: String,
+    role: String,
+    title: String,
+    task: String,
+    subpath: Option<String>,
+) -> Result<Session, String> {
+    let parent = {
+        let db = state.db.lock().unwrap();
+        store::get_session(&db, &parent_session_id)?.ok_or("父会话不存在")?
+    };
+    if parent.session_type == "subagent" || parent.parent_session_id.is_some() {
+        return Err("子 Agent 不允许再创建子 Agent".into());
+    }
+
+    let sub_workspace = if let Some(ref rel) = subpath {
+        let p = std::path::Path::new(rel);
+        if p.is_absolute() {
+            rel.clone()
+        } else {
+            std::path::Path::new(&parent.workspace_path).join(p).to_string_lossy().to_string()
+        }
+    } else {
+        parent.workspace_path.clone()
+    };
+
+    let (sub, user_msg) = {
+        let db = state.db.lock().unwrap();
+        let sub = store::create_subagent_session(
+            &db,
+            &parent_session_id,
+            &role,
+            &title,
+            &task,
+            &sub_workspace,
+            parent.access_mode.as_deref(),
+            parent.project_id.as_deref(),
+        )?;
+        let initial_prompt = format!(
+            "【子 Agent 协作任务】\n角色定位：{role}\n任务标题：{title}\n\n详细需求描述：\n{task}{}",
+            subpath.as_ref().map(|p| format!("\n重点目录：`{p}`")).unwrap_or_default()
+        );
+        let user_msg = store::new_message(&db, &sub.id, "user", Some(initial_prompt), false)?;
+        (sub, user_msg)
+    };
+
+    agent::spawn_session_task(app.clone(), sub.id.clone(), Some(user_msg.id));
+    let _ = app.emit("subagent:created", json!({
+        "parentId": parent_session_id,
+        "subagent": sub,
+    }));
+    let _ = app.emit("subagents:changed", json!({
+        "parentId": parent_session_id,
+    }));
+    Ok(sub)
+}
+
+#[tauri::command]
+pub fn stop_subagent(app: AppHandle, subagent_id: String) -> Result<(), String> {
+    let state = app.state::<crate::AppState>();
+    let parent_id = {
+        let db = state.db.lock().unwrap();
+        store::get_session(&db, &subagent_id)?.and_then(|s| s.parent_session_id)
+    };
+    agent::stop_session(&app, &subagent_id);
+    if let Some(pid) = parent_id {
+        let _ = app.emit("subagent:update", json!({
+            "parentId": pid,
+            "subagentId": subagent_id,
+            "status": "stopped",
+        }));
+        let _ = app.emit("subagents:changed", json!({"parentId": pid}));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn restart_subagent(app: AppHandle, subagent_id: String) -> Result<(), String> {
+    agent::restart_subagent(&app, &subagent_id)
+}
+
+#[tauri::command]
+pub fn restart_all_subagents(app: AppHandle, parent_session_id: String) -> Result<usize, String> {
+    agent::restart_all_subagents(&app, &parent_session_id)
+}
+
+#[tauri::command]
+pub fn delete_subagent(app: AppHandle, state: State<'_, crate::AppState>, subagent_id: String) -> Result<(), String> {
+    agent::stop_session(&app, &subagent_id);
+    let parent_id = {
+        let db = state.db.lock().unwrap();
+        let parent_id = store::get_session(&db, &subagent_id)?.and_then(|s| s.parent_session_id);
+        store::delete_session(&db, &subagent_id)?;
+        parent_id
+    };
+    if let Some(pid) = parent_id {
+        let _ = app.emit("subagents:changed", json!({"parentId": pid}));
+    }
+    Ok(())
+}
+
 /// 手动关闭正在执行的控制台命令进程
 #[tauri::command]
 pub fn kill_command(

@@ -315,6 +315,22 @@ pub struct Session {
     pub prompt_tokens: Option<u64>,
     #[serde(default)]
     pub completion_tokens: Option<u64>,
+    /// 父会话 ID（子 Agent 会话非空）
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
+    /// 会话类型：main | subagent
+    #[serde(default = "default_session_type")]
+    pub session_type: String,
+    /// 子 Agent 角色标签
+    #[serde(default)]
+    pub subagent_role: Option<String>,
+    /// 子 Agent 初始任务要求
+    #[serde(default)]
+    pub subagent_task: Option<String>,
+}
+
+fn default_session_type() -> String {
+    "main".into()
 }
 
 /// 临时空间中被拷贝的单个项目条目（主项目 key="main"，关联项目 key="link:<id>"）

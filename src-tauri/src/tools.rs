@@ -2,7 +2,7 @@ use crate::diffutil;
 use crate::models::truncate_result;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tokio::io::AsyncBufReadExt;
 
 #[cfg(windows)]
@@ -65,6 +65,14 @@ pub const TEMP_TOOL_NAMES: &[&str] = &[
     "temp_snapshot",
     "temp_restore",
     "temp_merge",
+];
+
+/// 子 Agent 协作工具名称列表
+pub const SUBAGENT_TOOL_NAMES: &[&str] = &[
+    "spawn_subagent",
+    "get_subagent_status",
+    "wait_subagents",
+    "stop_subagent",
 ];
 
 /// temp_* 工具在非临时空间上下文中的报错文案
@@ -231,6 +239,64 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "args": {"type": "string", "description": "传递给技能脚本的参数（可选）"}
                 },
                 "required": ["name"]
+            }),
+        },
+        // ---------- 子 Agent 进程协作工具集 ----------
+        ToolSpec {
+            name: "spawn_subagent",
+            description: "创建并启动一个独立的子 Agent 进程并行协作（如前端开发、后端开发、多模块开发等）。子 Agent 拥有独立上下文与工具环境，不污染主会话上下文。严禁子 Agent 递归嵌套调用本工具。",
+            risk: Risk::Write,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "role": {"type": "string", "description": "子 Agent 角色定位，例如：前端开发、后端开发、测试验证、文档编写"},
+                    "title": {"type": "string", "description": "子任务简明标题，如 编写用户中心页面组件"},
+                    "task": {"type": "string", "description": "分配给该子 Agent 的详细需求描述与任务要求"},
+                    "subpath": {"type": "string", "description": "可选：该子 Agent 重点关注的工作区相对子目录（如 src/ 或 backend/）"}
+                },
+                "required": ["role", "title", "task"]
+            }),
+        },
+        ToolSpec {
+            name: "get_subagent_status",
+            description: "查询子 Agent 进程的当前执行状态（running、done、failed、cancelled）与最新进展输出摘要。",
+            risk: Risk::ReadOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "subagent_id": {"type": "string", "description": "可选：子 Agent ID；缺省时返回全部子 Agent 状态"}
+                }
+            }),
+        },
+        ToolSpec {
+            name: "wait_subagents",
+            description: "等待一个或多个子 Agent 执行完毕并汇总获取它们的执行结论（包含所作改动与产出）。",
+            risk: Risk::ReadOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "subagent_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选：要等待的子 Agent ID 列表；缺省时等待全部运行中的子 Agent"
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "最大等待超时秒数（默认 60 秒，最大 300 秒）"
+                    }
+                }
+            }),
+        },
+        ToolSpec {
+            name: "stop_subagent",
+            description: "停止指定的正在运行的子 Agent 协作进程。",
+            risk: Risk::Write,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "subagent_id": {"type": "string", "description": "要停止的子 Agent ID"}
+                },
+                "required": ["subagent_id"]
             }),
         },
         // ---------- 临时空间专用（普通会话不下发，见 agent.rs run_once 的 specs 过滤） ----------
@@ -401,6 +467,10 @@ pub async fn execute(
         "list_skills" => list_skills_tool(ctx).await,
         "save_skill" => save_skill_tool(args, ctx).await,
         "run_skill" => run_skill_tool(args, ctx, on_partial).await,
+        "spawn_subagent" => spawn_subagent_tool(args, ctx).await,
+        "get_subagent_status" => get_subagent_status_tool(args, ctx).await,
+        "wait_subagents" => wait_subagents_tool(args, ctx).await,
+        "stop_subagent" => stop_subagent_tool(args, ctx).await,
         "temp_status" => temp_status(ctx).await,
         "temp_changes" => temp_changes(args, ctx).await,
         "temp_diff" => temp_diff(args, ctx).await,
@@ -996,6 +1066,249 @@ async fn run_skill_tool(
         "cwd": cwd.to_string_lossy()
     });
     run_command(&cmd_args, ctx, on_partial).await
+}
+
+// ---------- 子 Agent 协作工具具体实现 ----------
+
+async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
+    let role = args.get("role").and_then(|v| v.as_str()).ok_or("缺少 role 参数")?;
+    let title = args.get("title").and_then(|v| v.as_str()).ok_or("缺少 title 参数")?;
+    let task = args.get("task").and_then(|v| v.as_str()).ok_or("缺少 task 参数")?;
+    let subpath = args.get("subpath").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    let state = host.app.state::<crate::AppState>();
+    let parent_id = &host.session_id;
+
+    let (parent_session, current_subs_count) = {
+        let db = state.db.lock().unwrap();
+        let p = crate::store::get_session(&db, parent_id)?.ok_or("父会话不存在")?;
+        // 校验递归深度：子 Agent 会话禁止再次创建子 Agent
+        if p.session_type == "subagent" || p.parent_session_id.is_some() {
+            return Err("子 Agent 不允许递归创建新的子 Agent，请直接由当前子 Agent 完成指定任务。".into());
+        }
+        let subs = crate::store::list_subagents(&db, parent_id)?;
+        (p, subs.len())
+    };
+
+    if current_subs_count >= 10 {
+        return Err("子 Agent 数量已达上限 (10)，请等待部分子任务完成或停止后再创建。".into());
+    }
+
+    let sub_workspace = if let Some(ref rel) = subpath {
+        let p = Path::new(rel);
+        if p.is_absolute() {
+            rel.clone()
+        } else {
+            std::path::Path::new(&parent_session.workspace_path).join(p).to_string_lossy().to_string()
+        }
+    } else {
+        parent_session.workspace_path.clone()
+    };
+
+    let (sub, user_msg) = {
+        let db = state.db.lock().unwrap();
+        let sub = crate::store::create_subagent_session(
+            &db,
+            parent_id,
+            role,
+            title,
+            task,
+            &sub_workspace,
+            parent_session.access_mode.as_deref(),
+            parent_session.project_id.as_deref(),
+        )?;
+        let initial_prompt = format!(
+            "【子 Agent 协作任务】\n角色定位：{role}\n任务标题：{title}\n\n详细需求描述：\n{task}{}",
+            subpath.as_ref().map(|p| format!("\n重点目录：`{p}`")).unwrap_or_default()
+        );
+        let user_msg = crate::store::new_message(&db, &sub.id, "user", Some(initial_prompt), false)?;
+        (sub, user_msg)
+    };
+
+    // 启动子 Agent 异步运行循环
+    crate::agent::spawn_session_task(host.app.clone(), sub.id.clone(), Some(user_msg.id));
+
+    // 广播事件通知前端刷新子 Agent 列表
+    let _ = host.app.emit("subagent:created", json!({
+        "parentId": parent_id,
+        "subagent": sub,
+    }));
+    let _ = host.app.emit("subagents:changed", json!({
+        "parentId": parent_id,
+    }));
+
+    Ok(format!(
+        "已成功创建并启动子 Agent 进程！\n- ID: `{}`\n- 角色: {}\n- 标题: {}\n- 状态: 运行中 (running)\n\n子 Agent 正在独立上下文中执行，用户点击界面右侧可实时查看其完整对话流程与工具卡片。后续可通过 `wait_subagents` 或 `get_subagent_status` 协同跟进。",
+        sub.id, role, title
+    ))
+}
+
+async fn get_subagent_status_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
+    let target_id = args.get("subagent_id").and_then(|v| v.as_str());
+    let state = host.app.state::<crate::AppState>();
+    let parent_id = &host.session_id;
+
+    let subs = {
+        let db = state.db.lock().unwrap();
+        crate::store::list_subagents(&db, parent_id)?
+    };
+
+    if subs.is_empty() {
+        return Ok("当前会话尚未创建任何子 Agent 进程。".into());
+    }
+
+    let filtered: Vec<&crate::models::Session> = if let Some(tid) = target_id {
+        subs.iter().filter(|s| s.id == tid).collect()
+    } else {
+        subs.iter().collect()
+    };
+
+    if filtered.is_empty() {
+        return Ok(format!("未找到指定 ID 的子 Agent: {}", target_id.unwrap_or_default()));
+    }
+
+    let mut out = format!("共查询到 {} 个子 Agent 状态：\n\n", filtered.len());
+    let db = state.db.lock().unwrap();
+    for s in filtered {
+        let is_running = crate::agent::is_run_active(&state, &s.id);
+        let msgs = crate::store::get_messages(&db, &s.id, None, 10).unwrap_or_default();
+        let last_reply = msgs
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant" && !m.content.as_deref().unwrap_or("").is_empty())
+            .and_then(|m| m.content.as_deref())
+            .unwrap_or("(尚在准备或执行工具中)");
+        let preview = if last_reply.len() > 300 {
+            format!("{}...", &last_reply[..last_reply.char_indices().nth(300).map(|(i,_)| i).unwrap_or(last_reply.len())])
+        } else {
+            last_reply.to_string()
+        };
+
+        out.push_str(&format!(
+            "- **【{}】** (ID: `{}`)\n  角色: {}\n  状态: {}\n  Token消耗: {}\n  最新输出摘要: {}\n\n",
+            s.title,
+            s.id,
+            s.subagent_role.as_deref().unwrap_or("协作助手"),
+            if is_running { "🟡 运行中 (running)" } else { "🟢 已完成或空闲 (idle)" },
+            s.total_tokens.unwrap_or(0),
+            preview
+        ));
+    }
+
+    Ok(out)
+}
+
+async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
+    let timeout_secs = args
+        .get("timeout_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(60)
+        .clamp(5, 300);
+    let specified_ids: Option<Vec<String>> = args.get("subagent_ids").and_then(|v| {
+        v.as_array().map(|arr| {
+            arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()
+        })
+    });
+
+    let state = host.app.state::<crate::AppState>();
+    let parent_id = &host.session_id;
+
+    let target_ids: Vec<String> = {
+        let db = state.db.lock().unwrap();
+        let subs = crate::store::list_subagents(&db, parent_id)?;
+        if let Some(ids) = specified_ids {
+            subs.into_iter().filter(|s| ids.contains(&s.id)).map(|s| s.id).collect()
+        } else {
+            subs.into_iter().map(|s| s.id).collect()
+        }
+    };
+
+    if target_ids.is_empty() {
+        return Ok("没有找到需要等待的子 Agent。".into());
+    }
+
+    let start_wait = std::time::Instant::now();
+    let max_wait = std::time::Duration::from_secs(timeout_secs);
+
+    loop {
+        let any_running = target_ids.iter().any(|id| crate::agent::is_run_active(&state, id));
+        if !any_running || start_wait.elapsed() >= max_wait {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    let mut out = String::new();
+    let is_timed_out = start_wait.elapsed() >= max_wait;
+    if is_timed_out {
+        out.push_str(&format!("⚠️ 等待达到超时上限（{timeout_secs}s），部分子 Agent 可能仍在后台继续运行。\n\n"));
+    } else {
+        out.push_str("✅ 所有目标子 Agent 执行完毕！汇总结果如下：\n\n");
+    }
+
+    let db = state.db.lock().unwrap();
+    for id in &target_ids {
+        let is_running = crate::agent::is_run_active(&state, id);
+        let s = crate::store::get_session(&db, id)?.unwrap_or_else(|| {
+            crate::models::Session {
+                id: id.clone(),
+                title: "未知子Agent".into(),
+                workspace_path: "".into(),
+                access_mode: None,
+                project_id: None,
+                status: "active".into(),
+                last_message_at: None,
+                created_at: "".into(),
+                updated_at: "".into(),
+                is_temp: false,
+                temp_code: None,
+                temp_root: None,
+                source_workspace: None,
+                merged_seq: None,
+                merged_pending: false,
+                total_tokens: Some(0),
+                prompt_tokens: Some(0),
+                completion_tokens: Some(0),
+                parent_session_id: Some(parent_id.clone()),
+                session_type: "subagent".into(),
+                subagent_role: None,
+                subagent_task: None,
+            }
+        });
+        let msgs = crate::store::get_messages(&db, id, None, 10).unwrap_or_default();
+        let last_reply = msgs
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant" && !m.content.as_deref().unwrap_or("").is_empty())
+            .and_then(|m| m.content.as_deref())
+            .unwrap_or("(未产生文本回复)");
+
+        out.push_str(&format!(
+            "### 子 Agent: {} ({})\n- 状态: {}\n- Token: {}\n- 最终答复/成果：\n```markdown\n{}\n```\n\n",
+            s.title,
+            s.subagent_role.as_deref().unwrap_or(""),
+            if is_running { "🟡 仍在运行" } else { "🟢 已完成" },
+            s.total_tokens.unwrap_or(0),
+            last_reply
+        ));
+    }
+
+    Ok(out)
+}
+
+async fn stop_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
+    let subagent_id = args.get("subagent_id").and_then(|v| v.as_str()).ok_or("缺少 subagent_id 参数")?;
+    crate::agent::stop_session(&host.app, subagent_id);
+    let _ = host.app.emit("subagent:update", json!({
+        "parentId": host.session_id,
+        "subagentId": subagent_id,
+        "status": "stopped"
+    }));
+    Ok(format!("已成功停止子 Agent【{subagent_id}】。"))
 }
 
 #[cfg(test)]

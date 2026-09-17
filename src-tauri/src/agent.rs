@@ -130,7 +130,32 @@ pub fn spawn_session_task(app: AppHandle, session_id: String, trigger: Option<St
 
 /// 中断当前运行；根据文档约定，待执行队列不受影响，继续自动依次执行
 pub fn stop_session(app: &AppHandle, session_id: &str) {
+    stop_session_ext(app, session_id, true);
+}
+
+pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bool) {
     let state = app.state::<crate::AppState>();
+
+    // 0. 级联停止属于该主会话的所有子 Agent 进程
+    if cascade_subagents {
+        let subs = {
+            let db = state.db.lock().unwrap();
+            store::list_subagents(&db, session_id).unwrap_or_default()
+        };
+        for sub in subs {
+            stop_session_ext(app, &sub.id, false);
+            let _ = app.emit("subagent:update", json!({
+                "parentId": session_id,
+                "subagentId": sub.id,
+                "status": "cancelled"
+            }));
+            let _ = app.emit("run:status", json!({
+                "sessionId": sub.id,
+                "status": "cancelled"
+            }));
+        }
+    }
+
     // 1. 优先强杀该会话下全部正在运行的控制台进程树（必须在 abort 协程前强杀，防止协程终止后子进程孤立遗留）
     {
         let mut cmds = state.running_commands.lock().unwrap();
@@ -195,8 +220,75 @@ pub fn stop_session(app: &AppHandle, session_id: &str) {
             json!({"sessionId": session_id, "status": "idle"}),
         );
     }
-    // 队列未空则继续依次执行
-    spawn_session_task(app.clone(), session_id.to_string(), None);
+
+    // 仅在主会话主动停止且存在排队时消费队列；子会话停止时不自发恢复
+    let is_sub = {
+        let db = state.db.lock().unwrap();
+        store::get_session(&db, session_id)
+            .ok()
+            .flatten()
+            .map(|s| s.session_type == "subagent" || s.parent_session_id.is_some())
+            .unwrap_or(false)
+    };
+    if !is_sub && cascade_subagents {
+        spawn_session_task(app.clone(), session_id.to_string(), None);
+    }
+}
+
+/// 重启指定子 Agent 进程
+pub fn restart_subagent(app: &AppHandle, subagent_id: &str) -> Result<(), String> {
+    let state = app.state::<crate::AppState>();
+    // 先停止并收敛残留状态
+    stop_session_ext(app, subagent_id, false);
+
+    let (parent_id, trigger_id) = {
+        let db = state.db.lock().unwrap();
+        let s = store::get_session(&db, subagent_id)?.ok_or("子 Agent 不存在")?;
+        let msgs = store::all_messages(&db, subagent_id)?;
+        // 找到最后一条 user 消息作为 trigger
+        let user_msg_id = msgs
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.id.clone())
+            .unwrap_or_else(|| {
+                store::new_message(&db, subagent_id, "user", Some("请继续恢复并执行任务。".into()), false)
+                    .map(|m| m.id)
+                    .unwrap_or_default()
+            });
+        (s.parent_session_id, user_msg_id)
+    };
+
+    if !trigger_id.is_empty() {
+        spawn_session_task(app.clone(), subagent_id.to_string(), Some(trigger_id));
+        if let Some(ref pid) = parent_id {
+            let _ = app.emit("subagent:update", json!({
+                "parentId": pid,
+                "subagentId": subagent_id,
+                "status": "running"
+            }));
+            let _ = app.emit("subagents:changed", json!({"parentId": pid}));
+        }
+    }
+    Ok(())
+}
+
+/// 重启主会话下的全部已停止子 Agent
+pub fn restart_all_subagents(app: &AppHandle, parent_session_id: &str) -> Result<usize, String> {
+    let state = app.state::<crate::AppState>();
+    let subs = {
+        let db = state.db.lock().unwrap();
+        store::list_subagents(&db, parent_session_id)?
+    };
+    let mut count = 0;
+    for s in subs {
+        let is_running = is_run_active(&state, &s.id);
+        if !is_running {
+            let _ = restart_subagent(app, &s.id);
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String>) {
@@ -410,10 +502,13 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         }),
         event_id: None,
     };
+    let is_subagent = session.session_type == "subagent" || session.parent_session_id.is_some();
     let specs: Vec<ToolSpec> = tools::tool_specs()
         .into_iter()
         // 临时空间专用工具仅对临时空间会话下发
         .filter(|s| session.is_temp || !tools::TEMP_TOOL_NAMES.contains(&s.name))
+        // 递归防爆：子 Agent 自身不下发子 Agent 创建与管理工具
+        .filter(|s| !is_subagent || !tools::SUBAGENT_TOOL_NAMES.contains(&s.name))
         // 过滤设置中被禁用的工具
         .filter(|s| !settings.disabled_tools.contains(&s.name.to_string()))
         .collect();
@@ -1725,6 +1820,7 @@ fn project_section(
 
 fn system_prompt(session: &Session, project_section: Option<&str>) -> String {
     let os = if cfg!(windows) { "Windows" } else { "Unix-like" };
+    let is_sub = session.session_type == "subagent" || session.parent_session_id.is_some();
     let base = if session.workspace_path.is_empty() {
         // 未绑定工作区：纯对话模式
         format!(
@@ -1736,6 +1832,28 @@ fn system_prompt(session: &Session, project_section: Option<&str>) -> String {
 1. 当前会话没有绑定本地目录，文件与命令类工具（read_file / write_file / edit_file / glob / grep / list_dir / run_command）均不可用，不要尝试调用；相关的问题直接以文字回答或给出建议代码。
 2. 如果用户需要你实际读写文件、执行命令，请提示：在顶栏点击工作区按钮选择目录后再继续。
 3. 全程使用简体中文与用户交流，回答准确、简洁。"#,
+            os = os
+        )
+    } else if is_sub {
+        let role = session.subagent_role.as_deref().unwrap_or("专职子任务协作 Agent");
+        let task = session.subagent_task.as_deref().unwrap_or("");
+        format!(
+            r#"你是 harness_mini 派生出的专业协作子 Agent 进程。
+角色定位：{role}
+主 Agent 分配的专属任务：{task}
+工作区根目录：{path}
+操作系统：{os}
+
+工作规则：
+1. 专注于完成上述分配给你的专属任务，不发散去处理不相关的模块。
+2. 修改文件前必须先用 read_file 读取相关内容，用 edit_file 做基于精确原文的最小化修改；新文件才用 write_file。
+3. 动手前先用 glob / grep / list_dir 探索并理解代码结构。
+4. 修改完成后，尽量用 run_command 运行构建或测试来验证改动。
+5. 严禁再次创建子 Agent，直接使用现有工具高效完成分配的目标。
+6. 全程使用简体中文与用户交流；最终回复结构化总结：做了什么、改了哪些文件、验证结果如何。"#,
+            role = role,
+            task = task,
+            path = session.workspace_path,
             os = os
         )
     } else {
@@ -1752,7 +1870,8 @@ fn system_prompt(session: &Session, project_section: Option<&str>) -> String {
 4. 所有路径相对于工作区根目录，不要访问工作区之外的路径。
 5. 不要执行破坏性命令（如递归删除、格式化磁盘等），它们会被强制要求用户确认。
 6. 接到多步任务时，先用 todo 工具列出计划，并随进展更新各项状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done（切勿遗留 in_progress 状态）。
-7. 全程使用简体中文与用户交流；最终回复简洁总结：做了什么、改了哪些文件、验证结果如何。"#,
+7. 当面对大型复杂需求（如同时进行前端开发和后端开发、多个模块独立开发、多任务并行处理等）时，可调用 spawn_subagent 工具创建子 Agent 进程并行协作，提高执行效率；并可调用 get_subagent_status 或 wait_subagents 获知进度与整合结果。
+8. 全程使用简体中文与用户交流；最终回复简洁总结：做了什么、改了哪些文件、验证结果如何。"#,
             path = session.workspace_path,
             os = os
         )
@@ -2024,6 +2143,10 @@ mod tests {
             completion_tokens: Some(0),
             prompt_tokens: Some(0),
             total_tokens: Some(0),
+            parent_session_id: None,
+            session_type: "root".into(),
+            subagent_role: None,
+            subagent_task: None,
         };
         let with = system_prompt(&session, Some("## 项目约束\nX"));
         assert!(with.contains("工作区根目录：D:\\ws"));
