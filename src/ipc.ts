@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ApprovalRule, DataStatus, GrowthItem, Message, MergeSummary, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo } from "./types";
+import type { ApprovalRule, CollaboratorCreateInput, DataStatus, GrowthItem, Message, MergeSummary, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo } from "./types";
 
 export const ipc = {
   getSettings: () => invoke<Settings>("get_settings"),
@@ -72,7 +72,25 @@ export const ipc = {
   deleteQueuedMessage: (sessionId: string, messageId: string) =>
     invoke<void>("delete_queued_message", { sessionId, messageId }),
   stopRun: (sessionId: string) => invoke<void>("stop_run", { sessionId }),
-  // 子 Agent 进程协作
+  // 协作者与子进程协作
+  listCollaborators: (parentSessionId: string) =>
+    invoke<Session[]>("list_collaborators", { parentSessionId }),
+  listSubprocesses: (parentSessionId: string) =>
+    invoke<Session[]>("list_subprocesses", { parentSessionId }),
+  createCollaborator: (input: CollaboratorCreateInput) =>
+    invoke<Session>("create_collaborator", {
+      parentSessionId: input.parentSessionId,
+      role: input.role,
+      title: input.title ?? `${input.role}协作者`,
+      taskPrompt: input.taskPrompt,
+      subpath: input.subpath ?? null,
+      workspacePath: input.workspacePath ?? null,
+      autoReport: input.autoReport ?? true,
+    }),
+  setCollaboratorAutoReport: (collaboratorId: string, autoReport: boolean) =>
+    invoke<void>("set_collaborator_auto_report", { collaboratorId, autoReport }),
+  reportCollaboratorIncrement: (collaboratorId: string) =>
+    invoke<string>("report_collaborator_increment", { collaboratorId }),
   listSubagents: (parentSessionId: string) =>
     invoke<Session[]>("list_subagents", { parentSessionId }),
   spawnSubagent: (input: { parentSessionId: string; role: string; taskPrompt: string; title?: string; subpath?: string | null; workspacePath?: string | null }) =>
@@ -159,5 +177,5 @@ export const ipc = {
     invoke<SessionActiveState>("get_session_active_state", { sessionId }),
 };
 
-export type { Message, Session, SessionActiveState, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport };
+export type { Message, Session, SessionActiveState, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport, CollaboratorCreateInput };
 

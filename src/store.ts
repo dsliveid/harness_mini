@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "./ipc";
-import { DRAFT_ID, samePath, type ApprovalReq, type ApprovalRule, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice } from "./types";
+import { DRAFT_ID, samePath, type ApprovalReq, type ApprovalRule, type CollaboratorCreateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice } from "./types";
 
 export interface Toast {
   id: string;
@@ -114,11 +114,19 @@ interface Store {
   sessionTodos: Record<string, TodoItem[]>;
   /** 程序数据目录状态；pending=true 时启动拦截对话框等待用户选择 */
   dataStatus: DataStatus | null;
-  /** 子 Agent 进程列表，按父会话 ID 缓存 */
+  /** 项目协作者列表，按父会话 ID 缓存 */
+  collaborators: Record<string, Session[]>;
+  /** 当前选中的常驻协作者 ID */
+  activeCollaboratorId: string | null;
+  /** 是否打开「创建协作者」弹窗 */
+  showCreateCollaboratorModal: boolean;
+  /** 临时子进程列表，按父会话 ID 缓存 */
+  subprocesses: Record<string, Session[]>;
+  /** 子 Agent 进程列表，按父会话 ID 缓存（保持向下兼容） */
   subagents: Record<string, Session[]>;
   /** 当前在分屏中打开查看的子 Agent ID（null = 未打开） */
   activeSubagentId: string | null;
-  /** 子 Agent 对话窗体宽度（px），支持拖动并持久化记忆 */
+  /** 协作者/子 Agent 对话窗体宽度（px），支持拖动并持久化记忆 */
   subagentPanelWidth: number;
   /** 是否打开「创建子Agent」弹窗 */
   showCreateSubagentModal: boolean;
@@ -205,6 +213,17 @@ interface Store {
   dismissToolRetry: (sessionId: string) => void;
   onToolRetryGuidance: (p: ToolRetryGuidanceEvent) => void;
   loadSubagents: (parentSessionId: string) => Promise<void>;
+  loadCollaborators: (parentSessionId: string) => Promise<void>;
+  loadSubprocesses: (parentSessionId: string) => Promise<void>;
+  setActiveCollaboratorId: (id: string | null) => void;
+  setShowCreateCollaboratorModal: (open: boolean) => void;
+  createCollaborator: (input: CollaboratorCreateInput) => Promise<Session | null>;
+  setCollaboratorAutoReport: (collaboratorId: string, autoReport: boolean) => Promise<void>;
+  reportCollaboratorIncrement: (collaboratorId: string) => Promise<void>;
+  onCollaboratorsChanged: (p: any) => Promise<void>;
+  onCollaboratorUpdate: (p: any) => void;
+  onCollaboratorCreated: (collab: Session) => void;
+  onCollaboratorReported: (p: any) => void;
   setActiveSubagentId: (id: string | null) => void;
   setSubagentPanelWidth: (width: number) => void;
   setShowCreateSubagentModal: (open: boolean) => void;
@@ -336,6 +355,10 @@ export const useStore = create<Store>((set, get) => ({
   sessionRules: {},
   sessionTodos: {},
   dataStatus: null,
+  collaborators: {},
+  activeCollaboratorId: null,
+  showCreateCollaboratorModal: false,
+  subprocesses: {},
   subagents: {},
   activeSubagentId: null,
   subagentPanelWidth: Math.max(360, Number(localStorage.getItem(SUBAGENT_WIDTH_KEY)) || 480),
@@ -724,9 +747,18 @@ export const useStore = create<Store>((set, get) => ({
       }).catch(() => {});
       // 即时拉取并恢复运行态快照（流式文字、思考流、活跃工具卡片、审批卡片）
       void get().syncSessionActiveState(id);
-      // 拉取该会话的子 Agent 列表
+      // 拉取该会话的项目协作者与子进程列表
+      void get().loadCollaborators(id);
+      void get().loadSubprocesses(id);
       void get().loadSubagents(id);
-      // 切换主会话时，如果分屏中的子 Agent 不属于当前会话，则关闭分屏
+      // 切换主会话时，如果分屏中的协作者/子 Agent 不属于当前会话，则关闭分屏
+      const curCollabId = get().activeCollaboratorId;
+      if (curCollabId) {
+        const collabs = get().collaborators[id] ?? [];
+        if (!collabs.some((s) => s.id === curCollabId)) {
+          set({ activeCollaboratorId: null });
+        }
+      }
       const curSubId = get().activeSubagentId;
       if (curSubId) {
         const subs = get().subagents[id] ?? [];
@@ -1366,6 +1398,154 @@ export const useStore = create<Store>((set, get) => ({
       get().pushToast(`✅ 工具 ${p.toolName} 自纠成功，已恢复执行`);
     } else if (status === "failed") {
       get().pushToast(`❌ 工具 ${p.toolName} 自纠未果（已达重试上限）`);
+    }
+  },
+
+  async loadCollaborators(parentSessionId: string) {
+    try {
+      const list = await ipc.listCollaborators(parentSessionId);
+      set((st) => ({
+        collaborators: { ...st.collaborators, [parentSessionId]: list },
+      }));
+      const activeId = get().activeCollaboratorId;
+      if (activeId && list.some((s) => s.id === activeId)) {
+        if (!get().messages[activeId]) {
+          const msgs = await ipc.getMessages(activeId, undefined, 200);
+          set((st) => ({
+            messages: { ...st.messages, [activeId]: msgs },
+          }));
+        }
+      }
+    } catch (e) {
+      console.error("loadCollaborators error", e);
+    }
+  },
+
+  async loadSubprocesses(parentSessionId: string) {
+    try {
+      const list = await ipc.listSubprocesses(parentSessionId);
+      set((st) => ({
+        subprocesses: { ...st.subprocesses, [parentSessionId]: list },
+      }));
+    } catch (e) {
+      console.error("loadSubprocesses error", e);
+    }
+  },
+
+  setActiveCollaboratorId(id: string | null) {
+    set({ activeCollaboratorId: id, activeSubagentId: id });
+    if (id) {
+      ipc.getMessages(id, undefined, 200).then((msgs) => {
+        set((st) => ({
+          messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], msgs) },
+          hasMore: { ...st.hasMore, [id]: msgs.length >= 200 },
+        }));
+      }).catch((e) => get().pushToast(String(e)));
+      void get().syncSessionActiveState(id);
+    }
+  },
+
+  setShowCreateCollaboratorModal(open: boolean) {
+    set({ showCreateCollaboratorModal: open });
+  },
+
+  async createCollaborator(input) {
+    try {
+      const created = await ipc.createCollaborator(input);
+      set((st) => {
+        const existing = st.collaborators[input.parentSessionId] ?? [];
+        const nextList = [created, ...existing.filter((s) => s.id !== created.id)];
+        return {
+          collaborators: { ...st.collaborators, [input.parentSessionId]: nextList },
+          activeCollaboratorId: created.id,
+          activeSubagentId: created.id,
+          showCreateCollaboratorModal: false,
+        };
+      });
+      get().pushToast(`协作者「${created.title}」已创建并进入就绪状态`);
+      void get().syncSessionActiveState(created.id);
+      return created;
+    } catch (e) {
+      get().pushToast(`创建协作者失败: ${e}`);
+      return null;
+    }
+  },
+
+  async setCollaboratorAutoReport(collaboratorId: string, autoReport: boolean) {
+    try {
+      await ipc.setCollaboratorAutoReport(collaboratorId, autoReport);
+      set((st) => {
+        const nextCollabs: Record<string, Session[]> = {};
+        for (const [pid, list] of Object.entries(st.collaborators)) {
+          nextCollabs[pid] = list.map((c) => (c.id === collaboratorId ? { ...c, autoReport } : c));
+        }
+        return { collaborators: nextCollabs };
+      });
+      get().pushToast(autoReport ? "已开启任务完成自动汇报" : "已切换为手动汇报模式");
+    } catch (e) {
+      get().pushToast(`修改汇报设置失败: ${e}`);
+    }
+  },
+
+  async reportCollaboratorIncrement(collaboratorId: string) {
+    try {
+      const res = await ipc.reportCollaboratorIncrement(collaboratorId);
+      get().pushToast(res || "已向主会话提交增量汇报");
+    } catch (e) {
+      get().pushToast(`增量汇报失败: ${e}`);
+    }
+  },
+
+  async onCollaboratorsChanged(p) {
+    const pid = p?.parentSessionId || p?.parentId;
+    if (pid) {
+      await get().loadCollaborators(pid);
+    }
+  },
+
+  onCollaboratorUpdate(p) {
+    const cid = p?.collaboratorId || p?.subagentId;
+    const status = p?.status;
+    if (cid && status) {
+      set((st) => {
+        const nextCollabs: Record<string, Session[]> = {};
+        for (const [pid, list] of Object.entries(st.collaborators)) {
+          nextCollabs[pid] = list.map((c) => (c.id === cid ? { ...c, status } : c));
+        }
+        return {
+          collaborators: nextCollabs,
+          runStatus: {
+            ...st.runStatus,
+            [cid]: status === "running" ? "running" : "idle",
+          },
+        };
+      });
+    }
+  },
+
+  onCollaboratorCreated(collab) {
+    const pid = collab.parentSessionId;
+    if (!pid) return;
+    set((st) => {
+      const existing = st.collaborators[pid] ?? [];
+      if (existing.some((c) => c.id === collab.id)) return st;
+      return {
+        collaborators: { ...st.collaborators, [pid]: [collab, ...existing] },
+      };
+    });
+  },
+
+  onCollaboratorReported(p) {
+    const cid = p?.collaboratorId;
+    const lastId = p?.lastReportedMsgId;
+    if (cid && lastId) {
+      set((st) => {
+        const nextCollabs: Record<string, Session[]> = {};
+        for (const [pid, list] of Object.entries(st.collaborators)) {
+          nextCollabs[pid] = list.map((c) => (c.id === cid ? { ...c, lastReportedMsgId: lastId } : c));
+        }
+        return { collaborators: nextCollabs };
+      });
     }
   },
 

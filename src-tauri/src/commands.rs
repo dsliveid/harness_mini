@@ -703,25 +703,145 @@ pub fn delete_subagent(app: AppHandle, state: State<'_, crate::AppState>, subage
 }
 
 #[tauri::command]
-pub fn report_subagent_to_parent(
+pub fn list_collaborators(state: State<'_, crate::AppState>, parent_session_id: String) -> Result<Vec<Session>, String> {
+    let db = state.db.lock().unwrap();
+    store::list_collaborators(&db, &parent_session_id)
+}
+
+#[tauri::command]
+pub fn list_subprocesses(state: State<'_, crate::AppState>, parent_session_id: String) -> Result<Vec<Session>, String> {
+    let db = state.db.lock().unwrap();
+    store::list_subprocesses(&db, &parent_session_id)
+}
+
+#[tauri::command]
+pub fn create_collaborator(
     app: AppHandle,
     state: State<'_, crate::AppState>,
-    subagent_id: String,
-) -> Result<String, String> {
-    let (parent_id, report_prompt) = {
+    parent_session_id: String,
+    role: String,
+    title: String,
+    task_prompt: String,
+    subpath: Option<String>,
+    workspace_path: Option<String>,
+    auto_report: Option<bool>,
+) -> Result<Session, String> {
+    let parent = {
         let db = state.db.lock().unwrap();
-        let sub = store::get_session(&db, &subagent_id)?.ok_or("子 Agent 不存在")?;
-        let parent_id = sub.parent_session_id.ok_or("该会话不是子 Agent，没有父会话")?;
-        let msgs = store::get_messages(&db, &subagent_id, None, 50)?;
-        let last_reply = msgs
+        store::get_session(&db, &parent_session_id)?.ok_or("父会话不存在")?
+    };
+    if parent.session_type == "collaborator" || parent.session_type == "subprocess" || parent.parent_session_id.is_some() {
+        return Err("当前会话不可再创建协作者".into());
+    }
+
+    let sub_workspace = if let Some(ref ws) = workspace_path.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let p = std::path::Path::new(ws);
+        if p.is_absolute() {
+            ws.to_string()
+        } else {
+            std::path::Path::new(&parent.workspace_path).join(p).to_string_lossy().to_string()
+        }
+    } else {
+        parent.workspace_path.clone()
+    };
+
+    let auto_report_val = auto_report.unwrap_or(true);
+    let (collab, user_msg) = {
+        let db = state.db.lock().unwrap();
+        let collab = store::create_collaborator_session(
+            &db,
+            &parent_session_id,
+            &role,
+            &title,
+            &task_prompt,
+            &sub_workspace,
+            parent.access_mode.as_deref(),
+            parent.project_id.as_deref(),
+            auto_report_val,
+        )?;
+        let focus_info = subpath.as_ref().map(|p| {
+            format!("\n\n重点关注子目录：`{p}`\n（提示：请优先深入该子目录开展探索与修改；当前工作区根目录依然为完整的 `{sub_workspace}`）")
+        }).unwrap_or_default();
+        let initial_prompt = format!(
+            "【项目协作者初始化】\n角色定位：{role}\n身份名称：{title}\n工作区根目录：{sub_workspace}\n\n职责设定与初始任务：\n{task_prompt}{focus_info}"
+        );
+        let user_msg = store::new_message(&db, &collab.id, "user", Some(initial_prompt), false)?;
+        (collab, user_msg)
+    };
+
+    agent::spawn_session_task(app.clone(), collab.id.clone(), Some(user_msg.id));
+    let _ = app.emit("collaborator:created", json!({
+        "parentId": parent_session_id,
+        "collaborator": collab,
+    }));
+    let _ = app.emit("collaborators:changed", json!({
+        "parentId": parent_session_id,
+    }));
+    let _ = app.emit("subagent:created", json!({
+        "parentId": parent_session_id,
+        "subagent": collab,
+    }));
+    let _ = app.emit("subagents:changed", json!({
+        "parentId": parent_session_id,
+    }));
+    Ok(collab)
+}
+
+#[tauri::command]
+pub fn set_collaborator_auto_report(
+    app: AppHandle,
+    state: State<'_, crate::AppState>,
+    collaborator_id: String,
+    auto_report: bool,
+) -> Result<(), String> {
+    let parent_id = {
+        let db = state.db.lock().unwrap();
+        store::update_collaborator_auto_report(&db, &collaborator_id, auto_report)?;
+        store::get_session(&db, &collaborator_id)?.and_then(|s| s.parent_session_id)
+    };
+    if let Some(pid) = parent_id {
+        let _ = app.emit("collaborators:changed", json!({"parentId": pid}));
+    }
+    Ok(())
+}
+
+pub fn do_report_collaborator_increment(
+    app: &AppHandle,
+    collaborator_id: &str,
+) -> Result<String, String> {
+    let state = app.state::<crate::AppState>();
+    let (parent_id, report_prompt, new_watermark_id) = {
+        let db = state.db.lock().unwrap();
+        let collab = store::get_session(&db, collaborator_id)?.ok_or("协作者不存在")?;
+        let parent_id = collab.parent_session_id.ok_or("该会话没有关联的父会话")?;
+        let msgs = store::get_messages(&db, collaborator_id, None, 100)?;
+
+        let slice: Vec<&crate::models::Message> = if let Some(ref w_id) = collab.last_reported_msg_id {
+            if let Some(pos) = msgs.iter().position(|m| &m.id == w_id) {
+                msgs[pos + 1..].iter().collect()
+            } else {
+                msgs.iter().collect()
+            }
+        } else {
+            msgs.iter().collect()
+        };
+
+        if slice.is_empty() {
+            return Ok("自上次汇报以来暂无新增对话。".into());
+        }
+
+        let last_assistant = slice
             .iter()
             .rev()
-            .find(|m| m.role == "assistant" && !m.content.as_deref().unwrap_or("").is_empty())
-            .and_then(|m| m.content.as_deref())
-            .unwrap_or("(子 Agent 未产生文本产出)");
+            .find(|m| m.role == "assistant" && !m.content.as_deref().unwrap_or("").is_empty());
+
+        let (last_reply, new_watermark_id) = match last_assistant {
+            Some(m) => (m.content.as_deref().unwrap_or(""), m.id.clone()),
+            None => return Ok("协作者尚未生成有效产出，暂无需汇报。".into()),
+        };
 
         let mut touched_files = std::collections::BTreeSet::new();
-        for m in &msgs {
+        for m in &slice {
             for te in &m.tool_events {
                 if ["write_file", "edit_file", "apply_diff"].contains(&te.tool_name.as_str()) {
                     if let Some(p) = te.params.get("path").and_then(|v| v.as_str()) {
@@ -737,18 +857,18 @@ pub fn report_subagent_to_parent(
             format!("涉及改动文件：{}\n", list)
         };
 
-        let role = sub.subagent_role.as_deref().unwrap_or("协作助手");
+        let role = collab.subagent_role.as_deref().unwrap_or("协作者");
         let prompt = format!(
-            "【子 Agent 成果汇报 - {} ({})】\n{}\n{}\n请主 Agent 审阅以上产出，进行集成检验并继续推进后续工作。",
-            sub.title, role, touched_str, last_reply
+            "【协作者成果汇报 - {} ({})】\n{}\n{}\n请主 Agent 审阅以上增量产出，进行集成检验并继续推进后续工作。",
+            collab.title, role, touched_str, last_reply
         );
-        (parent_id, prompt)
+        (parent_id, prompt, new_watermark_id)
     };
 
     send_message(
         state,
-        app,
-        Some(parent_id),
+        app.clone(),
+        Some(parent_id.clone()),
         report_prompt,
         None,
         None,
@@ -757,7 +877,38 @@ pub fn report_subagent_to_parent(
         None,
     )?;
 
-    Ok("已成功将成果汇报发送至主会话并唤醒主 Agent！".into())
+    {
+        let state = app.state::<crate::AppState>();
+        let db = state.db.lock().unwrap();
+        let _ = store::update_collaborator_watermark(&db, collaborator_id, &new_watermark_id);
+    }
+
+    let _ = app.emit("collaborator:reported", json!({
+        "collaboratorId": collaborator_id,
+        "parentId": parent_id,
+        "lastReportedMsgId": new_watermark_id,
+    }));
+    let _ = app.emit("collaborators:changed", json!({
+        "parentId": parent_id,
+    }));
+
+    Ok("已成功将增量成果汇报发送至主会话！".into())
+}
+
+#[tauri::command]
+pub fn report_collaborator_increment(
+    app: AppHandle,
+    collaborator_id: String,
+) -> Result<String, String> {
+    do_report_collaborator_increment(&app, &collaborator_id)
+}
+
+#[tauri::command]
+pub fn report_subagent_to_parent(
+    app: AppHandle,
+    subagent_id: String,
+) -> Result<String, String> {
+    do_report_collaborator_increment(&app, &subagent_id)
 }
 
 /// 手动关闭正在执行的控制台命令进程

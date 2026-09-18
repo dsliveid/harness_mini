@@ -419,6 +419,16 @@ pub struct Session {
     /// 会话专属上下文 Token 上限（覆盖全局及模型推荐值）
     #[serde(default)]
     pub context_token_limit: Option<usize>,
+    /// 增量汇报水位线游标：上次已汇报的消息 ID（仅协作者使用）
+    #[serde(default)]
+    pub last_reported_msg_id: Option<String>,
+    /// 是否在任务执行完成后自动汇报主进程（默认 true）
+    #[serde(default = "default_auto_report")]
+    pub auto_report: Option<bool>,
+}
+
+fn default_auto_report() -> Option<bool> {
+    Some(true)
 }
 
 fn default_session_type() -> String {

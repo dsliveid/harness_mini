@@ -146,6 +146,10 @@ export interface Session {
   subagentTask?: string | null;
   /** 会话专属上下文 Token 上限（覆盖全局及模型推荐值） */
   contextTokenLimit?: number | null;
+  /** 增量汇报水位线游标：上次已汇报的消息 ID（仅协作者使用） */
+  lastReportedMsgId?: string | null;
+  /** 协作者执行完成后是否自动汇报主会话 */
+  autoReport?: boolean | null;
 }
 
 export interface SubagentCreateInput {
@@ -154,6 +158,16 @@ export interface SubagentCreateInput {
   task: string;
   subpath?: string;
   workspacePath?: string;
+}
+
+export interface CollaboratorCreateInput {
+  parentSessionId: string;
+  role: string;
+  title?: string;
+  taskPrompt: string;
+  subpath?: string;
+  workspacePath?: string;
+  autoReport?: boolean;
 }
 
 /** 临时空间中被拷贝的单个项目条目（主项目 key="main"，关联项目 key="link:<id>"） */

@@ -408,17 +408,27 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
         }
     }
 
-    // 若当前会话属于子 Agent，将其执行结论持久化并广播给主会话和前端界面
+    // 若当前会话属于子进程或协作者，将其执行结论持久化并广播给主会话和前端界面
+    let mut auto_report_task: Option<(String, bool)> = None;
     {
         let db = state.db.lock().unwrap();
         if let Ok(Some(s)) = store::get_session(&db, &session_id) {
-            if s.session_type == "subagent" || s.parent_session_id.is_some() {
+            if s.session_type == "collaborator" || s.session_type == "subprocess" || s.session_type == "subagent" || s.parent_session_id.is_some() {
                 let parent_id = s.parent_session_id.clone().unwrap_or_default();
                 let sub_status = match last_outcome {
                     RunOutcome::Done => "completed",
                     RunOutcome::Failed => "failed",
                 };
                 let _ = store::set_session_status(&db, &session_id, sub_status);
+                let _ = app.emit("collaborator:update", json!({
+                    "parentId": parent_id,
+                    "parentSessionId": parent_id,
+                    "collaboratorId": session_id,
+                    "status": sub_status,
+                }));
+                let _ = app.emit("collaborators:changed", json!({
+                    "parentId": parent_id,
+                }));
                 let _ = app.emit("subagent:update", json!({
                     "parentId": parent_id,
                     "parentSessionId": parent_id,
@@ -429,8 +439,20 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
                     "parentId": parent_id,
                     "parentSessionId": parent_id,
                 }));
+
+                if s.session_type == "collaborator" && s.auto_report.unwrap_or(true) && matches!(last_outcome, RunOutcome::Done) && !parent_id.is_empty() {
+                    auto_report_task = Some((session_id.clone(), true));
+                }
             }
         }
+    }
+
+    if let Some((collab_id, _)) = auto_report_task {
+        let app_clone = app.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let _ = crate::commands::do_report_collaborator_increment(&app_clone, &collab_id);
+        });
     }
 
     let _ = app.emit(
@@ -592,11 +614,46 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         } else {
             None
         };
-        match (db_sec, mem_sec) {
-            (Some(d), Some(m)) => Some(format!("{}\n\n## 本项目持久化认知与沉淀记忆（来自 .harness/memory/，可秒级召回）\n{}", d, m)),
-            (Some(d), None) => Some(d),
-            (None, Some(m)) => Some(format!("## 本项目持久化认知与沉淀记忆（来自 .harness/memory/，可秒级召回）\n{}", m)),
-            (None, None) => None,
+        let collabs_sec = if !is_subagent {
+            if let Ok(collabs) = store::list_collaborators(&db, session_id) {
+                if !collabs.is_empty() {
+                    let mut text = String::from("## 可用项目协作者 (Collaborators)\n你在规划和处理相关模块时，若对应协作者处于空闲状态，优先调用 `dispatch_collaborator` 委派：\n");
+                    for c in collabs {
+                        let is_busy = is_run_active(&state, &c.id);
+                        text.push_str(&format!(
+                            "- 【{}】(ID: `{}` | 角色: {} | 状态: {}): {}\n",
+                            c.title,
+                            c.id,
+                            c.subagent_role.as_deref().unwrap_or("协作者"),
+                            if is_busy { "🟡 运行中 (busy)" } else { "🟢 空闲 (idle)" },
+                            c.subagent_task.as_deref().unwrap_or("负责该领域工作")
+                        ));
+                    }
+                    Some(text)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut parts = Vec::new();
+        if let Some(d) = db_sec {
+            parts.push(d);
+        }
+        if let Some(m) = mem_sec {
+            parts.push(format!("## 本项目持久化认知与沉淀记忆（来自 .harness/memory/，可秒级召回）\n{}", m));
+        }
+        if let Some(c) = collabs_sec {
+            parts.push(c);
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n\n"))
         }
     };
     let sys = system_prompt(&session, project_section.as_deref(), &settings.disabled_sops);
@@ -1982,7 +2039,8 @@ fn project_section(
 
 fn system_prompt(session: &Session, project_section: Option<&str>, disabled_sops: &[String]) -> String {
     let os = if cfg!(windows) { "Windows" } else { "Unix-like" };
-    let is_sub = session.session_type == "subagent" || session.parent_session_id.is_some();
+    let is_collab = session.session_type == "collaborator";
+    let is_sub = is_collab || session.session_type == "subprocess" || session.session_type == "subagent" || session.parent_session_id.is_some();
     let is_sop_enabled = |name: &str| !disabled_sops.iter().any(|s| s == name);
 
     let base = if session.workspace_path.is_empty() {
@@ -1997,6 +2055,60 @@ fn system_prompt(session: &Session, project_section: Option<&str>, disabled_sops
 2. 如果用户需要你实际读写文件、执行命令，请提示：在顶栏点击工作区按钮选择目录后再继续。
 3. 全程使用简体中文与用户交流，回答准确、简洁。"#,
             os = os
+        )
+    } else if is_collab {
+        let role = session.subagent_role.as_deref().unwrap_or("常驻专业协作者");
+        let task = session.subagent_task.as_deref().unwrap_or("");
+        let mut rules = Vec::new();
+        let mut rule_num = 1;
+
+        rules.push(format!("{rule_num}. 专注于履行你的专业角色定位【{role}】，根据用户或主进程指派的目标深入工作。当前工作区根目录为【{}】，所有工具均以该根目录为基准。", session.workspace_path));
+        rule_num += 1;
+
+        if is_sop_enabled("plan_first") {
+            rules.push(format!("{rule_num}. 【方案先行与克制改动】：开始实际修改前，优先梳理实现思路。如果包含代码修改，必须先阅读原文并做最小化精确修改。"));
+            rule_num += 1;
+        }
+
+        if is_sop_enabled("memory_distill") {
+            rules.push(format!("{rule_num}. 【边读边记与强制沉淀 SOP】：阅读核心配置文件或深入探索代码后，及时调用 `record_memory` 沉淀高价值技术知识。"));
+            rule_num += 1;
+        }
+
+        if is_sop_enabled("safe_code_edit") {
+            rules.push(format!("{rule_num}. 修改文件前必须先用 read_file 读取相关内容，用 edit_file 做精确修改；新文件用 write_file。"));
+            rule_num += 1;
+            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir 探索并理解代码结构。"));
+            rule_num += 1;
+            rules.push(format!("{rule_num}. 修改完成后，尽量用 run_command 运行构建或测试验证改动。"));
+            rule_num += 1;
+        } else {
+            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir 探索并理解代码结构。"));
+            rule_num += 1;
+        }
+
+        rules.push(format!("{rule_num}. 你是一个常驻专家角色，支持与用户进行持续的多轮交流与迭代修改。"));
+        rule_num += 1;
+
+        rules.push(format!(
+            "{rule_num}. 全程使用简体中文交流；每一轮交付成果时，请简明总结完成状态、改动文件及核心技术逻辑，以便系统自动增量汇总汇报给主进程。"
+        ));
+
+        let rules_text = rules.join("\n");
+        format!(
+            r#"你是 harness_mini 项目中由用户配置的专业常驻协作者 (Collaborator)。
+角色定位：{role}
+职责设定：{task}
+工作区根目录：{path}
+操作系统：{os}
+
+工作规则：
+{rules_text}"#,
+            role = role,
+            task = task,
+            path = session.workspace_path,
+            os = os,
+            rules_text = rules_text
         )
     } else if is_sub {
         let role = session.subagent_role.as_deref().unwrap_or("专职子任务协作 Agent");
@@ -2095,7 +2207,7 @@ fn system_prompt(session: &Session, project_section: Option<&str>, disabled_sops
 
         if is_sop_enabled("subagent_orchestration") {
             rules.push(format!(
-                "{rule_num}. 【子进程协作与总架构编排 (Orchestration)】：\n   - 触发场景：当用户提出复杂需求、多模块开发（如前端界面与后端接口、多个独立模块并行开发、测试与功能并行）或明确要求并行处理时，你作为总架构师，必须采用子进程协作模式提升效率与模块隔离度。\n   - 编排执行标准流程（SOP）：\n     ① 规划拆解：先用 todo 工具明确列出架构规划与各子模块任务分工；\n     ② 派生子进程：连续调用 spawn_subagent 工具，为各独立模块派生专属子 Agent（指定明确的 role、title、task；若有专注子目录可传入 subpath；子 Agent 默认继承主项目的完整工作区根目录，若需处理外部独立项目可传入明确的 workspace 根路径）；\n     ③ 等待与汇聚：创建完相关子任务后，调用 wait_subagents 工具等待子进程执行完成，该工具将自动汇总并返回各子 Agent 的执行结论与产出；\n     ④ 整合验收：审阅子 Agent 成果并进行必要的全局验证或微调，最终向用户交付清晰完整的交付报告。"
+                "{rule_num}. 【团队协作者调度、子进程协作与总架构编排 (Orchestration)】：\n   - 触发场景：当用户提出复杂需求、多模块开发（如前端界面与后端接口、多个独立模块并行开发、测试与功能并行）或明确要求并行处理时，你作为总架构师，必须采用协作编排模式提升效率与模块隔离度。\n   - 编排执行标准流程（SOP）：\n     ① 规划拆解：先用 todo 工具明确列出架构规划与各子模块任务分工；\n     ② 优先委派协作者：若存在匹配的专属【项目协作者】（见上方可用协作者名录）且处于空闲中，优先调用 `dispatch_collaborator` 委派任务；\n     ③ 派生临时子进程：对于一次性独立排查或无专属常驻角色的任务，连续调用 `spawn_subprocess` 工具派生专属子进程；\n     ④ 等待与汇聚：调用 `wait_collaborators` 或 `wait_subprocesses` 等待执行完成，工具将自动汇总并返回执行结论与产出；\n     ⑤ 整合验收：审阅成果产出并进行必要的全局验证或微调，最终向用户交付清晰完整的交付报告。"
             ));
             rule_num += 1;
         }
@@ -2438,6 +2550,8 @@ mod tests {
             subagent_role: None,
             subagent_task: None,
             context_token_limit: None,
+            last_reported_msg_id: None,
+            auto_report: None,
         };
         let with = system_prompt(&session, Some("## 项目约束\nX"), &[]);
         assert!(with.contains("工作区根目录：D:\\ws"));
@@ -2472,6 +2586,8 @@ mod tests {
             subagent_role: None,
             subagent_task: None,
             context_token_limit: None,
+            last_reported_msg_id: None,
+            auto_report: None,
         };
         let all_enabled = system_prompt(&session, None, &[]);
         assert!(all_enabled.contains("方案先行"));

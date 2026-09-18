@@ -3,6 +3,7 @@ import { ipc } from "../ipc";
 import { useStore } from "../store";
 import type { ToolEvent } from "../types";
 import { Markdown } from "./Markdown";
+import { SubprocessCard } from "./SubprocessCard";
 import {
   FileText,
   FileEdit,
@@ -21,6 +22,8 @@ import {
   Zap,
   Copy,
   Check,
+  Cpu,
+  Users,
 } from "./Icons";
 
 function statusBadge(status: string) {
@@ -90,6 +93,15 @@ function ToolIcon({ name }: { name: string }) {
       return <GitCompare size={14} className="text-amber-400 shrink-0" />;
     case "temp_merge":
       return <GitMerge size={14} className="text-green-400 shrink-0" />;
+    case "spawn_subprocess":
+    case "spawn_subagent":
+    case "stop_subprocess":
+    case "stop_subagent":
+      return <Cpu size={14} className="text-indigo-400 shrink-0" />;
+    case "dispatch_collaborator":
+    case "wait_collaborators":
+    case "get_collaborators":
+      return <Users size={14} className="text-accent shrink-0" />;
     default:
       return <Wrench size={14} className="text-inkdim shrink-0" />;
   }
@@ -110,6 +122,15 @@ function paramTitle(ev: ToolEvent): string {
       return String(p.name ?? "");
     case "list_skills":
       return "技能工具库";
+    case "wait_subprocesses":
+    case "wait_subagents":
+      return "等待子进程完成汇聚";
+    case "dispatch_collaborator":
+      return `${p.collaborator_id ? `[${p.collaborator_id}] ` : ""}${p.task ?? ""}`;
+    case "wait_collaborators":
+      return "等待目标协作者汇报产出";
+    case "get_collaborators":
+      return "查询项目可用协作者名录";
     default:
       return String(p.path ?? "");
   }
@@ -133,6 +154,15 @@ const TOOL_LABELS: Record<string, string> = {
   temp_snapshot: "保存备份快照",
   temp_restore: "临时空间恢复",
   temp_merge: "合并到原目录",
+  spawn_subprocess: "派生子进程",
+  spawn_subagent: "派生子进程",
+  wait_subprocesses: "等待子进程汇聚",
+  wait_subagents: "等待子进程",
+  stop_subprocess: "停止子进程",
+  stop_subagent: "停止子进程",
+  dispatch_collaborator: "委派协作者任务",
+  wait_collaborators: "等待协作者汇报",
+  get_collaborators: "查询项目协作者",
 };
 
 function TodoList({ todos, isRunning }: { todos: any[]; isRunning: boolean }) {
@@ -289,6 +319,10 @@ function CollapsibleResult({ text }: { text: string }) {
 }
 
 export function ToolCard({ ev }: { ev: ToolEvent }) {
+  if (ev.toolName === "spawn_subprocess" || ev.toolName === "spawn_subagent") {
+    return <SubprocessCard ev={ev} />;
+  }
+
   const output = useStore((s) => s.toolOutputs[ev.id]);
   const killCommand = useStore((s) => s.killCommand);
   const pushToast = useStore((s) => s.pushToast);

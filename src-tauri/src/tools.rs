@@ -67,12 +67,18 @@ pub const TEMP_TOOL_NAMES: &[&str] = &[
     "temp_merge",
 ];
 
-/// 子 Agent 协作工具名称列表
+/// 子 Agent、协作者与子进程相关工具名称列表（子会话不下发）
 pub const SUBAGENT_TOOL_NAMES: &[&str] = &[
     "spawn_subagent",
     "get_subagent_status",
     "wait_subagents",
     "stop_subagent",
+    "spawn_subprocess",
+    "wait_subprocesses",
+    "stop_subprocess",
+    "dispatch_collaborator",
+    "wait_collaborators",
+    "get_collaborators",
 ];
 
 /// temp_* 工具在非临时空间上下文中的报错文案
@@ -339,6 +345,94 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "required": ["subagent_id"]
             }),
         },
+        ToolSpec {
+            name: "spawn_subprocess",
+            description: "创建并启动一个独立的临时子进程并行执行特定任务（如探索、排查、独立测试等）。子进程拥有独立上下文与工具环境，执行完成后其成果直接内嵌在主对话流中呈现。外部用户无法干预子进程，任务完成后自动销毁/归档。",
+            risk: Risk::Write,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "role": {"type": "string", "description": "子任务角色定位，例如：技术调研、单元测试、独立排查"},
+                    "title": {"type": "string", "description": "子任务简明标题，如 排查数据库连接泄漏"},
+                    "task": {"type": "string", "description": "分配给子进程的具体任务详细要求"},
+                    "workspace": {"type": "string", "description": "可选：独立的工作区绝对路径，缺省时继承主工作区"},
+                    "subpath": {"type": "string", "description": "可选：专注子目录（如 src/utils/）"}
+                },
+                "required": ["role", "title", "task"]
+            }),
+        },
+        ToolSpec {
+            name: "wait_subprocesses",
+            description: "等待一个或多个由你派生的临时子进程执行完毕，并自动汇总它们的执行结论与改动文件清单。",
+            risk: Risk::ReadOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "subprocess_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选：要等待的子进程 ID 列表；缺省时等待全部运行中的子进程"
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "最大等待超时秒数（默认 60 秒，最大 300 秒）"
+                    }
+                }
+            }),
+        },
+        ToolSpec {
+            name: "stop_subprocess",
+            description: "强制停止指定的正在运行的临时子进程。",
+            risk: Risk::Write,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "subprocess_id": {"type": "string", "description": "要停止的子进程 ID"}
+                },
+                "required": ["subprocess_id"]
+            }),
+        },
+        ToolSpec {
+            name: "dispatch_collaborator",
+            description: "向项目专属的常驻【项目协作者】（如前端专家、测试专家等）委派工作任务。协作者将在独立会话中基于其长远角色设定工作，完成后自动增量汇报主会话。注意：委派前请先调用 get_collaborators 确认其处于空闲状态。",
+            risk: Risk::Write,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "collaborator_id": {"type": "string", "description": "目标协作者 ID"},
+                    "task": {"type": "string", "description": "分配给该协作者的具体任务与要求"}
+                },
+                "required": ["collaborator_id", "task"]
+            }),
+        },
+        ToolSpec {
+            name: "wait_collaborators",
+            description: "等待一个或多个协作者完成其当前轮次执行，并自动提取它们自上次汇报以来的增量成果与改动文件汇总回主会话。",
+            risk: Risk::ReadOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "collaborator_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选：要等待的协作者 ID 列表；缺省时等待所有运行中的协作者"
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "最大等待超时秒数（默认 90 秒，最大 300 秒）"
+                    }
+                }
+            }),
+        },
+        ToolSpec {
+            name: "get_collaborators",
+            description: "查询当前项目已配置的所有协作者名录、角色专长、当前运行状态（idle 空闲 / busy 运行中）及最新产出摘要。",
+            risk: Risk::ReadOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
         // ---------- 临时空间专用（普通会话不下发，见 agent.rs run_once 的 specs 过滤） ----------
         ToolSpec {
             name: "temp_status",
@@ -509,10 +603,13 @@ pub async fn execute(
         "run_skill" => run_skill_tool(args, ctx, on_partial).await,
         "record_memory" => record_memory_tool(args, ctx).await,
         "read_memory" => read_memory_tool(args, ctx).await,
-        "spawn_subagent" => spawn_subagent_tool(args, ctx).await,
+        "spawn_subagent" | "spawn_subprocess" => spawn_subagent_tool(args, ctx).await,
         "get_subagent_status" => get_subagent_status_tool(args, ctx).await,
-        "wait_subagents" => wait_subagents_tool(args, ctx).await,
-        "stop_subagent" => stop_subagent_tool(args, ctx).await,
+        "wait_subagents" | "wait_subprocesses" => wait_subagents_tool(args, ctx).await,
+        "stop_subagent" | "stop_subprocess" => stop_subagent_tool(args, ctx).await,
+        "dispatch_collaborator" => dispatch_collaborator_tool(args, ctx).await,
+        "wait_collaborators" => wait_collaborators_tool(args, ctx).await,
+        "get_collaborators" => get_collaborators_tool(ctx).await,
         "temp_status" => temp_status(ctx).await,
         "temp_changes" => temp_changes(args, ctx).await,
         "temp_diff" => temp_diff(args, ctx).await,
@@ -1197,7 +1294,14 @@ async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
     // 启动子 Agent 异步运行循环
     crate::agent::spawn_session_task(host.app.clone(), sub.id.clone(), Some(user_msg.id));
 
-    // 广播事件通知前端刷新子 Agent 列表
+    // 广播事件通知前端刷新子 Agent / 子进程列表
+    let _ = host.app.emit("subprocess:created", json!({
+        "parentId": parent_id,
+        "subprocess": sub,
+    }));
+    let _ = host.app.emit("subprocesses:changed", json!({
+        "parentId": parent_id,
+    }));
     let _ = host.app.emit("subagent:created", json!({
         "parentId": parent_id,
         "subagent": sub,
@@ -1345,6 +1449,8 @@ async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
                 subagent_role: None,
                 subagent_task: None,
                 context_token_limit: None,
+                last_reported_msg_id: None,
+                auto_report: None,
             }
         });
         let msgs = crate::store::get_messages(&db, id, None, 50).unwrap_or_default();
@@ -1419,6 +1525,201 @@ async fn stop_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Strin
         "status": "stopped"
     }));
     Ok(format!("已成功停止子 Agent【{subagent_id}】。"))
+}
+
+async fn dispatch_collaborator_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
+    let collaborator_id = args.get("collaborator_id").and_then(|v| v.as_str()).ok_or("缺少 collaborator_id 参数")?;
+    let task = args.get("task").and_then(|v| v.as_str()).ok_or("缺少 task 参数")?;
+
+    let state = host.app.state::<crate::AppState>();
+    let parent_id = &host.session_id;
+
+    let collab = {
+        let db = state.db.lock().unwrap();
+        let s = crate::store::get_session(&db, collaborator_id)?.ok_or("未找到指定的协作者")?;
+        if s.parent_session_id.as_deref() != Some(parent_id) {
+            return Err("指定的协作者不属于当前主会话".into());
+        }
+        s
+    };
+
+    if crate::agent::is_run_active(&state, collaborator_id) {
+        return Err(format!("协作者【{}】当前正在运行中，请先调用 wait_collaborators 等待其完成，再指派新任务。", collab.title));
+    }
+
+    let user_prompt = format!("【主进程委派任务】\n{task}");
+    let user_msg = {
+        let db = state.db.lock().unwrap();
+        crate::store::new_message(&db, collaborator_id, "user", Some(user_prompt), false)?
+    };
+
+    crate::agent::spawn_session_task(host.app.clone(), collaborator_id.to_string(), Some(user_msg.id));
+
+    Ok(format!(
+        "已成功向协作者【{}】(角色: {}) 委派任务！\n- 任务要求: {}\n- 状态: 运行中 (running)\n\n协作者已开始独立执行。你可以紧接着调用 wait_collaborators 等待并获取其增量产出报告。",
+        collab.title,
+        collab.subagent_role.as_deref().unwrap_or("协作者"),
+        task
+    ))
+}
+
+async fn wait_collaborators_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
+    let timeout_secs = args
+        .get("timeout_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(90)
+        .clamp(5, 300);
+    let specified_ids: Option<Vec<String>> = args.get("collaborator_ids").and_then(|v| {
+        v.as_array().map(|arr| {
+            arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()
+        })
+    });
+
+    let state = host.app.state::<crate::AppState>();
+    let parent_id = &host.session_id;
+
+    let target_ids: Vec<String> = {
+        let db = state.db.lock().unwrap();
+        let collabs = crate::store::list_collaborators(&db, parent_id)?;
+        if let Some(ids) = specified_ids {
+            collabs.into_iter().filter(|s| ids.contains(&s.id)).map(|s| s.id).collect()
+        } else {
+            collabs.into_iter().map(|s| s.id).collect()
+        }
+    };
+
+    if target_ids.is_empty() {
+        return Ok("当前项目暂无需要等待的协作者。".into());
+    }
+
+    let start_wait = std::time::Instant::now();
+    let max_wait = std::time::Duration::from_secs(timeout_secs);
+
+    loop {
+        let any_running = target_ids.iter().any(|id| crate::agent::is_run_active(&state, id));
+        if !any_running || start_wait.elapsed() >= max_wait {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    let mut out = String::new();
+    let is_timed_out = start_wait.elapsed() >= max_wait;
+    if is_timed_out {
+        out.push_str(&format!("⚠️ 等待达到超时上限（{timeout_secs}s），部分协作者可能仍在后台运行。\n\n"));
+    } else {
+        out.push_str("✅ 目标协作者本轮执行完毕！汇总增量成果如下：\n\n");
+    }
+
+    let db = state.db.lock().unwrap();
+    for id in &target_ids {
+        let is_running = crate::agent::is_run_active(&state, id);
+        let s = match crate::store::get_session(&db, id)? {
+            Some(s) => s,
+            None => continue,
+        };
+        let msgs = crate::store::get_messages(&db, id, None, 50).unwrap_or_default();
+
+        let slice: Vec<&crate::models::Message> = if let Some(ref w_id) = s.last_reported_msg_id {
+            if let Some(pos) = msgs.iter().position(|m| &m.id == w_id) {
+                msgs[pos + 1..].iter().collect()
+            } else {
+                msgs.iter().collect()
+            }
+        } else {
+            msgs.iter().collect()
+        };
+
+        let last_assistant = slice
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant" && !m.content.as_deref().unwrap_or("").is_empty());
+
+        let last_reply = match last_assistant {
+            Some(m) => m.content.as_deref().unwrap_or("(未产生文本回复)"),
+            None => "(本轮暂无新增文本产出)",
+        };
+
+        let mut touched_files = std::collections::BTreeSet::new();
+        for m in &slice {
+            for te in &m.tool_events {
+                if ["write_file", "edit_file", "apply_diff"].contains(&te.tool_name.as_str()) {
+                    if let Some(p) = te.params.get("path").and_then(|v| v.as_str()) {
+                        touched_files.insert(p.to_string());
+                    }
+                }
+            }
+        }
+        let touched_line = if touched_files.is_empty() {
+            String::new()
+        } else {
+            let list = touched_files.into_iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ");
+            format!("- 涉及改动文件: {}\n", list)
+        };
+
+        if let Some(m) = last_assistant {
+            let _ = crate::store::update_collaborator_watermark(&db, id, &m.id);
+        }
+
+        out.push_str(&format!(
+            "### 协作者: {} ({})\n- 状态: {}\n- Token 消耗: {}\n{}- 增量产出与结论：\n```markdown\n{}\n```\n\n",
+            s.title,
+            s.subagent_role.as_deref().unwrap_or("协作者"),
+            if is_running { "🟡 仍在运行" } else { "🟢 已完成" },
+            s.total_tokens.unwrap_or(0),
+            touched_line,
+            last_reply
+        ));
+    }
+
+    Ok(out)
+}
+
+async fn get_collaborators_tool(ctx: &ToolCtx) -> Result<String, String> {
+    let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
+    let state = host.app.state::<crate::AppState>();
+    let parent_id = &host.session_id;
+
+    let collabs = {
+        let db = state.db.lock().unwrap();
+        crate::store::list_collaborators(&db, parent_id)?
+    };
+
+    if collabs.is_empty() {
+        return Ok("当前主会话尚未配置任何常驻协作者。如需并行处理任务，可由用户在界面顶部创建协作者，或由你调用 spawn_subprocess 派生临时子进程。".into());
+    }
+
+    let mut out = format!("当前已配置 {} 位项目协作者：\n\n", collabs.len());
+    let db = state.db.lock().unwrap();
+    for c in collabs {
+        let is_running = crate::agent::is_run_active(&state, &c.id);
+        let msgs = crate::store::get_messages(&db, &c.id, None, 10).unwrap_or_default();
+        let last_reply = msgs
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant" && !m.content.as_deref().unwrap_or("").is_empty())
+            .and_then(|m| m.content.as_deref())
+            .unwrap_or("(就绪待命)");
+        let preview = if last_reply.len() > 200 {
+            format!("{}...", &last_reply[..last_reply.char_indices().nth(200).map(|(i,_)| i).unwrap_or(last_reply.len())])
+        } else {
+            last_reply.to_string()
+        };
+
+        out.push_str(&format!(
+            "- **【{}】** (ID: `{}`)\n  角色: {}\n  状态: {}\n  初始职责: {}\n  最新进展: {}\n\n",
+            c.title,
+            c.id,
+            c.subagent_role.as_deref().unwrap_or("协作者"),
+            if is_running { "🟡 运行中 (busy)" } else { "🟢 空闲中 (idle)" },
+            c.subagent_task.as_deref().unwrap_or("负责该领域工作"),
+            preview
+        ));
+    }
+
+    Ok(out)
 }
 
 #[cfg(test)]

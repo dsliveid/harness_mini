@@ -226,6 +226,8 @@ fn init(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "sessions", "subagent_role", "subagent_role TEXT")?;
     ensure_column(conn, "sessions", "subagent_task", "subagent_task TEXT")?;
     ensure_column(conn, "sessions", "context_token_limit", "context_token_limit INTEGER")?;
+    ensure_column(conn, "sessions", "last_reported_msg_id", "last_reported_msg_id TEXT")?;
+    ensure_column(conn, "sessions", "auto_report", "auto_report INTEGER DEFAULT 1")?;
     let _ = backfill_message_tokens(conn);
     Ok(())
 }
@@ -1205,13 +1207,16 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         subagent_role: r.get(17)?,
         subagent_task: r.get(18)?,
         context_token_limit: r.get::<_, Option<i64>>(19).ok().flatten().map(|v| v as usize),
+        last_reported_msg_id: r.get(20)?,
+        auto_report: r.get::<_, Option<i64>>(21)?.map(|v| v != 0),
     })
 }
 
 const SESSION_COLS: &str =
     "id, title, workspace_path, access_mode, project_id, status, last_message_at, created_at, updated_at, \
      is_temp, temp_code, temp_root, source_workspace, merged_seq, merged_pending, \
-     parent_session_id, session_type, subagent_role, subagent_task, context_token_limit";
+     parent_session_id, session_type, subagent_role, subagent_task, context_token_limit, \
+     last_reported_msg_id, auto_report";
 
 fn attach_session_tokens(conn: &Connection, sessions: &mut [Session]) -> Result<(), String> {
     if sessions.is_empty() {
@@ -1320,6 +1325,60 @@ pub fn list_subagents(conn: &Connection, parent_session_id: &str) -> Result<Vec<
     Ok(sessions)
 }
 
+pub fn list_collaborators(conn: &Connection, parent_session_id: &str) -> Result<Vec<Session>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {SESSION_COLS} FROM sessions WHERE parent_session_id = ?1 AND session_type = 'collaborator' ORDER BY created_at ASC"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![parent_session_id], row_to_session)
+        .map_err(|e| e.to_string())?;
+    let mut sessions = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    attach_session_tokens(conn, &mut sessions)?;
+    Ok(sessions)
+}
+
+pub fn list_subprocesses(conn: &Connection, parent_session_id: &str) -> Result<Vec<Session>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {SESSION_COLS} FROM sessions WHERE parent_session_id = ?1 AND session_type IN ('subprocess', 'subagent') ORDER BY created_at ASC"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![parent_session_id], row_to_session)
+        .map_err(|e| e.to_string())?;
+    let mut sessions = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    attach_session_tokens(conn, &mut sessions)?;
+    Ok(sessions)
+}
+
+pub fn update_collaborator_watermark(
+    conn: &Connection,
+    collaborator_id: &str,
+    last_reported_msg_id: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE sessions SET last_reported_msg_id = ?2, updated_at = ?3 WHERE id = ?1",
+        params![collaborator_id, last_reported_msg_id, now()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn update_collaborator_auto_report(
+    conn: &Connection,
+    collaborator_id: &str,
+    auto_report: bool,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE sessions SET auto_report = ?2, updated_at = ?3 WHERE id = ?1",
+        params![collaborator_id, if auto_report { 1 } else { 0 }, now()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub fn create_session(
     conn: &Connection,
     workspace_path: &str,
@@ -1353,13 +1412,16 @@ pub fn create_session(
         subagent_role: None,
         subagent_task: None,
         context_token_limit: None,
+        last_reported_msg_id: None,
+        auto_report: None,
     };
     conn.execute(
         "INSERT INTO sessions(
             id, title, workspace_path, access_mode, project_id, status, 
             last_message_at, created_at, updated_at, 
-            parent_session_id, session_type, subagent_role, subagent_task
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,'main',NULL,NULL)",
+            parent_session_id, session_type, subagent_role, subagent_task,
+            last_reported_msg_id, auto_report
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,'main',NULL,NULL,NULL,NULL)",
         params![
             s.id,
             s.title,
@@ -1376,7 +1438,74 @@ pub fn create_session(
     Ok(s)
 }
 
-pub fn create_subagent_session(
+pub fn create_collaborator_session(
+    conn: &Connection,
+    parent_session_id: &str,
+    role: &str,
+    title: &str,
+    task: &str,
+    workspace_path: &str,
+    access_mode: Option<&str>,
+    project_id: Option<&str>,
+    auto_report: bool,
+) -> Result<Session, String> {
+    let t = now();
+    let norm_mode = access_mode.map(normalize_access_mode).unwrap_or_else(|| "confirm".into());
+    let s = Session {
+        id: uuid::Uuid::new_v4().to_string(),
+        title: title.to_string(),
+        workspace_path: workspace_path.to_string(),
+        access_mode: Some(norm_mode),
+        project_id: project_id.map(|s| s.to_string()),
+        status: "active".into(),
+        last_message_at: Some(t.clone()),
+        created_at: t.clone(),
+        updated_at: t,
+        is_temp: false,
+        temp_code: None,
+        temp_root: None,
+        source_workspace: None,
+        merged_seq: None,
+        merged_pending: false,
+        total_tokens: Some(0),
+        prompt_tokens: Some(0),
+        completion_tokens: Some(0),
+        parent_session_id: Some(parent_session_id.to_string()),
+        session_type: "collaborator".into(),
+        subagent_role: Some(role.to_string()),
+        subagent_task: Some(task.to_string()),
+        context_token_limit: None,
+        last_reported_msg_id: None,
+        auto_report: Some(auto_report),
+    };
+    conn.execute(
+        "INSERT INTO sessions(
+            id, title, workspace_path, access_mode, project_id, status, 
+            last_message_at, created_at, updated_at, 
+            parent_session_id, session_type, subagent_role, subagent_task,
+            last_reported_msg_id, auto_report
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'collaborator',?11,?12,NULL,?13)",
+        params![
+            s.id,
+            s.title,
+            s.workspace_path,
+            s.access_mode,
+            s.project_id,
+            s.status,
+            s.last_message_at,
+            s.created_at,
+            s.updated_at,
+            s.parent_session_id,
+            s.subagent_role,
+            s.subagent_task,
+            if auto_report { 1 } else { 0 },
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(s)
+}
+
+pub fn create_subprocess_session(
     conn: &Connection,
     parent_session_id: &str,
     role: &str,
@@ -1408,17 +1537,20 @@ pub fn create_subagent_session(
         prompt_tokens: Some(0),
         completion_tokens: Some(0),
         parent_session_id: Some(parent_session_id.to_string()),
-        session_type: "subagent".into(),
+        session_type: "subprocess".into(),
         subagent_role: Some(role.to_string()),
         subagent_task: Some(task.to_string()),
         context_token_limit: None,
+        last_reported_msg_id: None,
+        auto_report: Some(false),
     };
     conn.execute(
         "INSERT INTO sessions(
             id, title, workspace_path, access_mode, project_id, status, 
             last_message_at, created_at, updated_at, 
-            parent_session_id, session_type, subagent_role, subagent_task
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            parent_session_id, session_type, subagent_role, subagent_task,
+            last_reported_msg_id, auto_report
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'subprocess',?11,?12,NULL,0)",
         params![
             s.id,
             s.title,
@@ -1430,13 +1562,34 @@ pub fn create_subagent_session(
             s.created_at,
             s.updated_at,
             s.parent_session_id,
-            s.session_type,
             s.subagent_role,
             s.subagent_task,
         ],
     )
     .map_err(|e| e.to_string())?;
     Ok(s)
+}
+
+pub fn create_subagent_session(
+    conn: &Connection,
+    parent_session_id: &str,
+    role: &str,
+    title: &str,
+    task: &str,
+    workspace_path: &str,
+    access_mode: Option<&str>,
+    project_id: Option<&str>,
+) -> Result<Session, String> {
+    create_subprocess_session(
+        conn,
+        parent_session_id,
+        role,
+        title,
+        task,
+        workspace_path,
+        access_mode,
+        project_id,
+    )
 }
 
 pub fn touch_session(conn: &Connection, id: &str) -> Result<(), String> {

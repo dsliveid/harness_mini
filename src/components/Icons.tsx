@@ -70,6 +70,7 @@ export {
   Sliders,
   Cpu,
   Bot,
+  Users,
   Database,
   Wrench,
   Shield,

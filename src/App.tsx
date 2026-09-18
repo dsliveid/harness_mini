@@ -17,10 +17,10 @@ import { TempActions } from "./components/TempActions";
 import { Toasts } from "./components/Toasts";
 import { TokenStatsModal } from "./components/TokenStatsModal";
 import { TopBar } from "./components/TopBar";
-import { SubagentBar } from "./components/SubagentBar";
-import { SubagentView } from "./components/SubagentView";
+import { CollaboratorBar } from "./components/CollaboratorBar";
+import { CollaboratorView } from "./components/CollaboratorView";
 import { SubagentResizeHandle } from "./components/SubagentResizeHandle";
-import { CreateSubagentModal } from "./components/CreateSubagentModal";
+import { CreateCollaboratorModal } from "./components/CreateCollaboratorModal";
 import { WindowHeader } from "./components/WindowHeader";
 
 export default function App() {
@@ -28,7 +28,7 @@ export default function App() {
   const bootstrap = useStore((s) => s.bootstrap);
   const ready = useStore((s) => s.ready);
   const tempClearing = useStore((s) => s.tempClearing);
-  const activeSubagentId = useStore((s) => s.activeSubagentId);
+  const activeCollaboratorId = useStore((s) => s.activeCollaboratorId ?? s.activeSubagentId);
   const subagentPanelWidth = useStore((s) => s.subagentPanelWidth);
 
   useEffect(() => {
@@ -52,7 +52,7 @@ export default function App() {
         <Sidebar />
         <div className="flex-1 flex flex-col min-w-[500px] relative">
           <TopBar />
-          <SubagentBar />
+          <CollaboratorBar />
           <ChatView />
           <PendingQueue />
           <div className="relative">
@@ -69,14 +69,14 @@ export default function App() {
             </div>
           )}
         </div>
-        {activeSubagentId && (
+        {activeCollaboratorId && (
           <>
             <SubagentResizeHandle />
             <div
               style={{ width: `${subagentPanelWidth}px` }}
               className="shrink-0 flex flex-col min-h-0 overflow-hidden"
             >
-              <SubagentView subagentId={activeSubagentId} />
+              <CollaboratorView collaboratorId={activeCollaboratorId} />
             </div>
           </>
         )}
@@ -88,7 +88,7 @@ export default function App() {
       <DiffModal />
       <GrowthModal />
       <TokenStatsModal />
-      <CreateSubagentModal />
+      <CreateCollaboratorModal />
       <PromptHost />
       <Toasts />
       <DataDirGate />
