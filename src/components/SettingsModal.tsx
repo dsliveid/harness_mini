@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
 import { ipc } from "../ipc";
 import { useStore } from "../store";
-import type { Provider, Settings, ToolInfo } from "../types";
+import type { Provider, Settings, ToolInfo, AgentSopInfo } from "../types";
+import { formatTokens, resolveModelContextLimit, AGENT_SOPS } from "../types";
 import { DataDirSection } from "./DataDirSection";
 import { ModalActions, ModalClose } from "./ModalActions";
+import { ModelContextModal } from "./ModelContextModal";
 import {
   Cpu,
   Wrench,
+  ShieldCheck,
   Database,
   Plus,
   Eye,
@@ -18,9 +21,10 @@ import {
   Zap,
   Sparkles,
   BarChart2,
+  Sliders,
 } from "./Icons";
 
-type Tab = "models" | "tools" | "datadir";
+type Tab = "models" | "tools" | "sop" | "datadir";
 
 const TOOL_TITLES: Record<string, string> = {
   read_file: "读取文件",
@@ -41,90 +45,6 @@ const TOOL_TITLES: Record<string, string> = {
   temp_restore: "恢复状态",
   temp_merge: "合并回原目录",
 };
-
-interface ModelContextPreset {
-  id: string;
-  name: string;
-  category: string;
-  windowTokens: number;
-  recommendedLimit: number;
-  desc: string;
-}
-
-const MODEL_PRESETS: ModelContextPreset[] = [
-  {
-    id: "deepseek",
-    name: "DeepSeek V3 / R1",
-    category: "主流云端",
-    windowTokens: 64_000,
-    recommendedLimit: 56_000,
-    desc: "窗口 64K · 推荐安全上限 56,000",
-  },
-  {
-    id: "claude-3-5",
-    name: "Claude 3.5 Sonnet / Haiku",
-    category: "主流云端",
-    windowTokens: 200_000,
-    recommendedLimit: 180_000,
-    desc: "窗口 200K · 推荐安全上限 180,000",
-  },
-  {
-    id: "gpt-4o",
-    name: "GPT-4o / GPT-4o-mini",
-    category: "主流云端",
-    windowTokens: 128_000,
-    recommendedLimit: 110_000,
-    desc: "窗口 128K · 推荐安全上限 110,000",
-  },
-  {
-    id: "qwen-2-5",
-    name: "通义千问 Qwen 2.5 / Plus",
-    category: "国内厂商",
-    windowTokens: 128_000,
-    recommendedLimit: 110_000,
-    desc: "窗口 128K · 推荐安全上限 110,000",
-  },
-  {
-    id: "glm-4",
-    name: "智谱 GLM-4 / Plus",
-    category: "国内厂商",
-    windowTokens: 128_000,
-    recommendedLimit: 110_000,
-    desc: "窗口 128K · 推荐安全上限 110,000",
-  },
-  {
-    id: "kimi-moonshot",
-    name: "Kimi / Moonshot",
-    category: "国内厂商",
-    windowTokens: 200_000,
-    recommendedLimit: 180_000,
-    desc: "窗口 200K · 推荐安全上限 180,000",
-  },
-  {
-    id: "gemini-2",
-    name: "Gemini 1.5 / 2.0",
-    category: "超长上下文",
-    windowTokens: 1_000_000,
-    recommendedLimit: 200_000,
-    desc: "窗口 1M+ · 推荐安全上限 200,000+",
-  },
-  {
-    id: "ollama-32k",
-    name: "本地 32K (Ollama / Mistral)",
-    category: "本地模型",
-    windowTokens: 32_000,
-    recommendedLimit: 28_000,
-    desc: "窗口 32K · 推荐安全上限 28,000",
-  },
-  {
-    id: "ollama-8k",
-    name: "本地 8K (Llama 3 8B 默认)",
-    category: "本地模型",
-    windowTokens: 8_192,
-    recommendedLimit: 7_000,
-    desc: "窗口 8K · 推荐安全上限 7,000",
-  },
-];
 
 function renderRiskBadge(risk: string) {
   switch (risk) {
@@ -171,6 +91,12 @@ export function SettingsModal() {
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [newModel, setNewModel] = useState<Record<string, string>>({});
   const [expandedIds, setExpandedIds] = useState<Record<string, boolean>>({});
+  const [editingContextModel, setEditingContextModel] = useState<{
+    providerId: string;
+    providerName?: string;
+    modelName: string;
+    currentLimit: number;
+  } | null>(null);
 
   useEffect(() => {
     if (show) {
@@ -181,6 +107,7 @@ export function SettingsModal() {
       setCopiedId(null);
       setNewModel({});
       setExpandedIds({});
+      setEditingContextModel(null);
       // 打开时从后端拉取最新设置与工具列表，避免草稿基于启动时的旧缓存回写
       ipc
         .getSettings()
@@ -209,6 +136,26 @@ export function SettingsModal() {
 
   const updateProvider = (id: string, patch: Partial<Provider>) => {
     setLocal((cur) => ({ ...cur, providers: cur.providers.map((p) => (p.id === id ? { ...p, ...patch } : p)) }));
+  };
+
+  const handleSaveModelContext = (newLimit: number | null) => {
+    if (!editingContextModel) return;
+    const { providerId, modelName } = editingContextModel;
+    const key = `${providerId}:${modelName}`;
+    setLocal((cur) => {
+      const nextLimits = { ...(cur.modelContextLimits || {}) };
+      if (newLimit === null) {
+        delete nextLimits[key];
+        delete nextLimits[modelName];
+      } else {
+        nextLimits[key] = newLimit;
+        nextLimits[modelName] = newLimit;
+      }
+      return {
+        ...cur,
+        modelContextLimits: nextLimits,
+      };
+    });
   };
 
   const addProvider = () => {
@@ -393,7 +340,7 @@ export function SettingsModal() {
         </div>
 
         <div className="flex items-center gap-2 shrink-0 pt-0.5">
-          <span className={`text-[12px] select-none ${enabled ? "text-green-400 font-medium" : "text-inkdim"}`}>
+          <span className={`text-[12px] select-none whitespace-nowrap ${enabled ? "text-green-400 font-medium" : "text-inkdim"}`}>
             {enabled ? "启用" : "禁用"}
           </span>
           <button
@@ -402,6 +349,112 @@ export function SettingsModal() {
             aria-checked={enabled}
             title={enabled ? `点击禁用 ${t.name}` : `点击启用 ${t.name}`}
             onClick={() => toggleTool(t.name)}
+            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+              enabled ? "bg-accent" : "bg-panel3 border-edge"
+            }`}
+          >
+            <span
+              className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
+                enabled ? "translate-x-4" : "translate-x-0"
+              }`}
+            />
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  const isSopEnabled = (id: string) => !(local.disabledSops ?? []).includes(id);
+
+  const toggleSop = (id: string) => {
+    const current = local.disabledSops ?? [];
+    const next = current.includes(id)
+      ? current.filter((s) => s !== id)
+      : [...current, id];
+    setLocal((cur) => ({ ...cur, disabledSops: next }));
+  };
+
+  const enableAllSops = () => {
+    setLocal((cur) => ({ ...cur, disabledSops: [] }));
+  };
+
+  const disabledSopCount = (local.disabledSops ?? []).length;
+
+  const renderSopCategoryBadge = (category: AgentSopInfo["category"], label: string) => {
+    switch (category) {
+      case "thinking":
+        return (
+          <span className="text-[11px] px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-medium">
+            {label}
+          </span>
+        );
+      case "memory":
+        return (
+          <span className="text-[11px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 font-medium">
+            {label}
+          </span>
+        );
+      case "orchestration":
+        return (
+          <span className="text-[11px] px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-400 border border-purple-500/30 font-medium">
+            {label}
+          </span>
+        );
+      case "quality":
+        return (
+          <span className="text-[11px] px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-400 border border-blue-500/30 font-medium">
+            {label}
+          </span>
+        );
+      case "workflow":
+        return (
+          <span className="text-[11px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 border border-amber-500/30 font-medium">
+            {label}
+          </span>
+        );
+      default:
+        return (
+          <span className="text-[11px] px-1.5 py-0.5 rounded bg-panel3 text-inkdim border border-edge font-medium">
+            {label}
+          </span>
+        );
+    }
+  };
+
+  const renderSopItem = (s: AgentSopInfo) => {
+    const enabled = isSopEnabled(s.id);
+    return (
+      <div
+        key={s.id}
+        className={`border rounded-xl p-3 flex items-start justify-between gap-3 transition-colors ${
+          enabled ? "border-edge bg-panel" : "border-edge/50 bg-panel/40 opacity-75"
+        }`}
+      >
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <code className="text-[13px] font-mono font-medium text-ink bg-panel3 px-1.5 py-0.5 rounded border border-edge/60">
+              {s.id}
+            </code>
+            <span className="text-[12px] text-ink font-medium">{s.name}</span>
+            {renderSopCategoryBadge(s.category, s.categoryLabel)}
+          </div>
+          <div className="text-[12px] text-inkdim mt-1.5 leading-relaxed">{s.description}</div>
+          <div className="text-[11px] text-inkdim/60 mt-1.5 flex items-center gap-1 font-mono">
+            <span>↳</span>
+            <span>{s.disableEffect}</span>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2 shrink-0 pt-0.5">
+          <span className={`text-[12px] select-none whitespace-nowrap ${enabled ? "text-green-400 font-medium" : "text-inkdim"}`}>
+            {enabled ? "启用" : "禁用"}
+          </span>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={enabled}
+            title={enabled ? `点击禁用 ${s.name}` : `点击启用 ${s.name}`}
+            onClick={() => toggleSop(s.id)}
             className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
               enabled ? "bg-accent" : "bg-panel3 border-edge"
             }`}
@@ -443,6 +496,12 @@ export function SettingsModal() {
               <span className="flex items-center gap-2">
                 <Wrench size={15} />
                 <span>Agent 工具</span>
+              </span>
+            </button>
+            <button className={menuCls(tab === "sop")} onClick={() => setTab("sop")}>
+              <span className="flex items-center gap-2">
+                <ShieldCheck size={15} />
+                <span>Agent SOP</span>
               </span>
             </button>
             <button className={menuCls(tab === "datadir")} onClick={() => setTab("datadir")}>
@@ -593,9 +652,33 @@ export function SettingsModal() {
                                     const isCurrent =
                                       local.activeProviderId === p.id &&
                                       (local.activeModelId === m || local.activeModel === m);
+                                    const limit = resolveModelContextLimit(local, p.id, m);
+                                    const isCustom =
+                                      local.modelContextLimits?.[`${p.id}:${m}`] != null ||
+                                      local.modelContextLimits?.[m] != null;
                                     return (
                                       <div key={m} className="flex items-center gap-2 bg-panel2 border border-edge rounded-lg px-2.5 py-1.5">
                                         <span className="font-mono text-[12px] flex-1 truncate">{m}</span>
+                                        <button
+                                          type="button"
+                                          className={`text-[11px] font-mono px-2 py-0.5 rounded-md border flex items-center gap-1 transition-all shrink-0 ${
+                                            isCustom
+                                              ? "bg-accent/15 border-accent/40 text-accent hover:bg-accent/25"
+                                              : "bg-panel3/80 border-edge/80 text-inkdim hover:text-ink hover:border-accent/40 hover:bg-panel3"
+                                          }`}
+                                          onClick={() =>
+                                            setEditingContextModel({
+                                              providerId: p.id,
+                                              providerName: p.name,
+                                              modelName: m,
+                                              currentLimit: limit,
+                                            })
+                                          }
+                                          title={`点击配置 ${m} 的上下文上限（当前: ${limit.toLocaleString()} tokens）`}
+                                        >
+                                          <Sliders size={11} className="opacity-70" />
+                                          <span>{formatTokens(limit)}</span>
+                                        </button>
                                         {isCurrent ? (
                                           <span className="text-[11px] text-green-400 shrink-0">当前使用</span>
                                         ) : (
@@ -690,9 +773,9 @@ export function SettingsModal() {
                 {/* 运行参数 */}
                 <section>
                   <div className="font-medium mb-2">运行参数</div>
-                  <div className="grid grid-cols-3 gap-3">
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                     <label className="flex flex-col gap-1">
-                      <span className="text-inkdim">新对话默认访问模式</span>
+                      <span className="text-inkdim">默认访问模式</span>
                       <select
                         className={inputCls}
                         value={local.globalAccessMode}
@@ -724,83 +807,28 @@ export function SettingsModal() {
                         onChange={(e) => setLocal({ ...local, commandTimeoutSecs: Number(e.target.value) || 120 })}
                       />
                     </label>
-                  </div>
-                  <div className="flex flex-col gap-2.5 mt-4 p-3.5 rounded-xl bg-panel3/50 border border-edge/60">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <div className="text-[13px] font-medium text-ink">上下文 Token 上限</div>
-                        <div className="text-[11px] text-inkdim mt-0.5">
-                          单次会话可容纳的历史 Token 阈值。当未压缩历史达到此上限约 75% 时，将自动提炼 Markdown 备忘录并等待您确认后执行压缩。
-                        </div>
-                      </div>
-                      <span className="text-[12px] font-mono text-accent font-medium shrink-0 ml-2">
-                        {local.contextTokenLimit?.toLocaleString()} tokens
+                    <label className="flex flex-col gap-1">
+                      <span className="text-inkdim" title="当模型未单独配置且无法自动推断时使用的全局保底上限">
+                        未识别模型保底上限
                       </span>
-                    </div>
-
-                    {/* 各模型上下文规格预设选择器 */}
-                    <div className="flex flex-col gap-2 mt-1">
-                      <div className="flex items-center justify-between gap-3">
-                        <span className="text-[11px] text-inkdim shrink-0">选择模型规格预设：</span>
-                        <select
-                          className={`${inputCls} text-[12px] py-1 flex-1`}
-                          value=""
-                          onChange={(e) => {
-                            const val = Number(e.target.value);
-                            if (val) setLocal({ ...local, contextTokenLimit: val });
-                          }}
-                        >
-                          <option value="" disabled>
-                            从主流模型规格列表中选择快速填充...
-                          </option>
-                          {["主流云端", "国内厂商", "超长上下文", "本地模型"].map((cat) => (
-                            <optgroup key={cat} label={cat}>
-                              {MODEL_PRESETS.filter((p) => p.category === cat).map((p) => (
-                                <option key={p.id} value={p.recommendedLimit}>
-                                  {p.name}（{p.desc}）
-                                </option>
-                              ))}
-                            </optgroup>
-                          ))}
-                        </select>
-                      </div>
-
-                      {/* 常用规格快捷标签 */}
-                      <div className="flex flex-wrap gap-1.5 pt-0.5">
-                        {MODEL_PRESETS.map((p) => {
-                          const isCurrent = local.contextTokenLimit === p.recommendedLimit;
-                          return (
-                            <button
-                              key={p.id}
-                              type="button"
-                              className={`px-2 py-1 rounded-md text-[11px] transition-colors border ${
-                                isCurrent
-                                  ? "bg-accent/15 border-accent text-accent font-medium shadow-xs"
-                                  : "bg-panel border-edge hover:border-accent/40 text-inkdim hover:text-ink"
-                              }`}
-                              onClick={() => setLocal({ ...local, contextTokenLimit: p.recommendedLimit })}
-                              title={`${p.name}: ${p.desc}，点击应用推荐安全阈值`}
-                            >
-                              {p.name.split(" ")[0]} ({p.recommendedLimit >= 10000 ? `${p.recommendedLimit / 1000}k` : p.recommendedLimit})
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    {/* 手动微调数值 */}
-                    <div className="flex items-center gap-2 mt-2 pt-2.5 border-t border-edge/40">
-                      <span className="text-[12px] text-inkdim shrink-0">自由手动微调：</span>
                       <input
-                        className={`${inputCls} flex-1 font-mono text-[13px]`}
+                        className={inputCls}
                         type="number"
                         min={2000}
                         max={2000000}
                         step={1000}
                         value={local.contextTokenLimit}
                         onChange={(e) => setLocal({ ...local, contextTokenLimit: Number(e.target.value) || 64000 })}
+                        title="当模型未单独配置且无法自动推断时使用的全局保底上限"
                       />
-                      <span className="text-[12px] text-inkdim shrink-0">tokens</span>
+                    </label>
+                  </div>
+                  <div className="mt-3 text-[11px] text-inkdim bg-panel3/40 border border-edge/50 rounded-xl px-3.5 py-2.5 flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Sparkles size={13} className="text-accent shrink-0" />
+                      <span>
+                        各模型的上下文上限已按模型维度独立配置：点击上方模型列表中模型右侧的标签（如 <span className="font-mono text-accent font-medium">{formatTokens(local.contextTokenLimit || 64000)}</span>）即可弹出配置对话框进行微调。
+                      </span>
                     </div>
                   </div>
                 </section>
@@ -810,20 +838,20 @@ export function SettingsModal() {
             {tab === "tools" && (
               <div className="flex flex-col gap-5">
                 <section>
-                  <div className="flex items-center justify-between mb-3">
-                    <div>
+                  <div className="flex items-start justify-between gap-4 mb-3">
+                    <div className="flex-1 min-w-0">
                       <div className="font-medium text-[14px]">Agent 工具管理</div>
-                      <div className="text-[12px] text-inkdim mt-0.5">
+                      <div className="text-[12px] text-inkdim mt-0.5 leading-relaxed max-w-[520px]">
                         配置 Agent 可调用的工具。禁用后模型将无法获取和调用该工具。
                       </div>
                     </div>
-                    <div className="flex items-center gap-3">
-                      <span className="text-[12px] text-inkdim">
+                    <div className="flex items-center gap-2.5 shrink-0 pt-0.5">
+                      <span className="text-[12px] text-inkdim font-medium whitespace-nowrap bg-panel3 px-2 py-0.5 rounded-md border border-edge/60">
                         已启用 {toolList.length - disabledCount} / {toolList.length}
                       </span>
                       {disabledCount > 0 && (
                         <button
-                          className="text-[12px] text-accent hover:underline"
+                          className="text-[12px] text-accent hover:underline whitespace-nowrap"
                           onClick={enableAllTools}
                         >
                           全部启用
@@ -909,6 +937,49 @@ export function SettingsModal() {
               </div>
             )}
 
+            {tab === "sop" && (
+              <div className="flex flex-col gap-5">
+                <section>
+                  <div className="flex items-start justify-between gap-4 mb-3">
+                    <div className="flex-1 min-w-0">
+                      <div className="font-medium text-[14px]">Agent SOP 规范管理</div>
+                      <div className="text-[12px] text-inkdim mt-0.5 leading-relaxed max-w-[520px]">
+                        配置 Agent 在执行任务时遵循的标准作业程序规范（SOP）。禁用后模型将免除对应的硬性提示词约束与相关自动化行为。
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2.5 shrink-0 pt-0.5">
+                      <span className="text-[12px] text-inkdim font-medium whitespace-nowrap bg-panel3 px-2 py-0.5 rounded-md border border-edge/60">
+                        已启用 {AGENT_SOPS.length - disabledSopCount} / {AGENT_SOPS.length}
+                      </span>
+                      {disabledSopCount > 0 && (
+                        <button
+                          className="text-[12px] text-accent hover:underline whitespace-nowrap"
+                          onClick={enableAllSops}
+                        >
+                          全部启用
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* SOP 体系说明卡片 */}
+                  <div className="p-3 rounded-xl border border-edge/80 bg-panel3/40 flex items-start gap-3 mt-1 mb-2 text-[12px] leading-relaxed">
+                    <ShieldCheck size={16} className="text-accent shrink-0 mt-0.5" />
+                    <div className="flex flex-col gap-1">
+                      <div className="font-medium text-ink">标准作业程序 (SOP) 与自动化规范说明</div>
+                      <div className="text-inkdim leading-relaxed">
+                        SOP 是 Agent 保持谨慎、工程规范与高质量交付的底层约束。关闭某项规范后，Agent 将在该维度解除硬性规则束缚（例如：关闭方案先行后可直接动手编码；关闭边读边记后将不强制记录并跳过任务完成后的后台自动提炼）。
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col gap-2 mt-4">
+                    {AGENT_SOPS.map(renderSopItem)}
+                  </div>
+                </section>
+              </div>
+            )}
+
             {tab === "datadir" && (
               /* 数据目录（独立生效，不随「应用 / 保存」提交） */
               <section>
@@ -926,6 +997,18 @@ export function SettingsModal() {
           busy={saving}
         />
       </div>
+
+      {editingContextModel && (
+        <ModelContextModal
+          open={true}
+          providerId={editingContextModel.providerId}
+          providerName={editingContextModel.providerName}
+          modelName={editingContextModel.modelName}
+          currentLimit={editingContextModel.currentLimit}
+          onSave={handleSaveModelContext}
+          onClose={() => setEditingContextModel(null)}
+        />
+      )}
     </div>
   );
 }

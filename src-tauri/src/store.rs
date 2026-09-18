@@ -225,6 +225,7 @@ fn init(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "sessions", "session_type", "session_type TEXT NOT NULL DEFAULT 'main'")?;
     ensure_column(conn, "sessions", "subagent_role", "subagent_role TEXT")?;
     ensure_column(conn, "sessions", "subagent_task", "subagent_task TEXT")?;
+    ensure_column(conn, "sessions", "context_token_limit", "context_token_limit INTEGER")?;
     let _ = backfill_message_tokens(conn);
     Ok(())
 }
@@ -680,6 +681,51 @@ mod tests {
 
         let after_cleanup = get_tool_event_with_session(&conn, "ev-2").unwrap().unwrap().0;
         assert_eq!(after_cleanup.status, "failed");
+    }
+
+    #[test]
+    fn test_session_context_limit_crud() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        // 1. 创建会话后设置自定义 context_token_limit
+        let s = create_session(&conn, "D:\\ws", None, "test_session", "confirm").unwrap();
+        assert_eq!(s.context_token_limit, None);
+
+        set_session_context_limit(&conn, &s.id, Some(128_000)).unwrap();
+        let fetched = get_session(&conn, &s.id).unwrap().unwrap();
+        assert_eq!(fetched.context_token_limit, Some(128_000));
+
+        // 2. 更新为新的数值
+        set_session_context_limit(&conn, &s.id, Some(256_000)).unwrap();
+        let updated = get_session(&conn, &s.id).unwrap().unwrap();
+        assert_eq!(updated.context_token_limit, Some(256_000));
+
+        // 3. 清除会话级自定义，恢复为 None (跟随模型默认)
+        set_session_context_limit(&conn, &s.id, None).unwrap();
+        let cleared = get_session(&conn, &s.id).unwrap().unwrap();
+        assert_eq!(cleared.context_token_limit, None);
+
+        // 4. 模拟旧库迁移：无 context_token_limit 列时自动补充
+        let legacy_conn = Connection::open_in_memory().unwrap();
+        legacy_conn.execute_batch(
+            "CREATE TABLE sessions (
+               id TEXT PRIMARY KEY,
+               title TEXT NOT NULL,
+               workspace_path TEXT NOT NULL,
+               access_mode TEXT,
+               project_id TEXT,
+               status TEXT NOT NULL DEFAULT 'active',
+               last_message_at TEXT,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );"
+        ).unwrap();
+        init_schema(&legacy_conn).unwrap();
+        let legacy_s = create_session(&legacy_conn, "D:\\ws", None, "legacy", "confirm").unwrap();
+        set_session_context_limit(&legacy_conn, &legacy_s.id, Some(64_000)).unwrap();
+        let fetched_legacy = get_session(&legacy_conn, &legacy_s.id).unwrap().unwrap();
+        assert_eq!(fetched_legacy.context_token_limit, Some(64_000));
     }
 
     #[test]
@@ -1158,13 +1204,14 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         session_type: r.get::<_, Option<String>>(16)?.unwrap_or_else(|| "main".into()),
         subagent_role: r.get(17)?,
         subagent_task: r.get(18)?,
+        context_token_limit: r.get::<_, Option<i64>>(19).ok().flatten().map(|v| v as usize),
     })
 }
 
 const SESSION_COLS: &str =
     "id, title, workspace_path, access_mode, project_id, status, last_message_at, created_at, updated_at, \
      is_temp, temp_code, temp_root, source_workspace, merged_seq, merged_pending, \
-     parent_session_id, session_type, subagent_role, subagent_task";
+     parent_session_id, session_type, subagent_role, subagent_task, context_token_limit";
 
 fn attach_session_tokens(conn: &Connection, sessions: &mut [Session]) -> Result<(), String> {
     if sessions.is_empty() {
@@ -1305,6 +1352,7 @@ pub fn create_session(
         session_type: "main".into(),
         subagent_role: None,
         subagent_task: None,
+        context_token_limit: None,
     };
     conn.execute(
         "INSERT INTO sessions(
@@ -1363,6 +1411,7 @@ pub fn create_subagent_session(
         session_type: "subagent".into(),
         subagent_role: Some(role.to_string()),
         subagent_task: Some(task.to_string()),
+        context_token_limit: None,
     };
     conn.execute(
         "INSERT INTO sessions(
@@ -1451,6 +1500,16 @@ pub fn set_session_mode(conn: &Connection, id: &str, mode: &str) -> Result<(), S
     conn.execute(
         "UPDATE sessions SET access_mode = ?2 WHERE id = ?1",
         params![id, normalize_access_mode(mode)],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 设置会话专属上下文 Token 上限（None 表示清除专属设置，恢复跟随模型与全局默认）
+pub fn set_session_context_limit(conn: &Connection, id: &str, limit: Option<usize>) -> Result<(), String> {
+    conn.execute(
+        "UPDATE sessions SET context_token_limit = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, limit.map(|v| v as i64), now()],
     )
     .map_err(|e| e.to_string())?;
     Ok(())

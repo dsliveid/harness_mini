@@ -86,7 +86,8 @@ export function Composer() {
         isDraftLike ? draft?.projectId ?? st.currentProjectId ?? undefined : undefined,
         isDraftLike ? draft?.temp ?? undefined : undefined,
         // 访问模式为会话级：新对话落库时带上草稿上的取值（已从“上一条对话”继承）
-        isDraftLike ? draft?.accessMode ?? undefined : undefined
+        isDraftLike ? draft?.accessMode ?? undefined : undefined,
+        isDraftLike ? draft?.contextTokenLimit ?? undefined : undefined
       );
       const st2 = useStore.getState();
       // 后端随结果带回会话实体：切换前先入列，避免「currentId 已切换、会话事件未到达」

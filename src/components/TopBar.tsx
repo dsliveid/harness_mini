@@ -2,8 +2,9 @@ import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ipc } from "../ipc";
 import { currentSession, useStore } from "../store";
-import { DRAFT_ID, modelKey, parseModelKey, resolveActiveModel, samePath, type Project } from "../types";
+import { DRAFT_ID, formatTokens, modelKey, parseModelKey, resolveActiveModel, resolveModelContextLimit, samePath, type Project } from "../types";
 import { askConfirm } from "./PromptModal";
+import { ModelContextModal } from "./ModelContextModal";
 
 import {
   Wind,
@@ -35,8 +36,10 @@ export function TopBar() {
   const setSettingsLocal = useStore((s) => s.setSettingsLocal);
   const pushToast = useStore((s) => s.pushToast);
   const setDraftAccessMode = useStore((s) => s.setDraftAccessMode);
+  const setDraftContextTokenLimit = useStore((s) => s.setDraftContextTokenLimit);
 
   const [openMenu, setOpenMenu] = useState<OpenMenu>(null);
+  const [openSessionContextModal, setOpenSessionContextModal] = useState(false);
 
   const running = currentId ? runStatus[currentId] === "running" : false;
   const workspacePath = session?.workspacePath ?? draft?.workspacePath ?? "";
@@ -45,6 +48,15 @@ export function TopBar() {
   // 顶栏模型选择：按厂商分组（optgroup）；激活厂商失效时回落到第一个有模型的厂商
   const groups = settings.providers.filter((p) => (p.models ?? []).length > 0);
   const active = resolveActiveModel(settings);
+
+  // 上下文上限三级解析：会话专属设置 -> 模型独立配置/推断 -> 全局保底值
+  const sessionLimitOverride = session
+    ? session.contextTokenLimit ?? null
+    : (currentId === DRAFT_ID ? draft?.contextTokenLimit ?? null : null);
+  const isSessionOverridden = sessionLimitOverride != null;
+  const modelDefaultLimit = active ? resolveModelContextLimit(settings, active.provider.id, active.model) : (settings.contextTokenLimit || 64_000);
+  const effectiveLimit = sessionLimitOverride ?? modelDefaultLimit;
+  const activeLimit = effectiveLimit;
 
   // 访问模式为会话级：已保存对话取自身取值，未保存草稿取草稿上的取值（新建时已从
   // “上一条对话”继承）。不再有“跟随全局”状态，全局值仅作为新建对话的默认值。
@@ -145,6 +157,18 @@ export function TopBar() {
       await ipc.setSettings(next);
     } catch (err) {
       pushToast(String(err));
+    }
+  };
+
+  const handleSaveSessionLimit = async (newLimit: number | null) => {
+    if (session) {
+      try {
+        await ipc.setSessionContextLimit(session.id, newLimit);
+      } catch (err) {
+        pushToast(String(err));
+      }
+    } else if (currentId === DRAFT_ID) {
+      setDraftContextTokenLimit(newLimit);
     }
   };
 
@@ -331,24 +355,50 @@ export function TopBar() {
           )}
         </div>
 
-        {/* 模型选择器（自定义深色下拉） */}
+        {/* 模型切换器 */}
         <div className="relative shrink-0">
           <button
-            className={`flex items-center gap-1.5 bg-panel2/60 hover:bg-panel2 border border-edge/60 hover:border-accent/40 rounded-lg px-2.5 py-1 text-[12px] text-ink whitespace-nowrap shrink-0 transition-all shadow-sm max-w-[140px] lg:max-w-[180px] ${
+            className={`flex items-center gap-1.5 bg-panel2/60 hover:bg-panel2 border border-edge/60 hover:border-accent/40 rounded-lg px-2.5 py-1 text-[12px] text-ink whitespace-nowrap shrink-0 transition-all shadow-sm max-w-[170px] lg:max-w-[220px] ${
               openMenu === "model" ? "border-accent/50 bg-panel2 ring-1 ring-accent/20" : ""
             }`}
             onClick={() => setOpenMenu(openMenu === "model" ? null : "model")}
-            title={active ? `${active.provider.name} / ${active.model}` : "未配置模型"}
+            title={
+              active
+                ? `${active.provider.name} / ${active.model}\n有效上下文上限: ${effectiveLimit.toLocaleString()} tokens (~${formatTokens(effectiveLimit)})${
+                    isSessionOverridden ? " (★ 仅当前对话生效)" : " (跟随模型默认)"
+                  }`
+                : "未配置模型"
+            }
           >
             <Sparkles size={13} className="text-accent shrink-0" />
             <span className="truncate">{active?.model ?? "选择模型"}</span>
+            {active && (
+              <span
+                role="button"
+                className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 transition-all cursor-pointer ${
+                  isSessionOverridden
+                    ? "text-amber-400 bg-amber-500/15 border-amber-500/35 hover:bg-amber-500/25 font-semibold shadow-[0_0_8px_rgba(245,158,11,0.15)]"
+                    : "text-accent/80 bg-accent/10 border-accent/20 hover:bg-accent/20 hover:text-accent hover:border-accent/40"
+                }`}
+                title={`点击调整本次对话上下文上限\n当前有效上限: ${effectiveLimit.toLocaleString()} tokens (~${formatTokens(effectiveLimit)})${
+                  isSessionOverridden ? "\n（★ 本次对话专属自定义，优先级最高）" : "\n（跟随模型默认配置）"
+                }`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setOpenSessionContextModal(true);
+                }}
+                onMouseDown={(e) => e.stopPropagation()}
+              >
+                {formatTokens(effectiveLimit)}{isSessionOverridden ? " · 本次" : ""}
+              </span>
+            )}
             <ChevronDown size={11} className="opacity-60 shrink-0 ml-0.5 text-inkdim" />
           </button>
 
           {openMenu === "model" && (
             <>
               <div className="fixed inset-0 z-40" onMouseDown={() => setOpenMenu(null)} />
-              <div className="absolute right-0 top-10 z-50 w-[280px] bg-panel2 border border-edge/80 rounded-xl shadow-2xl p-1.5 max-h-[65vh] overflow-y-auto animate-in fade-in zoom-in-95 duration-100">
+              <div className="absolute right-0 top-10 z-50 w-[290px] bg-panel2 border border-edge/80 rounded-xl shadow-2xl p-1.5 max-h-[65vh] overflow-y-auto animate-in fade-in zoom-in-95 duration-100">
                 <div className="px-2.5 py-1 text-[11px] font-medium text-inkdim flex items-center justify-between">
                   <span>选择模型</span>
                   <span className="text-[10px] text-inkdim/70">
@@ -366,21 +416,28 @@ export function TopBar() {
                       <div className="flex flex-col gap-0.5 mt-0.5">
                         {p.models.map((m) => {
                           const isSelected = active?.provider.id === p.id && active?.model === m;
+                          const mLimit = resolveModelContextLimit(settings, p.id, m);
                           return (
                             <button
                               key={m}
-                              className={`w-full text-left px-2.5 py-1.5 rounded-lg text-[12px] transition-colors flex items-center justify-between ${
+                              className={`w-full text-left px-2.5 py-1.5 rounded-lg text-[12px] transition-colors flex items-center justify-between gap-2 ${
                                 isSelected
                                   ? "bg-accent/15 text-accent font-medium"
                                   : "hover:bg-panel3 text-ink/90 hover:text-ink"
                               }`}
                               onClick={() => void handleSelectModel(p.id, m)}
+                              title={`${p.name} · ${m}\n上下文上限: ${mLimit.toLocaleString()} tokens`}
                             >
-                              <div className="flex items-center gap-2 truncate min-w-0">
+                              <div className="flex items-center gap-2 truncate min-w-0 flex-1">
                                 <Cpu size={13} className={isSelected ? "text-accent" : "text-inkdim"} />
                                 <span className="truncate">{m}</span>
                               </div>
-                              {isSelected && <Check size={13} className="text-accent shrink-0 ml-1.5" />}
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                <span className="text-[10px] font-mono text-inkdim bg-panel3 px-1.5 py-0.5 rounded border border-edge/60">
+                                  {formatTokens(mLimit)}
+                                </span>
+                                {isSelected && <Check size={13} className="text-accent shrink-0 ml-1" />}
+                              </div>
                             </button>
                           );
                         })}
@@ -410,6 +467,20 @@ export function TopBar() {
           <span className="font-medium">{running ? "运行中" : "空闲"}</span>
         </div>
       </div>
+
+      {/* 调整本次对话上下文上限小弹窗（仅当前对话生效） */}
+      {openSessionContextModal && active && (
+        <ModelContextModal
+          open={openSessionContextModal}
+          providerId={active.provider.id}
+          providerName={active.provider.name}
+          modelName={active.model}
+          currentLimit={effectiveLimit}
+          isSessionScope={true}
+          onSave={handleSaveSessionLimit}
+          onClose={() => setOpenSessionContextModal(false)}
+        />
+      )}
     </div>
   );
 }

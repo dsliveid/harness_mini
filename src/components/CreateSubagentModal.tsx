@@ -1,6 +1,6 @@
-﻿import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useStore, currentSession } from "../store";
-import { Layers, X, Loader2, Sparkles } from "./Icons";
+import { Layers, X, Loader2, Sparkles, Folder } from "./Icons";
 
 const ROLE_PRESETS = [
   {
@@ -57,7 +57,15 @@ export function CreateSubagentModal() {
   const [selectedRole, setSelectedRole] = useState("frontend");
   const [title, setTitle] = useState("前端开发任务");
   const [taskPrompt, setTaskPrompt] = useState(ROLE_PRESETS[0].defaultPrompt);
+  const [workspacePath, setWorkspacePath] = useState(session?.workspacePath ?? "");
+  const [subpath, setSubpath] = useState("");
   const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    if (show && session?.workspacePath) {
+      setWorkspacePath(session.workspacePath);
+    }
+  }, [show, session?.workspacePath]);
 
   if (!show || !currentId || !session) return null;
 
@@ -81,8 +89,11 @@ export function CreateSubagentModal() {
         role: selectedRole,
         title: title.trim() || undefined,
         taskPrompt: taskPrompt.trim(),
+        subpath: subpath.trim() || undefined,
+        workspacePath: workspacePath.trim() || undefined,
       });
       handleRoleSelect("frontend");
+      setSubpath("");
     } finally {
       setSubmitting(false);
     }
@@ -152,6 +163,41 @@ export function CreateSubagentModal() {
               placeholder="例如：开发前端登录卡片组件、重构数据导出接口"
               className="w-full px-3 py-2 rounded-xl bg-panel2/60 border border-edge text-ink text-[13px] focus:outline-none focus:border-accent"
             />
+          </div>
+
+          {/* Workspace Path & Focus Subpath */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+            <div>
+              <label className="block text-[13px] font-medium text-ink mb-1.5 flex items-center justify-between">
+                <span className="flex items-center gap-1">
+                  <Folder size={13} className="text-inkdim" />
+                  <span>工作区根目录</span>
+                </span>
+                <span className="text-[11px] text-inkdim font-normal">执行基准根</span>
+              </label>
+              <input
+                type="text"
+                value={workspacePath}
+                onChange={(e) => setWorkspacePath(e.target.value)}
+                placeholder={session.workspacePath || "继承当前主项目根目录"}
+                className="w-full px-3 py-2 rounded-xl bg-panel2/60 border border-edge text-ink text-[12px] font-mono focus:outline-none focus:border-accent"
+                title="子 Agent 物理执行根目录，默认继承当前项目根目录，具备访问根目录下全局构建与配置文件的权限"
+              />
+            </div>
+            <div>
+              <label className="block text-[13px] font-medium text-ink mb-1.5 flex items-center justify-between">
+                <span>重点关注子目录</span>
+                <span className="text-[11px] text-inkdim font-normal">可选范围指引</span>
+              </label>
+              <input
+                type="text"
+                value={subpath}
+                onChange={(e) => setSubpath(e.target.value)}
+                placeholder="例如：src 或 backend/api"
+                className="w-full px-3 py-2 rounded-xl bg-panel2/60 border border-edge text-ink text-[12px] font-mono focus:outline-none focus:border-accent"
+                title="引导子 Agent 优先聚焦该子目录开展工作，不会剥夺其对项目根目录下文件的访问权"
+              />
+            </div>
           </div>
 
           {/* Task prompt */}

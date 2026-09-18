@@ -36,9 +36,63 @@ export interface Settings {
   maxSteps: number;
   commandTimeoutSecs: number;
   contextTokenLimit: number;
+  modelContextLimits?: Record<string, number>;
   lastWorkspacePath?: string | null;
   disabledTools?: string[];
+  disabledSops?: string[];
 }
+
+export interface AgentSopInfo {
+  id: string;
+  name: string;
+  category: "thinking" | "memory" | "orchestration" | "quality" | "workflow";
+  categoryLabel: string;
+  description: string;
+  disableEffect: string;
+}
+
+export const AGENT_SOPS: AgentSopInfo[] = [
+  {
+    id: "plan_first",
+    name: "方案先行规范",
+    category: "thinking",
+    categoryLabel: "思考范式",
+    description: "面对新功能开发、需求实现、架构重构或技术探索时，必须先分析可行性、梳理技术依赖并给出推荐方案向用户征询确认；在用户明确确认前，切勿擅自修改或新增代码文件。",
+    disableEffect: "禁用后：Agent 在接到开发任务后可直接开始写代码，无需先出方案征询确认。",
+  },
+  {
+    id: "memory_distill",
+    name: "边读边记与认知沉淀规范",
+    category: "memory",
+    categoryLabel: "知识资产",
+    description: "内置工作区长期认知记忆（.harness/memory/）；常见技术栈提问优先秒级召回；深入探索或阅读多个文件后强制调用 record_memory 沉淀技术大盘与主题碎记；对话完成后台自动萃取 digests。",
+    disableEffect: "禁用后：移除强制调用 record_memory 沉淀约束，且会话结束后不触发后台自动提炼。",
+  },
+  {
+    id: "subagent_orchestration",
+    name: "子进程协作与架构编排规范",
+    category: "orchestration",
+    categoryLabel: "协同体系",
+    description: "面对复杂需求、多模块并发开发（如前后端分离、多业务模块并行）时，总架构师按标准流程（规划拆解 -> 派生子 Agent -> 等待汇聚 -> 全局验收）采用子进程协同提升效率与模块隔离度。",
+    disableEffect: "禁用后：停用多子进程协作编排指引，Agent 倾向于在单主进程内串行处理全部任务。",
+  },
+  {
+    id: "safe_code_edit",
+    name: "代码克制与精确修改规范",
+    category: "quality",
+    categoryLabel: "工程质量",
+    description: "修改文件前必须先用 read_file 读取相关内容，用 edit_file 做基于精确原文的最小化修改；新文件才用 write_file；动手前探索代码结构，修改后尽量用 run_command 运行构建或测试验证。",
+    disableEffect: "禁用后：移除代码最小化精确修改与构建验证的强指引约束。",
+  },
+  {
+    id: "todo_lifecycle",
+    name: "任务清单全生命周期规范",
+    category: "workflow",
+    categoryLabel: "任务规划",
+    description: "接到多步任务时，先用 todo 工具列出计划，并随进展更新各项状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done，切勿遗留 in_progress 状态。",
+    disableEffect: "禁用后：允许 Agent 自由多步推进，不强制调用 todo 工具维护状态清单。",
+  },
+];
 
 export interface Project {
   id: string;
@@ -90,6 +144,8 @@ export interface Session {
   subagentRole?: string | null;
   /** 子 Agent 初始分配的任务描述 */
   subagentTask?: string | null;
+  /** 会话专属上下文 Token 上限（覆盖全局及模型推荐值） */
+  contextTokenLimit?: number | null;
 }
 
 export interface SubagentCreateInput {
@@ -97,6 +153,7 @@ export interface SubagentCreateInput {
   title: string;
   task: string;
   subpath?: string;
+  workspacePath?: string;
 }
 
 /** 临时空间中被拷贝的单个项目条目（主项目 key="main"，关联项目 key="link:<id>"） */
@@ -435,6 +492,150 @@ export function parseModelKey(key: string): { providerId: string; model: string 
   const i = key.indexOf(":");
   if (i <= 0) return null;
   return { providerId: key.slice(0, i), model: key.slice(i + 1) };
+}
+
+export interface ModelContextPreset {
+  id: string;
+  name: string;
+  category: string;
+  windowTokens: number;
+  recommendedLimit: number;
+  desc: string;
+}
+
+export const MODEL_CONTEXT_PRESETS: ModelContextPreset[] = [
+  {
+    id: "deepseek",
+    name: "DeepSeek V3 / R1",
+    category: "主流云端",
+    windowTokens: 64_000,
+    recommendedLimit: 56_000,
+    desc: "窗口 64K · 推荐安全上限 56,000",
+  },
+  {
+    id: "claude-3-5",
+    name: "Claude 3.5 Sonnet / Haiku",
+    category: "主流云端",
+    windowTokens: 200_000,
+    recommendedLimit: 180_000,
+    desc: "窗口 200K · 推荐安全上限 180,000",
+  },
+  {
+    id: "gpt-4o",
+    name: "GPT-4o / GPT-4o-mini",
+    category: "主流云端",
+    windowTokens: 128_000,
+    recommendedLimit: 110_000,
+    desc: "窗口 128K · 推荐安全上限 110,000",
+  },
+  {
+    id: "qwen-2-5",
+    name: "通义千问 Qwen 2.5 / Plus",
+    category: "国内厂商",
+    windowTokens: 128_000,
+    recommendedLimit: 110_000,
+    desc: "窗口 128K · 推荐安全上限 110,000",
+  },
+  {
+    id: "glm-4",
+    name: "智谱 GLM-4 / Plus",
+    category: "国内厂商",
+    windowTokens: 128_000,
+    recommendedLimit: 110_000,
+    desc: "窗口 128K · 推荐安全上限 110,000",
+  },
+  {
+    id: "kimi-moonshot",
+    name: "Kimi / Moonshot",
+    category: "国内厂商",
+    windowTokens: 200_000,
+    recommendedLimit: 180_000,
+    desc: "窗口 200K · 推荐安全上限 180,000",
+  },
+  {
+    id: "gemini-2",
+    name: "Gemini 1.5 / 2.0",
+    category: "超长上下文",
+    windowTokens: 1_000_000,
+    recommendedLimit: 200_000,
+    desc: "窗口 1M+ · 推荐安全上限 200,000+",
+  },
+  {
+    id: "ollama-32k",
+    name: "本地 32K (Ollama / Mistral)",
+    category: "本地模型",
+    windowTokens: 32_000,
+    recommendedLimit: 28_000,
+    desc: "窗口 32K · 推荐安全上限 28,000",
+  },
+  {
+    id: "ollama-8k",
+    name: "本地 8K (Llama 3 8B 默认)",
+    category: "本地模型",
+    windowTokens: 8_192,
+    recommendedLimit: 7_000,
+    desc: "窗口 8K · 推荐安全上限 7,000",
+  },
+];
+
+/** 根据模型名称启发式推断预设上下文上限 */
+export function inferModelContextLimit(model: string): number {
+  const lower = model.toLowerCase();
+  if (lower.includes("deepseek")) return 56_000;
+  if (lower.includes("claude")) return 180_000;
+  if (lower.includes("gpt-4o") || lower.includes("gpt-4.5") || lower.includes("o1") || lower.includes("o3")) return 110_000;
+  if (lower.includes("qwen") || lower.includes("千问")) return 110_000;
+  if (lower.includes("glm")) return 110_000;
+  if (lower.includes("kimi") || lower.includes("moonshot")) return 180_000;
+  if (lower.includes("gemini")) return 200_000;
+  if (lower.includes("8k")) return 7_000;
+  if (lower.includes("16k")) return 14_000;
+  if (lower.includes("32k")) return 28_000;
+  if (lower.includes("64k")) return 56_000;
+  if (lower.includes("128k")) return 110_000;
+  if (lower.includes("200k")) return 180_000;
+  if (lower.includes("1m")) return 200_000;
+  return 64_000;
+}
+
+/**
+ * 解析具体模型的生效上下文上限：
+ * 1. 优先根据 `providerId:model` 查找精准配置
+ * 2. 其次根据 `model` 查找全局模型配置
+ * 3. 再次根据模型名关键字推断预设规格
+ * 4. 最后回落至全局保底值 settings.contextTokenLimit
+ */
+export function resolveModelContextLimit(
+  settings: Settings,
+  providerId?: string | null,
+  model?: string | null
+): number {
+  if (!model) return settings.contextTokenLimit || 64_000;
+  const limits = settings.modelContextLimits || {};
+  if (providerId && limits[`${providerId}:${model}`] != null) {
+    return limits[`${providerId}:${model}`];
+  }
+  if (limits[model] != null) {
+    return limits[model];
+  }
+  const inferred = inferModelContextLimit(model);
+  if (inferred !== 64_000) {
+    return inferred;
+  }
+  return settings.contextTokenLimit || 64_000;
+}
+
+/** 将 token 数量格式化为易读的文本（如 56k, 180k, 1.2m） */
+export function formatTokens(tokens: number): string {
+  if (tokens >= 1_000_000) {
+    const m = tokens / 1_000_000;
+    return m % 1 === 0 ? `${m}M` : `${m.toFixed(1)}M`;
+  }
+  if (tokens >= 1_000) {
+    const k = tokens / 1_000;
+    return k % 1 === 0 ? `${k}k` : `${k.toFixed(1)}k`;
+  }
+  return String(tokens);
 }
 
 const IS_WIN = typeof navigator !== "undefined" && /win/i.test(navigator.platform);

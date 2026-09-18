@@ -38,6 +38,8 @@ export const ipc = {
   archiveSession: (id: string) => invoke<void>("archive_session", { id }),
   unarchiveSession: (id: string) => invoke<void>("unarchive_session", { id }),
   setSessionMode: (id: string, mode: string) => invoke<void>("set_session_mode", { id, mode }),
+  setSessionContextLimit: (id: string, limit: number | null) =>
+    invoke<void>("set_session_context_limit", { id, limit }),
   setSessionWorkspace: (id: string, path: string) =>
     invoke<void>("set_session_workspace", { id, path }),
   setSessionProject: (id: string, projectId: string | null) =>
@@ -53,6 +55,7 @@ export const ipc = {
     projectId?: string,
     temp?: TempAlloc,
     accessMode?: string,
+    contextTokenLimit?: number | null,
   ) =>
     invoke<{ sessionId: string; messageId: string; queued: boolean; session?: Session | null }>("send_message", {
       sessionId,
@@ -61,6 +64,7 @@ export const ipc = {
       projectId: projectId ?? null,
       temp: temp ?? null,
       accessMode: accessMode ?? null,
+      contextTokenLimit: contextTokenLimit ?? null,
     }),
   listQueued: (sessionId: string) => invoke<Message[]>("list_queued", { sessionId }),
   guideMessage: (sessionId: string, messageId: string) =>
@@ -71,13 +75,14 @@ export const ipc = {
   // 子 Agent 进程协作
   listSubagents: (parentSessionId: string) =>
     invoke<Session[]>("list_subagents", { parentSessionId }),
-  spawnSubagent: (input: { parentSessionId: string; role: string; taskPrompt: string; title?: string; subpath?: string | null }) =>
+  spawnSubagent: (input: { parentSessionId: string; role: string; taskPrompt: string; title?: string; subpath?: string | null; workspacePath?: string | null }) =>
     invoke<Session>("spawn_subagent", {
       parentSessionId: input.parentSessionId,
       role: input.role,
       title: input.title ?? `${input.role}任务`,
       task: input.taskPrompt,
       subpath: input.subpath ?? null,
+      workspacePath: input.workspacePath ?? null,
     }),
   stopSubagent: (subagentId: string) =>
     invoke<void>("stop_subagent", { subagentId }),

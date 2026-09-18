@@ -325,6 +325,21 @@ pub fn set_session_mode(state: State<'_, crate::AppState>, app: AppHandle, id: S
     Ok(())
 }
 
+#[tauri::command]
+pub fn set_session_context_limit(
+    state: State<'_, crate::AppState>,
+    app: AppHandle,
+    id: String,
+    limit: Option<usize>,
+) -> Result<(), String> {
+    {
+        let db = state.db.lock().unwrap();
+        store::set_session_context_limit(&db, &id, limit)?;
+    }
+    emit_session(&state, &app, &id);
+    Ok(())
+}
+
 /// 放行指定对话下所有挂起的审批请求（切换到「完全访问」时调用）
 fn resolve_pending_approvals(state: &crate::AppState, app: &AppHandle, session_id: &str) {
     let pending: Vec<(String, tokio::sync::oneshot::Sender<crate::approval::Decision>)> = {
@@ -424,6 +439,7 @@ pub fn send_message(
     project_id: Option<String>,
     temp: Option<TempAlloc>,
     access_mode: Option<String>,
+    context_token_limit: Option<usize>,
 ) -> Result<SendResult, String> {
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -457,6 +473,9 @@ pub fn send_message(
                 }
                 let title: String = text.chars().take(24).collect();
                 let s = store::create_session(&db, &t.main_temp, Some(&proj_id), &title, &access_mode)?;
+                if let Some(lim) = context_token_limit {
+                    let _ = store::set_session_context_limit(&db, &s.id, Some(lim));
+                }
                 store::set_session_temp(&db, &s.id, &t.code, &t.root, &t.source_workspace)?;
                 crate::temp::save_manifest(
                     &db,
@@ -484,6 +503,9 @@ pub fn send_message(
                     Some(pid)
                 };
                 let s = store::create_session(&db, &ws, project_id.as_deref(), &title, &access_mode)?;
+                if let Some(lim) = context_token_limit {
+                    let _ = store::set_session_context_limit(&db, &s.id, Some(lim));
+                }
                 let _ = app.emit("sessions:changed", json!({"created": s.id}));
                 s.id
             }
@@ -579,6 +601,7 @@ pub fn spawn_subagent(
     title: String,
     task: String,
     subpath: Option<String>,
+    workspace_path: Option<String>,
 ) -> Result<Session, String> {
     let parent = {
         let db = state.db.lock().unwrap();
@@ -588,10 +611,13 @@ pub fn spawn_subagent(
         return Err("子 Agent 不允许再创建子 Agent".into());
     }
 
-    let sub_workspace = if let Some(ref rel) = subpath {
-        let p = std::path::Path::new(rel);
+    // 关键修复：确定子 Agent 的物理工作区根目录
+    // 1. 若显式指定了 workspace_path，使用指定的独立根目录；
+    // 2. 缺省时严格继承父会话的完整工作区根目录，绝不能将 subpath 拼接到根目录上！
+    let sub_workspace = if let Some(ref ws) = workspace_path.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let p = std::path::Path::new(ws);
         if p.is_absolute() {
-            rel.clone()
+            ws.to_string()
         } else {
             std::path::Path::new(&parent.workspace_path).join(p).to_string_lossy().to_string()
         }
@@ -611,9 +637,11 @@ pub fn spawn_subagent(
             parent.access_mode.as_deref(),
             parent.project_id.as_deref(),
         )?;
+        let focus_info = subpath.as_ref().map(|p| {
+            format!("\n\n重点关注子目录：`{p}`\n（提示：请优先深入该子目录开展探索与修改；当前工作区根目录依然为完整的 `{sub_workspace}`，根目录下的全局构建与配置文件如 pom.xml / package.json / README 等均在合法访问范围内，需要时可直接读取）")
+        }).unwrap_or_default();
         let initial_prompt = format!(
-            "【子 Agent 协作任务】\n角色定位：{role}\n任务标题：{title}\n\n详细需求描述：\n{task}{}",
-            subpath.as_ref().map(|p| format!("\n重点目录：`{p}`")).unwrap_or_default()
+            "【子 Agent 协作任务】\n角色定位：{role}\n任务标题：{title}\n工作区根目录：{sub_workspace}\n\n详细需求描述：\n{task}{focus_info}"
         );
         let user_msg = store::new_message(&db, &sub.id, "user", Some(initial_prompt), false)?;
         (sub, user_msg)
@@ -722,6 +750,7 @@ pub fn report_subagent_to_parent(
         app,
         Some(parent_id),
         report_prompt,
+        None,
         None,
         None,
         None,

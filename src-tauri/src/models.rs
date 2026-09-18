@@ -69,9 +69,13 @@ pub struct SettingsData {
     #[serde(default = "default_ctx_tokens")]
     pub context_token_limit: usize,
     #[serde(default)]
+    pub model_context_limits: std::collections::HashMap<String, usize>,
+    #[serde(default)]
     pub last_workspace_path: Option<String>,
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+    #[serde(default)]
+    pub disabled_sops: Vec<String>,
 }
 
 impl Default for SettingsData {
@@ -85,9 +89,47 @@ impl Default for SettingsData {
             max_steps: default_max_steps(),
             command_timeout_secs: default_cmd_timeout(),
             context_token_limit: default_ctx_tokens(),
+            model_context_limits: std::collections::HashMap::new(),
             last_workspace_path: None,
             disabled_tools: vec![],
+            disabled_sops: vec![],
         }
+    }
+}
+
+/// 根据模型名称启发式推断预设上下文上限
+pub fn infer_model_context_limit(model: &str) -> usize {
+    let lower = model.to_lowercase();
+    if lower.contains("deepseek") {
+        56_000
+    } else if lower.contains("claude") {
+        180_000
+    } else if lower.contains("gpt-4o") || lower.contains("gpt-4.5") || lower.contains("o1") || lower.contains("o3") {
+        110_000
+    } else if lower.contains("qwen") || lower.contains("千问") {
+        110_000
+    } else if lower.contains("glm") {
+        110_000
+    } else if lower.contains("kimi") || lower.contains("moonshot") {
+        180_000
+    } else if lower.contains("gemini") {
+        200_000
+    } else if lower.contains("8k") {
+        7_000
+    } else if lower.contains("16k") {
+        14_000
+    } else if lower.contains("32k") {
+        28_000
+    } else if lower.contains("64k") {
+        56_000
+    } else if lower.contains("128k") {
+        110_000
+    } else if lower.contains("200k") {
+        180_000
+    } else if lower.contains("1m") {
+        200_000
+    } else {
+        64_000
     }
 }
 
@@ -107,6 +149,28 @@ impl SettingsData {
         let m = self.active_model_id.clone().or_else(|| self.active_model.clone());
         self.active_model_id = m.clone();
         self.active_model = m;
+    }
+
+    /// 解析指定模型的生效上下文上限（三级回落）：
+    /// 1. provider_id:model
+    /// 2. model
+    /// 3. infer_model_context_limit
+    /// 4. self.context_token_limit
+    pub fn resolve_context_limit(&self, provider_id: Option<&str>, model: &str) -> usize {
+        if let Some(pid) = provider_id {
+            let key = format!("{}:{}", pid, model);
+            if let Some(&lim) = self.model_context_limits.get(&key) {
+                return lim;
+            }
+        }
+        if let Some(&lim) = self.model_context_limits.get(model) {
+            return lim;
+        }
+        let inferred = infer_model_context_limit(model);
+        if inferred != 64_000 {
+            return inferred;
+        }
+        self.context_token_limit
     }
 }
 
@@ -222,6 +286,31 @@ mod tests {
         assert!(serialized.contains(r#""activeModelId":"m2""#));
         assert!(serialized.contains(r#""activeModel":"m2""#));
     }
+
+    #[test]
+    fn resolves_model_context_limit_with_fallbacks() {
+        let mut s = SettingsData::default();
+        s.context_token_limit = 64_000;
+
+        // 1. 智能推断测试
+        assert_eq!(s.resolve_context_limit(None, "deepseek-chat"), 56_000);
+        assert_eq!(s.resolve_context_limit(None, "claude-3-5-sonnet"), 180_000);
+        assert_eq!(s.resolve_context_limit(None, "gpt-4o"), 110_000);
+        assert_eq!(s.resolve_context_limit(None, "qwen-max"), 110_000);
+        assert_eq!(s.resolve_context_limit(None, "llama-3-8k"), 7_000);
+        assert_eq!(s.resolve_context_limit(None, "unknown-model"), 64_000);
+
+        // 2. 自定义覆盖测试（model 级别）
+        s.model_context_limits.insert("unknown-model".into(), 45_000);
+        assert_eq!(s.resolve_context_limit(None, "unknown-model"), 45_000);
+
+        // 3. 自定义覆盖测试（providerId:model 优先于 model）
+        s.model_context_limits.insert("deepseek-chat".into(), 60_000);
+        assert_eq!(s.resolve_context_limit(None, "deepseek-chat"), 60_000);
+        s.model_context_limits.insert("p1:deepseek-chat".into(), 62_000);
+        assert_eq!(s.resolve_context_limit(Some("p1"), "deepseek-chat"), 62_000);
+        assert_eq!(s.resolve_context_limit(Some("p2"), "deepseek-chat"), 60_000);
+    }
 }
 
 /// 审批规则：仅对所属对话生效（会话级；不跨对话共享，也不存在全局规则）
@@ -327,6 +416,9 @@ pub struct Session {
     /// 子 Agent 初始任务要求
     #[serde(default)]
     pub subagent_task: Option<String>,
+    /// 会话专属上下文 Token 上限（覆盖全局及模型推荐值）
+    #[serde(default)]
+    pub context_token_limit: Option<usize>,
 }
 
 fn default_session_type() -> String {

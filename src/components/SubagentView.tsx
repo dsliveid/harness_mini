@@ -17,6 +17,7 @@ import {
   Bot,
   Sparkles,
   ArrowUp,
+  Folder,
 } from "./Icons";
 
 function formatTokens(n?: number | null): string {
@@ -40,6 +41,7 @@ export function SubagentView({ subagentId }: { subagentId: string }) {
   const deleteSubagent = useStore((s) => s.deleteSubagent);
   const reportSubagentToParent = useStore((s) => s.reportSubagentToParent);
   const pushToast = useStore((s) => s.pushToast);
+  const setShowTokenStatsModal = useStore((s) => s.setShowTokenStatsModal);
 
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -49,6 +51,43 @@ export function SubagentView({ subagentId }: { subagentId: string }) {
   const stickRef = useRef(true);
 
   const turnMetricsMap = useMemo(() => computeTurnMetrics(msgs, isRunning), [msgs, isRunning]);
+
+  // 实时聚合子 Agent 会话 Token（结合已完结轮次、历史持久化值与正在流式中的生成粗估）
+  const tokenStats = useMemo(() => {
+    let total = 0;
+    let prompt = 0;
+    let completion = 0;
+
+    for (const msg of msgs) {
+      const tt = msg.totalTokens ?? (msg.usage?.totalTokens || (msg.usage?.inputEst || 0) + (msg.usage?.outputEst || 0)) ?? 0;
+      const pt = msg.promptTokens ?? (msg.usage?.promptTokens || msg.usage?.inputEst) ?? 0;
+      const ct = msg.completionTokens ?? (msg.usage?.completionTokens || msg.usage?.outputEst) ?? 0;
+
+      if (tt > 0 || pt > 0 || ct > 0) {
+        total += Number(tt) || 0;
+        prompt += Number(pt) || 0;
+        completion += Number(ct) || 0;
+      } else if (msg.role === "assistant" && isRunning && msg.id === msgs[msgs.length - 1]?.id) {
+        // 正在流式生成中的最后一条消息：动态估算流式增量 Token，带来实时的计数反馈
+        const streamedChars = (msg.content?.length || 0) + (msg.reasoning?.length || 0);
+        if (streamedChars > 0) {
+          const estOutput = Math.max(1, Math.round(streamedChars / 3));
+          completion += estOutput;
+          total += estOutput;
+        }
+      }
+    }
+
+    const finalTotal = Math.max(total, Number(subagent?.totalTokens) || 0);
+    const finalPrompt = Math.max(prompt, Number(subagent?.promptTokens) || 0);
+    const finalCompletion = Math.max(completion, Number(subagent?.completionTokens) || 0);
+
+    return {
+      totalTokens: finalTotal,
+      promptTokens: finalPrompt,
+      completionTokens: finalCompletion,
+    };
+  }, [msgs, isRunning, subagent?.totalTokens, subagent?.promptTokens, subagent?.completionTokens]);
 
   const resize = () => {
     const ta = taRef.current;
@@ -171,6 +210,15 @@ export function SubagentView({ subagentId }: { subagentId: string }) {
           <span className="font-medium text-[13px] text-ink truncate" title={subagent.title}>
             {subagent.title}
           </span>
+          {subagent.workspacePath && (
+            <span
+              className="hidden lg:inline-flex items-center gap-1 text-[11px] text-inkdim bg-panel2/80 px-1.5 py-0.5 rounded border border-edge/60 max-w-[180px] truncate shrink-0 cursor-default"
+              title={`工作区根目录: ${subagent.workspacePath}`}
+            >
+              <Folder size={11} className="shrink-0 opacity-70" />
+              <span className="truncate">{subagent.workspacePath.split(/[\\/]/).filter(Boolean).pop() || subagent.workspacePath}</span>
+            </span>
+          )}
           {isRunning ? (
             <span className="flex items-center gap-1 text-[11px] text-accent font-medium shrink-0 animate-pulse">
               <Loader2 size={12} className="animate-spin" />
@@ -191,17 +239,6 @@ export function SubagentView({ subagentId }: { subagentId: string }) {
 
         {/* Header Action Buttons */}
         <div className="flex items-center gap-1 shrink-0">
-          {/* Token count */}
-          {(subagent.totalTokens ?? 0) > 0 && (
-            <div
-              className="flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] text-inkdim bg-panel2 border border-edge/60 mr-1"
-              title={`Prompt: ${subagent.promptTokens ?? 0} | Completion: ${subagent.completionTokens ?? 0}`}
-            >
-              <Coins size={11} className="text-accent" />
-              <span>{formatTokens(subagent.totalTokens)}</span>
-            </div>
-          )}
-
           {/* Stop Button */}
           {isRunning && (
             <button
@@ -340,27 +377,28 @@ export function SubagentView({ subagentId }: { subagentId: string }) {
           <div className="flex items-center gap-2.5 shrink-0">
             <button
               type="button"
-              className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-[11px] transition-all font-mono border ${
-                (subagent.totalTokens ?? 0) > 0
-                  ? "bg-panel2/80 hover:bg-panel3 border-edge/80 text-ink shadow-xs"
+              className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-[11px] transition-all font-mono border cursor-pointer ${
+                tokenStats.totalTokens > 0
+                  ? "bg-panel2/80 hover:bg-panel3 border-edge/80 hover:border-amber-400/40 text-ink shadow-xs"
                   : "hover:bg-panel2 text-inkdim hover:text-ink border-transparent hover:border-edge/50"
               }`}
+              onClick={() => setShowTokenStatsModal(true)}
               title={
-                (subagent.totalTokens ?? 0) > 0
-                  ? `该子 Agent 累计消耗: ${(subagent.totalTokens ?? 0).toLocaleString()} tokens\n输入: ${(subagent.promptTokens ?? 0).toLocaleString()} · 输出: ${(subagent.completionTokens ?? 0).toLocaleString()}`
-                  : "子 Agent 独立会话消耗"
+                tokenStats.totalTokens > 0
+                  ? `该子 Agent 累计消耗: ${tokenStats.totalTokens.toLocaleString()} tokens\n输入: ${tokenStats.promptTokens.toLocaleString()} · 输出: ${tokenStats.completionTokens.toLocaleString()}\n点击打开 Token 消耗统计看板`
+                  : "子 Agent 独立会话消耗 · 点击打开 Token 统计看板"
               }
             >
               <Coins
                 size={12}
                 className={
-                  (subagent.totalTokens ?? 0) > 0
+                  tokenStats.totalTokens > 0
                     ? "text-amber-400 shrink-0"
                     : "text-inkdim group-hover:text-amber-400 transition-colors shrink-0"
                 }
               />
-              <span className={(subagent.totalTokens ?? 0) > 0 ? "font-medium text-ink" : "text-inkdim"}>
-                {formatTokens(subagent.totalTokens ?? 0)}
+              <span className={tokenStats.totalTokens > 0 ? "font-medium text-ink" : "text-inkdim"}>
+                {formatTokens(tokenStats.totalTokens)}
               </span>
               <span className="text-[10px] text-inkdim">tokens</span>
             </button>

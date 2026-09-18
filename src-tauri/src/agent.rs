@@ -380,6 +380,10 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
                 "lastAssistantId": last_assistant_id,
             }),
         );
+        // 方案 1：在会话正常完成交付后，异步触发后台主题碎记自动提炼兜底
+        if outcome == RunOutcome::Done {
+            crate::memory::trigger_auto_distillation(app.clone(), session_id.clone(), run_id.clone());
+        }
         // 失败时不再自动消费队列，等待用户处理
         if outcome == RunOutcome::Failed {
             break;
@@ -497,6 +501,9 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         api_key: pc.api_key.clone(),
         model: model.to_string(),
     };
+    let effective_ctx_limit = session.context_token_limit.unwrap_or_else(|| {
+        settings.resolve_context_limit(Some(&pc.id), model)
+    });
 
     // 临时空间上下文：temp_* 工具依赖的清单（非临时会话为 None，对应工具不下发也不可用）
     let temp_ctx = if session.is_temp {
@@ -556,13 +563,20 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         .collect();
     let max_steps = settings.max_steps.max(1) as usize;
 
-    // 项目约束 + 关联项目说明：按会话所属项目动态组装进 system prompt。
+    // 确保工作区记忆目录存在，并执行轻量记忆衰减清理
+    if !session.workspace_path.is_empty() {
+        let ws_path = std::path::Path::new(&session.workspace_path);
+        let _ = crate::memory::ensure_memory_dir(ws_path);
+        let _ = crate::memory::prune_memory(ws_path, 30, 20);
+    }
+
+    // 项目约束 + 关联项目说明 + 工作区知识记忆：按会话所属项目动态组装进 system prompt。
     // system 位于上下文第 0 位且永不截断 → 新对话注入一次、同对话多条消息不重复；
-    // 每次运行重建，修改约束 / 关联后同对话下一条消息就地生效。
+    // 每次运行重建，修改约束 / 关联或知识沉淀后同对话下一条消息就地生效。
     // 临时空间会话改用临时空间说明段（含临时路径映射与优先级 临时空间 > 关联项目 > 项目约束）
     let project_section = {
         let db = state.db.lock().unwrap();
-        if session.is_temp {
+        let db_sec = if session.is_temp {
             match crate::temp::load_manifest(&db, session_id) {
                 Ok(Some(m)) => Some(crate::temp::build_prompt_section(&db, &session, &m)),
                 _ => None,
@@ -572,9 +586,20 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
                 Some(pid) => build_project_section(&db, pid).unwrap_or(None),
                 None => None,
             }
+        };
+        let mem_sec = if !session.workspace_path.is_empty() {
+            crate::memory::load_project_memory(std::path::Path::new(&session.workspace_path))
+        } else {
+            None
+        };
+        match (db_sec, mem_sec) {
+            (Some(d), Some(m)) => Some(format!("{}\n\n## 本项目持久化认知与沉淀记忆（来自 .harness/memory/，可秒级召回）\n{}", d, m)),
+            (Some(d), None) => Some(d),
+            (None, Some(m)) => Some(format!("## 本项目持久化认知与沉淀记忆（来自 .harness/memory/，可秒级召回）\n{}", m)),
+            (None, None) => None,
         }
     };
-    let sys = system_prompt(&session, project_section.as_deref());
+    let sys = system_prompt(&session, project_section.as_deref(), &settings.disabled_sops);
     let mut files_modified = false;
     let mut sop_retry_count = 0usize;
     let mut sop_verified = false;
@@ -589,7 +614,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
                 session_id,
                 &cfg,
                 &sys,
-                settings.context_token_limit,
+                effective_ctx_limit,
             )
             .await;
             if compacted {
@@ -601,7 +626,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         // ---- 步骤 1/2：组装上下文（含运行中被"引导"注入的新消息） ----
         let (messages, est_in, truncation_notice) = {
             let db = state.db.lock().unwrap();
-            build_context(&db, session_id, &sys, settings.context_token_limit)
+            build_context(&db, session_id, &sys, effective_ctx_limit)
         };
         if let Some(ref notice) = truncation_notice {
             let _ = app.emit("context:truncated", notice);
@@ -1623,19 +1648,14 @@ fn build_context(
                         obj["tool_calls"] = tcs.clone();
                         est += estimate_tokens(&content) + crate::models::estimate_value_tokens(tcs);
                         out.push(obj);
+
                         // 紧随其后补齐每个调用的 tool 结果（缺失则合成，避免协议错误）
                         if let Some(arr) = tcs.as_array() {
                             for tc in arr {
                                 let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
-                                let mut text = tool_results
+                                let text = tool_results
                                     .remove(&id)
                                     .unwrap_or_else(|| "(执行被中断，无结果)".into());
-                                // 历史较长工具结果折叠瘦身 (Tool Result Pruning)：
-                                // 超过 2048 字符时截取首部并保留折叠提示，节省上下文且不丢失语义
-                                if text.len() > 2048 {
-                                    let safe_len = text.char_indices().nth(400).map(|(i, _)| i).unwrap_or(text.len());
-                                    text = format!("{}\n\n...(中间大段输出已在后续步骤处理，为节省上下文已折叠)...", &text[..safe_len]);
-                                }
                                 est += estimate_tokens(&text);
                                 out.push(json!({"role": "tool", "tool_call_id": id, "content": text}));
                             }
@@ -1651,6 +1671,120 @@ fn build_context(
                 }
             }
             _ => {} // tool 消息已在上面消费；queued 消息跳过
+        }
+    }
+
+    // ---- 动态上下文感知工具输出瘦身 (Dynamic Context-Aware Tool Result Slimming) ----
+    // 治理策略：
+    // 1. 安全水位（est <= 80% token_limit）：完全不折叠任何工具输出，保障 Agent 跨步骤探索（Gather -> Synthesize）的工作记忆。
+    // 2. 超出水位（est > 80% token_limit）：自远及近，优先瘦身较早历史中 > 2048 字符的工具输出，保护最近工作记忆。
+    // 3. 活跃轮次绝对保护：当前正在等待 LLM 消费的工具结果严禁折叠。
+    let safe_threshold = token_limit * 80 / 100;
+    if est > safe_threshold {
+        struct AssistantToolGroup {
+            assistant_idx: usize,
+            tool_indices: Vec<usize>,
+            is_active: bool,
+        }
+
+        let mut groups: Vec<AssistantToolGroup> = Vec::new();
+        let mut curr_group: Option<AssistantToolGroup> = None;
+
+        for (idx, m) in out.iter().enumerate() {
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            if role == "assistant" {
+                if let Some(g) = curr_group.take() {
+                    groups.push(g);
+                }
+                let has_tools = m
+                    .get("tool_calls")
+                    .and_then(|tc| tc.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false);
+                if has_tools {
+                    curr_group = Some(AssistantToolGroup {
+                        assistant_idx: idx,
+                        tool_indices: Vec::new(),
+                        is_active: false,
+                    });
+                }
+            } else if role == "tool" {
+                if let Some(ref mut g) = curr_group {
+                    g.tool_indices.push(idx);
+                }
+            } else if role == "user" {
+                if let Some(g) = curr_group.take() {
+                    groups.push(g);
+                }
+            }
+        }
+        if let Some(g) = curr_group.take() {
+            groups.push(g);
+        }
+
+        // 标记当前正处于活跃消费状态的最后一组工具调用
+        if let Some(last_g) = groups.last_mut() {
+            if last_g.assistant_idx + last_g.tool_indices.len() + 1 == out.len() {
+                last_g.is_active = true;
+            }
+        }
+
+        // 保护最近的 2 组工具调用作为短期工作记忆（避免上一步刚读完、下一步就看不见）
+        let recent_cutoff = groups.len().saturating_sub(2);
+
+        // 阶段 1：自远及近遍历远期历史工具组
+        for g in groups.iter().take(recent_cutoff) {
+            for &t_idx in &g.tool_indices {
+                if est <= safe_threshold {
+                    break;
+                }
+                let text = out[t_idx].get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if text.len() > 2048 {
+                    let safe_len = text.char_indices().nth(2048).map(|(i, _)| i).unwrap_or(text.len());
+                    let slimmed = format!(
+                        "{}\n\n...[历史工具输出过长（共 {} 字符），已折叠前序详情以节省上下文空间]...",
+                        &text[..safe_len],
+                        text.len()
+                    );
+                    let old_tokens = estimate_tokens(&text);
+                    let new_tokens = estimate_tokens(&slimmed);
+                    est = est.saturating_sub(old_tokens).saturating_add(new_tokens);
+                    out[t_idx]["content"] = Value::String(slimmed);
+                }
+            }
+            if est <= safe_threshold {
+                break;
+            }
+        }
+
+        // 阶段 2：若折叠完远期历史后仍然超过 token_limit，允许对「近期但非活跃」工具输出折叠（绝对保护 is_active）
+        if est > token_limit {
+            for g in groups.iter().skip(recent_cutoff) {
+                if g.is_active {
+                    continue;
+                }
+                for &t_idx in &g.tool_indices {
+                    if est <= token_limit {
+                        break;
+                    }
+                    let text = out[t_idx].get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if text.len() > 2048 {
+                        let safe_len = text.char_indices().nth(2048).map(|(i, _)| i).unwrap_or(text.len());
+                        let slimmed = format!(
+                            "{}\n\n...[历史工具输出过长（共 {} 字符），已折叠前序详情以节省上下文空间]...",
+                            &text[..safe_len],
+                            text.len()
+                        );
+                        let old_tokens = estimate_tokens(&text);
+                        let new_tokens = estimate_tokens(&slimmed);
+                        est = est.saturating_sub(old_tokens).saturating_add(new_tokens);
+                        out[t_idx]["content"] = Value::String(slimmed);
+                    }
+                }
+                if est <= token_limit {
+                    break;
+                }
+            }
         }
     }
 
@@ -1846,9 +1980,11 @@ fn project_section(
     s
 }
 
-fn system_prompt(session: &Session, project_section: Option<&str>) -> String {
+fn system_prompt(session: &Session, project_section: Option<&str>, disabled_sops: &[String]) -> String {
     let os = if cfg!(windows) { "Windows" } else { "Unix-like" };
     let is_sub = session.session_type == "subagent" || session.parent_session_id.is_some();
+    let is_sop_enabled = |name: &str| !disabled_sops.iter().any(|s| s == name);
+
     let base = if session.workspace_path.is_empty() {
         // 未绑定工作区：纯对话模式
         format!(
@@ -1865,6 +2001,42 @@ fn system_prompt(session: &Session, project_section: Option<&str>) -> String {
     } else if is_sub {
         let role = session.subagent_role.as_deref().unwrap_or("专职子任务协作 Agent");
         let task = session.subagent_task.as_deref().unwrap_or("");
+        let mut rules = Vec::new();
+        let mut rule_num = 1;
+
+        rules.push(format!("{rule_num}. 专注于完成上述分配给你的专属任务。当前合法工作区根目录为【{}】，所有工具（read_file / write_file / edit_file / glob / grep / list_dir / run_command / record_memory / read_memory）均以该根目录为基准。根目录下的全局构建与配置文件（如 pom.xml / package.json / Cargo.toml / README 等）及各级子目录均在合法可访问范围内。", session.workspace_path));
+        rule_num += 1;
+
+        if is_sop_enabled("plan_first") {
+            rules.push(format!("{rule_num}. 【方案先行与克制改动】：在开始实际修改前，优先梳理与分析实现思路。若是分析调研类任务，重点产出结构清晰的分析报告与沉淀；若包含代码修改，必须先阅读原文并做最小化精确修改。"));
+            rule_num += 1;
+        }
+
+        if is_sop_enabled("memory_distill") {
+            rules.push(format!("{rule_num}. 【边读边记与强制沉淀 SOP（必须严格遵守）】：当你阅读分析了核心配置文件（如 pom.xml、package.json、Cargo.toml 等）或深入探索了具体业务模块代码后，在任务交付前**必须至少调用一次 `record_memory` 工具**将核心成果提炼落盘（技术框架体系沉淀至 category: \"profile\"，具体业务链路/功能模块/排错分析沉淀至 category: \"digest\"，工程避坑点沉淀至 category: \"convention\"），严禁完成多步探索后直接文字汇报而不留存持久化记忆。"));
+            rule_num += 1;
+        }
+
+        if is_sop_enabled("safe_code_edit") {
+            rules.push(format!("{rule_num}. 修改文件前必须先用 read_file 读取相关内容，用 edit_file 做基于精确原文的最小化修改；新文件才用 write_file。"));
+            rule_num += 1;
+            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir 探索并理解代码结构。"));
+            rule_num += 1;
+            rules.push(format!("{rule_num}. 修改完成后，尽量用 run_command 运行构建或测试来验证改动。"));
+            rule_num += 1;
+        } else {
+            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir 探索并理解代码结构。"));
+            rule_num += 1;
+        }
+
+        rules.push(format!("{rule_num}. 严禁再次创建子 Agent，直接使用现有工具高效完成分配的目标。"));
+        rule_num += 1;
+
+        rules.push(format!(
+            "{rule_num}. 全程使用简体中文与用户交流；任务完成后，最终回复必须严格按以下结构化格式汇报成果，以便父 Agent 汇总整合：\n   - 🎯 任务完成状态（全部完成 / 部分完成 / 遇到阻碍）\n   - 📝 改动的文件清单（请列出准确相对路径）\n   - 💡 核心实现逻辑与技术改动说明\n   - 🧪 构建与测试验证结果"
+        ));
+
+        let rules_text = rules.join("\n");
         format!(
             r#"你是 harness_mini 派生出的专业协作子 Agent 进程。
 角色定位：{role}
@@ -1873,22 +2045,64 @@ fn system_prompt(session: &Session, project_section: Option<&str>) -> String {
 操作系统：{os}
 
 工作规则：
-1. 专注于完成上述分配给你的专属任务，不发散去处理不相关的模块。
-2. 修改文件前必须先用 read_file 读取相关内容，用 edit_file 做基于精确原文的最小化修改；新文件才用 write_file。
-3. 动手前先用 glob / grep / list_dir 探索并理解代码结构。
-4. 修改完成后，尽量用 run_command 运行构建或测试来验证改动。
-5. 严禁再次创建子 Agent，直接使用现有工具高效完成分配的目标。
-6. 全程使用简体中文与用户交流；任务完成后，最终回复必须严格按以下结构化格式汇报成果，以便父 Agent 汇总整合：
-   - 🎯 任务完成状态（全部完成 / 部分完成 / 遇到阻碍）
-   - 📝 改动的文件清单（请列出准确相对路径）
-   - 💡 核心实现逻辑与技术改动说明
-   - 🧪 构建与测试验证结果"#,
+{rules_text}"#,
             role = role,
             task = task,
             path = session.workspace_path,
-            os = os
+            os = os,
+            rules_text = rules_text
         )
     } else {
+        let mut rules = Vec::new();
+        let mut rule_num = 1;
+
+        if is_sop_enabled("plan_first") {
+            rules.push(format!(
+                "{rule_num}. 【方案先行（先分析设计，不急于改代码）】：\n   - 当用户提出新功能开发、需求实现、架构重构或技术探索时，**必须先分析可行性、梳理技术依赖并给出推荐的实现方案与步骤，向用户征询确认；在用户未明确确认修改或要求直接编码前，切勿擅自修改或新增代码文件**。"
+            ));
+            rule_num += 1;
+        }
+
+        if is_sop_enabled("memory_distill") {
+            rules.push(format!(
+                "{rule_num}. 【边读边记与强制沉淀 SOP（必须严格遵守）】：\n   - 工作区内置了长期认知记忆系统（存储于 `.harness/memory/`）。下方已自动载入本项目沉淀的技术大盘（profile.md）、工程规范（conventions.md）与重要碎记（digests）。\n   - 秒级召回优先：当用户询问“当前项目采用的技术”、“技术栈是什么”、“工程规范”等常见问题时，**优先基于已载入的持久化记忆秒级直接回答**，无需反复调用工具重新扫描全量代码；若发现信息有缺失或过期，再针对性读取少量文件并用 record_memory 补全。\n   - 强制沉淀检查点：凡是在当前任务中阅读了 2 个以上文件、深入分析了某个功能模块/流程/配置文件后，在给出最终答复前，**必须至少调用一次 `record_memory` 工具**将核心事实沉淀到工作区，严禁在多步阅读探索后只输出文字答复而不落盘留存：\n     * 独立业务模块/流程链路/排错分析/架构设计 -> **必须调用 `record_memory(category: \"digest\", title: \"...\", content: \"...\")` 固化为主题碎记**；\n     * 项目技术大盘与框架体系 -> 调用 `record_memory(category: \"profile\", ...)` 沉淀至 profile.md；\n     * 常用规范与避坑要点 -> 调用 `record_memory(category: \"convention\", ...)` 沉淀至 conventions.md。"
+            ));
+            rule_num += 1;
+        }
+
+        if is_sop_enabled("safe_code_edit") {
+            rules.push(format!("{rule_num}. 修改文件前必须先用 read_file 读取相关内容，用 edit_file 做基于精确原文的最小化修改；新文件才用 write_file。"));
+            rule_num += 1;
+            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir 探索并理解代码结构。"));
+            rule_num += 1;
+            rules.push(format!("{rule_num}. 修改完成后，尽量用 run_command 运行构建或测试来验证改动。"));
+            rule_num += 1;
+        } else {
+            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir 探索并理解代码结构。"));
+            rule_num += 1;
+        }
+
+        rules.push(format!("{rule_num}. 所有路径相对于工作区根目录，不要访问工作区之外的路径。"));
+        rule_num += 1;
+
+        rules.push(format!("{rule_num}. 不要执行破坏性命令（如递归删除、格式化磁盘等），它们会被强制要求用户确认。"));
+        rule_num += 1;
+
+        if is_sop_enabled("todo_lifecycle") {
+            rules.push(format!("{rule_num}. 接到多步任务时，先用 todo 工具列出计划，并随进展更新各项状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done（切勿遗留 in_progress 状态）。"));
+            rule_num += 1;
+        }
+
+        if is_sop_enabled("subagent_orchestration") {
+            rules.push(format!(
+                "{rule_num}. 【子进程协作与总架构编排 (Orchestration)】：\n   - 触发场景：当用户提出复杂需求、多模块开发（如前端界面与后端接口、多个独立模块并行开发、测试与功能并行）或明确要求并行处理时，你作为总架构师，必须采用子进程协作模式提升效率与模块隔离度。\n   - 编排执行标准流程（SOP）：\n     ① 规划拆解：先用 todo 工具明确列出架构规划与各子模块任务分工；\n     ② 派生子进程：连续调用 spawn_subagent 工具，为各独立模块派生专属子 Agent（指定明确的 role、title、task；若有专注子目录可传入 subpath；子 Agent 默认继承主项目的完整工作区根目录，若需处理外部独立项目可传入明确的 workspace 根路径）；\n     ③ 等待与汇聚：创建完相关子任务后，调用 wait_subagents 工具等待子进程执行完成，该工具将自动汇总并返回各子 Agent 的执行结论与产出；\n     ④ 整合验收：审阅子 Agent 成果并进行必要的全局验证或微调，最终向用户交付清晰完整的交付报告。"
+            ));
+            rule_num += 1;
+        }
+
+        rules.push(format!("{rule_num}. 全程使用简体中文与用户交流；最终回复简洁总结：做了什么、改了哪些文件、验证结果如何。"));
+
+        let rules_text = rules.join("\n");
         format!(
             r#"你是 harness_mini，一个谨慎、专业的编码 Agent，运行在用户的本地工作区中。
 
@@ -1896,22 +2110,10 @@ fn system_prompt(session: &Session, project_section: Option<&str>) -> String {
 操作系统：{os}
 
 工作规则：
-1. 修改文件前必须先用 read_file 读取相关内容，用 edit_file 做基于精确原文的最小化修改；新文件才用 write_file。
-2. 动手前先用 glob / grep / list_dir 探索并理解代码结构。
-3. 修改完成后，尽量用 run_command 运行构建或测试来验证改动。
-4. 所有路径相对于工作区根目录，不要访问工作区之外的路径。
-5. 不要执行破坏性命令（如递归删除、格式化磁盘等），它们会被强制要求用户确认。
-6. 接到多步任务时，先用 todo 工具列出计划，并随进展更新各项状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done（切勿遗留 in_progress 状态）。
-7. 【子进程协作与总架构编排 (Orchestration)】：
-   - 触发场景：当用户提出复杂需求、多模块开发（如前端界面与后端接口、多个独立模块并行开发、测试与功能并行）或明确要求并行处理时，你作为总架构师，必须采用子进程协作模式提升效率与模块隔离度。
-   - 编排执行标准流程（SOP）：
-     ① 规划拆解：先用 todo 工具明确列出架构规划与各子模块任务分工；
-     ② 派生子进程：连续调用 spawn_subagent 工具，为各独立模块派生专属子 Agent（指定明确的 role、title、task 及 subpath）；
-     ③ 等待与汇聚：创建完相关子任务后，调用 wait_subagents 工具等待子进程执行完成，该工具将自动汇总并返回各子 Agent 的执行结论与产出；
-     ④ 整合验收：审阅子 Agent 成果并进行必要的全局验证或微调，最终向用户交付清晰完整的交付报告。
-8. 全程使用简体中文与用户交流；最终回复简洁总结：做了什么、改了哪些文件、验证结果如何。"#,
+{rules_text}"#,
             path = session.workspace_path,
-            os = os
+            os = os,
+            rules_text = rules_text
         )
     };
     match project_section {
@@ -2090,6 +2292,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_active_turn_tool_results_not_folded() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        store::init_schema(&conn).unwrap();
+        let s = store::create_session(&conn, ".", None, "test", "confirm").unwrap();
+
+        // 轮次 1：用户提问 + assistant 执行工具（大文本读取，例如 5000 字符）
+        let _ = store::new_message(&conn, &s.id, "user", Some("请读取文件".into()), false).unwrap();
+        let a1 = store::new_message(&conn, &s.id, "assistant", Some(String::new()), false).unwrap();
+        store::update_message_tool_calls(
+            &conn,
+            &a1.id,
+            &json!([{"id": "call_read", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"pom.xml\"}"}}]),
+            "",
+            None,
+        ).unwrap();
+        let big_content = "X".repeat(5000);
+        let t1 = store::new_message(&conn, &s.id, "tool", Some(big_content.clone()), false).unwrap();
+        store::set_message_tool_call_id(&conn, &t1.id, "call_read").unwrap();
+
+        // 当处于当前活跃轮次（正等待消费工具结果）时，大输出绝对不能被折叠！
+        let (msgs, _, _) = build_context(&conn, &s.id, "sys", 64000);
+        let msgs = msgs.unwrap();
+        assert_eq!(msgs.len(), 4); // sys, user, assistant, tool
+        assert_eq!(msgs[3]["role"], "tool");
+        let active_tool_content = msgs[3]["content"].as_str().unwrap();
+        assert_eq!(active_tool_content.len(), 5000);
+        assert_eq!(active_tool_content, big_content);
+
+        // 轮次 1 完成：assistant 给出解答
+        let _ = store::new_message(&conn, &s.id, "assistant", Some("分析完毕".into()), false).unwrap();
+        // 进入轮次 2：用户提出新问题
+        let _ = store::new_message(&conn, &s.id, "user", Some("下一步".into()), false).unwrap();
+
+        // 当上下文水位充裕时（如 64000 空间），即使进入后续轮次也保持完整工作记忆，绝不误折叠！
+        let (msgs2, _, _) = build_context(&conn, &s.id, "sys", 64000);
+        let msgs2 = msgs2.unwrap();
+        assert_eq!(msgs2.len(), 6); // sys, user, assistant(tc), tool, assistant(reply), user
+        assert_eq!(msgs2[3]["role"], "tool");
+        assert_eq!(msgs2[3]["content"].as_str().unwrap().len(), 5000);
+
+        // 仅当上下文面临严重压力（设置较小 token_limit 触发 safe_threshold）时，才按需对远期历史实施折叠瘦身
+        let (msgs3, _, _) = build_context(&conn, &s.id, "sys", 1000);
+        let msgs3 = msgs3.unwrap();
+        assert_eq!(msgs3[3]["role"], "tool");
+        let hist_tool_content = msgs3[3]["content"].as_str().unwrap();
+        assert!(hist_tool_content.contains("已折叠前序详情以节省上下文空间"));
+        assert!(hist_tool_content.len() < 5000);
+    }
+
     fn link(name: &str, path: &str, description: &str, constraints: Option<&str>) -> ResolvedLink {
         ResolvedLink {
             name: name.into(),
@@ -2185,12 +2437,61 @@ mod tests {
             session_type: "root".into(),
             subagent_role: None,
             subagent_task: None,
+            context_token_limit: None,
         };
-        let with = system_prompt(&session, Some("## 项目约束\nX"));
+        let with = system_prompt(&session, Some("## 项目约束\nX"), &[]);
         assert!(with.contains("工作区根目录：D:\\ws"));
         assert!(with.ends_with("## 项目约束\nX"));
-        let without = system_prompt(&session, None);
+        let without = system_prompt(&session, None, &[]);
         assert!(!without.contains("项目约束"));
+    }
+
+    #[test]
+    fn system_prompt_respects_disabled_sops() {
+        let session = Session {
+            id: "s1".into(),
+            title: "T".into(),
+            workspace_path: "D:\\ws".into(),
+            access_mode: None,
+            project_id: Some("p1".into()),
+            status: "active".into(),
+            last_message_at: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            is_temp: false,
+            temp_code: None,
+            temp_root: None,
+            source_workspace: None,
+            merged_seq: None,
+            merged_pending: false,
+            completion_tokens: Some(0),
+            prompt_tokens: Some(0),
+            total_tokens: Some(0),
+            parent_session_id: None,
+            session_type: "root".into(),
+            subagent_role: None,
+            subagent_task: None,
+            context_token_limit: None,
+        };
+        let all_enabled = system_prompt(&session, None, &[]);
+        assert!(all_enabled.contains("方案先行"));
+        assert!(all_enabled.contains("边读边记与强制沉淀 SOP"));
+        assert!(all_enabled.contains("子进程协作与总架构编排"));
+        assert!(all_enabled.contains("修改文件前必须先用 read_file 读取相关内容"));
+        assert!(all_enabled.contains("todo 工具列出计划"));
+
+        let disabled = vec![
+            "plan_first".to_string(),
+            "memory_distill".to_string(),
+            "todo_lifecycle".to_string(),
+            "safe_code_edit".to_string(),
+        ];
+        let filtered = system_prompt(&session, None, &disabled);
+        assert!(!filtered.contains("方案先行"));
+        assert!(!filtered.contains("边读边记与强制沉淀 SOP"));
+        assert!(!filtered.contains("todo 工具列出计划"));
+        assert!(!filtered.contains("修改文件前必须先用 read_file 读取相关内容"));
+        assert!(filtered.contains("子进程协作与总架构编排"));
     }
 
     #[test]

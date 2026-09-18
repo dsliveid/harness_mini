@@ -4,6 +4,7 @@ mod commands;
 mod diffutil;
 mod growth;
 mod llm;
+pub mod memory;
 mod models;
 mod paths;
 mod secrets;
@@ -342,6 +343,7 @@ pub fn run() {
             commands::archive_session,
             commands::unarchive_session,
             commands::set_session_mode,
+            commands::set_session_context_limit,
             commands::set_session_workspace,
             commands::set_session_project,
             commands::get_messages,

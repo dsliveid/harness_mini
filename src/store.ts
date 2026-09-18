@@ -67,7 +67,10 @@ interface Store {
     temp?: TempAlloc | null;
     /** 访问模式（会话级）：新建草稿时继承“上一条对话”，首次发送时随会话落库 */
     accessMode: "confirm" | "full_access";
+    /** 会话专属上下文上限（草稿阶段设置，落库时随会话持久化） */
+    contextTokenLimit?: number | null;
   } | null;
+  setDraftContextTokenLimit: (limit: number | null) => void;
   /** 临时空间运行时状态（临时目录是否存在 / 是否有变更 / 合并状态），按会话 id 缓存 */
   tempInfo: Record<string, TempInfo>;
   currentProjectId: string | null; // 当前进入的项目（项目视图下发送空对话时落库到该项目）
@@ -205,7 +208,7 @@ interface Store {
   setActiveSubagentId: (id: string | null) => void;
   setSubagentPanelWidth: (width: number) => void;
   setShowCreateSubagentModal: (open: boolean) => void;
-  createSubagent: (input: { parentSessionId: string; role: string; taskPrompt: string; title?: string }) => Promise<Session | null>;
+  createSubagent: (input: { parentSessionId: string; role: string; taskPrompt: string; title?: string; subpath?: string | null; workspacePath?: string | null }) => Promise<Session | null>;
   stopSubagent: (subagentId: string) => Promise<void>;
   restartSubagent: (subagentId: string) => Promise<void>;
   restartAllSubagents: (parentSessionId: string) => Promise<void>;
@@ -635,6 +638,7 @@ export const useStore = create<Store>((set, get) => ({
         temp: null,
         // 模式继承上一条对话；无可继承来源时用设置页的新对话默认值
         accessMode: (inherit ? prev?.accessMode : undefined) ?? st.settings.globalAccessMode,
+        contextTokenLimit: inherit ? prev?.contextTokenLimit ?? null : null,
       },
       currentId: DRAFT_ID,
       readOnly: false,
@@ -655,6 +659,7 @@ export const useStore = create<Store>((set, get) => ({
           temp,
           // 临时空间对话同样继承上一条对话的访问模式
           accessMode: prev?.accessMode ?? st.settings.globalAccessMode,
+          contextTokenLimit: prev?.contextTokenLimit ?? null,
         },
         currentId: DRAFT_ID,
         readOnly: false,
@@ -676,6 +681,12 @@ export const useStore = create<Store>((set, get) => ({
     const d = get().draft;
     if (!d) return;
     set({ draft: { ...d, accessMode: mode } });
+  },
+
+  setDraftContextTokenLimit(limit) {
+    const d = get().draft;
+    if (!d) return;
+    set({ draft: { ...d, contextTokenLimit: limit } });
   },
 
   async selectSession(id, readOnly = false) {
@@ -959,9 +970,46 @@ export const useStore = create<Store>((set, get) => ({
         };
       }
 
+      // 同步更新所属子 Agent 会话的累计 token
+      let nextSubagents = st.subagents;
+      let foundParentId: string | null = null;
+      for (const [pid, subList] of Object.entries(st.subagents)) {
+        if (subList.some((s) => s.id === m.sessionId)) {
+          foundParentId = pid;
+          break;
+        }
+      }
+      if (foundParentId) {
+        let subTotal = 0;
+        let subPrompt = 0;
+        let subCompletion = 0;
+        for (const msg of updatedList) {
+          const tt = msg.totalTokens ?? (msg.usage?.totalTokens || (msg.usage?.inputEst || 0) + (msg.usage?.outputEst || 0)) ?? 0;
+          const pt = msg.promptTokens ?? (msg.usage?.promptTokens || msg.usage?.inputEst) ?? 0;
+          const ct = msg.completionTokens ?? (msg.usage?.completionTokens || msg.usage?.outputEst) ?? 0;
+          subTotal += Number(tt) || 0;
+          subPrompt += Number(pt) || 0;
+          subCompletion += Number(ct) || 0;
+        }
+        nextSubagents = {
+          ...st.subagents,
+          [foundParentId]: (st.subagents[foundParentId] ?? []).map((s) =>
+            s.id === m.sessionId
+              ? {
+                  ...s,
+                  totalTokens: subTotal,
+                  promptTokens: subPrompt,
+                  completionTokens: subCompletion,
+                }
+              : s
+          ),
+        };
+      }
+
       return {
         messages: { ...st.messages, [m.sessionId]: updatedList },
         sessions: nextSessions,
+        subagents: nextSubagents,
       };
     });
   },
@@ -1132,10 +1180,41 @@ export const useStore = create<Store>((set, get) => ({
 
   onSessionUpdate(s) {
     if (s.status !== "active") {
-      set((st) => ({ sessions: st.sessions.filter((x) => x.id !== s.id) }));
+      set((st) => ({
+        sessions: st.sessions.filter((x) => x.id !== s.id),
+        subagents: Object.fromEntries(
+          Object.entries(st.subagents).map(([pid, list]) => [
+            pid,
+            list.filter((x) => x.id !== s.id),
+          ])
+        ),
+      }));
       return;
     }
     set((st) => {
+      // 若为子 Agent 会话，同步更新至 subagents 映射中，绝不可混入主会话列表 sessions
+      let parentId = s.parentSessionId;
+      if (!parentId) {
+        for (const [pid, list] of Object.entries(st.subagents)) {
+          if (list.some((x) => x.id === s.id)) {
+            parentId = pid;
+            break;
+          }
+        }
+      }
+
+      if (parentId || s.sessionType === "subagent") {
+        if (!parentId) return st;
+        const existing = st.subagents[parentId] ?? [];
+        const hasIt = existing.some((x) => x.id === s.id);
+        const nextList = hasIt
+          ? existing.map((x) => (x.id === s.id ? { ...x, ...s } : x))
+          : [...existing, s];
+        return {
+          subagents: { ...st.subagents, [parentId]: nextList },
+        };
+      }
+
       const idx = st.sessions.findIndex((x) => x.id === s.id);
       if (idx >= 0) {
         const next = st.sessions.slice();

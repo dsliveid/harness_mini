@@ -241,6 +241,45 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "required": ["name"]
             }),
         },
+        // ---------- 项目专属知识与记忆工具集 ----------
+        ToolSpec {
+            name: "record_memory",
+            description: "在多步探索或代码阅读中，及时将关键技术栈、架构约定或阶段性分析结论固化至项目知识库（.harness/memory/），避免大文件反复堆积与遗忘。",
+            risk: Risk::Write,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": ["tech_stack", "profile", "convention", "digest"],
+                        "description": "记忆类型：tech_stack/profile（项目技术大盘与框架体系，永久驻留）、convention（工程规范与避坑约定）、digest（阶段性探索碎记）"
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "简明标题，例如：Spring Boot与中间件架构、全局统一返回规范、JWT鉴权链路"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "提炼总结的高价值结构化 Markdown 知识内容"
+                    }
+                },
+                "required": ["category", "title", "content"]
+            }),
+        },
+        ToolSpec {
+            name: "read_memory",
+            description: "查阅当前项目在 .harness/memory/ 中已积累的知识库档案（包括技术大盘、工程规范或特定主题碎记）。",
+            risk: Risk::ReadOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "可选：profile（技术大盘）、conventions（规范约定）、或指定主题名称；缺省时列出所有记忆清单概览"
+                    }
+                }
+            }),
+        },
         // ---------- 子 Agent 进程协作工具集 ----------
         ToolSpec {
             name: "spawn_subagent",
@@ -252,7 +291,8 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "role": {"type": "string", "description": "子 Agent 角色定位，例如：前端开发、后端开发、测试验证、文档编写"},
                     "title": {"type": "string", "description": "子任务简明标题，如 编写用户中心页面组件"},
                     "task": {"type": "string", "description": "分配给该子 Agent 的详细需求描述与任务要求"},
-                    "subpath": {"type": "string", "description": "可选：该子 Agent 重点关注的工作区相对子目录（如 src/ 或 backend/）"}
+                    "workspace": {"type": "string", "description": "可选：指定子 Agent 独立的工作区根目录绝对路径。缺省时默认继承当前主项目的完整工作区根目录。"},
+                    "subpath": {"type": "string", "description": "可选：该子 Agent 重点关注的工作区相对子目录（如 src/ 或 backend/）。注意：此项仅作为任务重点指引，子 Agent 的工作区根目录依然为完整项目根目录，仍能访问根目录下的构建配置（如 pom.xml/package.json 等）。"}
                 },
                 "required": ["role", "title", "task"]
             }),
@@ -467,6 +507,8 @@ pub async fn execute(
         "list_skills" => list_skills_tool(ctx).await,
         "save_skill" => save_skill_tool(args, ctx).await,
         "run_skill" => run_skill_tool(args, ctx, on_partial).await,
+        "record_memory" => record_memory_tool(args, ctx).await,
+        "read_memory" => read_memory_tool(args, ctx).await,
         "spawn_subagent" => spawn_subagent_tool(args, ctx).await,
         "get_subagent_status" => get_subagent_status_tool(args, ctx).await,
         "wait_subagents" => wait_subagents_tool(args, ctx).await,
@@ -1068,6 +1110,21 @@ async fn run_skill_tool(
     run_command(&cmd_args, ctx, on_partial).await
 }
 
+// ---------- 项目专属知识与记忆工具实现 ----------
+
+async fn record_memory_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let category = args.get("category").and_then(|v| v.as_str()).ok_or("缺少 category 参数")?;
+    let title = args.get("title").and_then(|v| v.as_str()).ok_or("缺少 title 参数")?;
+    let content = args.get("content").and_then(|v| v.as_str()).ok_or("缺少 content 参数")?;
+
+    crate::memory::record_memory(&ctx.workspace, category, title, content)
+}
+
+async fn read_memory_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let topic = args.get("topic").and_then(|v| v.as_str());
+    crate::memory::read_memory(&ctx.workspace, topic)
+}
+
 // ---------- 子 Agent 协作工具具体实现 ----------
 
 async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
@@ -1076,6 +1133,12 @@ async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
     let title = args.get("title").and_then(|v| v.as_str()).ok_or("缺少 title 参数")?;
     let task = args.get("task").and_then(|v| v.as_str()).ok_or("缺少 task 参数")?;
     let subpath = args.get("subpath").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let workspace_arg = args
+        .get("workspace")
+        .or_else(|| args.get("workspace_path"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
 
     let state = host.app.state::<crate::AppState>();
     let parent_id = &host.session_id;
@@ -1095,10 +1158,13 @@ async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
         return Err("子 Agent 数量已达上限 (10)，请等待部分子任务完成或停止后再创建。".into());
     }
 
-    let sub_workspace = if let Some(ref rel) = subpath {
-        let p = Path::new(rel);
+    // 关键修复：确定子 Agent 的物理工作区根目录
+    // 1. 若显式指定了 workspace（如跨项目调用），使用指定的独立根目录；
+    // 2. 缺省时严格继承父会话的完整工作区根目录，绝不能将 subpath 拼接到根目录上！
+    let sub_workspace = if let Some(ws) = workspace_arg {
+        let p = Path::new(ws);
         if p.is_absolute() {
-            rel.clone()
+            ws.to_string()
         } else {
             std::path::Path::new(&parent_session.workspace_path).join(p).to_string_lossy().to_string()
         }
@@ -1118,9 +1184,11 @@ async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
             parent_session.access_mode.as_deref(),
             parent_session.project_id.as_deref(),
         )?;
+        let focus_info = subpath.as_ref().map(|p| {
+            format!("\n\n重点关注子目录：`{p}`\n（提示：请优先深入该子目录开展探索与修改；当前工作区根目录依然为完整的 `{sub_workspace}`，根目录下的全局构建与配置文件如 pom.xml / package.json / README 等均在合法访问范围内，需要时可直接读取）")
+        }).unwrap_or_default();
         let initial_prompt = format!(
-            "【子 Agent 协作任务】\n角色定位：{role}\n任务标题：{title}\n\n详细需求描述：\n{task}{}",
-            subpath.as_ref().map(|p| format!("\n重点目录：`{p}`")).unwrap_or_default()
+            "【子 Agent 协作任务】\n角色定位：{role}\n任务标题：{title}\n工作区根目录：{sub_workspace}\n\n详细需求描述：\n{task}{focus_info}"
         );
         let user_msg = crate::store::new_message(&db, &sub.id, "user", Some(initial_prompt), false)?;
         (sub, user_msg)
@@ -1276,6 +1344,7 @@ async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
                 session_type: "subagent".into(),
                 subagent_role: None,
                 subagent_task: None,
+                context_token_limit: None,
             }
         });
         let msgs = crate::store::get_messages(&db, id, None, 50).unwrap_or_default();
@@ -1302,6 +1371,29 @@ async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
             let list = touched_files.into_iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ");
             format!("- 涉及改动文件: {}\n", list)
         };
+
+        // 自动沉淀技术分析类子任务成果至项目技术大盘 (profile.md)
+        let is_tech_analysis = {
+            let role_str = s.subagent_role.as_deref().unwrap_or("");
+            let title_str = s.title.as_str();
+            let task_str = s.subagent_task.as_deref().unwrap_or("");
+            role_str.contains("技术栈") || role_str.contains("架构")
+                || title_str.contains("技术栈") || title_str.contains("架构")
+                || task_str.contains("技术栈") || task_str.contains("依赖分析")
+        };
+        if is_tech_analysis && !is_running && last_reply.len() > 50 && last_reply != "(未产生文本回复)" {
+            let already_recorded = msgs.iter().any(|m| {
+                m.tool_events.iter().any(|te| te.tool_name == "record_memory")
+            });
+            if !already_recorded && !ctx.workspace.as_os_str().is_empty() {
+                let _ = crate::memory::record_memory(
+                    &ctx.workspace,
+                    "profile",
+                    &s.title,
+                    last_reply,
+                );
+            }
+        }
 
         out.push_str(&format!(
             "### 协同子 Agent: {} ({})\n- 状态: {}\n- Token 消耗: {}\n{}- 交付成果与回复：\n```markdown\n{}\n```\n\n",

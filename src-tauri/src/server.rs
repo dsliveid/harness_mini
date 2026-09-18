@@ -340,7 +340,8 @@ pub async fn dispatch_rpc(
             let project_id = params.get("projectId").and_then(|v| v.as_str()).map(|s| s.to_string());
             let temp: Option<TempAlloc> = params.get("temp").and_then(|v| serde_json::from_value(v.clone()).ok());
             let access_mode = params.get("accessMode").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let res = commands::send_message(st, app.clone(), session_id, text, workspace_path, project_id, temp, access_mode)?;
+            let context_token_limit = params.get("contextTokenLimit").and_then(|v| v.as_u64()).map(|s| s as usize);
+            let res = commands::send_message(st, app.clone(), session_id, text, workspace_path, project_id, temp, access_mode, context_token_limit)?;
             Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
         }
         "list_queued" => {
