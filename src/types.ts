@@ -150,6 +150,8 @@ export interface Session {
   lastReportedMsgId?: string | null;
   /** 协作者执行完成后是否自动汇报主会话 */
   autoReport?: boolean | null;
+  /** 触发派生该子任务的工具事件 ID */
+  triggerToolEventId?: string | null;
 }
 
 export interface SubagentCreateInput {
@@ -168,6 +170,15 @@ export interface CollaboratorCreateInput {
   subpath?: string;
   workspacePath?: string;
   autoReport?: boolean;
+}
+
+export interface SessionCreateInput {
+  workspacePath?: string;
+  projectId?: string;
+  title?: string;
+  accessMode?: string;
+  contextTokenLimit?: number | null;
+  temp?: TempAlloc;
 }
 
 /** 临时空间中被拷贝的单个项目条目（主项目 key="main"，关联项目 key="link:<id>"） */
@@ -279,6 +290,7 @@ export interface ToolEvent {
   status: string; // pending_approval | running | success | failed | denied | timeout
   approvalScope?: string | null;
   createdAt: string;
+  subprocessId?: string | null;
 }
 
 export interface Message {

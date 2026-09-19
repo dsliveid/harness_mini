@@ -3,7 +3,7 @@ import { ipc } from "../ipc";
 import { useStore } from "../store";
 import type { ToolEvent } from "../types";
 import { Markdown } from "./Markdown";
-import { SubprocessCard } from "./SubprocessCard";
+import { SubprocessBranchTree } from "./SubprocessBranchTree";
 import {
   FileText,
   FileEdit,
@@ -320,7 +320,7 @@ function CollapsibleResult({ text }: { text: string }) {
 
 export function ToolCard({ ev }: { ev: ToolEvent }) {
   if (ev.toolName === "spawn_subprocess" || ev.toolName === "spawn_subagent") {
-    return <SubprocessCard ev={ev} />;
+    return <SubprocessBranchTree event={ev} />;
   }
 
   const output = useStore((s) => s.toolOutputs[ev.id]);

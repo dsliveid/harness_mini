@@ -52,23 +52,24 @@ export function CreateCollaboratorModal() {
   const setShow = useStore((s) => s.setShowCreateCollaboratorModal);
   const currentId = useStore((s) => s.currentId);
   const session = useStore((s) => currentSession(s));
+  const draft = useStore((s) => s.draft);
   const createCollaborator = useStore((s) => s.createCollaborator);
 
   const [selectedRole, setSelectedRole] = useState("frontend");
   const [title, setTitle] = useState("前端开发协作者");
   const [taskPrompt, setTaskPrompt] = useState(ROLE_PRESETS[0].defaultPrompt);
-  const [workspacePath, setWorkspacePath] = useState(session?.workspacePath ?? "");
+  const [workspacePath, setWorkspacePath] = useState(session?.workspacePath ?? draft?.workspacePath ?? "");
   const [subpath, setSubpath] = useState("");
   const [autoReport, setAutoReport] = useState(true);
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
-    if (show && session?.workspacePath) {
-      setWorkspacePath(session.workspacePath);
+    if (show) {
+      setWorkspacePath(session?.workspacePath ?? draft?.workspacePath ?? "");
     }
-  }, [show, session?.workspacePath]);
+  }, [show, session?.workspacePath, draft?.workspacePath]);
 
-  if (!show || !currentId || !session) return null;
+  if (!show || !currentId) return null;
 
   const handleRoleSelect = (roleId: string) => {
     setSelectedRole(roleId);
@@ -182,7 +183,7 @@ export function CreateCollaboratorModal() {
                 type="text"
                 value={workspacePath}
                 onChange={(e) => setWorkspacePath(e.target.value)}
-                placeholder={session.workspacePath || "继承当前主项目根目录"}
+                placeholder={session?.workspacePath || draft?.workspacePath || "继承当前主项目根目录"}
                 className="w-full px-3 py-2 rounded-xl bg-panel2/60 border border-edge text-ink text-[12px] font-mono focus:outline-none focus:border-accent"
                 title="协作者物理执行根目录，默认继承当前项目根目录"
               />

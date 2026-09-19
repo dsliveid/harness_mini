@@ -425,6 +425,9 @@ pub struct Session {
     /// 是否在任务执行完成后自动汇报主进程（默认 true）
     #[serde(default = "default_auto_report")]
     pub auto_report: Option<bool>,
+    /// 触发派生该子进程/子 Agent 的工具事件 ID
+    #[serde(default)]
+    pub trigger_tool_event_id: Option<String>,
 }
 
 fn default_auto_report() -> Option<bool> {
@@ -598,6 +601,9 @@ pub struct ToolEvent {
     #[serde(default)]
     pub approval_scope: Option<String>, // mode | session | once | none
     pub created_at: String,
+    /// 该工具调用派生创建的子进程/子 Agent 真实会话 ID
+    #[serde(default)]
+    pub subprocess_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

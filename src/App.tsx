@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { useAppEvents } from "./events";
-import { useStore } from "./store";
+import { useStore, SUBAGENT_MIN_PANEL_WIDTH } from "./store";
 import { ArchiveModal } from "./components/ArchiveModal";
 import { ChatView } from "./components/ChatView";
 import { Composer } from "./components/Composer";
@@ -23,13 +23,35 @@ import { SubagentResizeHandle } from "./components/SubagentResizeHandle";
 import { CreateCollaboratorModal } from "./components/CreateCollaboratorModal";
 import { WindowHeader } from "./components/WindowHeader";
 
+import { DRAFT_ID } from "./types";
+
+const EMPTY_COLLABS: any[] = [];
+
 export default function App() {
   useAppEvents();
   const bootstrap = useStore((s) => s.bootstrap);
   const ready = useStore((s) => s.ready);
   const tempClearing = useStore((s) => s.tempClearing);
-  const activeCollaboratorId = useStore((s) => s.activeCollaboratorId ?? s.activeSubagentId);
+  const activeCollaboratorId = useStore((s) => s.activeCollaboratorId);
+  const activeSubprocessId = useStore((s) => s.activeSubprocessId);
+  const activeSubagentId = useStore((s) => s.activeSubagentId);
+  const currentParentId = useStore((s) => s.currentId);
+  const allCollabs = useStore((s) => s.collaborators);
+  const collabs = currentParentId ? allCollabs[currentParentId] ?? EMPTY_COLLABS : EMPTY_COLLABS;
   const subagentPanelWidth = useStore((s) => s.subagentPanelWidth);
+
+  // 判定右侧分屏当前要激活的面板类型与 ID（新对话草稿或无会话时不开启右侧分屏）
+  const hasValidParent = !!currentParentId && currentParentId !== DRAFT_ID;
+  const activeSideId = hasValidParent
+    ? activeSubprocessId || activeCollaboratorId || activeSubagentId
+    : null;
+  const isCollaborator = activeCollaboratorId
+    ? true
+    : activeSubprocessId
+    ? false
+    : activeSubagentId
+    ? collabs.some((c) => c.id === activeSubagentId)
+    : false;
 
   useEffect(() => {
     void bootstrap();
@@ -50,7 +72,7 @@ export default function App() {
       <WindowHeader />
       <div className="flex-1 min-h-0 flex">
         <Sidebar />
-        <div className="flex-1 flex flex-col min-w-[500px] relative">
+        <div className="flex-1 flex flex-col min-w-0 md:min-w-[380px] relative">
           <TopBar />
           <CollaboratorBar />
           <ChatView />
@@ -69,14 +91,14 @@ export default function App() {
             </div>
           )}
         </div>
-        {activeCollaboratorId && (
+        {activeSideId && (
           <>
             <SubagentResizeHandle />
             <div
-              style={{ width: `${subagentPanelWidth}px` }}
+              style={{ width: `${subagentPanelWidth}px`, minWidth: `${SUBAGENT_MIN_PANEL_WIDTH}px` }}
               className="shrink-0 flex flex-col min-h-0 overflow-hidden"
             >
-              <CollaboratorView collaboratorId={activeCollaboratorId} />
+              <CollaboratorView collaboratorId={activeSideId} />
             </div>
           </>
         )}

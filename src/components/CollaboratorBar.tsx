@@ -1,12 +1,18 @@
-import { useRef } from "react";
+import { useRef, useMemo } from "react";
 import { useStore, currentSession } from "../store";
-import { DRAFT_ID } from "../types";
+import { DRAFT_ID, type Session } from "../types";
 import { Users, Plus, Square, RefreshCw, Loader2, CheckCircle2, AlertCircle } from "./Icons";
+
+const EMPTY_COLLABS_BAR: Session[] = [];
 
 export function CollaboratorBar() {
   const currentId = useStore((s) => s.currentId);
   const session = useStore((s) => currentSession(s));
-  const collaborators = useStore((s) => (s.currentId ? s.collaborators[s.currentId] ?? [] : []));
+  const allCollaborators = useStore((s) => s.collaborators);
+  const collaborators = useMemo(
+    () => (currentId && currentId !== DRAFT_ID ? allCollaborators[currentId] ?? EMPTY_COLLABS_BAR : EMPTY_COLLABS_BAR),
+    [allCollaborators, currentId]
+  );
   const activeCollaboratorId = useStore((s) => s.activeCollaboratorId);
   const setActiveCollaboratorId = useStore((s) => s.setActiveCollaboratorId);
   const setShowCreateCollaboratorModal = useStore((s) => s.setShowCreateCollaboratorModal);
@@ -15,7 +21,7 @@ export function CollaboratorBar() {
   const runStatus = useStore((s) => s.runStatus);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  if (!currentId || currentId === DRAFT_ID || !session) {
+  if (!currentId) {
     return null;
   }
 

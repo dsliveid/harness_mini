@@ -2,15 +2,62 @@ import { create } from "zustand";
 import { ipc } from "./ipc";
 import { DRAFT_ID, samePath, type ApprovalReq, type ApprovalRule, type CollaboratorCreateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice } from "./types";
 
+export type ToastType = "success" | "error" | "warning" | "info";
+
 export interface Toast {
   id: string;
   text: string;
+  type: ToastType;
 }
+
+export function inferToastType(text: string): ToastType {
+  const t = text.trim();
+  if (t.startsWith("✅")) return "success";
+  if (t.startsWith("❌")) return "error";
+  if (t.startsWith("⚠️")) return "warning";
+  if (t.startsWith("ℹ️")) return "info";
+
+  // Error patterns (checked before success/warning to avoid ambiguous matches like "删除失败")
+  if (
+    /失败|错误|异常|未果|\berror\b|\bfailed\b|\bfaile(d)?\b|\bexception\b|\brejected\b|\bdenied\b|\btimeout\b|\binvalid\b/i.test(
+      t
+    )
+  ) {
+    return "error";
+  }
+
+  // Warning patterns
+  if (
+    /警告|\bwarning\b|未通过|自愈|自省|受阻|超限|请[输选填]|未[选设]|不能|不可|已关联/i.test(
+      t
+    )
+  ) {
+    return "warning";
+  }
+
+  // Success patterns
+  if (
+    /成功|通过|已保存|已采纳|已启用|已停用|已删除|已终止|已重启|已创建|已复制|已恢复|已开启|已切换|已提交|已更新|已就绪|已确认|\bsuccess\b/i.test(
+      t
+    )
+  ) {
+    return "success";
+  }
+
+  if (/\b\w+Error\b|\b\w+Exception\b/i.test(t)) {
+    return "error";
+  }
+
+  return "info";
+}
+
 
 /** 记住上次查看的会话 id：页面重载（如开发热更新）后回到原位，而不是跳到列表第一个 */
 const LAST_SESSION_KEY = "harness_mini.lastSessionId";
 const SESSION_DRAFTS_KEY = "harness_mini.sessionDrafts";
 const SUBAGENT_WIDTH_KEY = "harness_mini.subagentPanelWidth";
+export const SUBAGENT_MIN_PANEL_WIDTH = 560;
+export const SUBAGENT_DEFAULT_PANEL_WIDTH = 600;
 
 function loadSessionDrafts(): Record<string, string> {
   try {
@@ -122,6 +169,8 @@ interface Store {
   showCreateCollaboratorModal: boolean;
   /** 临时子进程列表，按父会话 ID 缓存 */
   subprocesses: Record<string, Session[]>;
+  /** 当前在分屏中打开查看的临时子进程 ID（null = 未打开） */
+  activeSubprocessId: string | null;
   /** 子 Agent 进程列表，按父会话 ID 缓存（保持向下兼容） */
   subagents: Record<string, Session[]>;
   /** 当前在分屏中打开查看的子 Agent ID（null = 未打开） */
@@ -176,7 +225,7 @@ interface Store {
   onSessionRules: (p: { sessionId: string; rules: ApprovalRule[] }) => void;
   setSettingsLocal: (s: Settings) => void;
   onSettingsChanged: (s: Settings) => void;
-  pushToast: (text: string) => void;
+  pushToast: (text: string, type?: ToastType) => void;
   dismissToast: (id: string) => void;
 
   // 事件处理
@@ -215,9 +264,11 @@ interface Store {
   loadSubagents: (parentSessionId: string) => Promise<void>;
   loadCollaborators: (parentSessionId: string) => Promise<void>;
   loadSubprocesses: (parentSessionId: string) => Promise<void>;
+  setActiveSubprocessId: (id: string | null) => void;
   setActiveCollaboratorId: (id: string | null) => void;
   setShowCreateCollaboratorModal: (open: boolean) => void;
   createCollaborator: (input: CollaboratorCreateInput) => Promise<Session | null>;
+  deleteCollaborator: (collaboratorId: string) => Promise<void>;
   setCollaboratorAutoReport: (collaboratorId: string, autoReport: boolean) => Promise<void>;
   reportCollaboratorIncrement: (collaboratorId: string) => Promise<void>;
   onCollaboratorsChanged: (p: any) => Promise<void>;
@@ -359,9 +410,10 @@ export const useStore = create<Store>((set, get) => ({
   activeCollaboratorId: null,
   showCreateCollaboratorModal: false,
   subprocesses: {},
+  activeSubprocessId: null,
   subagents: {},
   activeSubagentId: null,
-  subagentPanelWidth: Math.max(360, Number(localStorage.getItem(SUBAGENT_WIDTH_KEY)) || 480),
+  subagentPanelWidth: Math.max(SUBAGENT_MIN_PANEL_WIDTH, Number(localStorage.getItem(SUBAGENT_WIDTH_KEY)) || SUBAGENT_DEFAULT_PANEL_WIDTH),
   showCreateSubagentModal: false,
   // 启动默认进入项目视图
   view: "project",
@@ -666,6 +718,9 @@ export const useStore = create<Store>((set, get) => ({
       currentId: DRAFT_ID,
       readOnly: false,
       messages: { ...get().messages, [DRAFT_ID]: [] },
+      activeCollaboratorId: null,
+      activeSubprocessId: null,
+      activeSubagentId: null,
     });
   },
 
@@ -687,6 +742,9 @@ export const useStore = create<Store>((set, get) => ({
         currentId: DRAFT_ID,
         readOnly: false,
         messages: { ...get().messages, [DRAFT_ID]: [] },
+        activeCollaboratorId: null,
+        activeSubprocessId: null,
+        activeSubagentId: null,
       });
     } catch (e) {
       get().pushToast(String(e));
@@ -757,6 +815,13 @@ export const useStore = create<Store>((set, get) => ({
         const collabs = get().collaborators[id] ?? [];
         if (!collabs.some((s) => s.id === curCollabId)) {
           set({ activeCollaboratorId: null });
+        }
+      }
+      const curSubprocId = get().activeSubprocessId;
+      if (curSubprocId) {
+        const subprocs = get().subprocesses[id] ?? [];
+        if (!subprocs.some((s) => s.id === curSubprocId)) {
+          set({ activeSubprocessId: null });
         }
       }
       const curSubId = get().activeSubagentId;
@@ -909,9 +974,10 @@ export const useStore = create<Store>((set, get) => ({
     set({ settings: { ...s, activeModelId, activeModel: activeModelId } });
   },
 
-  pushToast(text) {
+  pushToast(text, type) {
     const id = Math.random().toString(36).slice(2);
-    set((st) => ({ toasts: [...st.toasts, { id, text }] }));
+    const resolvedType = type ?? inferToastType(text);
+    set((st) => ({ toasts: [...st.toasts, { id, text, type: resolvedType }] }));
     setTimeout(() => get().dismissToast(id), 6000);
   },
   dismissToast(id) {
@@ -1038,10 +1104,47 @@ export const useStore = create<Store>((set, get) => ({
         };
       }
 
+      // 同步更新所属临时子进程列表的累计 token
+      let nextSubprocesses = st.subprocesses;
+      let foundSubprocParentId: string | null = null;
+      for (const [pid, subList] of Object.entries(st.subprocesses)) {
+        if (subList.some((s) => s.id === m.sessionId)) {
+          foundSubprocParentId = pid;
+          break;
+        }
+      }
+      if (foundSubprocParentId) {
+        let subTotal = 0;
+        let subPrompt = 0;
+        let subCompletion = 0;
+        for (const msg of updatedList) {
+          const tt = msg.totalTokens ?? (msg.usage?.totalTokens || (msg.usage?.inputEst || 0) + (msg.usage?.outputEst || 0)) ?? 0;
+          const pt = msg.promptTokens ?? (msg.usage?.promptTokens || msg.usage?.inputEst) ?? 0;
+          const ct = msg.completionTokens ?? (msg.usage?.completionTokens || msg.usage?.outputEst) ?? 0;
+          subTotal += Number(tt) || 0;
+          subPrompt += Number(pt) || 0;
+          subCompletion += Number(ct) || 0;
+        }
+        nextSubprocesses = {
+          ...st.subprocesses,
+          [foundSubprocParentId]: (st.subprocesses[foundSubprocParentId] ?? []).map((s) =>
+            s.id === m.sessionId
+              ? {
+                  ...s,
+                  totalTokens: subTotal,
+                  promptTokens: subPrompt,
+                  completionTokens: subCompletion,
+                }
+              : s
+          ),
+        };
+      }
+
       return {
         messages: { ...st.messages, [m.sessionId]: updatedList },
         sessions: nextSessions,
         subagents: nextSubagents,
+        subprocesses: nextSubprocesses,
       };
     });
   },
@@ -1275,12 +1378,31 @@ export const useStore = create<Store>((set, get) => ({
       delete tempInfo[deleted];
       delete sessionDrafts[deleted];
       persistSessionDraftsImmediate(sessionDrafts);
+      const nextSubagents: Record<string, Session[]> = {};
+      for (const [pid, list] of Object.entries(st.subagents)) {
+        nextSubagents[pid] = list.filter((s) => s.id !== deleted);
+      }
+      const nextCollaborators: Record<string, Session[]> = {};
+      for (const [pid, list] of Object.entries(st.collaborators)) {
+        nextCollaborators[pid] = list.filter((s) => s.id !== deleted);
+      }
+      const nextSubprocesses: Record<string, Session[]> = {};
+      for (const [pid, list] of Object.entries(st.subprocesses)) {
+        nextSubprocesses[pid] = list.filter((s) => s.id !== deleted);
+      }
+
       return {
         messages,
         queues,
         runStatus,
         tempInfo,
         sessionDrafts,
+        subagents: nextSubagents,
+        collaborators: nextCollaborators,
+        subprocesses: nextSubprocesses,
+        activeSubagentId: st.activeSubagentId === deleted ? null : st.activeSubagentId,
+        activeCollaboratorId: st.activeCollaboratorId === deleted ? null : st.activeCollaboratorId,
+        activeSubprocessId: st.activeSubprocessId === deleted ? null : st.activeSubprocessId,
         ...(st.currentId === deleted ? { currentId: null, readOnly: false } : {}),
       };
     });
@@ -1408,12 +1530,16 @@ export const useStore = create<Store>((set, get) => ({
         collaborators: { ...st.collaborators, [parentSessionId]: list },
       }));
       const activeId = get().activeCollaboratorId;
-      if (activeId && list.some((s) => s.id === activeId)) {
-        if (!get().messages[activeId]) {
-          const msgs = await ipc.getMessages(activeId, undefined, 200);
-          set((st) => ({
-            messages: { ...st.messages, [activeId]: msgs },
-          }));
+      if (activeId) {
+        if (list.some((s) => s.id === activeId)) {
+          if (!get().messages[activeId]) {
+            const msgs = await ipc.getMessages(activeId, undefined, 200);
+            set((st) => ({
+              messages: { ...st.messages, [activeId]: msgs },
+            }));
+          }
+        } else {
+          set({ activeCollaboratorId: null });
         }
       }
     } catch (e) {
@@ -1432,8 +1558,21 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
+  setActiveSubprocessId(id: string | null) {
+    set({ activeSubprocessId: id, activeCollaboratorId: null, activeSubagentId: id });
+    if (id) {
+      ipc.getMessages(id, undefined, 200).then((msgs) => {
+        set((st) => ({
+          messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], msgs) },
+          hasMore: { ...st.hasMore, [id]: msgs.length >= 200 },
+        }));
+      }).catch((e) => get().pushToast(String(e)));
+      void get().syncSessionActiveState(id);
+    }
+  },
+
   setActiveCollaboratorId(id: string | null) {
-    set({ activeCollaboratorId: id, activeSubagentId: id });
+    set({ activeCollaboratorId: id, activeSubagentId: id, activeSubprocessId: null });
     if (id) {
       ipc.getMessages(id, undefined, 200).then((msgs) => {
         set((st) => ({
@@ -1451,12 +1590,30 @@ export const useStore = create<Store>((set, get) => ({
 
   async createCollaborator(input) {
     try {
+      let parentId = input.parentSessionId;
+      if (!parentId || parentId === DRAFT_ID) {
+        // 新对话尚未保存：先创建一个默认的主对话，设置为主进程和统筹协调者
+        const st = get();
+        const draft = st.draft;
+        const newSession = await ipc.createSession({
+          workspacePath: draft?.workspacePath || undefined,
+          projectId: draft?.projectId || st.currentProjectId || undefined,
+          title: "主进程与统筹协调者",
+          accessMode: draft?.accessMode || undefined,
+          contextTokenLimit: draft?.contextTokenLimit || undefined,
+          temp: draft?.temp || undefined,
+        });
+        st.onSessionUpdate(newSession);
+        await st.selectSession(newSession.id);
+        parentId = newSession.id;
+        input.parentSessionId = parentId;
+      }
       const created = await ipc.createCollaborator(input);
       set((st) => {
-        const existing = st.collaborators[input.parentSessionId] ?? [];
+        const existing = st.collaborators[parentId] ?? [];
         const nextList = [created, ...existing.filter((s) => s.id !== created.id)];
         return {
-          collaborators: { ...st.collaborators, [input.parentSessionId]: nextList },
+          collaborators: { ...st.collaborators, [parentId]: nextList },
           activeCollaboratorId: created.id,
           activeSubagentId: created.id,
           showCreateCollaboratorModal: false,
@@ -1468,6 +1625,40 @@ export const useStore = create<Store>((set, get) => ({
     } catch (e) {
       get().pushToast(`创建协作者失败: ${e}`);
       return null;
+    }
+  },
+
+  async deleteCollaborator(collaboratorId: string) {
+    try {
+      await ipc.deleteSubagent(collaboratorId);
+      set((st) => {
+        const nextCollaborators: Record<string, Session[]> = {};
+        for (const [pid, list] of Object.entries(st.collaborators)) {
+          nextCollaborators[pid] = list.filter((s) => s.id !== collaboratorId);
+        }
+        const nextSubagents: Record<string, Session[]> = {};
+        for (const [pid, list] of Object.entries(st.subagents)) {
+          nextSubagents[pid] = list.filter((s) => s.id !== collaboratorId);
+        }
+        const nextSubprocesses: Record<string, Session[]> = {};
+        for (const [pid, list] of Object.entries(st.subprocesses)) {
+          nextSubprocesses[pid] = list.filter((s) => s.id !== collaboratorId);
+        }
+        const messages = { ...st.messages };
+        delete messages[collaboratorId];
+        return {
+          collaborators: nextCollaborators,
+          subagents: nextSubagents,
+          subprocesses: nextSubprocesses,
+          messages,
+          activeCollaboratorId: st.activeCollaboratorId === collaboratorId ? null : st.activeCollaboratorId,
+          activeSubagentId: st.activeSubagentId === collaboratorId ? null : st.activeSubagentId,
+          activeSubprocessId: st.activeSubprocessId === collaboratorId ? null : st.activeSubprocessId,
+        };
+      });
+      get().pushToast("已移除协作者", "success");
+    } catch (e) {
+      get().pushToast(`移除协作者失败: ${e}`, "error");
     }
   },
 
@@ -1583,8 +1774,9 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   setSubagentPanelWidth(width: number) {
-    const maxAllowed = Math.max(360, window.innerWidth - 240 - 500);
-    const clamped = Math.max(360, Math.min(width, maxAllowed));
+    const minAllowed = SUBAGENT_MIN_PANEL_WIDTH;
+    const maxAllowed = Math.max(minAllowed, window.innerWidth - 240 - 380);
+    const clamped = Math.max(minAllowed, Math.min(width, maxAllowed));
     localStorage.setItem(SUBAGENT_WIDTH_KEY, String(clamped));
     set({ subagentPanelWidth: clamped });
   },
@@ -1660,14 +1852,29 @@ export const useStore = create<Store>((set, get) => ({
         for (const [pid, list] of Object.entries(st.subagents)) {
           nextSubagents[pid] = list.filter((s) => s.id !== subagentId);
         }
+        const nextCollaborators: Record<string, Session[]> = {};
+        for (const [pid, list] of Object.entries(st.collaborators)) {
+          nextCollaborators[pid] = list.filter((s) => s.id !== subagentId);
+        }
+        const nextSubprocesses: Record<string, Session[]> = {};
+        for (const [pid, list] of Object.entries(st.subprocesses)) {
+          nextSubprocesses[pid] = list.filter((s) => s.id !== subagentId);
+        }
+        const messages = { ...st.messages };
+        delete messages[subagentId];
         return {
           subagents: nextSubagents,
+          collaborators: nextCollaborators,
+          subprocesses: nextSubprocesses,
+          messages,
           activeSubagentId: st.activeSubagentId === subagentId ? null : st.activeSubagentId,
+          activeCollaboratorId: st.activeCollaboratorId === subagentId ? null : st.activeCollaboratorId,
+          activeSubprocessId: st.activeSubprocessId === subagentId ? null : st.activeSubprocessId,
         };
       });
-      get().pushToast("已删除子 Agent");
+      get().pushToast("已删除", "success");
     } catch (e) {
-      get().pushToast(`删除子 Agent 失败: ${e}`);
+      get().pushToast(`删除失败: ${e}`, "error");
     }
   },
 

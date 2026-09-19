@@ -1125,6 +1125,7 @@ async fn handle_tool_call(
         status: "running".into(),
         approval_scope: Some("none".into()),
         created_at: now,
+        subprocess_id: None,
     };
 
     let spec = specs.iter().find(|s| s.name == tool_name);
@@ -1317,15 +1318,44 @@ async fn handle_tool_call(
         Ok(t) => ("success".to_string(), t),
         Err(e) => ("failed".to_string(), format!("工具执行失败：{e}")),
     };
-    ev.status = status.clone();
-    ev.result_text = Some(text.clone());
+    let mut detected_sub_id: Option<String> = None;
+    if (tool_name == "spawn_subprocess" || tool_name == "spawn_subagent") && status == "success" {
+        for line in text.lines() {
+            if line.contains("ID:") {
+                let trimmed = line.trim();
+                let after = if let Some(idx) = trimmed.find("ID:") {
+                    &trimmed[idx + 3..]
+                } else {
+                    ""
+                };
+                let id_val = after.trim().trim_matches('`').trim();
+                if !id_val.is_empty() {
+                    detected_sub_id = Some(id_val.to_string());
+                    ev.subprocess_id = Some(id_val.to_string());
+                    if let Some(obj) = ev.params.as_object_mut() {
+                        obj.insert("subprocess_id".into(), json!(id_val));
+                    }
+                    break;
+                }
+            }
+        }
+    }
     {
         let db = state.db.lock().unwrap();
         // todo 工具：保存会话任务清单快照
         if tool_name == "todo" && status == "success" {
             let _ = store::set_kv(&db, session_id, "todos", &args.to_string());
         }
-        let _ = store::update_tool_event(&db, &ev.id, &status, Some(&text), None);
+        let params_str = serde_json::to_string(&ev.params).ok();
+        let _ = store::update_tool_event_full(
+            &db,
+            &ev.id,
+            &status,
+            Some(&text),
+            None,
+            detected_sub_id.as_deref().or(ev.subprocess_id.as_deref()),
+            params_str.as_deref(),
+        );
     }
     emit_tool_with(app, session_id, &ev, json!({ "elapsedMs": elapsed }));
     (status, text)

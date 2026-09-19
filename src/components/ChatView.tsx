@@ -9,6 +9,9 @@ import { CompactionBanner, CompactedHistoryCard } from "./CompactionBanner";
 import { TruncationNoticeList } from "./TruncationNoticeCard";
 import { Bot, Plus, Sprout, ShieldCheck, AlertTriangle, Loader2 } from "./Icons";
 
+const EMPTY_PROPOSALS: any[] = [];
+const EMPTY_COMPACTIONS: any[] = [];
+
 export function ChatView() {
   const currentId = useStore((s) => s.currentId);
   const msgs = useStore((s) => currentMessages(s));
@@ -22,10 +25,10 @@ export function ChatView() {
   const providers = useStore((s) => s.settings.providers);
   const projects = useStore((s) => s.projects);
   const draft = useStore((s) => s.draft);
-  const proposals = useStore((s) => (s.currentId ? s.activeProposals[s.currentId] ?? [] : []));
+  const proposals = useStore((s) => (s.currentId ? s.activeProposals[s.currentId] : undefined)) ?? EMPTY_PROPOSALS;
   const currentGrowthStatus = useStore((s) => (s.currentId ? s.growthStatus[s.currentId] : null));
   const currentSopStatus = useStore((s) => (s.currentId ? s.sopStatus[s.currentId] : null));
-  const compactions = useStore((s) => (s.currentId ? s.sessionCompactions[s.currentId] ?? [] : []));
+  const compactions = useStore((s) => (s.currentId ? s.sessionCompactions[s.currentId] : undefined)) ?? EMPTY_COMPACTIONS;
   // 临时空间对话：合并点（含）之前的消息永久不可编辑重发
   const mergedBoundary = session?.mergedSeq ?? null;
 
@@ -48,18 +51,20 @@ export function ChatView() {
     stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
   };
 
-  if (!currentId || (currentId === DRAFT_ID && msgs.length === 0)) {
+  if (!currentId || msgs.length === 0) {
     const noProvider = providers.every((p) => !(p.models ?? []).length);
-    const noWorkspace = currentId === DRAFT_ID && !draft?.workspacePath;
-    const isTempDraft = currentId === DRAFT_ID && !!draft?.temp;
-    const draftProject = draft?.projectId ? projects.find((p) => p.id === draft.projectId) : null;
+    const noWorkspace = currentId === DRAFT_ID ? !draft?.workspacePath : !session?.workspacePath;
+    const isTempDraft = currentId === DRAFT_ID ? !!draft?.temp : !!session?.isTemp;
+    const project = currentId === DRAFT_ID
+      ? (draft?.projectId ? projects.find((p) => p.id === draft.projectId) : null)
+      : (session?.projectId ? projects.find((p) => p.id === session.projectId) : null);
     return (
       <div className="flex-1 flex items-center justify-center overflow-y-auto select-none">
         <div className="max-w-[480px] px-6 text-center animate-in fade-in zoom-in-95 duration-200">
           <div className="w-14 h-14 rounded-2xl bg-panel2 border border-edge flex items-center justify-center mx-auto mb-4 shadow-lg text-accent">
             <Bot size={28} strokeWidth={1.8} />
           </div>
-          <div className="text-lg font-semibold mb-2 text-ink">{draftProject ? draftProject.name : "harness_mini"}</div>
+          <div className="text-lg font-semibold mb-2 text-ink">{session?.title ?? (project ? project.name : "harness_mini")}</div>
           {noProvider ? (
             <div className="text-inkdim text-[13px] leading-relaxed">
               尚未配置模型。请先点击左下角 <b className="text-ink">设置</b>，添加一个 OpenAI 兼容厂商（Base URL / API Key / 模型名）。
@@ -76,13 +81,21 @@ export function ChatView() {
             </div>
           ) : isTempDraft ? (
             <div className="text-inkdim text-[13px] leading-relaxed">
-              当前为「{draftProject?.name ?? "项目"}」的<b className="text-ink">临时空间对话</b>。
+              当前为「{project?.name ?? "项目"}」的<b className="text-ink">临时空间对话</b>。
               发送第一条消息后创建临时空间，并把主项目与关联项目拷贝进去（原目录不受影响，可随时合并或清空）。
               <div className="mt-2 text-[12px] opacity-80">Agent 可以读写临时副本中的文件、执行命令（需确认）、搜索代码。</div>
             </div>
+          ) : session ? (
+            <div className="text-inkdim text-[13px] leading-relaxed">
+              <div className="font-semibold text-ink text-[14px] mb-1.5 flex items-center justify-center gap-1.5">
+                <span>⚡</span>
+                <span>主进程与统筹协调者已就绪</span>
+              </div>
+              <div>当前会话作为主架构师与统筹核心，您可以在此输入指令让主进程统领全局，也可以在上方协作者栏与专属专家协同工作。</div>
+            </div>
           ) : (
             <div className="text-inkdim text-[13px] leading-relaxed">
-              {draftProject
+              {project
                 ? "当前为项目下的临时对话，发送第一条消息后自动保存到该项目。"
                 : "当前为临时对话，发送第一条消息后才会保存。"}
               <div className="mt-2 text-[12px] opacity-80">Agent 可以读写文件、执行命令（需确认）、搜索代码。</div>

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ApprovalRule, CollaboratorCreateInput, DataStatus, GrowthItem, Message, MergeSummary, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo } from "./types";
+import type { ApprovalRule, CollaboratorCreateInput, DataStatus, GrowthItem, Message, MergeSummary, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo } from "./types";
 
 export const ipc = {
   getSettings: () => invoke<Settings>("get_settings"),
@@ -32,6 +32,15 @@ export const ipc = {
   deleteProjectLink: (id: string) => invoke<void>("delete_project_link", { id }),
 
   listSessions: () => invoke<Session[]>("list_sessions"),
+  createSession: (input: SessionCreateInput) =>
+    invoke<Session>("create_session", {
+      workspacePath: input.workspacePath ?? null,
+      projectId: input.projectId ?? null,
+      title: input.title ?? null,
+      accessMode: input.accessMode ?? null,
+      contextTokenLimit: input.contextTokenLimit ?? null,
+      temp: input.temp ?? null,
+    }),
   listArchived: () => invoke<Session[]>("list_archived"),
   renameSession: (id: string, title: string) => invoke<void>("rename_session", { id, title }),
   deleteSession: (id: string) => invoke<void>("delete_session", { id }),
@@ -177,5 +186,5 @@ export const ipc = {
     invoke<SessionActiveState>("get_session_active_state", { sessionId }),
 };
 
-export type { Message, Session, SessionActiveState, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport, CollaboratorCreateInput };
+export type { Message, Session, SessionActiveState, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport, CollaboratorCreateInput, SessionCreateInput };
 

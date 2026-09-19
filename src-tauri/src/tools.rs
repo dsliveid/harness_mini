@@ -290,7 +290,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "spawn_subagent",
             description: "创建并启动一个独立的子 Agent 进程并行协作（如前端开发、后端开发、多模块开发等）。子 Agent 拥有独立上下文与工具环境，不污染主会话上下文。通常与 wait_subagents 配合使用：总架构师连续派生多个子任务后，应紧接着调用 wait_subagents 等待完成并汇总结果。严禁子 Agent 递归嵌套调用本工具。",
-            risk: Risk::Write,
+            risk: Risk::ReadOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -348,7 +348,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "spawn_subprocess",
             description: "创建并启动一个独立的临时子进程并行执行特定任务（如探索、排查、独立测试等）。子进程拥有独立上下文与工具环境，执行完成后其成果直接内嵌在主对话流中呈现。外部用户无法干预子进程，任务完成后自动销毁/归档。",
-            risk: Risk::Write,
+            risk: Risk::ReadOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -395,7 +395,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "dispatch_collaborator",
             description: "向项目专属的常驻【项目协作者】（如前端专家、测试专家等）委派工作任务。协作者将在独立会话中基于其长远角色设定工作，完成后自动增量汇报主会话。注意：委派前请先调用 get_collaborators 确认其处于空闲状态。",
-            risk: Risk::Write,
+            risk: Risk::ReadOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -1280,7 +1280,21 @@ async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
             &sub_workspace,
             parent_session.access_mode.as_deref(),
             parent_session.project_id.as_deref(),
+            ctx.event_id.as_deref(),
         )?;
+        // 关键强绑定：立即将生成的真实 sub.id 回填并持久化至当前 tool_event
+        if let Some(ref ev_id) = ctx.event_id {
+            let mut params_with_id = args.clone();
+            if let Some(obj) = params_with_id.as_object_mut() {
+                obj.insert("subprocess_id".into(), json!(sub.id));
+            }
+            let _ = crate::store::set_tool_event_subprocess_id(
+                &db,
+                ev_id,
+                &sub.id,
+                Some(&params_with_id.to_string()),
+            );
+        }
         let focus_info = subpath.as_ref().map(|p| {
             format!("\n\n重点关注子目录：`{p}`\n（提示：请优先深入该子目录开展探索与修改；当前工作区根目录依然为完整的 `{sub_workspace}`，根目录下的全局构建与配置文件如 pom.xml / package.json / README 等均在合法访问范围内，需要时可直接读取）")
         }).unwrap_or_default();
@@ -1294,10 +1308,11 @@ async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
     // 启动子 Agent 异步运行循环
     crate::agent::spawn_session_task(host.app.clone(), sub.id.clone(), Some(user_msg.id));
 
-    // 广播事件通知前端刷新子 Agent / 子进程列表
+    // 广播事件通知前端刷新子 Agent / 子进程列表（附带 toolEventId 与 subprocess 强关联）
     let _ = host.app.emit("subprocess:created", json!({
         "parentId": parent_id,
         "subprocess": sub,
+        "toolEventId": ctx.event_id,
     }));
     let _ = host.app.emit("subprocesses:changed", json!({
         "parentId": parent_id,
@@ -1305,6 +1320,7 @@ async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
     let _ = host.app.emit("subagent:created", json!({
         "parentId": parent_id,
         "subagent": sub,
+        "toolEventId": ctx.event_id,
     }));
     let _ = host.app.emit("subagents:changed", json!({
         "parentId": parent_id,
@@ -1451,6 +1467,7 @@ async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
                 context_token_limit: None,
                 last_reported_msg_id: None,
                 auto_report: None,
+                trigger_tool_event_id: None,
             }
         });
         let msgs = crate::store::get_messages(&db, id, None, 50).unwrap_or_default();

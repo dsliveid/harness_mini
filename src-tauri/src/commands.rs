@@ -257,10 +257,18 @@ pub fn delete_session(state: State<'_, crate::AppState>, app: AppHandle, id: Str
     if is_run_active(&state, &id) {
         agent::stop_session(&app, &id);
     }
-    let db = state.db.lock().unwrap();
-    store::delete_session(&db, &id)?;
-    drop(db);
+    let parent_id = {
+        let db = state.db.lock().unwrap();
+        let parent_id = store::get_session(&db, &id)?.and_then(|s| s.parent_session_id);
+        store::delete_session(&db, &id)?;
+        parent_id
+    };
     let _ = app.emit("sessions:changed", json!({"deleted": id}));
+    if let Some(pid) = parent_id {
+        let _ = app.emit("subagents:changed", json!({"parentId": pid}));
+        let _ = app.emit("collaborators:changed", json!({"parentId": pid}));
+        let _ = app.emit("subprocesses:changed", json!({"parentId": pid}));
+    }
     Ok(())
 }
 
@@ -425,6 +433,88 @@ pub fn get_messages(
 ) -> Result<Vec<Message>, String> {
     let db = state.db.lock().unwrap();
     store::get_messages(&db, &session_id, before_seq, limit.unwrap_or(200))
+}
+
+#[tauri::command]
+pub fn create_session(
+    app: AppHandle,
+    state: State<'_, crate::AppState>,
+    workspace_path: Option<String>,
+    project_id: Option<String>,
+    title: Option<String>,
+    access_mode: Option<String>,
+    context_token_limit: Option<usize>,
+    temp: Option<TempAlloc>,
+) -> Result<Session, String> {
+    let access_mode = crate::models::normalize_access_mode(access_mode.as_deref().unwrap_or("confirm"));
+    let title = title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "主进程与统筹协调者".to_string());
+
+    let db = state.db.lock().unwrap();
+    if let Some(t) = temp {
+        let proj_id = project_id.ok_or("临时空间对话缺少归属项目")?;
+        store::get_project(&db, &proj_id)?.ok_or("归属项目不存在")?;
+        let data_dir = state
+            .data_dir
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or("数据目录不可用")?;
+        let root = PathBuf::from(&t.root);
+        crate::temp::validate_root(&root, &data_dir)?;
+        for p in &t.projects {
+            if !crate::temp::is_under(Path::new(&p.temp), &root) {
+                return Err(format!("临时空间路径非法: {}", p.temp));
+            }
+        }
+        let s = store::create_session(&db, &t.main_temp, Some(&proj_id), &title, &access_mode)?;
+        if let Some(lim) = context_token_limit {
+            let _ = store::set_session_context_limit(&db, &s.id, Some(lim));
+        }
+        store::set_session_temp(&db, &s.id, &t.code, &t.root, &t.source_workspace)?;
+        crate::temp::save_manifest(
+            &db,
+            &s.id,
+            &TempManifest {
+                code: t.code.clone(),
+                root: t.root.clone(),
+                projects: t.projects.clone(),
+            },
+        )?;
+        let _ = app.emit("sessions:changed", json!({"created": s.id}));
+        let _ = app.emit("session:update", &s);
+        return Ok(s);
+    }
+
+    let ws = workspace_path.clone().unwrap_or_default();
+    let project_id = if ws.is_empty() {
+        project_id
+    } else {
+        let p = store::find_or_create_project_by_path(&db, &ws)?;
+        let pid = p.id.clone();
+        let _ = app.emit("projects:changed", &p);
+        Some(pid)
+    };
+    let s = store::create_session(&db, &ws, project_id.as_deref(), &title, &access_mode)?;
+    if let Some(lim) = context_token_limit {
+        let _ = store::set_session_context_limit(&db, &s.id, Some(lim));
+    }
+    if !ws.is_empty() {
+        let mut settings = store::get_settings(&db).unwrap_or_default();
+        settings.last_workspace_path = Some(ws);
+        if let Ok(json) = serde_json::to_string(&settings) {
+            let _ = db.execute(
+                "INSERT INTO settings(key, value) VALUES('app_settings', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![json],
+            );
+        }
+    }
+    let _ = app.emit("sessions:changed", json!({"created": s.id}));
+    let _ = app.emit("session:update", &s);
+    Ok(s)
 }
 
 // ---------- 消息发送 / 队列 / 重发 ----------
@@ -636,6 +726,7 @@ pub fn spawn_subagent(
             &sub_workspace,
             parent.access_mode.as_deref(),
             parent.project_id.as_deref(),
+            None,
         )?;
         let focus_info = subpath.as_ref().map(|p| {
             format!("\n\n重点关注子目录：`{p}`\n（提示：请优先深入该子目录开展探索与修改；当前工作区根目录依然为完整的 `{sub_workspace}`，根目录下的全局构建与配置文件如 pom.xml / package.json / README 等均在合法访问范围内，需要时可直接读取）")
@@ -698,7 +789,10 @@ pub fn delete_subagent(app: AppHandle, state: State<'_, crate::AppState>, subage
     };
     if let Some(pid) = parent_id {
         let _ = app.emit("subagents:changed", json!({"parentId": pid}));
+        let _ = app.emit("collaborators:changed", json!({"parentId": pid}));
+        let _ = app.emit("subprocesses:changed", json!({"parentId": pid}));
     }
+    let _ = app.emit("sessions:changed", json!({"deleted": subagent_id}));
     Ok(())
 }
 
@@ -728,11 +822,28 @@ pub fn create_collaborator(
 ) -> Result<Session, String> {
     let parent = {
         let db = state.db.lock().unwrap();
-        store::get_session(&db, &parent_session_id)?.ok_or("父会话不存在")?
+        if parent_session_id.is_empty() || parent_session_id == "draft" {
+            let ws = workspace_path.clone().unwrap_or_default();
+            let project_id = if ws.is_empty() {
+                None
+            } else {
+                let p = store::find_or_create_project_by_path(&db, &ws)?;
+                let pid = p.id.clone();
+                let _ = app.emit("projects:changed", &p);
+                Some(pid)
+            };
+            let s = store::create_session(&db, &ws, project_id.as_deref(), "主进程与统筹协调者", "confirm")?;
+            let _ = app.emit("sessions:changed", json!({"created": s.id}));
+            let _ = app.emit("session:update", &s);
+            s
+        } else {
+            store::get_session(&db, &parent_session_id)?.ok_or("父会话不存在")?
+        }
     };
     if parent.session_type == "collaborator" || parent.session_type == "subprocess" || parent.parent_session_id.is_some() {
         return Err("当前会话不可再创建协作者".into());
     }
+    let real_parent_id = parent.id.clone();
 
     let sub_workspace = if let Some(ref ws) = workspace_path.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         let p = std::path::Path::new(ws);
@@ -746,43 +857,39 @@ pub fn create_collaborator(
     };
 
     let auto_report_val = auto_report.unwrap_or(true);
-    let (collab, user_msg) = {
+    let task_desc = if let Some(ref p) = subpath.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        format!("{task_prompt}\n（重点关注子目录：`{p}`）")
+    } else {
+        task_prompt
+    };
+    let collab = {
         let db = state.db.lock().unwrap();
-        let collab = store::create_collaborator_session(
+        store::create_collaborator_session(
             &db,
-            &parent_session_id,
+            &real_parent_id,
             &role,
             &title,
-            &task_prompt,
+            &task_desc,
             &sub_workspace,
             parent.access_mode.as_deref(),
             parent.project_id.as_deref(),
             auto_report_val,
-        )?;
-        let focus_info = subpath.as_ref().map(|p| {
-            format!("\n\n重点关注子目录：`{p}`\n（提示：请优先深入该子目录开展探索与修改；当前工作区根目录依然为完整的 `{sub_workspace}`）")
-        }).unwrap_or_default();
-        let initial_prompt = format!(
-            "【项目协作者初始化】\n角色定位：{role}\n身份名称：{title}\n工作区根目录：{sub_workspace}\n\n职责设定与初始任务：\n{task_prompt}{focus_info}"
-        );
-        let user_msg = store::new_message(&db, &collab.id, "user", Some(initial_prompt), false)?;
-        (collab, user_msg)
+        )?
     };
 
-    agent::spawn_session_task(app.clone(), collab.id.clone(), Some(user_msg.id));
     let _ = app.emit("collaborator:created", json!({
-        "parentId": parent_session_id,
+        "parentId": real_parent_id,
         "collaborator": collab,
     }));
     let _ = app.emit("collaborators:changed", json!({
-        "parentId": parent_session_id,
+        "parentId": real_parent_id,
     }));
     let _ = app.emit("subagent:created", json!({
-        "parentId": parent_session_id,
+        "parentId": real_parent_id,
         "subagent": collab,
     }));
     let _ = app.emit("subagents:changed", json!({
-        "parentId": parent_session_id,
+        "parentId": real_parent_id,
     }));
     Ok(collab)
 }

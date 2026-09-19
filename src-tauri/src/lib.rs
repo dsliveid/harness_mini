@@ -347,6 +347,7 @@ pub fn run() {
             commands::set_session_workspace,
             commands::set_session_project,
             commands::get_messages,
+            commands::create_session,
             commands::send_message,
             commands::list_queued,
             commands::guide_message,

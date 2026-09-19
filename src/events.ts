@@ -47,7 +47,45 @@ export function useAppEvents() {
       listen<any>("collaborator:update", (e) => s.onCollaboratorUpdate(e.payload)),
       listen<any>("collaborator:reported", (e) => s.onCollaboratorReported(e.payload)),
       listen<any>("subprocesses:changed", (e) => s.loadSubprocesses(e.payload?.parentId || e.payload?.parentSessionId)),
-      listen<Session>("subprocess:created", (e) => s.loadSubprocesses(e.payload?.parentSessionId || (e.payload as any)?.parentId)),
+      listen<any>("subprocess:created", (e) => {
+        const pid = e.payload?.parentId || e.payload?.parentSessionId;
+        const sub = e.payload?.subprocess;
+        const toolEventId = e.payload?.toolEventId;
+        if (pid && sub) {
+          useStore.setState((st) => {
+            const existing = st.subprocesses[pid] ?? [];
+            const updated = existing.some((s) => s.id === sub.id)
+              ? existing.map((s) => (s.id === sub.id ? sub : s))
+              : [...existing, sub];
+
+            // 若有对应的工具调用事件，立即打上强关联
+            let nextMessages = st.messages;
+            if (toolEventId && st.messages[pid]) {
+              const msgs = st.messages[pid].map((m) => {
+                if (!m.toolEvents || m.toolEvents.length === 0) return m;
+                const updatedEvs = m.toolEvents.map((ev) => {
+                  if (ev.id === toolEventId) {
+                    return {
+                      ...ev,
+                      subprocessId: sub.id,
+                      params: { ...(ev.params || {}), subprocess_id: sub.id },
+                    };
+                  }
+                  return ev;
+                });
+                return { ...m, toolEvents: updatedEvs };
+              });
+              nextMessages = { ...st.messages, [pid]: msgs };
+            }
+
+            return {
+              subprocesses: { ...st.subprocesses, [pid]: updated },
+              messages: nextMessages,
+            };
+          });
+        }
+        if (pid) void s.loadSubprocesses(pid);
+      }),
       listen<any>("subagents:changed", (e) => s.onSubagentsChanged(e.payload)),
       listen<Session>("subagent:created", (e) => s.onSubagentCreated(e.payload as Session)),
       listen<any>("subagent:update", (e) => s.onSubagentUpdate(e.payload)),

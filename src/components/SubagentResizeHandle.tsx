@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { useStore } from "../store";
+import { useStore, SUBAGENT_DEFAULT_PANEL_WIDTH } from "../store";
 
 export function SubagentResizeHandle() {
   const setSubagentPanelWidth = useStore((s) => s.setSubagentPanelWidth);
@@ -11,7 +11,7 @@ export function SubagentResizeHandle() {
   }, []);
 
   const handleDoubleClick = useCallback(() => {
-    setSubagentPanelWidth(480);
+    setSubagentPanelWidth(SUBAGENT_DEFAULT_PANEL_WIDTH);
   }, [setSubagentPanelWidth]);
 
   useEffect(() => {

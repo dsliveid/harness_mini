@@ -228,6 +228,10 @@ fn init(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "sessions", "context_token_limit", "context_token_limit INTEGER")?;
     ensure_column(conn, "sessions", "last_reported_msg_id", "last_reported_msg_id TEXT")?;
     ensure_column(conn, "sessions", "auto_report", "auto_report INTEGER DEFAULT 1")?;
+    ensure_column(conn, "sessions", "trigger_tool_event_id", "trigger_tool_event_id TEXT")?;
+    ensure_column(conn, "tool_events", "subprocess_id", "subprocess_id TEXT")?;
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_trigger_tool ON sessions(trigger_tool_event_id)", []);
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_tool_events_subprocess ON tool_events(subprocess_id)", []);
     let _ = backfill_message_tokens(conn);
     Ok(())
 }
@@ -1209,6 +1213,7 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         context_token_limit: r.get::<_, Option<i64>>(19).ok().flatten().map(|v| v as usize),
         last_reported_msg_id: r.get(20)?,
         auto_report: r.get::<_, Option<i64>>(21)?.map(|v| v != 0),
+        trigger_tool_event_id: r.get(22)?,
     })
 }
 
@@ -1216,7 +1221,7 @@ const SESSION_COLS: &str =
     "id, title, workspace_path, access_mode, project_id, status, last_message_at, created_at, updated_at, \
      is_temp, temp_code, temp_root, source_workspace, merged_seq, merged_pending, \
      parent_session_id, session_type, subagent_role, subagent_task, context_token_limit, \
-     last_reported_msg_id, auto_report";
+     last_reported_msg_id, auto_report, trigger_tool_event_id";
 
 fn attach_session_tokens(conn: &Connection, sessions: &mut [Session]) -> Result<(), String> {
     if sessions.is_empty() {
@@ -1414,6 +1419,7 @@ pub fn create_session(
         context_token_limit: None,
         last_reported_msg_id: None,
         auto_report: None,
+        trigger_tool_event_id: None,
     };
     conn.execute(
         "INSERT INTO sessions(
@@ -1431,7 +1437,7 @@ pub fn create_session(
             s.status,
             s.last_message_at,
             s.created_at,
-            s.updated_at
+            s.updated_at,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -1477,6 +1483,7 @@ pub fn create_collaborator_session(
         context_token_limit: None,
         last_reported_msg_id: None,
         auto_report: Some(auto_report),
+        trigger_tool_event_id: None,
     };
     conn.execute(
         "INSERT INTO sessions(
@@ -1514,6 +1521,7 @@ pub fn create_subprocess_session(
     workspace_path: &str,
     access_mode: Option<&str>,
     project_id: Option<&str>,
+    trigger_tool_event_id: Option<&str>,
 ) -> Result<Session, String> {
     let t = now();
     let norm_mode = access_mode.map(normalize_access_mode).unwrap_or_else(|| "confirm".into());
@@ -1543,14 +1551,15 @@ pub fn create_subprocess_session(
         context_token_limit: None,
         last_reported_msg_id: None,
         auto_report: Some(false),
+        trigger_tool_event_id: trigger_tool_event_id.map(|s| s.to_string()),
     };
     conn.execute(
         "INSERT INTO sessions(
             id, title, workspace_path, access_mode, project_id, status, 
             last_message_at, created_at, updated_at, 
             parent_session_id, session_type, subagent_role, subagent_task,
-            last_reported_msg_id, auto_report
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'subprocess',?11,?12,NULL,0)",
+            last_reported_msg_id, auto_report, trigger_tool_event_id
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'subprocess',?11,?12,NULL,0,?13)",
         params![
             s.id,
             s.title,
@@ -1564,6 +1573,7 @@ pub fn create_subprocess_session(
             s.parent_session_id,
             s.subagent_role,
             s.subagent_task,
+            s.trigger_tool_event_id,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -1579,6 +1589,7 @@ pub fn create_subagent_session(
     workspace_path: &str,
     access_mode: Option<&str>,
     project_id: Option<&str>,
+    trigger_tool_event_id: Option<&str>,
 ) -> Result<Session, String> {
     create_subprocess_session(
         conn,
@@ -1589,6 +1600,7 @@ pub fn create_subagent_session(
         workspace_path,
         access_mode,
         project_id,
+        trigger_tool_event_id,
     )
 }
 
@@ -1967,7 +1979,7 @@ fn tool_events_for(
     let _ = message_ids;
     let mut stmt = conn
         .prepare(
-            "SELECT id, message_id, tool_name, tool_call_id, params_json, result_text, status, approval_scope, created_at
+            "SELECT id, message_id, tool_name, tool_call_id, params_json, result_text, status, approval_scope, created_at, subprocess_id
              FROM tool_events WHERE message_id = ?1 ORDER BY rowid ASC",
         )
         .map_err(|e| e.to_string())?;
@@ -1984,6 +1996,7 @@ fn tool_events_for(
                 status: r.get(6)?,
                 approval_scope: r.get(7)?,
                 created_at: r.get(8)?,
+                subprocess_id: r.get(9)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -2178,8 +2191,8 @@ pub fn remove_queued(conn: &Connection, message_id: &str) -> Result<bool, String
 
 pub fn insert_tool_event(conn: &Connection, ev: &ToolEvent) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO tool_events(id, message_id, tool_name, tool_call_id, params_json, result_text, status, approval_scope, created_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        "INSERT INTO tool_events(id, message_id, tool_name, tool_call_id, params_json, result_text, status, approval_scope, created_at, subprocess_id)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         params![
             ev.id,
             ev.message_id,
@@ -2189,7 +2202,8 @@ pub fn insert_tool_event(conn: &Connection, ev: &ToolEvent) -> Result<(), String
             ev.result_text,
             ev.status,
             ev.approval_scope,
-            ev.created_at
+            ev.created_at,
+            ev.subprocess_id,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -2203,13 +2217,48 @@ pub fn update_tool_event(
     result_text: Option<&str>,
     approval_scope: Option<&str>,
 ) -> Result<(), String> {
+    update_tool_event_full(conn, id, status, result_text, approval_scope, None, None)
+}
+
+pub fn update_tool_event_full(
+    conn: &Connection,
+    id: &str,
+    status: &str,
+    result_text: Option<&str>,
+    approval_scope: Option<&str>,
+    subprocess_id: Option<&str>,
+    params_json: Option<&str>,
+) -> Result<(), String> {
     conn.execute(
         "UPDATE tool_events SET status = ?2,
             result_text = COALESCE(?3, result_text),
-            approval_scope = COALESCE(?4, approval_scope)
+            approval_scope = COALESCE(?4, approval_scope),
+            subprocess_id = COALESCE(?5, subprocess_id),
+            params_json = COALESCE(?6, params_json)
          WHERE id = ?1",
-        params![id, status, result_text, approval_scope],
+        params![id, status, result_text, approval_scope, subprocess_id, params_json],
     )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn set_tool_event_subprocess_id(
+    conn: &Connection,
+    id: &str,
+    subprocess_id: &str,
+    params_json: Option<&str>,
+) -> Result<(), String> {
+    if let Some(pj) = params_json {
+        conn.execute(
+            "UPDATE tool_events SET subprocess_id = ?2, params_json = ?3 WHERE id = ?1",
+            params![id, subprocess_id, pj],
+        )
+    } else {
+        conn.execute(
+            "UPDATE tool_events SET subprocess_id = ?2 WHERE id = ?1",
+            params![id, subprocess_id],
+        )
+    }
     .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -2266,7 +2315,7 @@ pub fn fail_open_runs(conn: &Connection, session_id: &str) -> Result<(), String>
 pub fn fail_open_tool_events(conn: &Connection, session_id: &str) -> Result<Vec<ToolEvent>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, message_id, tool_name, tool_call_id, params_json, result_text, status, approval_scope, created_at
+            "SELECT id, message_id, tool_name, tool_call_id, params_json, result_text, status, approval_scope, created_at, subprocess_id
              FROM tool_events
              WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)
                AND status IN ('running', 'pending_approval')",
@@ -2285,6 +2334,7 @@ pub fn fail_open_tool_events(conn: &Connection, session_id: &str) -> Result<Vec<
                 status: "failed".to_string(),
                 approval_scope: r.get(7)?,
                 created_at: r.get(8)?,
+                subprocess_id: r.get(9)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -2322,7 +2372,7 @@ pub fn cleanup_orphaned_running_states(conn: &Connection) -> Result<(), String> 
 pub fn get_tool_event_with_session(conn: &Connection, event_id: &str) -> Result<Option<(ToolEvent, String)>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT te.id, te.message_id, te.tool_name, te.tool_call_id, te.params_json, te.result_text, te.status, te.approval_scope, te.created_at, m.session_id
+            "SELECT te.id, te.message_id, te.tool_name, te.tool_call_id, te.params_json, te.result_text, te.status, te.approval_scope, te.created_at, m.session_id, te.subprocess_id
              FROM tool_events te
              JOIN messages m ON te.message_id = m.id
              WHERE te.id = ?1",
@@ -2341,6 +2391,7 @@ pub fn get_tool_event_with_session(conn: &Connection, event_id: &str) -> Result<
                 status: r.get(6)?,
                 approval_scope: r.get(7)?,
                 created_at: r.get(8)?,
+                subprocess_id: r.get(10)?,
             };
             let session_id: String = r.get(9)?;
             Ok((ev, session_id))

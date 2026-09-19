@@ -86,6 +86,7 @@ export {
   XCircle,
   AlertCircle,
   AlertTriangle,
+  Info,
   Loader2,
   Circle,
   Clock,

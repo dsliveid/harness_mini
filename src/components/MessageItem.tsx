@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo } from "react";
 import { ipc } from "../ipc";
-import { useStore } from "../store";
+import { useStore, inferToastType, type ToastType } from "../store";
 import type { Message, ToolEvent, TurnMetrics } from "../types";
 import { Markdown } from "./Markdown";
 import { ToolCard } from "./ToolCard";
+import { SubprocessBranchTree } from "./SubprocessBranchTree";
 import { Brain, ChevronRight, Pencil, Copy, Check, Clock, Zap } from "./Icons";
 
 function formatDuration(ms?: number | null): string {
@@ -21,6 +22,43 @@ function formatTokens(n?: number | null): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 10_000) return `${(n / 1_000).toFixed(1)}k`;
   return n.toLocaleString("zh-CN");
+}
+
+type ToolGroupItem =
+  | { type: "subprocess_group"; events: ToolEvent[]; id: string }
+  | { type: "single"; event: ToolEvent; id: string };
+
+/** 聚合连续的子进程派生工具调用，形成树状分支图群组 */
+function groupToolEvents(events: ToolEvent[]): ToolGroupItem[] {
+  const groups: ToolGroupItem[] = [];
+  let curSubprocGroup: ToolEvent[] = [];
+
+  const flushSubprocs = () => {
+    if (curSubprocGroup.length > 0) {
+      groups.push({
+        type: "subprocess_group",
+        events: curSubprocGroup,
+        id: `subproc-group-${curSubprocGroup[0].id}`,
+      });
+      curSubprocGroup = [];
+    }
+  };
+
+  for (const ev of events) {
+    const isSub = ev.toolName === "spawn_subprocess" || ev.toolName === "spawn_subagent";
+    if (isSub) {
+      curSubprocGroup.push(ev);
+    } else {
+      flushSubprocs();
+      groups.push({
+        type: "single",
+        event: ev,
+        id: ev.id,
+      });
+    }
+  }
+  flushSubprocs();
+  return groups;
 }
 
 /** 工具事件按 assistant 消息中 tool_calls 的顺序排列 */
@@ -131,9 +169,19 @@ export function MessageItem({
   if (msg.role === "tool") return null; // 工具结果已由 ToolCard 呈现
 
   if (msg.role === "system") {
+    const content = msg.content ?? "";
+    const type = inferToastType(content);
+    const systemStyles: Record<ToastType, string> = {
+      success: "border-emerald-500/40 bg-emerald-500/10 text-emerald-300",
+      error: "border-red-500/40 bg-red-500/10 text-red-300",
+      warning: "border-amber-500/40 bg-amber-500/10 text-amber-300",
+      info: "border-sky-500/40 bg-sky-500/10 text-sky-300",
+    };
+    const style = systemStyles[type] || systemStyles.info;
+
     return (
-      <div className="self-center max-w-[92%] border border-red-500/40 bg-red-500/10 rounded-xl px-4 py-3">
-        <div className="text-[13px] text-red-300 whitespace-pre-wrap leading-relaxed">{msg.content}</div>
+      <div className={`self-center max-w-[92%] border rounded-xl px-4 py-3 ${style}`}>
+        <div className="text-[13px] whitespace-pre-wrap leading-relaxed">{msg.content}</div>
       </div>
     );
   }
@@ -208,7 +256,7 @@ export function MessageItem({
   }
 
   if (msg.role === "assistant") {
-    const events = orderedEvents(msg);
+    const events = useMemo(() => orderedEvents(msg), [msg.toolEvents, msg.toolCalls]);
     const hasContent = !!msg.content;
     const hasReasoning = !!msg.reasoning;
 
@@ -228,11 +276,16 @@ export function MessageItem({
     const hasStepDuration = !isTurnEnd && stepDuration != null && stepDuration > 0;
     const showDuration = isRunningTurn || streaming || hasTurnDuration || hasStepDuration;
 
+    const toolGroups = useMemo(() => groupToolEvents(events), [events]);
+
     return (
       <div className="flex flex-col gap-2">
-        {events.map((ev) => (
-          <ToolCard key={ev.id} ev={ev} />
-        ))}
+        {toolGroups.map((g) => {
+          if (g.type === "subprocess_group") {
+            return <SubprocessBranchTree key={g.id} events={g.events} />;
+          }
+          return <ToolCard key={g.id} ev={g.event} />;
+        })}
         {hasReasoning && <ReasoningBlock text={msg.reasoning!} streaming={streaming} />}
         {hasContent && (
           <div className="group relative">

@@ -126,3 +126,9 @@ body {
   animation: pulse-dot 1s infinite;
   @apply text-inkdim;
 }
+
+@keyframes dash {
+  to {
+    stroke-dashoffset: -20;
+  }
+}
