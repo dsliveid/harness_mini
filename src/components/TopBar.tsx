@@ -20,6 +20,7 @@ import {
   Zap,
   Sparkles,
   Cpu,
+  Sliders,
 } from "./Icons";
 
 type OpenMenu = "ws" | "mode" | "model" | null;
@@ -37,6 +38,7 @@ export function TopBar() {
   const pushToast = useStore((s) => s.pushToast);
   const setDraftAccessMode = useStore((s) => s.setDraftAccessMode);
   const setDraftContextTokenLimit = useStore((s) => s.setDraftContextTokenLimit);
+  const openModelMatrixModal = useStore((s) => s.openModelMatrixModal);
 
   const [openMenu, setOpenMenu] = useState<OpenMenu>(null);
   const [openSessionContextModal, setOpenSessionContextModal] = useState(false);
@@ -399,8 +401,23 @@ export function TopBar() {
             <>
               <div className="fixed inset-0 z-40" onMouseDown={() => setOpenMenu(null)} />
               <div className="absolute right-0 top-10 z-50 w-[290px] bg-panel2 border border-edge/80 rounded-xl shadow-2xl p-1.5 max-h-[65vh] overflow-y-auto animate-in fade-in zoom-in-95 duration-100">
+                <div className="p-1 mb-1 border-b border-edge/50">
+                  <button
+                    className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-accent/10 hover:bg-accent/20 border border-accent/25 text-accent text-[12px] font-medium transition-colors cursor-pointer"
+                    onClick={() => {
+                      setOpenMenu(null);
+                      openModelMatrixModal(currentId);
+                    }}
+                  >
+                    <span className="flex items-center gap-1.5">
+                      <Sliders size={13} />
+                      <span>能力模型设置</span>
+                    </span>
+                    <span className="text-[10.5px] opacity-80">生图 · 视觉 &rarr;</span>
+                  </button>
+                </div>
                 <div className="px-2.5 py-1 text-[11px] font-medium text-inkdim flex items-center justify-between">
-                  <span>选择模型</span>
+                  <span>选择对话模型</span>
                   <span className="text-[10px] text-inkdim/70">
                     共 {groups.reduce((acc, g) => acc + g.models.length, 0)} 个
                   </span>

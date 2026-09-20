@@ -433,6 +433,34 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "properties": {}
             }),
         },
+        ToolSpec {
+            name: "generate_image",
+            description: "根据提示词生成图片。当用户要求画图、生成图片、插图、海报、图标等图像时调用。生成的图片将保存至本地并在界面展示。注意：若存在专属图像生成协作者，主进程必须优先委派协作者处理。",
+            risk: Risk::Write,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "用于生成图片的详细提示词 (Prompt)，应尽量丰富画面细节、风格、构图与光影"
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "可选：指定生图模型名称。缺省时系统自动匹配会话绑定的生图模型"
+                    },
+                    "size": {
+                        "type": "string",
+                        "description": "图片分辨率，如 1024x1024, 768x1344, 1344x768, 512x512 等，默认 1024x1024",
+                        "enum": ["1024x1024", "768x1344", "1344x768", "512x512"]
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "可选：指定生成的图片文件相对路径（如 assets/banner.png），缺省时自动保存在 generated_images 目录"
+                    }
+                },
+                "required": ["prompt"]
+            }),
+        },
         // ---------- 临时空间专用（普通会话不下发，见 agent.rs run_once 的 specs 过滤） ----------
         ToolSpec {
             name: "temp_status",
@@ -610,6 +638,7 @@ pub async fn execute(
         "dispatch_collaborator" => dispatch_collaborator_tool(args, ctx).await,
         "wait_collaborators" => wait_collaborators_tool(args, ctx).await,
         "get_collaborators" => get_collaborators_tool(ctx).await,
+        "generate_image" => generate_image_tool(args, ctx).await,
         "temp_status" => temp_status(ctx).await,
         "temp_changes" => temp_changes(args, ctx).await,
         "temp_diff" => temp_diff(args, ctx).await,
@@ -1444,30 +1473,9 @@ async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
             crate::models::Session {
                 id: id.clone(),
                 title: "未知子Agent".into(),
-                workspace_path: "".into(),
-                access_mode: None,
-                project_id: None,
-                status: "active".into(),
-                last_message_at: None,
-                created_at: "".into(),
-                updated_at: "".into(),
-                is_temp: false,
-                temp_code: None,
-                temp_root: None,
-                source_workspace: None,
-                merged_seq: None,
-                merged_pending: false,
-                total_tokens: Some(0),
-                prompt_tokens: Some(0),
-                completion_tokens: Some(0),
                 parent_session_id: Some(parent_id.clone()),
                 session_type: "subagent".into(),
-                subagent_role: None,
-                subagent_task: None,
-                context_token_limit: None,
-                last_reported_msg_id: None,
-                auto_report: None,
-                trigger_tool_event_id: None,
+                ..Default::default()
             }
         });
         let msgs = crate::store::get_messages(&db, id, None, 50).unwrap_or_default();
@@ -1737,6 +1745,108 @@ async fn get_collaborators_tool(ctx: &ToolCtx) -> Result<String, String> {
     }
 
     Ok(out)
+}
+
+async fn generate_image_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
+    let state = host.app.state::<crate::AppState>();
+    let session_id = &host.session_id;
+
+    let session = {
+        let db = state.db.lock().unwrap();
+        crate::store::get_session(&db, session_id)?
+            .ok_or_else(|| format!("会话不存在: {session_id}"))?
+    };
+
+    let settings = {
+        let db = state.db.lock().unwrap();
+        let master = state.master_key.lock().unwrap();
+        crate::store::get_settings_with_secrets(&db, &master)?
+    };
+
+    let requested_model = args.get("model").and_then(|v| v.as_str()).map(|s| s.trim()).filter(|s| !s.is_empty());
+
+    // 解析生图模型 (Provider, ModelName)：
+    // 1. 若工具参数显式指定了 model，优先在所有厂商中匹配
+    // 2. 检查会话专属生图模型 image_provider_id / image_model_id
+    // 3. 检查会话专属模型 provider_id / model_id 是否具备 image_gen 能力
+    // 4. 检查会话所属 provider 是否有其他模型具备 image_gen 能力
+    // 5. 检查全局 active_image_provider_id / active_image_model_id
+    // 6. 查找全局任意厂商中具备 image_gen 能力的模型
+    let resolved = if let Some(req_m) = requested_model {
+        settings.providers.iter().find(|p| p.models.iter().any(|m| m == req_m))
+            .map(|p| (p.clone(), req_m.to_string()))
+            .or_else(|| crate::models::resolve_active_model(&settings).map(|(p, _)| (p.clone(), req_m.to_string())))
+    } else if let (Some(pid), Some(mid)) = (&session.image_provider_id, &session.image_model_id) {
+        settings.providers.iter().find(|p| &p.id == pid)
+            .map(|p| (p.clone(), mid.clone()))
+    } else if let (Some(pid), Some(mid)) = (&session.provider_id, &session.model_id) {
+        if settings.has_capability(Some(pid), mid, "image_gen") {
+            settings.providers.iter().find(|p| &p.id == pid).map(|p| (p.clone(), mid.clone()))
+        } else if let Some(p) = settings.providers.iter().find(|p| &p.id == pid) {
+            p.models.iter().find(|m| settings.has_capability(Some(pid), m, "image_gen"))
+                .map(|m| (p.clone(), m.clone()))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+    .or_else(|| {
+        crate::models::resolve_active_image_model(&settings)
+            .map(|(p, m)| (p.clone(), m.to_string()))
+    });
+
+    let (provider, model_name) = resolved.ok_or_else(|| {
+        "生图失败：当前未配置具备【图像生成 (image_gen)】能力的可行模型。\n\n请在【设置 -> 厂商配置】中为对应厂商模型勾选「生图」能力，或为生图协作者配置指定的生图模型。".to_string()
+    })?;
+
+    let prompt = args.get("prompt").and_then(|v| v.as_str()).ok_or("缺少 prompt 参数")?;
+    let size = args.get("size").and_then(|v| v.as_str());
+    let filename_arg = args.get("filename").and_then(|v| v.as_str());
+
+    let cfg = crate::llm::LlmCfg {
+        base_url: provider.base_url.clone(),
+        api_key: provider.api_key.clone(),
+        model: model_name.clone(),
+    };
+
+    let img_bytes = crate::llm::generate_image_api(&cfg, prompt, size).await?;
+
+    let target_path = if let Some(fname) = filename_arg.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if !ctx.workspace.as_os_str().is_empty() {
+            let p = Path::new(fname);
+            if p.is_absolute() {
+                PathBuf::from(p)
+            } else {
+                ctx.workspace.join(p)
+            }
+        } else {
+            let data_dir = state.data_dir.lock().unwrap().clone().unwrap_or_else(|| state.default_data_dir.clone());
+            data_dir.join("generated_images").join(session_id).join(fname)
+        }
+    } else {
+        let data_dir = state.data_dir.lock().unwrap().clone().unwrap_or_else(|| state.default_data_dir.clone());
+        let folder = data_dir.join("generated_images").join(session_id);
+        let ext = "png";
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let rand_id = &uuid::Uuid::new_v4().to_string()[..6];
+        folder.join(format!("img_{timestamp}_{rand_id}.{ext}"))
+    };
+
+    if let Some(parent) = target_path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| format!("创建图片存储目录失败: {e}"))?;
+    }
+
+    tokio::fs::write(&target_path, &img_bytes).await.map_err(|e| format!("写入图片文件失败: {e}"))?;
+
+    let target_str = target_path.to_string_lossy().to_string();
+    let size_display = size.unwrap_or("1024x1024");
+    let kb = img_bytes.len() / 1024;
+
+    Ok(format!(
+        "🎨 图片生成成功！\n- 保存路径: `{target_str}`\n- 使用模型: `{model_name}`\n- 提示词: {prompt}\n- 分辨率: {size_display}\n- 大小: {kb} KB\n\n![{prompt}]({target_str})"
+    ))
 }
 
 #[cfg(test)]

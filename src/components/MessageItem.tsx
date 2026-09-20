@@ -5,7 +5,8 @@ import type { Message, ToolEvent, TurnMetrics } from "../types";
 import { Markdown } from "./Markdown";
 import { ToolCard } from "./ToolCard";
 import { SubprocessBranchTree } from "./SubprocessBranchTree";
-import { Brain, ChevronRight, Pencil, Copy, Check, Clock, Zap } from "./Icons";
+import { Brain, ChevronRight, Pencil, Copy, Check, Clock, Zap, File } from "./Icons";
+import { toAssetUrl, formatFileSize } from "../utils/image";
 
 function formatDuration(ms?: number | null): string {
   if (ms == null || isNaN(ms)) return "";
@@ -137,6 +138,7 @@ export function MessageItem({
 }) {
   const pushToast = useStore((s) => s.pushToast);
   const setShowTokenStatsModal = useStore((s) => s.setShowTokenStatsModal);
+  const setLightboxImage = useStore((s) => s.setLightboxImage);
   const [editing, setEditing] = useState(false);
   const [editText, setEditText] = useState("");
   const [copied, setCopied] = useState(false);
@@ -247,8 +249,60 @@ export function MessageItem({
               <Pencil size={13} />
             </button>
           )}
-          <div className="bg-panel2 border border-edge rounded-2xl px-4 py-2.5 shadow-sm text-ink">
-            <div className="whitespace-pre-wrap text-[14px] leading-relaxed">{msg.content}</div>
+          <div className="bg-panel2 border border-edge rounded-2xl px-4 py-2.5 shadow-sm text-ink max-w-full">
+            {/* 附件展示：图片网格与文件列表 */}
+            {msg.attachments && msg.attachments.length > 0 && (
+              <div className="space-y-2 mb-2">
+                {/* 图片九宫格/响应式网格 */}
+                {msg.attachments.some((a) => a.is_image) && (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                    {msg.attachments
+                      .filter((a) => a.is_image)
+                      .map((att) => (
+                        <div
+                          key={att.id}
+                          onClick={() => setLightboxImage({ src: att.path, title: att.name })}
+                          className="group/img relative rounded-xl overflow-hidden border border-edge/80 bg-panel3/40 aspect-square cursor-zoom-in shadow-2xs hover:border-accent/60 transition-all"
+                        >
+                          <img
+                            src={toAssetUrl(att.path)}
+                            alt={att.name}
+                            className="w-full h-full object-cover group-hover/img:scale-105 transition-transform duration-200"
+                          />
+                          <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/40 to-transparent p-1.5 opacity-0 group-hover/img:opacity-100 transition-opacity">
+                            <div className="text-[11px] text-white truncate font-medium">{att.name}</div>
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+                )}
+
+                {/* 通用文件列表卡片 */}
+                {msg.attachments.some((a) => !a.is_image) && (
+                  <div className="flex flex-col gap-1.5">
+                    {msg.attachments
+                      .filter((a) => !a.is_image)
+                      .map((att) => (
+                        <div
+                          key={att.id}
+                          className="flex items-center gap-2.5 px-3 py-2 rounded-xl bg-panel3/40 border border-edge text-xs shadow-2xs"
+                        >
+                          <div className="w-7 h-7 rounded-lg bg-accent/15 border border-accent/30 flex items-center justify-center text-accent shrink-0">
+                            <File size={15} />
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <div className="font-medium text-ink truncate text-[12px]" title={att.name}>
+                              {att.name}
+                            </div>
+                            <div className="text-[10px] text-inkdim">{formatFileSize(att.size)}</div>
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+                )}
+              </div>
+            )}
+            {msg.content && <div className="whitespace-pre-wrap text-[14px] leading-relaxed">{msg.content}</div>}
           </div>
         </div>
       </div>

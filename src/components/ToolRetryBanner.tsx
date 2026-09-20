@@ -47,7 +47,9 @@ export function ToolRetryBanner() {
     : isFailed
     ? "border-red-500/40 bg-panel2/95 text-red-300 shadow-[0_8px_30px_rgba(239,68,68,0.15)]"
     : isCancelled
-    ? "border-zinc-500/40 bg-panel2/95 text-zinc-300 shadow-xl"
+    ? error
+      ? "border-amber-500/40 bg-panel2/95 text-amber-300 shadow-[0_8px_30px_rgba(245,158,11,0.15)]"
+      : "border-zinc-500/40 bg-panel2/95 text-zinc-300 shadow-xl"
     : "border-purple-500/40 bg-panel2/95 text-purple-300 shadow-[0_8px_30px_rgba(168,85,247,0.15)]";
 
   return (
@@ -66,7 +68,10 @@ export function ToolRetryBanner() {
               <AlertCircle size={16} className="text-red-400 shrink-0 select-none" />
             )}
             {isCancelled && (
-              <AlertTriangle size={15} className="text-zinc-400 shrink-0 select-none" />
+              <AlertTriangle
+                size={15}
+                className={`${error ? "text-amber-400" : "text-zinc-400"} shrink-0 select-none`}
+              />
             )}
 
             <div className="text-[13px] font-semibold text-ink flex items-center gap-1.5 flex-wrap select-text">
@@ -110,19 +115,28 @@ export function ToolRetryBanner() {
             </span>
           )}
           {isCancelled && (
-            <span>当前会话已停止运行，未完成的工具自纠已取消。</span>
+            <span>
+              当前会话已停止运行，未完成的工具自纠已取消。
+              {error ? " 您可展开下方查看中止前的错误原因详情。" : ""}
+            </span>
           )}
         </div>
 
-        {/* 失败或重试时的错误详情展开 */}
-        {error && (isFailed || isRetrying) && (
+        {/* 失败、重试或中止时的错误详情展开 */}
+        {error && !isSuccess && (
           <div className="flex flex-col gap-1.5 pt-1.5 border-t border-edge/40">
             <div className="flex items-center justify-between select-none">
               <button
                 className="flex items-center gap-1 text-[11px] text-inkdim hover:text-ink transition-colors cursor-pointer"
                 onClick={() => setShowDetail(!showDetail)}
               >
-                <span>{showDetail ? "收起错误详情" : "查看失败原因详情"}</span>
+                <span>
+                  {showDetail
+                    ? "收起错误详情"
+                    : isCancelled
+                    ? "查看中止前失败原因详情"
+                    : "查看失败原因详情"}
+                </span>
                 {showDetail ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
               </button>
 

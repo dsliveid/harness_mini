@@ -58,6 +58,11 @@ export {
   Link,
   Link2,
   Scissors,
+  Paperclip,
+  Image,
+  File,
+  ZoomIn,
+  ZoomOut,
 
   // AI & 状态
   Brain,

@@ -45,6 +45,7 @@ export function useAppEvents() {
       listen<any>("collaborators:changed", (e) => s.onCollaboratorsChanged(e.payload)),
       listen<Session>("collaborator:created", (e) => s.onCollaboratorCreated(e.payload as Session)),
       listen<any>("collaborator:update", (e) => s.onCollaboratorUpdate(e.payload)),
+      listen<any>("collaborator:updated", (e) => s.onCollaboratorUpdate(e.payload)),
       listen<any>("collaborator:reported", (e) => s.onCollaboratorReported(e.payload)),
       listen<any>("subprocesses:changed", (e) => s.loadSubprocesses(e.payload?.parentId || e.payload?.parentSessionId)),
       listen<any>("subprocess:created", (e) => {

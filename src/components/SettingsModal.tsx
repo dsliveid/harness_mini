@@ -2,10 +2,17 @@ import { useEffect, useState } from "react";
 import { ipc } from "../ipc";
 import { useStore } from "../store";
 import type { Provider, Settings, ToolInfo, AgentSopInfo } from "../types";
-import { formatTokens, resolveModelContextLimit, AGENT_SOPS } from "../types";
+import { formatTokens, resolveModelContextLimit, resolveModelCapabilities, hasModelCapability, AGENT_SOPS } from "../types";
 import { DataDirSection } from "./DataDirSection";
 import { ModalActions, ModalClose } from "./ModalActions";
 import { ModelContextModal } from "./ModelContextModal";
+
+const MODEL_CAP_OPTIONS = [
+  { id: "chat", label: "对话", icon: "💬" },
+  { id: "image_gen", label: "生图", icon: "🎨" },
+  { id: "vision", label: "视觉", icon: "👁️" },
+] as const;
+
 import {
   Cpu,
   Wrench,
@@ -656,9 +663,49 @@ export function SettingsModal() {
                                     const isCustom =
                                       local.modelContextLimits?.[`${p.id}:${m}`] != null ||
                                       local.modelContextLimits?.[m] != null;
+                                    const caps = resolveModelCapabilities(local, p.id, m);
                                     return (
                                       <div key={m} className="flex items-center gap-2 bg-panel2 border border-edge rounded-lg px-2.5 py-1.5">
                                         <span className="font-mono text-[12px] flex-1 truncate">{m}</span>
+
+                                        {/* 模型能力标签微调 */}
+                                        <div className="flex items-center gap-1 shrink-0" title="模型能力标记（点击切换）">
+                                          {MODEL_CAP_OPTIONS.map((cap) => {
+                                            const active = caps.includes(cap.id);
+                                            return (
+                                              <button
+                                                key={cap.id}
+                                                type="button"
+                                                onClick={() => {
+                                                  const nextCaps = active
+                                                    ? caps.filter((c) => c !== cap.id)
+                                                    : [...caps, cap.id];
+                                                  setLocal((cur) => ({
+                                                    ...cur,
+                                                    modelCapabilities: {
+                                                      ...(cur.modelCapabilities || {}),
+                                                      [`${p.id}:${m}`]: nextCaps,
+                                                    },
+                                                  }));
+                                                }}
+                                                title={active ? `点击取消【${cap.label}】能力` : `点击赋予【${cap.label}】能力`}
+                                                className={`text-[10px] px-1.5 py-0.5 rounded transition-all cursor-pointer flex items-center gap-0.5 border ${
+                                                  active
+                                                    ? cap.id === "chat"
+                                                      ? "bg-blue-500/15 text-blue-400 border-blue-500/30 font-medium"
+                                                      : cap.id === "image_gen"
+                                                      ? "bg-purple-500/15 text-purple-400 border-purple-500/30 font-medium"
+                                                      : "bg-emerald-500/15 text-emerald-400 border-emerald-500/30 font-medium"
+                                                    : "bg-panel3/40 text-inkdim/40 border-edge/50 hover:text-inkdim hover:border-edge"
+                                                }`}
+                                              >
+                                                <span>{cap.icon}</span>
+                                                <span>{cap.label}</span>
+                                              </button>
+                                            );
+                                          })}
+                                        </div>
+
                                         <button
                                           type="button"
                                           className={`text-[11px] font-mono px-2 py-0.5 rounded-md border flex items-center gap-1 transition-all shrink-0 ${
@@ -704,6 +751,7 @@ export function SettingsModal() {
                                         </button>
                                       </div>
                                     );
+
                                   })}
                                   {p.models.length === 0 && <div className="text-[12px] text-amber-400">请至少添加一个模型</div>}
                                 </div>
@@ -767,6 +815,110 @@ export function SettingsModal() {
                       );
                     })}
                     {local.providers.length === 0 && <div className="text-inkdim">尚未添加厂商。支持任意 OpenAI 兼容接口。</div>}
+                  </div>
+                </section>
+
+                {/* 默认生图模型配置 */}
+                <section>
+                  <div className="font-medium mb-2 flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span>全局默认生图模型</span>
+                      <span className="text-[11px] font-normal text-inkdim">
+                        （当未在协作者中单独指定时使用；若留空则主进程默认不直接提供生图工具，引导调度协作者）
+                      </span>
+                    </div>
+                  </div>
+                  <div className="bg-panel border border-edge rounded-xl p-3 flex flex-col gap-2.5">
+                    <div className="flex items-center gap-3">
+                      <span className="text-inkdim text-[12px] shrink-0 w-24">执行生图模型</span>
+                      <select
+                        className={`${inputCls} flex-1`}
+                        value={
+                          local.activeImageProviderId && local.activeImageModelId
+                            ? `${local.activeImageProviderId}::${local.activeImageModelId}`
+                            : ""
+                        }
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          if (!val) {
+                            setLocal((cur) => ({
+                              ...cur,
+                              activeImageProviderId: null,
+                              activeImageModelId: null,
+                            }));
+                          } else {
+                            const [pid, mid] = val.split("::");
+                            setLocal((cur) => ({
+                              ...cur,
+                              activeImageProviderId: pid,
+                              activeImageModelId: mid,
+                            }));
+                          }
+                        }}
+                      >
+                        <option value="">未配置（推荐：由专门的图像生成协作者承接生图，避免主进程模型冲突）</option>
+                        {local.providers.map((p) => (
+                          <optgroup key={p.id} label={p.name}>
+                            {p.models.map((m) => {
+                              const isImg = hasModelCapability(local, p.id, m, "image_gen");
+                              return (
+                                <option key={`${p.id}::${m}`} value={`${p.id}::${m}`}>
+                                  {isImg ? "🎨 " : ""}{m} ({p.name}){isImg ? " [已标生图]" : ""}
+                                </option>
+                              );
+                            })}
+                          </optgroup>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <span className="text-inkdim text-[12px] shrink-0 w-24">视觉感知模型</span>
+                      <select
+                        className={`${inputCls} flex-1`}
+                        value={
+                          local.activeVisionProviderId && local.activeVisionModelId
+                            ? `${local.activeVisionProviderId}::${local.activeVisionModelId}`
+                            : ""
+                        }
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          if (!val) {
+                            setLocal((cur) => ({
+                              ...cur,
+                              activeVisionProviderId: null,
+                              activeVisionModelId: null,
+                            }));
+                          } else {
+                            const [pid, mid] = val.split("::");
+                            setLocal((cur) => ({
+                              ...cur,
+                              activeVisionProviderId: pid,
+                              activeVisionModelId: mid,
+                            }));
+                          }
+                        }}
+                      >
+                        <option value="">未配置（跟随当前对话模型或回落多模态模型）</option>
+                        {local.providers.map((p) => (
+                          <optgroup key={p.id} label={p.name}>
+                            {p.models.map((m) => {
+                              const isVis = hasModelCapability(local, p.id, m, "vision");
+                              return (
+                                <option key={`${p.id}::${m}`} value={`${p.id}::${m}`}>
+                                  {isVis ? "👁️ " : ""}{m} ({p.name}){isVis ? " [已标视觉]" : ""}
+                                </option>
+                              );
+                            })}
+                          </optgroup>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="text-[11px] text-inkdim flex items-center gap-1.5 leading-relaxed bg-panel3/40 rounded-lg px-2.5 py-1.5 border border-edge/40">
+                      <Sparkles size={13} className="text-accent shrink-0" />
+                      <span>
+                        建议：将纯生图模型（如 <code className="font-mono text-accent">doubao-seedream-5.0-lite</code>）标记为 <span className="text-purple-400 font-medium">🎨 生图</span> 能力，并在「图像生成协作者」中单独绑定。这样对话思考与生图物理隔离，杜绝 400 Bad Request。
+                      </span>
+                    </div>
                   </div>
                 </section>
 

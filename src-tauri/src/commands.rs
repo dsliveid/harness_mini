@@ -530,10 +530,12 @@ pub fn send_message(
     temp: Option<TempAlloc>,
     access_mode: Option<String>,
     context_token_limit: Option<usize>,
+    attachments: Option<Vec<crate::models::Attachment>>,
 ) -> Result<SendResult, String> {
     let text = text.trim().to_string();
-    if text.is_empty() {
-        return Err("消息不能为空".into());
+    let has_attachments = attachments.as_ref().map(|a| !a.is_empty()).unwrap_or(false);
+    if text.is_empty() && !has_attachments {
+        return Err("消息内容与附件不能同时为空".into());
     }
     // 访问模式为会话级：新对话落库时由前端传入（继承“上一条对话”或默认值）
     let access_mode = crate::models::normalize_access_mode(access_mode.as_deref().unwrap_or("confirm"));
@@ -561,7 +563,13 @@ pub fn send_message(
                         return Err(format!("临时空间路径非法: {}", p.temp));
                     }
                 }
-                let title: String = text.chars().take(24).collect();
+                let title: String = if !text.is_empty() {
+                    text.chars().take(24).collect()
+                } else if let Some(att) = attachments.as_ref().and_then(|a| a.first()) {
+                    format!("[{}] {}", if att.is_image { "图片" } else { "文件" }, att.name)
+                } else {
+                    "新对话".into()
+                };
                 let s = store::create_session(&db, &t.main_temp, Some(&proj_id), &title, &access_mode)?;
                 if let Some(lim) = context_token_limit {
                     let _ = store::set_session_context_limit(&db, &s.id, Some(lim));
@@ -582,7 +590,13 @@ pub fn send_message(
             None => {
                 // 空字符串 = 未绑定工作区（纯对话模式），草稿的工作区由前端显式传入
                 let ws = workspace_path.clone().unwrap_or_default();
-                let title: String = text.chars().take(24).collect();
+                let title: String = if !text.is_empty() {
+                    text.chars().take(24).collect()
+                } else if let Some(att) = attachments.as_ref().and_then(|a| a.first()) {
+                    format!("[{}] {}", if att.is_image { "图片" } else { "文件" }, att.name)
+                } else {
+                    "新对话".into()
+                };
                 // 工作区即项目：落库时按工作区路径关联项目；尚无该项目则自动创建一条项目数据
                 let project_id = if ws.is_empty() {
                     project_id
@@ -601,7 +615,8 @@ pub fn send_message(
             }
         };
         let active = is_run_active(&state, &sid);
-        let msg = store::new_message(&db, &sid, "user", Some(text), active)?;
+        let content_opt = if text.is_empty() { None } else { Some(text) };
+        let msg = store::new_message_with_attachments(&db, &sid, "user", content_opt, attachments, active, None)?;
         let msg_id = msg.id.clone();
         store::touch_session(&db, &sid)?;
         // 记住最近工作区（未绑定工作区的纯对话不覆盖；临时空间路径不记住）
@@ -634,6 +649,79 @@ pub fn send_message(
         agent::spawn_session_task(app.clone(), result.session_id.clone(), Some(msg_id));
     }
     Ok(result)
+}
+
+#[tauri::command]
+pub async fn save_attachment(
+    state: State<'_, crate::AppState>,
+    session_id: Option<String>,
+    name: String,
+    mime_type: String,
+    base64_data: Option<String>,
+    source_path: Option<String>,
+) -> Result<crate::models::Attachment, String> {
+    use base64::Engine;
+
+    let data_dir = state
+        .data_dir
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| state.default_data_dir.clone());
+    let sid = session_id.unwrap_or_else(|| "temp".to_string());
+    let attach_dir = data_dir.join("attachments").join(&sid);
+    tokio::fs::create_dir_all(&attach_dir)
+        .await
+        .map_err(|e| format!("创建附件目录失败: {e}"))?;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let safe_base_name = name.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
+    let target_filename = format!("{}_{}", &id[..8], safe_base_name);
+    let target_path = attach_dir.join(&target_filename);
+
+    let size = if let Some(b64) = base64_data {
+        let clean_b64 = if let Some(idx) = b64.find(',') {
+            &b64[idx + 1..]
+        } else {
+            &b64
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(clean_b64.trim())
+            .map_err(|e| format!("附件 Base64 解码失败: {e}"))?;
+        let len = bytes.len() as u64;
+        tokio::fs::write(&target_path, &bytes)
+            .await
+            .map_err(|e| format!("保存附件失败: {e}"))?;
+        len
+    } else if let Some(src) = source_path {
+        let src_p = PathBuf::from(&src);
+        if !src_p.exists() {
+            return Err(format!("源文件不存在: {src}"));
+        }
+        let meta = tokio::fs::metadata(&src_p)
+            .await
+            .map_err(|e| format!("读取源文件信息失败: {e}"))?;
+        tokio::fs::copy(&src_p, &target_path)
+            .await
+            .map_err(|e| format!("拷贝附件文件失败: {e}"))?;
+        meta.len()
+    } else {
+        return Err("缺少 base64_data 或 source_path".into());
+    };
+
+    let is_img = mime_type.starts_with("image/")
+        || ["png", "jpg", "jpeg", "webp", "gif", "bmp", "svg"]
+            .iter()
+            .any(|ext| name.to_lowercase().ends_with(ext));
+
+    Ok(crate::models::Attachment {
+        id,
+        name,
+        mime_type,
+        size,
+        path: target_path.to_string_lossy().to_string(),
+        is_image: is_img,
+    })
 }
 
 #[tauri::command]
@@ -819,6 +907,13 @@ pub fn create_collaborator(
     subpath: Option<String>,
     workspace_path: Option<String>,
     auto_report: Option<bool>,
+    provider_id: Option<String>,
+    model_id: Option<String>,
+    dispatch_rule: Option<String>,
+    image_provider_id: Option<String>,
+    image_model_id: Option<String>,
+    vision_provider_id: Option<String>,
+    vision_model_id: Option<String>,
 ) -> Result<Session, String> {
     let parent = {
         let db = state.db.lock().unwrap();
@@ -870,10 +965,17 @@ pub fn create_collaborator(
             &role,
             &title,
             &task_desc,
+            dispatch_rule.as_deref(),
             &sub_workspace,
             parent.access_mode.as_deref(),
             parent.project_id.as_deref(),
             auto_report_val,
+            provider_id.as_deref(),
+            model_id.as_deref(),
+            image_provider_id.as_deref(),
+            image_model_id.as_deref(),
+            vision_provider_id.as_deref(),
+            vision_model_id.as_deref(),
         )?
     };
 
@@ -891,7 +993,136 @@ pub fn create_collaborator(
     let _ = app.emit("subagents:changed", json!({
         "parentId": real_parent_id,
     }));
+
     Ok(collab)
+}
+
+#[tauri::command]
+pub fn update_collaborator(
+    app: AppHandle,
+    state: State<'_, crate::AppState>,
+    collaborator_id: String,
+    title: String,
+    role: String,
+    task_prompt: String,
+    dispatch_rule: Option<String>,
+    subpath: Option<String>,
+    workspace_path: Option<String>,
+    auto_report: Option<bool>,
+    provider_id: Option<String>,
+    model_id: Option<String>,
+    image_provider_id: Option<String>,
+    image_model_id: Option<String>,
+    vision_provider_id: Option<String>,
+    vision_model_id: Option<String>,
+) -> Result<Session, String> {
+    let parent_id = {
+        let db = state.db.lock().unwrap();
+        let s = store::get_session(&db, &collaborator_id)?.ok_or("协作者不存在")?;
+        if s.session_type != "collaborator" {
+            return Err("仅支持编辑协作者".into());
+        }
+        s.parent_session_id.ok_or("协作者未关联父会话")?
+    };
+
+    let parent_ws = {
+        let db = state.db.lock().unwrap();
+        store::get_session(&db, &parent_id)?
+            .map(|p| p.workspace_path)
+            .unwrap_or_default()
+    };
+
+    let sub_workspace = if let Some(ref ws) = workspace_path.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let p = std::path::Path::new(ws);
+        if p.is_absolute() {
+            ws.to_string()
+        } else {
+            std::path::Path::new(&parent_ws).join(p).to_string_lossy().to_string()
+        }
+    } else {
+        parent_ws
+    };
+
+    let auto_report_val = auto_report.unwrap_or(true);
+    let task_desc = if let Some(ref p) = subpath.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if !task_prompt.contains("（重点关注子目录：") {
+            format!("{task_prompt}\n（重点关注子目录：`{p}`）")
+        } else {
+            task_prompt
+        }
+    } else {
+        task_prompt
+    };
+
+    let collab = {
+        let db = state.db.lock().unwrap();
+        store::update_collaborator_session(
+            &db,
+            &collaborator_id,
+            &title,
+            &role,
+            &task_desc,
+            dispatch_rule.as_deref(),
+            &sub_workspace,
+            auto_report_val,
+            provider_id.as_deref(),
+            model_id.as_deref(),
+            image_provider_id.as_deref(),
+            image_model_id.as_deref(),
+            vision_provider_id.as_deref(),
+            vision_model_id.as_deref(),
+        )?
+    };
+
+    let _ = app.emit("collaborator:updated", json!({
+        "parentId": parent_id,
+        "collaborator": collab,
+    }));
+    let _ = app.emit("collaborators:changed", json!({
+        "parentId": parent_id,
+    }));
+    let _ = app.emit("subagents:changed", json!({
+        "parentId": parent_id,
+    }));
+    let _ = app.emit("session:update", &collab);
+
+    Ok(collab)
+}
+
+#[tauri::command]
+pub fn set_session_models(
+    app: AppHandle,
+    state: State<'_, crate::AppState>,
+    session_id: String,
+    provider_id: Option<String>,
+    model_id: Option<String>,
+    image_provider_id: Option<String>,
+    image_model_id: Option<String>,
+    vision_provider_id: Option<String>,
+    vision_model_id: Option<String>,
+) -> Result<Session, String> {
+    let db = state.db.lock().unwrap();
+    let updated = store::update_session_models(
+        &db,
+        &session_id,
+        provider_id.as_deref(),
+        model_id.as_deref(),
+        image_provider_id.as_deref(),
+        image_model_id.as_deref(),
+        vision_provider_id.as_deref(),
+        vision_model_id.as_deref(),
+    )?;
+    drop(db);
+
+    let _ = app.emit("session:update", &updated);
+    let _ = app.emit("sessions:changed", json!({ "updated": session_id }));
+    if updated.session_type == "collaborator" {
+        let _ = app.emit("collaborator:updated", &updated);
+        if let Some(ref pid) = updated.parent_session_id {
+            let _ = app.emit("collaborators:changed", json!({ "parentId": pid }));
+        }
+    }
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -977,6 +1208,7 @@ pub fn do_report_collaborator_increment(
         app.clone(),
         Some(parent_id.clone()),
         report_prompt,
+        None,
         None,
         None,
         None,

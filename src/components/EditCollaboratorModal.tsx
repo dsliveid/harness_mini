@@ -1,0 +1,604 @@
+import { useState, useEffect } from "react";
+import { useStore } from "../store";
+import { hasModelCapability, defaultDispatchRuleForRole } from "../types";
+import { ipc } from "../ipc";
+import { Users, X, Loader2, Sparkles, Folder, Check, ChevronDown, ChevronRight, Cpu, Sliders } from "./Icons";
+import { ModelCapabilitySelect } from "./ModelCapabilitySelect";
+
+const ROLE_PRESETS = [
+  {
+    id: "frontend",
+    name: "前端开发",
+    icon: "💻",
+    desc: "专注 UI 界面、组件实现、交互与样式设计",
+    defaultPrompt: "负责项目的前端模块开发与样式交互优化，遵循项目现有规范，确保界面流畅与体验统一。",
+    defaultDispatchRule: "当涉及 UI 界面设计、页面实现、组件重构、Vue/React 模板与 CSS 交互开发时，必须优先委派本协作者。",
+  },
+  {
+    id: "backend",
+    name: "后端开发",
+    icon: "⚙️",
+    desc: "专注服务端逻辑、API 接口、数据处理与性能",
+    defaultPrompt: "负责服务端的业务逻辑与 API 接口开发，确保数据一致性、异常健全与性能稳定。",
+    defaultDispatchRule: "当涉及服务端业务逻辑、API 接口、数据库 CRUD、后台架构开发时，必须优先委派本协作者。",
+  },
+  {
+    id: "pm",
+    name: "产品经理",
+    icon: "📋",
+    desc: "专注需求拆解、PRD方案制定与业务边界梳理",
+    defaultPrompt: "作为产品经理，负责将用户需求拆解细化为清晰的 PRD 需求文档、交互流程和功能边界，为研发团队提供清晰的产品定义与方案。",
+    defaultDispatchRule: "当涉及需求分析梳理、PRD 方案编写、功能边界与业务流程设计时，必须优先委派本协作者。",
+  },
+  {
+    id: "pmo",
+    name: "项目经理",
+    icon: "📊",
+    desc: "专注任务拆解(WBS)、里程碑排期与进度追踪",
+    defaultPrompt: "作为项目经理 (PMO)，负责拆解任务清单、统筹各协作者里程碑排期、识别关键风险并推动交付闭环。",
+    defaultDispatchRule: "当涉及任务拆解(WBS)、里程碑节点排期、进度与风险追踪时，必须优先委派本协作者。",
+  },
+  {
+    id: "vision",
+    name: "图像识别",
+    icon: "👁️",
+    desc: "专注多模态图片识别、设计稿解析与视觉分析",
+    defaultPrompt: "作为多模态视觉协作者，负责精准识别分析用户提供的图片、设计稿或运行报错截图，提取关键结构并向主进程汇报成果。",
+    defaultDispatchRule: "当用户发送图片、截图、设计稿并要求视觉识别分析时，必须优先委派本协作者。",
+  },
+  {
+    id: "image_gen",
+    name: "图像生成",
+    icon: "🎨",
+    desc: "专注图片生成、提示词润色与视觉配图制作",
+    defaultPrompt: "作为图像生成协作者，负责根据具体场景构思提示词并调用 generate_image 工具生成图片，产出素材并汇报主进程。",
+    defaultDispatchRule: "当用户提出画图、生成图片、插图、海报、Logo、图标、配图制作等视觉生成需求时，必须优先委派本协作者。",
+  },
+  {
+    id: "testing",
+    name: "测试校验",
+    icon: "🧪",
+    desc: "专注自动化测试、缺陷验证与质量检查",
+    defaultPrompt: "编写单元测试与集成验证用例，全面覆盖关键逻辑边界，防范回归缺陷。",
+    defaultDispatchRule: "当需要编写自动化测试用例、单元测试、执行回归测试与缺陷验证时，必须优先委派本协作者。",
+  },
+  {
+    id: "review",
+    name: "代码审阅",
+    icon: "🔍",
+    desc: "专注代码质量审查、Bug 定位与重构优化",
+    defaultPrompt: "深入分析代码设计与潜在隐患，提出针对性重构建议并实施精确修复。",
+    defaultDispatchRule: "当需要对代码实现进行质量审查、重构优化与架构防劣化时，必须优先委派本协作者。",
+  },
+  {
+    id: "fullstack",
+    name: "全栈开发",
+    icon: "⚡",
+    desc: "端到端实现全功能模块与前后端串联",
+    defaultPrompt: "端到端打通前后端业务链路，实现高内聚低耦合的完整功能模块。",
+    defaultDispatchRule: "当涉及端到端打通前后端完整功能链路开发时，必须优先委派本协作者。",
+  },
+  {
+    id: "custom",
+    name: "自定义",
+    icon: "🤝",
+    desc: "自由定制专属职责定位与执行模型",
+    defaultPrompt: "",
+    defaultDispatchRule: "当用户任务属于本协作者专业领域范围时，必须优先委派本协作者处理。",
+  },
+];
+
+export function EditCollaboratorModal() {
+  const show = useStore((s) => s.showEditCollaboratorModal);
+  const setShow = useStore((s) => s.setShowEditCollaboratorModal);
+  const editingId = useStore((s) => s.editingCollaboratorId);
+  const setEditingId = useStore((s) => s.setEditingCollaboratorId);
+  const settings = useStore((s) => s.settings);
+  const allSessions = useStore((s) => s.sessions);
+  const allCollabs = useStore((s) => s.collaborators);
+  const updateCollaborator = useStore((s) => s.updateCollaborator);
+  const pushToast = useStore((s) => s.pushToast);
+
+  const [loading, setLoading] = useState(false);
+  const [selectedRole, setSelectedRole] = useState("frontend");
+  const [title, setTitle] = useState("");
+  const [taskPrompt, setTaskPrompt] = useState("");
+  const [dispatchRule, setDispatchRule] = useState("");
+  const [workspacePath, setWorkspacePath] = useState("");
+  const [subpath, setSubpath] = useState("");
+  const [autoReport, setAutoReport] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [selectedModelKey, setSelectedModelKey] = useState<string>(""); // "providerId::modelId" (chat)
+  const [selectedImageModelKey, setSelectedImageModelKey] = useState<string>(""); // "providerId::modelId" (image_gen)
+  const [selectedVisionModelKey, setSelectedVisionModelKey] = useState<string>(""); // "providerId::modelId" (vision)
+  const [showAdvanced, setShowAdvanced] = useState(false);
+
+  const providers = settings?.providers ?? [];
+
+  // 当弹窗打开且有 editingId 时，拉取并回显会话现有字段
+  useEffect(() => {
+    if (!show || !editingId) return;
+
+    const state = useStore.getState();
+    let target = allSessions.find((s) => s.id === editingId);
+    if (!target) {
+      for (const list of Object.values(allCollabs)) {
+        const found = list.find((s) => s.id === editingId);
+        if (found) {
+          target = found;
+          break;
+        }
+      }
+    }
+    if (!target) {
+      for (const list of Object.values(state.subprocesses)) {
+        const found = list.find((s) => s.id === editingId);
+        if (found) {
+          target = found;
+          break;
+        }
+      }
+    }
+    if (!target) {
+      for (const list of Object.values(state.subagents)) {
+        const found = list.find((s) => s.id === editingId);
+        if (found) {
+          target = found;
+          break;
+        }
+      }
+    }
+
+    const fillData = (s: any) => {
+      const role = s.subagentRole || s.subagent_role || "custom";
+      setSelectedRole(role);
+      setTitle(s.title || "协作者");
+      setTaskPrompt(s.subagentTask || s.subagent_task || "");
+      setDispatchRule(s.dispatchRule || s.dispatch_rule || defaultDispatchRuleForRole(role));
+      setWorkspacePath(s.workspacePath || s.workspace_path || "");
+      setAutoReport(s.autoReport ?? s.auto_report ?? true);
+
+      const pid = s.providerId || s.provider_id;
+      const mid = s.modelId || s.model_id;
+      if (pid && mid) {
+        setSelectedModelKey(`${pid}::${mid}`);
+      } else {
+        setSelectedModelKey("");
+      }
+
+      const imgPid = s.imageProviderId || s.image_provider_id;
+      const imgMid = s.imageModelId || s.image_model_id;
+      if (imgPid && imgMid) {
+        setSelectedImageModelKey(`${imgPid}::${imgMid}`);
+      } else {
+        setSelectedImageModelKey("");
+      }
+
+      const visPid = s.visionProviderId || s.vision_provider_id;
+      const visMid = s.visionModelId || s.vision_model_id;
+      if (visPid && visMid) {
+        setSelectedVisionModelKey(`${visPid}::${visMid}`);
+      } else {
+        setSelectedVisionModelKey("");
+      }
+    };
+
+    if (target) {
+      fillData(target);
+    } else if (state.currentId) {
+      setLoading(true);
+      ipc
+        .listCollaborators(state.currentId)
+        .then((freshList) => {
+          const found = freshList.find((x) => x.id === editingId);
+          if (found) fillData(found);
+        })
+        .catch((err: unknown) => pushToast(String(err)))
+        .finally(() => setLoading(false));
+    }
+  }, [show, editingId, allSessions, allCollabs, pushToast]);
+
+  if (!show || !editingId) return null;
+
+  const handleRoleSelect = (roleId: string) => {
+    setSelectedRole(roleId);
+    const preset = ROLE_PRESETS.find((r) => r.id === roleId);
+    if (preset) {
+      if (!title || ROLE_PRESETS.some((p) => title.startsWith(p.name))) {
+        setTitle(`${preset.name}协作者`);
+      }
+      if (preset.defaultDispatchRule && (!dispatchRule || ROLE_PRESETS.some((p) => p.defaultDispatchRule === dispatchRule))) {
+        setDispatchRule(preset.defaultDispatchRule);
+      }
+      if (preset.defaultPrompt && (!taskPrompt || ROLE_PRESETS.some((p) => p.defaultPrompt === taskPrompt))) {
+        setTaskPrompt(preset.defaultPrompt);
+      }
+    }
+
+    // 若切换到生图角色且尚未选择生图模型，自动推荐
+    if (roleId === "image_gen" && !selectedImageModelKey) {
+      for (const p of providers) {
+        const found = p.models.find(
+          (m) => hasModelCapability(settings, p.id, m, "image_gen")
+        );
+        if (found) {
+          setSelectedImageModelKey(`${p.id}::${found}`);
+          break;
+        }
+      }
+    } else if (roleId === "vision" && !selectedVisionModelKey) {
+      for (const p of providers) {
+        const found = p.models.find(
+          (m) => hasModelCapability(settings, p.id, m, "vision")
+        );
+        if (found) {
+          setSelectedVisionModelKey(`${p.id}::${found}`);
+          break;
+        }
+      }
+    }
+  };
+
+  const handleSave = async () => {
+    if (!taskPrompt.trim() || submitting) return;
+    setSubmitting(true);
+    try {
+      let providerId: string | null = null;
+      let modelId: string | null = null;
+      if (selectedModelKey) {
+        const parts = selectedModelKey.split("::");
+        if (parts.length === 2) {
+          providerId = parts[0];
+          modelId = parts[1];
+        }
+      }
+
+      let imageProviderId: string | null = null;
+      let imageModelId: string | null = null;
+      if (selectedImageModelKey) {
+        const parts = selectedImageModelKey.split("::");
+        if (parts.length === 2) {
+          imageProviderId = parts[0];
+          imageModelId = parts[1];
+        }
+      }
+
+      let visionProviderId: string | null = null;
+      let visionModelId: string | null = null;
+      if (selectedVisionModelKey) {
+        const parts = selectedVisionModelKey.split("::");
+        if (parts.length === 2) {
+          visionProviderId = parts[0];
+          visionModelId = parts[1];
+        }
+      }
+
+      await updateCollaborator({
+        collaboratorId: editingId,
+        role: selectedRole,
+        title: title.trim() || "协作者",
+        taskPrompt: taskPrompt.trim(),
+        dispatchRule: dispatchRule.trim() || null,
+        subpath: subpath.trim() || null,
+        workspacePath: workspacePath.trim() || null,
+        autoReport,
+        providerId,
+        modelId,
+        imageProviderId,
+        imageModelId,
+        visionProviderId,
+        visionModelId,
+      });
+
+      pushToast("协作者配置已更新并同步落库");
+      setShow(false);
+      setEditingId(null);
+    } catch (e) {
+      pushToast(`更新失败: ${String(e)}`);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const activeModelName = settings?.activeModelId || settings?.activeModel || "全局激活模型";
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4 animate-in fade-in duration-150">
+      <div className="bg-panel border border-edge rounded-2xl w-full max-w-[540px] shadow-2xl flex flex-col max-h-[85vh] overflow-hidden">
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-3.5 border-b border-edge bg-panel2/40">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-xl bg-accent/15 border border-accent/30 flex items-center justify-center text-accent">
+              <Users size={17} />
+            </div>
+            <div>
+              <div className="font-semibold text-ink text-[14px]">编辑协作者配置</div>
+              <div className="text-[11px] text-inkdim">修改角色职责、驱动模型、生图槽位及主进程调度规则</div>
+            </div>
+          </div>
+          <button
+            onClick={() => {
+              setShow(false);
+              setEditingId(null);
+            }}
+            className="w-7 h-7 rounded-lg hover:bg-panel2 flex items-center justify-center text-inkdim hover:text-ink transition-colors cursor-pointer"
+          >
+            <X size={16} />
+          </button>
+        </div>
+
+        {/* Content */}
+        {loading ? (
+          <div className="flex-1 p-8 flex flex-col items-center justify-center text-inkdim">
+            <Loader2 size={24} className="animate-spin text-accent mb-2" />
+            <span className="text-[12px]">加载协作者详情中…</span>
+          </div>
+        ) : (
+          <div className="flex-1 overflow-y-auto p-4 space-y-3">
+            {/* Role selection - Compact pills grid */}
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="text-[12px] font-medium text-ink">角色定位</label>
+                <span className="text-[11px] text-inkdim">
+                  {ROLE_PRESETS.find((r) => r.id === selectedRole)?.desc}
+                </span>
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                {ROLE_PRESETS.map((preset) => {
+                  const isSelected = selectedRole === preset.id;
+                  return (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      title={preset.desc}
+                      onClick={() => handleRoleSelect(preset.id)}
+                      className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-left transition-all cursor-pointer ${
+                        isSelected
+                          ? "bg-accent/15 border-accent text-accent font-medium shadow-xs ring-1 ring-accent/30"
+                          : "bg-panel2/40 hover:bg-panel2 border-edge text-inkdim hover:text-ink"
+                      }`}
+                    >
+                      <span className="text-sm shrink-0">{preset.icon}</span>
+                      <span className="text-[12px] truncate">{preset.name}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Collaborator Title */}
+            <div>
+              <label className="block text-[12px] font-medium text-ink mb-1">协作者名称</label>
+              <input
+                type="text"
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder="例如：图像生成协作者"
+                className="w-full px-3 py-1.5 rounded-lg bg-panel2/60 border border-edge text-ink text-[12px] focus:outline-none focus:border-accent"
+              />
+            </div>
+
+            {/* 全能力模型独立配置矩阵 */}
+            <div className="bg-panel2/30 border border-edge/80 rounded-xl p-3 space-y-2.5">
+              <div className="flex items-center justify-between border-b border-edge/40 pb-2">
+                <div className="flex items-center gap-1.5 text-[12px] font-semibold text-ink">
+                  <Sliders size={13} className="text-accent" />
+                  <span>各能力执行模型配置</span>
+                </div>
+                <span className="text-[10.5px] text-inkdim">
+                  不支持的能力在下拉选项中已置灰禁用
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
+                {/* 1. 对话思考 */}
+                <div className="bg-panel2/60 border border-blue-500/20 rounded-lg p-2.5 flex flex-col justify-between gap-1.5">
+                  <div>
+                    <div className="flex items-center justify-between text-[11.5px] font-medium text-blue-400">
+                      <span className="flex items-center gap-1">
+                        <span>💬</span>
+                        <span>对话思考</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-inkdim">chat</span>
+                    </div>
+                    <div className="text-[10.5px] text-inkdim leading-tight mt-0.5 mb-1.5">
+                      负责日常规划、逻辑推理与对话
+                    </div>
+                  </div>
+                  <ModelCapabilitySelect
+                    capability="chat"
+                    value={selectedModelKey}
+                    onChange={setSelectedModelKey}
+                    providers={providers}
+                    settings={settings}
+                    allowInherit={true}
+                    inheritLabel={`继承主进程 (${activeModelName})`}
+                  />
+                </div>
+
+                {/* 2. 图像生成 */}
+                <div className="bg-panel2/60 border border-pink-500/20 rounded-lg p-2.5 flex flex-col justify-between gap-1.5">
+                  <div>
+                    <div className="flex items-center justify-between text-[11.5px] font-medium text-pink-400">
+                      <span className="flex items-center gap-1">
+                        <span>🎨</span>
+                        <span>图像生成</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-inkdim">image_gen</span>
+                    </div>
+                    <div className="text-[10.5px] text-inkdim leading-tight mt-0.5 mb-1.5">
+                      调用生图工具 generate_image 时执行
+                    </div>
+                  </div>
+                  <ModelCapabilitySelect
+                    capability="image_gen"
+                    value={selectedImageModelKey}
+                    onChange={setSelectedImageModelKey}
+                    providers={providers}
+                    settings={settings}
+                    allowInherit={true}
+                    inheritLabel="未指定 (跟随全局或同厂商)"
+                  />
+                </div>
+
+                {/* 3. 视觉感知 */}
+                <div className="bg-panel2/60 border border-purple-500/20 rounded-lg p-2.5 flex flex-col justify-between gap-1.5">
+                  <div>
+                    <div className="flex items-center justify-between text-[11.5px] font-medium text-purple-400">
+                      <span className="flex items-center gap-1">
+                        <span>👁️</span>
+                        <span>视觉感知</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-inkdim">vision</span>
+                    </div>
+                    <div className="text-[10.5px] text-inkdim leading-tight mt-0.5 mb-1.5">
+                      处理图片附件与多模态解析
+                    </div>
+                  </div>
+                  <ModelCapabilitySelect
+                    capability="vision"
+                    value={selectedVisionModelKey}
+                    onChange={setSelectedVisionModelKey}
+                    providers={providers}
+                    settings={settings}
+                    allowInherit={true}
+                    inheritLabel="未指定 (回落主对话模型)"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* 主进程调度触发规则 */}
+            <div>
+              <label className="block text-[12px] font-medium text-ink mb-1 flex items-center justify-between">
+                <span className="flex items-center gap-1">
+                  <Sparkles size={12} className="text-accent" />
+                  <span>主进程调度触发规则 (注入主进程)</span>
+                  <span className="text-rose-400">*</span>
+                </span>
+                <span className="text-[11px] text-inkdim font-normal">主进程据此意图优先委派</span>
+              </label>
+              <textarea
+                rows={2}
+                value={dispatchRule}
+                onChange={(e) => setDispatchRule(e.target.value)}
+                placeholder="定义主进程在什么场景下必须把任务优先委派给本协作者..."
+                className="w-full px-3 py-1.5 rounded-lg bg-panel2/60 border border-edge text-ink text-[12px] focus:outline-none focus:border-accent resize-none leading-relaxed"
+              />
+            </div>
+
+            {/* Role prompt / description */}
+            <div>
+              <label className="block text-[12px] font-medium text-ink mb-1 flex items-center justify-between">
+                <span>
+                  专业职责与定位描述 <span className="text-rose-400">*</span>
+                </span>
+                <span className="text-[11px] text-inkdim font-normal">协作者自身的 System Prompt 职责</span>
+              </label>
+              <textarea
+                rows={2}
+                value={taskPrompt}
+                onChange={(e) => setTaskPrompt(e.target.value)}
+                placeholder="详细描述该协作者的职责定位、技能要求或输出标准..."
+                className="w-full px-3 py-1.5 rounded-lg bg-panel2/60 border border-edge text-ink text-[12px] focus:outline-none focus:border-accent resize-none leading-relaxed"
+              />
+            </div>
+
+            {/* Auto Report Checkbox */}
+            <div>
+              <label className="flex items-center gap-2 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={autoReport}
+                  onChange={(e) => setAutoReport(e.target.checked)}
+                  className="sr-only"
+                />
+                <div
+                  className={`w-3.5 h-3.5 rounded border flex items-center justify-center transition-colors ${
+                    autoReport ? "bg-accent border-accent text-white" : "border-edge bg-panel2"
+                  }`}
+                >
+                  {autoReport && <Check size={10} strokeWidth={3} />}
+                </div>
+                <div className="text-[11.5px] text-ink">
+                  <span>执行完成自动汇总汇报主任务</span>
+                  <span className="text-inkdim ml-1 text-[11px]">（完成时自动唤醒主进程衔接后续）</span>
+                </div>
+              </label>
+            </div>
+
+            {/* Collapsible Advanced Section */}
+            <div className="border border-edge/60 rounded-xl overflow-hidden bg-panel2/20">
+              <button
+                type="button"
+                onClick={() => setShowAdvanced(!showAdvanced)}
+                className="w-full px-3 py-2 flex items-center justify-between text-inkdim hover:text-ink text-[11.5px] font-medium transition-colors cursor-pointer"
+              >
+                <span className="flex items-center gap-1.5">
+                  <Folder size={12} />
+                  <span>高级物理目录配置 (工作区 / 子目录)</span>
+                </span>
+                {showAdvanced ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+              </button>
+              {showAdvanced && (
+                <div className="p-3 pt-0 border-t border-edge/40 space-y-2 text-[11.5px]">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2">
+                    <div>
+                      <label className="block text-ink mb-1 text-[11px]">工作区根目录</label>
+                      <input
+                        type="text"
+                        value={workspacePath}
+                        onChange={(e) => setWorkspacePath(e.target.value)}
+                        placeholder="继承当前项目根目录"
+                        className="w-full px-2.5 py-1 rounded bg-panel2/60 border border-edge text-ink text-[11px] font-mono focus:outline-none focus:border-accent"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-ink mb-1 text-[11px]">重点关注子目录</label>
+                      <input
+                        type="text"
+                        value={subpath}
+                        onChange={(e) => setSubpath(e.target.value)}
+                        placeholder="例如：src/components 或 docs"
+                        className="w-full px-2.5 py-1 rounded bg-panel2/60 border border-edge text-ink text-[11px] font-mono focus:outline-none focus:border-accent"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Footer */}
+        <div className="px-5 py-3 border-t border-edge bg-panel2/30 flex items-center justify-end gap-2.5">
+          <button
+            type="button"
+            onClick={() => {
+              setShow(false);
+              setEditingId(null);
+            }}
+            className="px-3.5 py-1.5 rounded-lg border border-edge text-inkdim hover:text-ink hover:bg-panel2 text-[12px] transition-colors cursor-pointer"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            disabled={!taskPrompt.trim() || submitting || loading}
+            onClick={handleSave}
+            className="px-4 py-1.5 rounded-lg bg-accent hover:bg-blue-500 disabled:opacity-50 text-white text-[12px] font-medium transition-colors shadow-sm flex items-center gap-1.5 cursor-pointer"
+          >
+            {submitting ? (
+              <>
+                <Loader2 size={13} className="animate-spin" />
+                <span>保存中…</span>
+              </>
+            ) : (
+              <span>保存修改</span>
+            )}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

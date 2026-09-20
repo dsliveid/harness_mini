@@ -37,6 +37,11 @@ export interface Settings {
   commandTimeoutSecs: number;
   contextTokenLimit: number;
   modelContextLimits?: Record<string, number>;
+  modelCapabilities?: Record<string, string[]>;
+  activeImageProviderId?: string | null;
+  activeImageModelId?: string | null;
+  activeVisionProviderId?: string | null;
+  activeVisionModelId?: string | null;
   lastWorkspacePath?: string | null;
   disabledTools?: string[];
   disabledSops?: string[];
@@ -117,6 +122,15 @@ export interface ProjectLink {
   createdAt: string;
 }
 
+export interface Attachment {
+  id: string;
+  name: string;
+  mime_type: string;
+  size: number;
+  path: string;
+  is_image: boolean;
+}
+
 export interface Session {
   id: string;
   title: string;
@@ -152,6 +166,27 @@ export interface Session {
   autoReport?: boolean | null;
   /** 触发派生该子任务的工具事件 ID */
   triggerToolEventId?: string | null;
+  /** 专属模型厂商 ID */
+  providerId?: string | null;
+  provider_id?: string | null;
+  /** 专属模型 ID */
+  modelId?: string | null;
+  model_id?: string | null;
+  /** 主进程调度触发规则 */
+  dispatchRule?: string | null;
+  dispatch_rule?: string | null;
+  /** 专属生图模型厂商 ID */
+  imageProviderId?: string | null;
+  image_provider_id?: string | null;
+  /** 专属生图模型 ID */
+  imageModelId?: string | null;
+  image_model_id?: string | null;
+  /** 专属视觉模型厂商 ID */
+  visionProviderId?: string | null;
+  vision_provider_id?: string | null;
+  /** 专属视觉模型 ID */
+  visionModelId?: string | null;
+  vision_model_id?: string | null;
 }
 
 export interface SubagentCreateInput {
@@ -167,9 +202,43 @@ export interface CollaboratorCreateInput {
   role: string;
   title?: string;
   taskPrompt: string;
+  dispatchRule?: string | null;
   subpath?: string;
   workspacePath?: string;
   autoReport?: boolean;
+  providerId?: string | null;
+  modelId?: string | null;
+  imageProviderId?: string | null;
+  imageModelId?: string | null;
+  visionProviderId?: string | null;
+  visionModelId?: string | null;
+}
+
+export interface CollaboratorUpdateInput {
+  collaboratorId: string;
+  title: string;
+  role: string;
+  taskPrompt: string;
+  dispatchRule?: string | null;
+  subpath?: string | null;
+  workspacePath?: string | null;
+  autoReport?: boolean;
+  providerId?: string | null;
+  modelId?: string | null;
+  imageProviderId?: string | null;
+  imageModelId?: string | null;
+  visionProviderId?: string | null;
+  visionModelId?: string | null;
+}
+
+export interface SessionModelsUpdateInput {
+  sessionId: string;
+  providerId?: string | null;
+  modelId?: string | null;
+  imageProviderId?: string | null;
+  imageModelId?: string | null;
+  visionProviderId?: string | null;
+  visionModelId?: string | null;
 }
 
 export interface SessionCreateInput {
@@ -305,6 +374,7 @@ export interface Message {
   toolCalls?: any[] | null;
   toolCallId?: string | null;
   queued: boolean;
+  attachments?: Attachment[] | null;
   usage?: any;
   createdAt: string;
   toolEvents: ToolEvent[];
@@ -650,6 +720,175 @@ export function resolveModelContextLimit(
   }
   return settings.contextTokenLimit || 64_000;
 }
+
+/** 根据模型名称启发式推断默认能力（chat 对话、image_gen 生图、vision 视觉） */
+export function inferDefaultModelCapabilities(model: string): string[] {
+  const lower = model.toLowerCase();
+  if (lower.includes("embedding") || lower.includes("rerank")) {
+    return [];
+  }
+  const isImg =
+    lower.includes("seedream") ||
+    lower.includes("seedance") ||
+    lower.includes("seed-edit") ||
+    lower.includes("cogview") ||
+    lower.includes("dall-e") ||
+    lower.includes("dalle") ||
+    lower.includes("flux") ||
+    lower.includes("sdxl") ||
+    lower.includes("stable-diffusion") ||
+    lower.includes("wanx") ||
+    lower.includes("kolors") ||
+    lower.includes("t2i") ||
+    lower.includes("imagen") ||
+    lower.includes("image-gen") ||
+    lower.includes("image_gen");
+  if (isImg) {
+    return ["image_gen"];
+  }
+  const isVis =
+    lower.includes("vl") ||
+    lower.includes("vision") ||
+    lower.includes("4v") ||
+    lower.includes("omni") ||
+    lower.includes("gpt-4o") ||
+    lower.includes("claude-3") ||
+    lower.includes("gemini");
+  if (isVis) {
+    return ["chat", "vision"];
+  }
+  return ["chat"];
+}
+
+/**
+ * 获取指定模型的能力列表：
+ * 1. 优先根据 `providerId:model` 查找用户显式配置
+ * 2. 其次根据 `model` 查找全局模型配置
+ * 3. 缺省时通过模型名进行平滑推断
+ */
+export function resolveModelCapabilities(
+  settings: Settings,
+  providerId?: string | null,
+  model?: string | null
+): string[] {
+  if (!model) return ["chat"];
+  const caps = settings.modelCapabilities || {};
+  if (providerId && caps[`${providerId}:${model}`] != null) {
+    return caps[`${providerId}:${model}`];
+  }
+  if (caps[model] != null) {
+    return caps[model];
+  }
+  return inferDefaultModelCapabilities(model);
+}
+
+/** 检查指定模型是否具备某项特定能力 */
+export function hasModelCapability(
+  settings: Settings,
+  providerId: string | null | undefined,
+  model: string | null | undefined,
+  cap: string
+): boolean {
+  const list = resolveModelCapabilities(settings, providerId, model);
+  return list.includes(cap);
+}
+
+export type ModelCapability = "chat" | "image_gen" | "vision";
+
+export interface ModelCapabilityMeta {
+  id: ModelCapability;
+  label: string;
+  icon: string;
+  description: string;
+  badgeClass: string;
+}
+
+export const MODEL_CAPABILITY_METAS: Record<ModelCapability, ModelCapabilityMeta> = {
+  chat: {
+    id: "chat",
+    label: "对话思考",
+    icon: "💬",
+    description: "驱动日常对话、任务规划、代码编写与执行逻辑推演",
+    badgeClass: "bg-blue-500/15 text-blue-400 border-blue-500/30",
+  },
+  image_gen: {
+    id: "image_gen",
+    label: "图像生成",
+    icon: "🎨",
+    description: "驱动生图工具 (generate_image)，支持海报/图标/概念图生成",
+    badgeClass: "bg-pink-500/15 text-pink-400 border-pink-500/30",
+  },
+  vision: {
+    id: "vision",
+    label: "视觉感知",
+    icon: "👁️",
+    description: "驱动图片多模态理解与视觉识别，支持分析用户截图与设计稿",
+    badgeClass: "bg-purple-500/15 text-purple-400 border-purple-500/30",
+  },
+};
+
+/** 解析当前全局生效的生图厂商 + 模型 */
+export function resolveActiveImageModel(settings: Settings): { provider: Provider; model: string } | null {
+  if (settings.activeImageProviderId && settings.activeImageModelId) {
+    const p = settings.providers.find((item) => item.id === settings.activeImageProviderId);
+    if (p && p.models.includes(settings.activeImageModelId)) {
+      return { provider: p, model: settings.activeImageModelId };
+    }
+  }
+  for (const p of settings.providers) {
+    for (const m of p.models) {
+      if (hasModelCapability(settings, p.id, m, "image_gen")) {
+        return { provider: p, model: m };
+      }
+    }
+  }
+  return null;
+}
+
+/** 解析当前全局生效的视觉厂商 + 模型 */
+export function resolveActiveVisionModel(settings: Settings): { provider: Provider; model: string } | null {
+  if (settings.activeVisionProviderId && settings.activeVisionModelId) {
+    const p = settings.providers.find((item) => item.id === settings.activeVisionProviderId);
+    if (p && p.models.includes(settings.activeVisionModelId)) {
+      return { provider: p, model: settings.activeVisionModelId };
+    }
+  }
+  for (const p of settings.providers) {
+    for (const m of p.models) {
+      if (hasModelCapability(settings, p.id, m, "vision")) {
+        return { provider: p, model: m };
+      }
+    }
+  }
+  return resolveActiveModel(settings);
+}
+
+/** 预设角色的默认调度触发规则（主进程 System Prompt 注入使用） */
+export function defaultDispatchRuleForRole(role: string): string {
+  switch (role) {
+    case "image_gen":
+      return "当用户提出画图、生成图片、插图、海报、Logo、图标、配图制作等视觉生成需求时，必须优先委派本协作者。";
+    case "frontend":
+      return "当涉及 UI 界面设计、页面实现、组件重构、Vue/React 模板与 CSS 交互开发时，必须优先委派本协作者。";
+    case "backend":
+      return "当涉及服务端业务逻辑、API 接口、数据库 CRUD、后台架构开发时，必须优先委派本协作者。";
+    case "pm":
+      return "当涉及需求分析梳理、PRD 方案编写、功能边界与业务流程设计时，必须优先委派本协作者。";
+    case "pmo":
+      return "当涉及任务拆解(WBS)、里程碑节点排期、进度与风险追踪时，必须优先委派本协作者。";
+    case "vision":
+      return "当用户发送图片、截图、设计稿并要求视觉识别分析时，必须优先委派本协作者。";
+    case "testing":
+      return "当需要编写自动化测试用例、单元测试、执行回归测试与缺陷验证时，必须优先委派本协作者。";
+    case "review":
+      return "当需要对代码实现进行质量审查、重构优化与架构防劣化时，必须优先委派本协作者。";
+    case "fullstack":
+      return "当涉及端到端打通前后端完整功能链路开发时，必须优先委派本协作者。";
+    default:
+      return "当用户任务属于本协作者专业领域范围时，必须优先委派本协作者处理。";
+  }
+}
+
 
 /** 将 token 数量格式化为易读的文本（如 56k, 180k, 1.2m） */
 export function formatTokens(tokens: number): string {

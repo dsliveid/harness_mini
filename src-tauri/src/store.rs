@@ -229,6 +229,14 @@ fn init(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "sessions", "last_reported_msg_id", "last_reported_msg_id TEXT")?;
     ensure_column(conn, "sessions", "auto_report", "auto_report INTEGER DEFAULT 1")?;
     ensure_column(conn, "sessions", "trigger_tool_event_id", "trigger_tool_event_id TEXT")?;
+    ensure_column(conn, "sessions", "provider_id", "provider_id TEXT")?;
+    ensure_column(conn, "sessions", "model_id", "model_id TEXT")?;
+    ensure_column(conn, "sessions", "dispatch_rule", "dispatch_rule TEXT")?;
+    ensure_column(conn, "sessions", "image_provider_id", "image_provider_id TEXT")?;
+    ensure_column(conn, "sessions", "image_model_id", "image_model_id TEXT")?;
+    ensure_column(conn, "sessions", "vision_provider_id", "vision_provider_id TEXT")?;
+    ensure_column(conn, "sessions", "vision_model_id", "vision_model_id TEXT")?;
+    ensure_column(conn, "messages", "attachments_json", "attachments_json TEXT")?;
     ensure_column(conn, "tool_events", "subprocess_id", "subprocess_id TEXT")?;
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_trigger_tool ON sessions(trigger_tool_event_id)", []);
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_tool_events_subprocess ON tool_events(subprocess_id)", []);
@@ -1214,6 +1222,13 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         last_reported_msg_id: r.get(20)?,
         auto_report: r.get::<_, Option<i64>>(21)?.map(|v| v != 0),
         trigger_tool_event_id: r.get(22)?,
+        provider_id: r.get(23)?,
+        model_id: r.get(24)?,
+        dispatch_rule: r.get(25)?,
+        image_provider_id: r.get(26)?,
+        image_model_id: r.get(27)?,
+        vision_provider_id: r.get(28)?,
+        vision_model_id: r.get(29)?,
     })
 }
 
@@ -1221,7 +1236,8 @@ const SESSION_COLS: &str =
     "id, title, workspace_path, access_mode, project_id, status, last_message_at, created_at, updated_at, \
      is_temp, temp_code, temp_root, source_workspace, merged_seq, merged_pending, \
      parent_session_id, session_type, subagent_role, subagent_task, context_token_limit, \
-     last_reported_msg_id, auto_report, trigger_tool_event_id";
+     last_reported_msg_id, auto_report, trigger_tool_event_id, provider_id, model_id, \
+     dispatch_rule, image_provider_id, image_model_id, vision_provider_id, vision_model_id";
 
 fn attach_session_tokens(conn: &Connection, sessions: &mut [Session]) -> Result<(), String> {
     if sessions.is_empty() {
@@ -1420,6 +1436,13 @@ pub fn create_session(
         last_reported_msg_id: None,
         auto_report: None,
         trigger_tool_event_id: None,
+        provider_id: None,
+        model_id: None,
+        dispatch_rule: None,
+        image_provider_id: None,
+        image_model_id: None,
+        vision_provider_id: None,
+        vision_model_id: None,
     };
     conn.execute(
         "INSERT INTO sessions(
@@ -1450,10 +1473,17 @@ pub fn create_collaborator_session(
     role: &str,
     title: &str,
     task: &str,
+    dispatch_rule: Option<&str>,
     workspace_path: &str,
     access_mode: Option<&str>,
     project_id: Option<&str>,
     auto_report: bool,
+    provider_id: Option<&str>,
+    model_id: Option<&str>,
+    image_provider_id: Option<&str>,
+    image_model_id: Option<&str>,
+    vision_provider_id: Option<&str>,
+    vision_model_id: Option<&str>,
 ) -> Result<Session, String> {
     let t = now();
     let norm_mode = access_mode.map(normalize_access_mode).unwrap_or_else(|| "confirm".into());
@@ -1484,14 +1514,23 @@ pub fn create_collaborator_session(
         last_reported_msg_id: None,
         auto_report: Some(auto_report),
         trigger_tool_event_id: None,
+        provider_id: provider_id.map(|s| s.to_string()),
+        model_id: model_id.map(|s| s.to_string()),
+        dispatch_rule: dispatch_rule.map(|s| s.to_string()),
+        image_provider_id: image_provider_id.map(|s| s.to_string()),
+        image_model_id: image_model_id.map(|s| s.to_string()),
+        vision_provider_id: vision_provider_id.map(|s| s.to_string()),
+        vision_model_id: vision_model_id.map(|s| s.to_string()),
     };
     conn.execute(
         "INSERT INTO sessions(
             id, title, workspace_path, access_mode, project_id, status, 
             last_message_at, created_at, updated_at, 
             parent_session_id, session_type, subagent_role, subagent_task,
-            last_reported_msg_id, auto_report
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'collaborator',?11,?12,NULL,?13)",
+            last_reported_msg_id, auto_report, provider_id, model_id,
+            dispatch_rule, image_provider_id, image_model_id,
+            vision_provider_id, vision_model_id
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'collaborator',?11,?12,NULL,?13,?14,?15,?16,?17,?18,?19,?20)",
         params![
             s.id,
             s.title,
@@ -1506,10 +1545,109 @@ pub fn create_collaborator_session(
             s.subagent_role,
             s.subagent_task,
             if auto_report { 1 } else { 0 },
+            s.provider_id,
+            s.model_id,
+            s.dispatch_rule,
+            s.image_provider_id,
+            s.image_model_id,
+            s.vision_provider_id,
+            s.vision_model_id,
         ],
     )
     .map_err(|e| e.to_string())?;
     Ok(s)
+}
+
+pub fn update_collaborator_session(
+    conn: &Connection,
+    collaborator_id: &str,
+    title: &str,
+    role: &str,
+    task: &str,
+    dispatch_rule: Option<&str>,
+    workspace_path: &str,
+    auto_report: bool,
+    provider_id: Option<&str>,
+    model_id: Option<&str>,
+    image_provider_id: Option<&str>,
+    image_model_id: Option<&str>,
+    vision_provider_id: Option<&str>,
+    vision_model_id: Option<&str>,
+) -> Result<Session, String> {
+    let t = now();
+    conn.execute(
+        "UPDATE sessions SET 
+            title = ?1,
+            subagent_role = ?2,
+            subagent_task = ?3,
+            dispatch_rule = ?4,
+            workspace_path = ?5,
+            auto_report = ?6,
+            provider_id = ?7,
+            model_id = ?8,
+            image_provider_id = ?9,
+            image_model_id = ?10,
+            vision_provider_id = ?11,
+            vision_model_id = ?12,
+            updated_at = ?13
+         WHERE id = ?14 AND session_type = 'collaborator'",
+        params![
+            title,
+            role,
+            task,
+            dispatch_rule,
+            workspace_path,
+            if auto_report { 1 } else { 0 },
+            provider_id,
+            model_id,
+            image_provider_id,
+            image_model_id,
+            vision_provider_id,
+            vision_model_id,
+            t,
+            collaborator_id,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    get_session(conn, collaborator_id)?.ok_or_else(|| "协作者不存在".to_string())
+}
+
+pub fn update_session_models(
+    conn: &Connection,
+    session_id: &str,
+    provider_id: Option<&str>,
+    model_id: Option<&str>,
+    image_provider_id: Option<&str>,
+    image_model_id: Option<&str>,
+    vision_provider_id: Option<&str>,
+    vision_model_id: Option<&str>,
+) -> Result<Session, String> {
+    let t = now();
+    conn.execute(
+        "UPDATE sessions SET 
+            provider_id = ?1,
+            model_id = ?2,
+            image_provider_id = ?3,
+            image_model_id = ?4,
+            vision_provider_id = ?5,
+            vision_model_id = ?6,
+            updated_at = ?7
+         WHERE id = ?8",
+        params![
+            provider_id,
+            model_id,
+            image_provider_id,
+            image_model_id,
+            vision_provider_id,
+            vision_model_id,
+            t,
+            session_id,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    get_session(conn, session_id)?.ok_or_else(|| "会话不存在".to_string())
 }
 
 pub fn create_subprocess_session(
@@ -1552,6 +1690,13 @@ pub fn create_subprocess_session(
         last_reported_msg_id: None,
         auto_report: Some(false),
         trigger_tool_event_id: trigger_tool_event_id.map(|s| s.to_string()),
+        provider_id: None,
+        model_id: None,
+        dispatch_rule: None,
+        image_provider_id: None,
+        image_model_id: None,
+        vision_provider_id: None,
+        vision_model_id: None,
     };
     conn.execute(
         "INSERT INTO sessions(
@@ -1730,8 +1875,8 @@ pub fn next_seq(conn: &Connection, session_id: &str) -> Result<i64, String> {
 
 pub fn insert_message(conn: &Connection, m: &Message) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO messages(id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+        "INSERT INTO messages(id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
         params![
             m.id,
             m.session_id,
@@ -1750,6 +1895,7 @@ pub fn insert_message(conn: &Connection, m: &Message) -> Result<(), String> {
             m.total_tokens.unwrap_or(0) as i64,
             m.duration_ms.unwrap_or(0) as i64,
             m.turn_duration_ms.unwrap_or(0) as i64,
+            m.attachments.as_ref().and_then(|v| serde_json::to_string(v).ok()),
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -1792,11 +1938,12 @@ pub fn new_message(
     new_message_with_run(conn, session_id, role, content, queued, None)
 }
 
-pub fn new_message_with_run(
+pub fn new_message_with_attachments(
     conn: &Connection,
     session_id: &str,
     role: &str,
     content: Option<String>,
+    attachments: Option<Vec<Attachment>>,
     queued: bool,
     run_id: Option<&str>,
 ) -> Result<Message, String> {
@@ -1820,9 +1967,21 @@ pub fn new_message_with_run(
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
+        attachments,
     };
     insert_message(conn, &m)?;
     Ok(m)
+}
+
+pub fn new_message_with_run(
+    conn: &Connection,
+    session_id: &str,
+    role: &str,
+    content: Option<String>,
+    queued: bool,
+    run_id: Option<&str>,
+) -> Result<Message, String> {
+    new_message_with_attachments(conn, session_id, role, content, None, queued, run_id)
 }
 
 pub fn update_message_content(
@@ -1922,7 +2081,7 @@ pub fn get_messages(
 ) -> Result<Vec<Message>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms
+            "SELECT id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json
              FROM messages WHERE session_id = ?1 AND seq < COALESCE(?2, 9223372036854775807)
              ORDER BY seq DESC LIMIT ?3",
         )
@@ -1936,6 +2095,7 @@ pub fn get_messages(
             let tt: Option<i64> = r.get(13)?;
             let dur: Option<i64> = r.get(14)?;
             let turn_dur: Option<i64> = r.get(15)?;
+            let att: Option<String> = r.get(16)?;
             Ok(Message {
                 id: r.get(0)?,
                 session_id: session_id.to_string(),
@@ -1955,6 +2115,7 @@ pub fn get_messages(
                 prompt_tokens: pt.map(|v| v as u64),
                 completion_tokens: ct.map(|v| v as u64),
                 total_tokens: tt.map(|v| v as u64),
+                attachments: att.and_then(|s| serde_json::from_str(&s).ok()),
             })
         })
         .map_err(|e| e.to_string())?
@@ -2074,7 +2235,7 @@ pub fn list_session_compactions(conn: &Connection, session_id: &str) -> Result<V
 pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, String> {
     let opt = conn
         .query_row(
-            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms
+            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json
              FROM messages WHERE id = ?1",
             params![id],
             |r| {
@@ -2085,6 +2246,7 @@ pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, Strin
                 let tt: Option<i64> = r.get(14)?;
                 let dur: Option<i64> = r.get(15)?;
                 let turn_dur: Option<i64> = r.get(16)?;
+                let att: Option<String> = r.get(17)?;
                 Ok(Message {
                     id: r.get(0)?,
                     session_id: r.get(1)?,
@@ -2104,6 +2266,7 @@ pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, Strin
                     prompt_tokens: pt.map(|v| v as u64),
                     completion_tokens: ct.map(|v| v as u64),
                     total_tokens: tt.map(|v| v as u64),
+                    attachments: att.and_then(|s| serde_json::from_str(&s).ok()),
                 })
             },
         )
@@ -2117,7 +2280,7 @@ pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, Strin
 pub fn list_queued(conn: &Connection, session_id: &str) -> Result<Vec<Message>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms
+            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json
              FROM messages WHERE session_id = ?1 AND queued = 1 ORDER BY seq ASC",
         )
         .map_err(|e| e.to_string())?;
@@ -2130,6 +2293,7 @@ pub fn list_queued(conn: &Connection, session_id: &str) -> Result<Vec<Message>, 
             let tt: Option<i64> = r.get(14)?;
             let dur: Option<i64> = r.get(15)?;
             let turn_dur: Option<i64> = r.get(16)?;
+            let att: Option<String> = r.get(17)?;
             Ok(Message {
                 id: r.get(0)?,
                 session_id: r.get(1)?,
@@ -2149,6 +2313,7 @@ pub fn list_queued(conn: &Connection, session_id: &str) -> Result<Vec<Message>, 
                 prompt_tokens: pt.map(|v| v as u64),
                 completion_tokens: ct.map(|v| v as u64),
                 total_tokens: tt.map(|v| v as u64),
+                attachments: att.and_then(|s| serde_json::from_str(&s).ok()),
             })
         })
         .map_err(|e| e.to_string())?;

@@ -209,3 +209,104 @@ fn truncate(s: &str, n: usize) -> String {
     }
     format!("{}…", &s[..end])
 }
+
+/// 调用 OpenAI 兼容 /images/generations 接口生成图片，并返回图片二进制数据
+pub async fn generate_image_api(
+    cfg: &LlmCfg,
+    prompt: &str,
+    size: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    if cfg.api_key.trim().is_empty() {
+        return Err("当前厂商的 API Key 为空，请在设置中配置并保存有效的 API Key 后重试".into());
+    }
+
+    let b = cfg.base_url.trim().trim_end_matches('/');
+    let b = b.strip_suffix("/chat/completions").unwrap_or(b);
+    let b = b.strip_suffix("/images/generations").unwrap_or(b);
+    let url = format!("{b}/images/generations");
+    let mut body = json!({
+        "model": cfg.model,
+        "prompt": prompt,
+        "n": 1,
+    });
+    if let Some(s) = size {
+        body["size"] = json!(s);
+    }
+
+    let resp = client()
+        .post(&url)
+        .bearer_auth(cfg.api_key.trim())
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("生图请求失败: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 400 && (text.contains("image generation is only supported by certain models") || text.contains("InvalidParameter")) {
+            return Err(format!(
+                "生图接口返回 400 Bad Request：模型【{}】不是该服务商支持的生图模型。\n云端提示：{}\n\n请在【设置 -> 厂商配置】中检查并配置该服务商正确的生图模型（如 doubao-seedream-5.0-lite、cogview-3-plus、dall-e-3 等），或在创建/编辑协作者时指定生图模型。",
+                cfg.model,
+                truncate(&text, 400)
+            ));
+        }
+        if status.as_u16() == 401 {
+            return Err(format!(
+                "生图接口返回 401 Unauthorized：API Key 无效或未授权。\n云端提示：{}\n\n请在【设置 -> 厂商配置】中检查并重新填写该厂商的有效 API Key。",
+                truncate(&text, 400)
+            ));
+        }
+        return Err(format!("生图接口返回 {status}: {}", truncate(&text, 2000)));
+    }
+
+    let val: Value = resp.json().await.map_err(|e| format!("生图响应解析失败: {e}"))?;
+
+    // 1. 尝试提取 OpenAI 标准 data[0].b64_json
+    if let Some(b64) = val.get("data")
+        .and_then(|d| d.get(0))
+        .and_then(|item| item.get("b64_json"))
+        .and_then(|v| v.as_str())
+    {
+        return base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| format!("Base64 解码失败: {e}"));
+    }
+
+    // 2. 尝试提取 images[0] (部分 WebUI 或本地生图服务返回)
+    if let Some(b64) = val.get("images")
+        .and_then(|d| d.get(0))
+        .and_then(|v| v.as_str())
+    {
+        let clean_b64 = if let Some(idx) = b64.find(',') {
+            &b64[idx + 1..]
+        } else {
+            b64
+        };
+        return base64::engine::general_purpose::STANDARD
+            .decode(clean_b64)
+            .map_err(|e| format!("Base64 解码失败: {e}"));
+    }
+
+    // 3. 尝试提取 data[0].url 并发起 HTTP GET 下载
+    if let Some(img_url) = val.get("data")
+        .and_then(|d| d.get(0))
+        .and_then(|item| item.get("url"))
+        .and_then(|v| v.as_str())
+    {
+        let img_resp = client()
+            .get(img_url)
+            .send()
+            .await
+            .map_err(|e| format!("下载生成的图片失败: {e}"))?;
+        if !img_resp.status().is_success() {
+            return Err(format!("下载图片失败，HTTP 状态: {}", img_resp.status()));
+        }
+        let bytes = img_resp.bytes().await.map_err(|e| format!("读取图片数据失败: {e}"))?;
+        return Ok(bytes.to_vec());
+    }
+
+    Err(format!("未能从生图响应中解析到图片数据: {}", truncate(&val.to_string(), 500)))
+}
+

@@ -21,6 +21,9 @@ import { CollaboratorBar } from "./components/CollaboratorBar";
 import { CollaboratorView } from "./components/CollaboratorView";
 import { SubagentResizeHandle } from "./components/SubagentResizeHandle";
 import { CreateCollaboratorModal } from "./components/CreateCollaboratorModal";
+import { EditCollaboratorModal } from "./components/EditCollaboratorModal";
+import { ModelMatrixModal } from "./components/ModelMatrixModal";
+import { ImageLightboxModal } from "./components/ImageLightboxModal";
 import { WindowHeader } from "./components/WindowHeader";
 
 import { DRAFT_ID } from "./types";
@@ -111,6 +114,9 @@ export default function App() {
       <GrowthModal />
       <TokenStatsModal />
       <CreateCollaboratorModal />
+      <EditCollaboratorModal />
+      <ModelMatrixModal />
+      <ImageLightboxModal />
       <PromptHost />
       <Toasts />
       <DataDirGate />

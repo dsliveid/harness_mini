@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "./ipc";
-import { DRAFT_ID, samePath, type ApprovalReq, type ApprovalRule, type CollaboratorCreateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice } from "./types";
+import { DRAFT_ID, samePath, type ApprovalReq, type ApprovalRule, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice } from "./types";
 
 export type ToastType = "success" | "error" | "warning" | "info";
 
@@ -180,6 +180,8 @@ interface Store {
   /** 是否打开「创建子Agent」弹窗 */
   showCreateSubagentModal: boolean;
   view: "list" | "project";
+  lightboxImage: { src: string; alt?: string; title?: string } | null;
+  setLightboxImage: (img: { src: string; alt?: string; title?: string } | null) => void;
 
   bootstrap: () => Promise<void>;
   /** 拉取全局运行中的会话，恢复各会话的“运行中”状态显示（启动/界面刷新后调用） */
@@ -267,7 +269,18 @@ interface Store {
   setActiveSubprocessId: (id: string | null) => void;
   setActiveCollaboratorId: (id: string | null) => void;
   setShowCreateCollaboratorModal: (open: boolean) => void;
+  showEditCollaboratorModal: boolean;
+  setShowEditCollaboratorModal: (open: boolean) => void;
+  editingCollaboratorId: string | null;
+  setEditingCollaboratorId: (id: string | null) => void;
+  /** 能力模型分配矩阵弹窗 */
+  showModelMatrixModal: boolean;
+  modelMatrixSessionId: string | null;
+  openModelMatrixModal: (sessionId?: string | null) => void;
+  closeModelMatrixModal: () => void;
+  setSessionModels: (input: SessionModelsUpdateInput) => Promise<boolean>;
   createCollaborator: (input: CollaboratorCreateInput) => Promise<Session | null>;
+  updateCollaborator: (input: CollaboratorUpdateInput) => Promise<Session | null>;
   deleteCollaborator: (collaboratorId: string) => Promise<void>;
   setCollaboratorAutoReport: (collaboratorId: string, autoReport: boolean) => Promise<void>;
   reportCollaboratorIncrement: (collaboratorId: string) => Promise<void>;
@@ -409,6 +422,10 @@ export const useStore = create<Store>((set, get) => ({
   collaborators: {},
   activeCollaboratorId: null,
   showCreateCollaboratorModal: false,
+  showEditCollaboratorModal: false,
+  editingCollaboratorId: null,
+  showModelMatrixModal: false,
+  modelMatrixSessionId: null,
   subprocesses: {},
   activeSubprocessId: null,
   subagents: {},
@@ -417,6 +434,8 @@ export const useStore = create<Store>((set, get) => ({
   showCreateSubagentModal: false,
   // 启动默认进入项目视图
   view: "project",
+  lightboxImage: null,
+  setLightboxImage: (img) => set({ lightboxImage: img }),
 
   async bootstrap() {
     // 数据目录状态优先获取：pending 时启动拦截对话框要在其余数据加载前就绪
@@ -593,8 +612,17 @@ export const useStore = create<Store>((set, get) => ({
           nextOutputs = outs;
         }
       }
+      const nextRetry = { ...st.toolRetryStatus };
+      if (nextRetry[sessionId] && nextRetry[sessionId].status === "retrying") {
+        nextRetry[sessionId] = {
+          ...nextRetry[sessionId],
+          status: "cancelled",
+          message: "会话已停止，未完成的工具自纠已取消",
+        };
+      }
       return {
         runStatus: { ...st.runStatus, [sessionId]: "idle" },
+        toolRetryStatus: nextRetry,
         messages: nextMessages,
         toolOutputs: nextOutputs,
       };
@@ -1281,7 +1309,12 @@ export const useStore = create<Store>((set, get) => ({
   onRunStatus(p) {
     set((st) => {
       const nextRetry = { ...st.toolRetryStatus };
-      if (p.status !== "running") {
+      if (p.status === "running") {
+        // 新一轮会话启动时，自动清除上一轮残留的已中止或已完结的自纠提示
+        if (nextRetry[p.sessionId] && nextRetry[p.sessionId].status !== "retrying") {
+          delete nextRetry[p.sessionId];
+        }
+      } else {
         if (nextRetry[p.sessionId] && nextRetry[p.sessionId].status === "retrying") {
           nextRetry[p.sessionId] = {
             ...nextRetry[p.sessionId],
@@ -1588,6 +1621,63 @@ export const useStore = create<Store>((set, get) => ({
     set({ showCreateCollaboratorModal: open });
   },
 
+  setShowEditCollaboratorModal(open: boolean) {
+    set({ showEditCollaboratorModal: open });
+  },
+
+  setEditingCollaboratorId(id: string | null) {
+    set({ editingCollaboratorId: id, showEditCollaboratorModal: id !== null });
+  },
+
+  openModelMatrixModal(sessionId) {
+    set({ showModelMatrixModal: true, modelMatrixSessionId: sessionId ?? get().currentId ?? null });
+  },
+
+  closeModelMatrixModal() {
+    set({ showModelMatrixModal: false, modelMatrixSessionId: null });
+  },
+
+  async setSessionModels(input) {
+    try {
+      const updated = await ipc.setSessionModels(input);
+      get().onSessionUpdate(updated);
+      set((st) => {
+        const nextCollabs: Record<string, Session[]> = {};
+        for (const [pid, list] of Object.entries(st.collaborators)) {
+          nextCollabs[pid] = list.map((c) => (c.id === updated.id ? updated : c));
+        }
+        return { collaborators: nextCollabs };
+      });
+      get().pushToast(`模型能力配置已生效`);
+      return true;
+    } catch (e) {
+      get().pushToast(`更新模型配置失败: ${e}`);
+      return false;
+    }
+  },
+
+  async updateCollaborator(input) {
+    try {
+      const updated = await ipc.updateCollaborator(input);
+      set((st) => {
+        const nextCollabs: Record<string, Session[]> = {};
+        for (const [pid, list] of Object.entries(st.collaborators)) {
+          nextCollabs[pid] = list.map((c) => (c.id === updated.id ? updated : c));
+        }
+        return {
+          collaborators: nextCollabs,
+          showEditCollaboratorModal: false,
+          editingCollaboratorId: null,
+        };
+      });
+      get().pushToast(`协作者「${updated.title}」配置已更新`);
+      return updated;
+    } catch (e) {
+      get().pushToast(`更新协作者失败: ${e}`);
+      return null;
+    }
+  },
+
   async createCollaborator(input) {
     try {
       let parentId = input.parentSessionId;
@@ -1695,6 +1785,17 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   onCollaboratorUpdate(p) {
+    if (p?.id) {
+      const updated = p as Session;
+      set((st) => {
+        const nextCollabs: Record<string, Session[]> = {};
+        for (const [pid, list] of Object.entries(st.collaborators)) {
+          nextCollabs[pid] = list.map((c) => (c.id === updated.id ? { ...c, ...updated } : c));
+        }
+        return { collaborators: nextCollabs };
+      });
+      return;
+    }
     const cid = p?.collaboratorId || p?.subagentId;
     const status = p?.status;
     if (cid && status) {

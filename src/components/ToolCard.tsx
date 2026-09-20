@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { ipc } from "../ipc";
 import { useStore } from "../store";
 import type { ToolEvent } from "../types";
 import { Markdown } from "./Markdown";
 import { SubprocessBranchTree } from "./SubprocessBranchTree";
+import { toAssetUrl } from "../utils/image";
 import {
   FileText,
   FileEdit,
@@ -24,6 +25,7 @@ import {
   Check,
   Cpu,
   Users,
+  Image,
 } from "./Icons";
 
 function statusBadge(status: string) {
@@ -50,6 +52,13 @@ function toolCategoryBadge(name: string) {
     return (
       <span className="text-[10px] px-1.5 py-[0.5px] rounded bg-amber-500/10 text-amber-400 border border-amber-500/20 shrink-0">
         临时空间
+      </span>
+    );
+  }
+  if (name === "generate_image") {
+    return (
+      <span className="text-[10px] px-1.5 py-[0.5px] rounded bg-pink-500/10 text-pink-400 border border-pink-500/20 shrink-0">
+        多模态生图
       </span>
     );
   }
@@ -83,6 +92,8 @@ function ToolIcon({ name }: { name: string }) {
       return <Search size={14} className="text-indigo-400 shrink-0" />;
     case "todo":
       return <CheckSquare size={14} className="text-purple-400 shrink-0" />;
+    case "generate_image":
+      return <Image size={14} className="text-pink-400 shrink-0" />;
     case "list_skills":
     case "save_skill":
     case "run_skill":
@@ -117,6 +128,8 @@ function paramTitle(ev: ToolEvent): string {
       return `${p.pattern ?? ""}${p.path ? `（${p.path}）` : ""}`;
     case "todo":
       return "任务清单";
+    case "generate_image":
+      return String(p.prompt ?? "");
     case "run_skill":
     case "save_skill":
       return String(p.name ?? "");
@@ -145,6 +158,7 @@ const TOOL_LABELS: Record<string, string> = {
   edit_file: "编辑文件",
   run_command: "执行命令",
   todo: "任务清单",
+  generate_image: "生成图片",
   list_skills: "查询技能库",
   save_skill: "固化项目技能",
   run_skill: "执行项目技能",
@@ -326,6 +340,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
   const output = useStore((s) => s.toolOutputs[ev.id]);
   const killCommand = useStore((s) => s.killCommand);
   const pushToast = useStore((s) => s.pushToast);
+  const setLightboxImage = useStore((s) => s.setLightboxImage);
   const isRunning = useStore((s) => (s.currentId ? s.runStatus[s.currentId] === "running" : false));
   const [terminating, setTerminating] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -333,8 +348,16 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
   const label = TOOL_LABELS[ev.toolName] ?? ev.toolName;
   const isCommandTool = ev.toolName === "run_command";
   const commandText = isCommandTool ? String(ev.params?.command ?? "") : "";
+  const isImageTool = ev.toolName === "generate_image";
+  const imagePrompt = isImageTool ? String(ev.params?.prompt ?? "") : "";
   // 默认收起为一行（标题 + 状态），点击展开查看命令输出/文件内容
   const [expanded, setExpanded] = useState(false);
+
+  const generatedImagePath = useMemo(() => {
+    if (ev.toolName !== "generate_image" || ev.status !== "success" || !ev.resultText) return null;
+    const match = ev.resultText.match(/!\[.*?\]\((.*?)\)/);
+    return match ? match[1] : null;
+  }, [ev.toolName, ev.status, ev.resultText]);
 
   const handleCopyCommand = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -345,6 +368,20 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
         setCopied(true);
         setTimeout(() => setCopied(false), 1500);
         pushToast("命令行已复制到剪贴板");
+      },
+      () => pushToast("复制失败")
+    );
+  };
+
+  const handleCopyPrompt = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const textToCopy = imagePrompt || title;
+    if (!textToCopy) return;
+    navigator.clipboard.writeText(textToCopy).then(
+      () => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+        pushToast("提示词已复制到剪贴板");
       },
       () => pushToast("复制失败")
     );
@@ -411,6 +448,16 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
               {copied ? <Check size={12} className="text-green-400" /> : <Copy size={12} />}
             </button>
           )}
+          {isImageTool && (imagePrompt || title) && (
+            <button
+              type="button"
+              className="p-1 rounded hover:bg-panel3 text-inkdim hover:text-ink transition-colors"
+              title="复制提示词"
+              onClick={handleCopyPrompt}
+            >
+              {copied ? <Check size={12} className="text-green-400" /> : <Copy size={12} />}
+            </button>
+          )}
           {ev.toolName === "run_command" && ev.status === "running" && (
             <button
               type="button"
@@ -438,6 +485,44 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
       {/* 审批条是交互入口，保持常显 */}
       {ev.status === "pending_approval" && <ApprovalSection ev={ev} />}
 
+      {/* 生图成果卡片展示 */}
+      {generatedImagePath && (
+        <div className="mt-2.5 rounded-xl overflow-hidden border border-edge/80 bg-panel3/30 p-2.5 shadow-sm">
+          <div
+            className="relative group cursor-zoom-in flex items-center justify-center bg-black/20 rounded-lg overflow-hidden py-1"
+            onClick={() =>
+              setLightboxImage({
+                src: generatedImagePath,
+                title: String(ev.params?.prompt ?? "生成图片"),
+              })
+            }
+          >
+            <img
+              src={toAssetUrl(generatedImagePath)}
+              alt={String(ev.params?.prompt ?? "生成图片")}
+              className="max-h-72 w-auto max-w-full rounded-lg object-contain shadow-md group-hover:scale-[1.01] transition-transform"
+            />
+          </div>
+          <div className="mt-2 flex items-center justify-between px-1 text-[11.5px] text-inkdim gap-2">
+            <span className="truncate flex-1 font-mono" title={String(ev.params?.prompt ?? "")}>
+              🎨 {String(ev.params?.prompt ?? "")}
+            </span>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-panel hover:bg-panel3 text-inkdim hover:text-ink transition-colors text-[11px]"
+                onClick={handleCopyPrompt}
+                title="复制提示词"
+              >
+                {copied ? <Check size={11} className="text-green-400" /> : <Copy size={11} />}
+                <span>{copied ? "已复制" : "复制"}</span>
+              </button>
+              <span className="text-[11px] opacity-75">点击放大预览</span>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 展开时：若是执行命令，先展示完整的命令行（带复制按钮与完整换行支持） */}
       {expanded && isCommandTool && commandText && (
         <div className="mt-2.5 rounded-lg border border-edge/60 bg-[#111114] overflow-hidden">
@@ -458,6 +543,30 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
           </div>
           <pre className="p-3 text-[12px] font-mono text-emerald-300/90 whitespace-pre-wrap break-all select-text max-h-48 overflow-y-auto selection:bg-emerald-500/30">
             {commandText}
+          </pre>
+        </div>
+      )}
+
+      {/* 展开时：若是生图工具，展示完整提示词（带复制按钮与完整换行支持） */}
+      {expanded && isImageTool && (imagePrompt || title) && (
+        <div className="mt-2.5 rounded-lg border border-edge/60 bg-[#111114] overflow-hidden">
+          <div className="flex items-center justify-between px-3 py-1.5 bg-panel3/40 border-b border-edge/40 text-[11px] text-inkdim select-none">
+            <span className="flex items-center gap-1.5 font-medium text-inkdim">
+              <Image size={12} className="text-pink-400" />
+              <span>完整提示词</span>
+            </span>
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-panel3 hover:bg-edge hover:text-ink text-inkdim transition-colors text-[11px]"
+              onClick={handleCopyPrompt}
+              title="复制提示词"
+            >
+              {copied ? <Check size={12} className="text-green-400" /> : <Copy size={12} />}
+              <span>{copied ? "已复制" : "复制"}</span>
+            </button>
+          </div>
+          <pre className="p-3 text-[12px] font-mono text-pink-300/90 whitespace-pre-wrap break-all select-text max-h-48 overflow-y-auto selection:bg-pink-500/30">
+            {imagePrompt || title}
           </pre>
         </div>
       )}

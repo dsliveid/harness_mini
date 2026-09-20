@@ -20,6 +20,7 @@ import {
   Folder,
   Cpu,
   Eye,
+  Pencil,
 } from "./Icons";
 
 function formatTokens(n?: number | null): string {
@@ -408,6 +409,22 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
             </button>
           )}
 
+          {/* 协作者专属：编辑配置按钮 */}
+          {!isSubprocess && (
+            <button
+              type="button"
+              onClick={() => {
+                useStore.getState().setEditingCollaboratorId(collaboratorId);
+                useStore.getState().setShowEditCollaboratorModal(true);
+              }}
+              className="flex items-center gap-1 px-2.5 py-1 rounded-md text-inkdim hover:text-ink hover:bg-panel2 border border-edge text-[11px] font-medium transition-colors cursor-pointer shrink-0 whitespace-nowrap"
+              title="编辑协作者配置（名称、角色、驱动模型、生图模型、调度规则等）"
+            >
+              <Pencil size={11} />
+              <span>编辑</span>
+            </button>
+          )}
+
           {/* Divider */}
           <div className="h-3.5 w-px bg-edge/80 shrink-0 mx-0.5" />
 
@@ -434,15 +451,40 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
       </div>
 
       {/* Task Prompt Overview Banner */}
-      {collab.subagentTask && (
-        <div className="px-3.5 py-2 bg-panel2/30 border-b border-edge/60 text-[12px] flex items-center gap-2 shrink-0 select-none">
-          <Sparkles size={12} className="text-accent shrink-0" />
-          <span className="text-ink font-medium shrink-0 text-[11.5px]">
-            {isSubprocess ? "子任务目标：" : "协作职责："}
-          </span>
-          <span className="truncate text-inkdim flex-1 text-[11.5px]" title={collab.subagentTask}>
-            {collab.subagentTask}
-          </span>
+      {(collab.subagentTask || collab.dispatchRule || collab.dispatch_rule || collab.modelId || collab.model_id) && (
+        <div className="px-3.5 py-2 bg-panel2/30 border-b border-edge/60 text-[12px] flex flex-col gap-1 shrink-0 select-none">
+          <div className="flex items-center gap-2">
+            <Sparkles size={12} className="text-accent shrink-0" />
+            <span className="text-ink font-medium shrink-0 text-[11.5px]">
+              {isSubprocess ? "子任务目标：" : "协作职责："}
+            </span>
+            <span className="truncate text-inkdim flex-1 text-[11.5px]" title={collab.subagentTask || ""}>
+              {collab.subagentTask || "未填写职责"}
+            </span>
+            {/* Model Badges */}
+            <div className="flex items-center gap-1.5 shrink-0 text-[10.5px]">
+              {(collab.modelId || collab.model_id) && (
+                <span className="px-1.5 py-0.5 rounded bg-panel3 border border-edge text-inkdim font-mono flex items-center gap-1" title="对话思考驱动模型">
+                  <Cpu size={10} className="text-accent" />
+                  <span>{collab.modelId || collab.model_id}</span>
+                </span>
+              )}
+              {(collab.imageModelId || collab.image_model_id) && (
+                <span className="px-1.5 py-0.5 rounded bg-purple-500/10 border border-purple-500/30 text-purple-300 font-mono flex items-center gap-1" title="专属生图执行模型">
+                  <span>🎨</span>
+                  <span>{collab.imageModelId || collab.image_model_id}</span>
+                </span>
+              )}
+            </div>
+          </div>
+          {(collab.dispatchRule || collab.dispatch_rule) && (
+            <div className="flex items-center gap-1.5 text-[11px] text-inkdim/80 pl-5">
+              <span className="text-accent font-medium shrink-0">触发规则:</span>
+              <span className="truncate flex-1" title={collab.dispatchRule || collab.dispatch_rule || ""}>
+                {collab.dispatchRule || collab.dispatch_rule}
+              </span>
+            </div>
+          )}
         </div>
       )}
 

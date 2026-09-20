@@ -70,6 +70,19 @@ pub struct SettingsData {
     pub context_token_limit: usize,
     #[serde(default)]
     pub model_context_limits: std::collections::HashMap<String, usize>,
+    /// 各模型的能力映射：key 为 "provider_id:model_name" 或 "model_name"，value 为能力列表如 ["chat", "image_gen", "vision"]
+    #[serde(default)]
+    pub model_capabilities: std::collections::HashMap<String, Vec<String>>,
+    /// 全局默认生图模型配置
+    #[serde(default)]
+    pub active_image_provider_id: Option<String>,
+    #[serde(default)]
+    pub active_image_model_id: Option<String>,
+    /// 全局默认视觉感知模型配置
+    #[serde(default)]
+    pub active_vision_provider_id: Option<String>,
+    #[serde(default)]
+    pub active_vision_model_id: Option<String>,
     #[serde(default)]
     pub last_workspace_path: Option<String>,
     #[serde(default)]
@@ -90,6 +103,11 @@ impl Default for SettingsData {
             command_timeout_secs: default_cmd_timeout(),
             context_token_limit: default_ctx_tokens(),
             model_context_limits: std::collections::HashMap::new(),
+            model_capabilities: std::collections::HashMap::new(),
+            active_image_provider_id: None,
+            active_image_model_id: None,
+            active_vision_provider_id: None,
+            active_vision_model_id: None,
             last_workspace_path: None,
             disabled_tools: vec![],
             disabled_sops: vec![],
@@ -172,7 +190,117 @@ impl SettingsData {
         }
         self.context_token_limit
     }
+
+    /// 获取指定模型的能力列表（优先用户显式配置，缺省时启发式推断）
+    pub fn resolve_model_capabilities(&self, provider_id: Option<&str>, model: &str) -> Vec<String> {
+        if let Some(pid) = provider_id {
+            let key = format!("{}:{}", pid, model);
+            if let Some(caps) = self.model_capabilities.get(&key) {
+                return caps.clone();
+            }
+        }
+        if let Some(caps) = self.model_capabilities.get(model) {
+            return caps.clone();
+        }
+        infer_default_capabilities(model)
+    }
+
+    /// 检查指定模型是否具备某项能力（如 "chat", "image_gen", "vision"）
+    pub fn has_capability(&self, provider_id: Option<&str>, model: &str, cap: &str) -> bool {
+        let caps = self.resolve_model_capabilities(provider_id, model);
+        caps.iter().any(|c| c == cap)
+    }
 }
+
+/// 根据模型名称推断默认能力集合（未显式配置时的平滑初始推断）
+pub fn infer_default_capabilities(model: &str) -> Vec<String> {
+    let lower = model.to_lowercase();
+    if lower.contains("embedding") || lower.contains("rerank") {
+        return vec![];
+    }
+    let is_img = lower.contains("seedream")
+        || lower.contains("seedance")
+        || lower.contains("seed-edit")
+        || lower.contains("cogview")
+        || lower.contains("dall-e")
+        || lower.contains("dalle")
+        || lower.contains("flux")
+        || lower.contains("sdxl")
+        || lower.contains("stable-diffusion")
+        || lower.contains("wanx")
+        || lower.contains("kolors")
+        || lower.contains("t2i")
+        || lower.contains("imagen")
+        || lower.contains("image-gen")
+        || lower.contains("image_gen");
+    if is_img {
+        return vec!["image_gen".to_string()];
+    }
+    let is_vis = lower.contains("vl")
+        || lower.contains("vision")
+        || lower.contains("4v")
+        || lower.contains("omni")
+        || lower.contains("gpt-4o")
+        || lower.contains("claude-3")
+        || lower.contains("gemini");
+    if is_vis {
+        return vec!["chat".to_string(), "vision".to_string()];
+    }
+    vec!["chat".to_string()]
+}
+
+/// 预设角色的默认调度触发规则（主进程 System Prompt 注入使用）
+pub fn default_dispatch_rule_for_role(role: &str) -> &'static str {
+    match role {
+        "image_gen" => "当用户提出画图、生成图片、插图、海报、Logo、图标、配图制作等视觉生成需求时，必须优先委派本协作者。",
+        "frontend" => "当涉及 UI 界面设计、页面实现、组件重构、Vue/React 模板与 CSS 交互开发时，必须优先委派本协作者。",
+        "backend" => "当涉及服务端业务逻辑、API 接口、数据库 CRUD、后台架构开发时，必须优先委派本协作者。",
+        "pm" => "当涉及需求分析梳理、PRD 方案编写、功能边界与业务流程设计时，必须优先委派本协作者。",
+        "pmo" => "当涉及任务拆解(WBS)、里程碑节点排期、进度与风险追踪时，必须优先委派本协作者。",
+        "vision" => "当用户发送图片、截图、设计稿并要求视觉识别分析时，必须优先委派本协作者。",
+        "testing" => "当需要编写自动化测试用例、单元测试、执行回归测试与缺陷验证时，必须优先委派本协作者。",
+        "review" => "当需要对代码实现进行质量审查、重构优化与架构防劣化时，必须优先委派本协作者。",
+        "fullstack" => "当涉及端到端打通前后端完整功能链路开发时，必须优先委派本协作者。",
+        _ => "当用户任务属于本协作者专业领域范围时，必须优先委派本协作者处理。",
+    }
+}
+
+/// 解析全局生效的 (生图厂商, 生图模型)：优先全局激活项，若无则在已配置厂商中寻找具备 image_gen 能力的模型
+pub fn resolve_active_image_model(settings: &SettingsData) -> Option<(&ProviderCfg, &str)> {
+    if let (Some(pid), Some(mid)) = (&settings.active_image_provider_id, &settings.active_image_model_id) {
+        if let Some(p) = settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid)) {
+            return Some((p, mid.as_str()));
+        }
+    }
+    // 回落：查找任意配置了 image_gen 能力的模型
+    for p in &settings.providers {
+        for m in &p.models {
+            if settings.has_capability(Some(&p.id), m, "image_gen") {
+                return Some((p, m.as_str()));
+            }
+        }
+    }
+    None
+}
+
+/// 解析全局生效的 (视觉厂商, 视觉模型)：优先全局激活项，若无则在已配置厂商中寻找具备 vision 能力的模型
+pub fn resolve_active_vision_model(settings: &SettingsData) -> Option<(&ProviderCfg, &str)> {
+    if let (Some(pid), Some(mid)) = (&settings.active_vision_provider_id, &settings.active_vision_model_id) {
+        if let Some(p) = settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid)) {
+            return Some((p, mid.as_str()));
+        }
+    }
+    // 回落：查找任意配置了 vision 能力的模型
+    for p in &settings.providers {
+        for m in &p.models {
+            if settings.has_capability(Some(&p.id), m, "vision") {
+                return Some((p, m.as_str()));
+            }
+        }
+    }
+    None
+}
+
 
 /// 解析当前生效的 (厂商, 模型)：优先全局激活项，激活项缺失/失效时回落到第一个有模型的厂商
 pub fn resolve_active_model(settings: &SettingsData) -> Option<(&ProviderCfg, &str)> {
@@ -428,6 +556,27 @@ pub struct Session {
     /// 触发派生该子进程/子 Agent 的工具事件 ID
     #[serde(default)]
     pub trigger_tool_event_id: Option<String>,
+    /// 会话专属模型厂商 ID（为空则跟随全局）
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    /// 会话专属模型标识（为空则跟随全局）
+    #[serde(default)]
+    pub model_id: Option<String>,
+    /// 注入主进程的调度触发规则（由用户在创建/编辑协作者时配置）
+    #[serde(default)]
+    pub dispatch_rule: Option<String>,
+    /// 会话专属生图模型厂商 ID（为空则跟随全局）
+    #[serde(default)]
+    pub image_provider_id: Option<String>,
+    /// 会话专属生图模型标识（为空则跟随全局）
+    #[serde(default)]
+    pub image_model_id: Option<String>,
+    /// 会话专属视觉感知模型厂商 ID（为空则跟随全局）
+    #[serde(default)]
+    pub vision_provider_id: Option<String>,
+    /// 会话专属视觉感知模型标识（为空则跟随全局）
+    #[serde(default)]
+    pub vision_model_id: Option<String>,
 }
 
 fn default_auto_report() -> Option<bool> {
@@ -436,6 +585,46 @@ fn default_auto_report() -> Option<bool> {
 
 fn default_session_type() -> String {
     "main".into()
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            title: String::new(),
+            workspace_path: String::new(),
+            access_mode: Some("confirm".into()),
+            project_id: None,
+            status: "active".into(),
+            last_message_at: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            is_temp: false,
+            temp_code: None,
+            temp_root: None,
+            source_workspace: None,
+            merged_seq: None,
+            merged_pending: false,
+            total_tokens: Some(0),
+            prompt_tokens: Some(0),
+            completion_tokens: Some(0),
+            parent_session_id: None,
+            session_type: "main".into(),
+            subagent_role: None,
+            subagent_task: None,
+            context_token_limit: None,
+            last_reported_msg_id: None,
+            auto_report: Some(true),
+            trigger_tool_event_id: None,
+            provider_id: None,
+            model_id: None,
+            dispatch_rule: None,
+            image_provider_id: None,
+            image_model_id: None,
+            vision_provider_id: None,
+            vision_model_id: None,
+        }
+    }
 }
 
 /// 临时空间中被拷贝的单个项目条目（主项目 key="main"，关联项目 key="link:<id>"）
@@ -608,6 +797,18 @@ pub struct ToolEvent {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
+pub struct Attachment {
+    pub id: String,
+    pub name: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub path: String,
+    #[serde(default)]
+    pub is_image: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct Message {
     pub id: String,
     pub session_id: String,
@@ -642,6 +843,9 @@ pub struct Message {
     pub completion_tokens: Option<u64>,
     #[serde(default)]
     pub total_tokens: Option<u64>,
+    /// 消息携带的附件列表（图片或文件）
+    #[serde(default)]
+    pub attachments: Option<Vec<Attachment>>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]

@@ -508,8 +508,49 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         return (RunOutcome::Failed, None, run_tokens);
     }
 
-    // 解析模型配置：全局激活的厂商 + 模型，失效时回落到第一个有模型的厂商
-    let Some((pc, model)) = resolve_active_model(&settings) else {
+    // 检查当前会话是否包含图片附件
+    let has_images = {
+        let db = state.db.lock().unwrap();
+        store::all_messages(&db, session_id).unwrap_or_default().iter().any(|m| {
+            m.attachments.as_ref().map(|atts| atts.iter().any(|a| a.is_image)).unwrap_or(false)
+        })
+    };
+
+    // 解析模型配置：
+    // 1. 若当前会话包含图片附件且配置了专属视觉模型（或全局视觉模型），优先使用视觉模型
+    // 2. 否则优先使用会话专属绑定的厂商 + 模型（若已指定），未指定或失效时回退到全局激活模型
+    // 注意：对话引擎必须具备 chat 能力；若用户绑定的模型只具备 image_gen，自动回退到厂商内具备 chat 能力的模型或全局激活模型
+    let resolved_vision_model = if has_images {
+        if let (Some(v_pid), Some(v_mid)) = (&session.vision_provider_id, &session.vision_model_id) {
+            settings.providers.iter().find(|p| &p.id == v_pid && p.models.iter().any(|m| m == v_mid))
+                .map(|p| (p.clone(), v_mid.clone()))
+        } else {
+            crate::models::resolve_active_vision_model(&settings)
+                .map(|(p, m)| (p.clone(), m.to_string()))
+        }
+    } else {
+        None
+    };
+
+    let resolved_model = if let Some(vm) = resolved_vision_model {
+        Some(vm)
+    } else if let (Some(pid), Some(mid)) = (&session.provider_id, &session.model_id) {
+        if let Some(p) = settings.providers.iter().find(|p| &p.id == pid) {
+            if p.models.contains(mid) && settings.has_capability(Some(pid), mid, "chat") {
+                Some((p.clone(), mid.clone()))
+            } else if let Some(chat_m) = p.models.iter().find(|m| settings.has_capability(Some(pid), m, "chat")) {
+                Some((p.clone(), chat_m.clone()))
+            } else {
+                resolve_active_model(&settings).map(|(p, m)| (p.clone(), m.to_string()))
+            }
+        } else {
+            resolve_active_model(&settings).map(|(p, m)| (p.clone(), m.to_string()))
+        }
+    } else {
+        resolve_active_model(&settings).map(|(p, m)| (p.clone(), m.to_string()))
+    };
+
+    let Some((pc, model)) = resolved_model else {
         emit_error(
             app,
             session_id,
@@ -521,10 +562,10 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
     let cfg = LlmCfg {
         base_url: pc.base_url.clone(),
         api_key: pc.api_key.clone(),
-        model: model.to_string(),
+        model: model.clone(),
     };
     let effective_ctx_limit = session.context_token_limit.unwrap_or_else(|| {
-        settings.resolve_context_limit(Some(&pc.id), model)
+        settings.resolve_context_limit(Some(&pc.id), &model)
     });
 
     // 临时空间上下文：temp_* 工具依赖的清单（非临时会话为 None，对应工具不下发也不可用）
@@ -560,12 +601,39 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         event_id: None,
     };
     let is_subagent = session.session_type == "subagent" || session.parent_session_id.is_some();
+
+    // 工具能力准入管控：
+    // 1. 若为主进程且名录中已配置【图像生成协作者】，主进程物理屏蔽直接生图工具 generate_image，强制走 dispatch_collaborator 委派；
+    // 2. 只有当前会话本身绑定了生图模型、或属于生图协作者、或主进程未配置生图协作者但全局配有 image_gen 模型时，才下发生图工具。
+    let has_collab_image_gen = if !is_subagent {
+        let db = state.db.lock().unwrap();
+        store::list_collaborators(&db, session_id)
+            .map(|list| list.iter().any(|c| c.subagent_role.as_deref() == Some("image_gen") || c.image_model_id.is_some()))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    let session_has_image_gen = if session.session_type == "collaborator" && session.subagent_role.as_deref() == Some("image_gen") {
+        true
+    } else if session.image_model_id.is_some() {
+        true
+    } else if !has_collab_image_gen {
+        settings.active_image_model_id.is_some()
+            || session.model_id.as_deref().map(|m| settings.has_capability(session.provider_id.as_deref(), m, "image_gen")).unwrap_or(false)
+            || resolve_active_model(&settings).map(|(p, m)| settings.has_capability(Some(&p.id), m, "image_gen")).unwrap_or(false)
+    } else {
+        false
+    };
+
     let specs: Vec<ToolSpec> = tools::tool_specs()
         .into_iter()
         // 临时空间专用工具仅对临时空间会话下发
         .filter(|s| session.is_temp || !tools::TEMP_TOOL_NAMES.contains(&s.name))
         // 递归防爆：子 Agent 自身不下发子 Agent 创建与管理工具
         .filter(|s| !is_subagent || !tools::SUBAGENT_TOOL_NAMES.contains(&s.name))
+        // 工具能力准入：只有具备生图能力的会话才下发 generate_image
+        .filter(|s| s.name != "generate_image" || session_has_image_gen)
         // 过滤设置中被禁用的工具
         .filter(|s| !settings.disabled_tools.contains(&s.name.to_string()))
         .collect();
@@ -617,16 +685,45 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         let collabs_sec = if !is_subagent {
             if let Ok(collabs) = store::list_collaborators(&db, session_id) {
                 if !collabs.is_empty() {
-                    let mut text = String::from("## 可用项目协作者 (Collaborators)\n你在规划和处理相关模块时，若对应协作者处于空闲状态，优先调用 `dispatch_collaborator` 委派：\n");
+                    let mut text = String::from("## 可用项目协作者名录 (Collaborators)\n你拥有以下常驻专业协作者团队。当用户任务命中某位协作者的【调度触发规则】且该协作者处于空闲状态时，你**必须无条件优先调用 `dispatch_collaborator` 委派**，随后紧接着调用 `wait_collaborators` 获取其成果报告，严禁自行直接执行！\n\n");
                     for c in collabs {
                         let is_busy = is_run_active(&state, &c.id);
+                        let role_display = match c.subagent_role.as_deref() {
+                            Some("image_gen") => "AI 绘画师 / 图像生成",
+                            Some("vision") => "视觉感知 / 图像识别",
+                            Some("frontend") => "前端开发",
+                            Some("backend") => "后端开发",
+                            Some("pm") => "产品经理",
+                            Some("pmo") => "项目经理",
+                            Some("testing") => "测试校验",
+                            Some("review") => "代码审阅",
+                            Some("fullstack") => "全栈开发",
+                            Some(r) => r,
+                            None => "专业协作者",
+                        };
+                        let dispatch_rule = c.dispatch_rule.as_deref()
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or_else(|| crate::models::default_dispatch_rule_for_role(c.subagent_role.as_deref().unwrap_or("")));
+                        let model_info = if let Some(ref m) = c.model_id {
+                            format!(" | 对话模型: `{m}`")
+                        } else {
+                            String::new()
+                        };
+                        let image_model_info = if let Some(ref im) = c.image_model_id {
+                            format!(" | 生图模型: `{im}`")
+                        } else {
+                            String::new()
+                        };
                         text.push_str(&format!(
-                            "- 【{}】(ID: `{}` | 角色: {} | 状态: {}): {}\n",
+                            "### 【{}】(ID: `{}` | 角色: {}{}{})\n- **当前状态**: {}\n- **主进程调度触发规则（命中即委派）**: {}\n- **专业职责设定**: {}\n\n",
                             c.title,
                             c.id,
-                            c.subagent_role.as_deref().unwrap_or("协作者"),
-                            if is_busy { "🟡 运行中 (busy)" } else { "🟢 空闲 (idle)" },
-                            c.subagent_task.as_deref().unwrap_or("负责该领域工作")
+                            role_display,
+                            model_info,
+                            image_model_info,
+                            if is_busy { "🟡 运行中 (busy)" } else { "🟢 空闲 (idle，可立即委派)" },
+                            dispatch_rule,
+                            c.subagent_task.as_deref().unwrap_or("负责该领域专职工作")
                         ));
                     }
                     Some(text)
@@ -1146,8 +1243,8 @@ async fn handle_tool_call(
     };
     let risk = spec.risk;
 
-    // 未绑定工作区的会话为纯对话模式：文件/命令工具不可用（todo 除外，仅记录计划）
-    if ctx.workspace.as_os_str().is_empty() && tool_name != "todo" {
+    // 未绑定工作区的会话为纯对话模式：文件/命令工具不可用（todo、generate_image 除外）
+    if ctx.workspace.as_os_str().is_empty() && tool_name != "todo" && tool_name != "generate_image" {
         let text = "当前会话未绑定工作区，文件与命令工具不可用。请直接以文字回答用户，并提示：如需读写文件或执行命令，可在顶栏选择工作区目录后重试。".to_string();
         ev.status = "failed".into();
         ev.result_text = Some(text.clone());
@@ -1462,6 +1559,12 @@ fn build_preview(tool_name: &str, args: &Value) -> String {
             let new = args.get("new_string").and_then(|c| c.as_str()).unwrap_or("");
             format!("{path}\n{}", crate::diffutil::diff_lines(old, new, 4000).text)
         }
+        "generate_image" => {
+            let prompt = args.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
+            let size = args.get("size").and_then(|s| s.as_str()).unwrap_or("1024x1024");
+            let filename = args.get("filename").and_then(|f| f.as_str()).unwrap_or("自动生成路径");
+            format!("根据提示词生成图片：\n提示词: {prompt}\n分辨率: {size}\n目标文件: {filename}")
+        }
         _ => serde_json::to_string_pretty(args).unwrap_or_default(),
     }
 }
@@ -1720,9 +1823,62 @@ fn build_context(
         }
         match m.role.as_str() {
             "user" => {
-                let content = m.content.clone().unwrap_or_default();
-                est += estimate_tokens(&content);
-                out.push(json!({"role": "user", "content": content}));
+                let mut text_content = m.content.clone().unwrap_or_default();
+                let mut image_parts: Vec<Value> = Vec::new();
+
+                if let Some(ref atts) = m.attachments {
+                    for att in atts {
+                        if att.is_image {
+                            if let Ok(bytes) = std::fs::read(&att.path) {
+                                use base64::Engine;
+                                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                let mime = if att.mime_type.is_empty() { "image/png" } else { &att.mime_type };
+                                let data_url = format!("data:{};base64,{}", mime, b64);
+                                image_parts.push(json!({
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": data_url
+                                    }
+                                }));
+                                est += 1000;
+                            }
+                        } else {
+                            let file_path = std::path::Path::new(&att.path);
+                            if let Ok(meta) = std::fs::metadata(file_path) {
+                                let size = meta.len();
+                                if size < 50 * 1024 {
+                                    if let Ok(bytes) = std::fs::read(file_path) {
+                                        let is_binary = bytes.iter().take(1024).any(|&b| b == 0);
+                                        if !is_binary {
+                                            let text = String::from_utf8_lossy(&bytes);
+                                            let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("txt");
+                                            text_content.push_str(&format!(
+                                                "\n\n### 📎 附件参考文件: {} (大小: {} 字节)\n```{ext}\n{}\n```",
+                                                att.name, size, text
+                                            ));
+                                            est += estimate_tokens(&text);
+                                            continue;
+                                        }
+                                    }
+                                }
+                                text_content.push_str(&format!(
+                                    "\n\n### 📎 附件参考文件: {} (大小: {} 字节)\n本地物理路径: `{}`",
+                                    att.name, size, att.path
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                est += estimate_tokens(&text_content);
+
+                if !image_parts.is_empty() {
+                    let mut parts = vec![json!({"type": "text", "text": text_content})];
+                    parts.extend(image_parts);
+                    out.push(json!({"role": "user", "content": parts}));
+                } else {
+                    out.push(json!({"role": "user", "content": text_content}));
+                }
             }
             "assistant" => {
                 let mut obj = json!({"role": "assistant"});
@@ -2095,6 +2251,11 @@ fn system_prompt(session: &Session, project_section: Option<&str>, disabled_sops
         rules.push(format!("{rule_num}. 专注于履行你的专业角色定位【{role}】，根据用户或主进程指派的目标深入工作。当前工作区根目录为【{}】，所有工具均以该根目录为基准。", session.workspace_path));
         rule_num += 1;
 
+        if session.subagent_role.as_deref() == Some("image_gen") {
+            rules.push(format!("{rule_num}. 【AI 绘画与图像生成核心职责】：根据用户或主进程的要求，深入理解视觉意图并提炼出画面细节丰富的高质量提示词（包括画质、风格、构图、主体、光影），直接调用 `generate_image` 工具生成图片。图片生成完成后在回复中展示成果并简明汇报。"));
+            rule_num += 1;
+        }
+
         if is_sop_enabled("plan_first") {
             rules.push(format!("{rule_num}. 【方案先行与克制改动】：开始实际修改前，优先梳理实现思路。如果包含代码修改，必须先阅读原文并做最小化精确修改。"));
             rule_num += 1;
@@ -2237,7 +2398,7 @@ fn system_prompt(session: &Session, project_section: Option<&str>, disabled_sops
 
         if is_sop_enabled("subagent_orchestration") {
             rules.push(format!(
-                "{rule_num}. 【团队协作者调度、子进程协作与总架构编排 (Orchestration)】：\n   - 触发场景：当用户提出复杂需求、多模块开发（如前端界面与后端接口、多个独立模块并行开发、测试与功能并行）或明确要求并行处理时，你作为总架构师，必须采用协作编排模式提升效率与模块隔离度。\n   - 编排执行标准流程（SOP）：\n     ① 规划拆解：先用 todo 工具明确列出架构规划与各子模块任务分工；\n     ② 优先委派协作者：若存在匹配的专属【项目协作者】（见上方可用协作者名录）且处于空闲中，优先调用 `dispatch_collaborator` 委派任务；\n     ③ 派生临时子进程：对于一次性独立排查或无专属常驻角色的任务，连续调用 `spawn_subprocess` 工具派生专属子进程；\n     ④ 等待与汇聚：调用 `wait_collaborators` 或 `wait_subprocesses` 等待执行完成，工具将自动汇总并返回执行结论与产出；\n     ⑤ 整合验收：审阅成果产出并进行必要的全局验证或微调，最终向用户交付清晰完整的交付报告。"
+                "{rule_num}. 【团队协作者优先委派原则（最高优先级准则）】：\n   - 角色定位：你作为总架构师与统筹协调者，拥有专属的常驻专家团队（见下方【可用项目协作者名录】）。\n   - 强制委派机制：在接收到用户指令后，你必须首先对照各协作者的【主进程调度触发规则】；只要当前任务命中了某位空闲协作者的专属职责（例如涉及画图/生图/Logo制作命中【AI 绘画师】、涉及PRD/需求分析命中【产品经理】、涉及前端界面开发命中【前端开发】等），你【必须无条件优先且立即调用 `dispatch_collaborator` 工具】将任务委派给该协作者，并在调用后紧接着调用 `wait_collaborators` 等待成果汇报！\n   - 严禁越俎代庖：当名录中存在对应领域的专职协作者时，严禁自行直接执行！让专职角色做专职的事，你专注把控全局架构与成果汇总验收；\n   - 临时子进程协作：若面对一次性复杂探索或无专属常驻协作者覆盖的独立排查，可调用 `spawn_subprocess` 派生专属子进程并行处理。"
             ));
             rule_num += 1;
         }
@@ -2582,6 +2743,7 @@ mod tests {
             context_token_limit: None,
             last_reported_msg_id: None,
             auto_report: None,
+            ..Default::default()
         };
         let with = system_prompt(&session, Some("## 项目约束\nX"), &[]);
         assert!(with.contains("工作区根目录：D:\\ws"));
@@ -2618,6 +2780,7 @@ mod tests {
             context_token_limit: None,
             last_reported_msg_id: None,
             auto_report: None,
+            ..Default::default()
         };
         let all_enabled = system_prompt(&session, None, &[]);
         assert!(all_enabled.contains("方案先行"));

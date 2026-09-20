@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ApprovalRule, CollaboratorCreateInput, DataStatus, GrowthItem, Message, MergeSummary, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo } from "./types";
+import type { ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, DataStatus, GrowthItem, Message, MergeSummary, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo } from "./types";
 
 export const ipc = {
   getSettings: () => invoke<Settings>("get_settings"),
@@ -57,6 +57,21 @@ export const ipc = {
   getMessages: (sessionId: string, beforeSeq?: number, limit?: number) =>
     invoke<Message[]>("get_messages", { sessionId, beforeSeq: beforeSeq ?? null, limit: limit ?? 200 }),
 
+  saveAttachment: (input: {
+    sessionId?: string | null;
+    name: string;
+    mimeType: string;
+    base64Data?: string | null;
+    sourcePath?: string | null;
+  }) =>
+    invoke<Attachment>("save_attachment", {
+      sessionId: input.sessionId ?? null,
+      name: input.name,
+      mimeType: input.mimeType,
+      base64Data: input.base64Data ?? null,
+      sourcePath: input.sourcePath ?? null,
+    }),
+
   sendMessage: (
     sessionId: string | null,
     text: string,
@@ -65,6 +80,7 @@ export const ipc = {
     temp?: TempAlloc,
     accessMode?: string,
     contextTokenLimit?: number | null,
+    attachments?: Attachment[] | null,
   ) =>
     invoke<{ sessionId: string; messageId: string; queued: boolean; session?: Session | null }>("send_message", {
       sessionId,
@@ -74,6 +90,7 @@ export const ipc = {
       temp: temp ?? null,
       accessMode: accessMode ?? null,
       contextTokenLimit: contextTokenLimit ?? null,
+      attachments: attachments ?? null,
     }),
   listQueued: (sessionId: string) => invoke<Message[]>("list_queued", { sessionId }),
   guideMessage: (sessionId: string, messageId: string) =>
@@ -95,6 +112,40 @@ export const ipc = {
       subpath: input.subpath ?? null,
       workspacePath: input.workspacePath ?? null,
       autoReport: input.autoReport ?? true,
+      providerId: input.providerId ?? null,
+      modelId: input.modelId ?? null,
+      dispatchRule: input.dispatchRule ?? null,
+      imageProviderId: input.imageProviderId ?? null,
+      imageModelId: input.imageModelId ?? null,
+      visionProviderId: input.visionProviderId ?? null,
+      visionModelId: input.visionModelId ?? null,
+    }),
+  updateCollaborator: (input: CollaboratorUpdateInput) =>
+    invoke<Session>("update_collaborator", {
+      collaboratorId: input.collaboratorId,
+      title: input.title,
+      role: input.role,
+      taskPrompt: input.taskPrompt,
+      dispatchRule: input.dispatchRule ?? null,
+      subpath: input.subpath ?? null,
+      workspacePath: input.workspacePath ?? null,
+      autoReport: input.autoReport ?? true,
+      providerId: input.providerId ?? null,
+      modelId: input.modelId ?? null,
+      imageProviderId: input.imageProviderId ?? null,
+      imageModelId: input.imageModelId ?? null,
+      visionProviderId: input.visionProviderId ?? null,
+      visionModelId: input.visionModelId ?? null,
+    }),
+  setSessionModels: (input: SessionModelsUpdateInput) =>
+    invoke<Session>("set_session_models", {
+      sessionId: input.sessionId,
+      providerId: input.providerId ?? null,
+      modelId: input.modelId ?? null,
+      imageProviderId: input.imageProviderId ?? null,
+      imageModelId: input.imageModelId ?? null,
+      visionProviderId: input.visionProviderId ?? null,
+      visionModelId: input.visionModelId ?? null,
     }),
   setCollaboratorAutoReport: (collaboratorId: string, autoReport: boolean) =>
     invoke<void>("set_collaborator_auto_report", { collaboratorId, autoReport }),
@@ -186,5 +237,5 @@ export const ipc = {
     invoke<SessionActiveState>("get_session_active_state", { sessionId }),
 };
 
-export type { Message, Session, SessionActiveState, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport, CollaboratorCreateInput, SessionCreateInput };
+export type { Message, Session, SessionActiveState, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport, CollaboratorCreateInput, CollaboratorUpdateInput, SessionCreateInput, SessionModelsUpdateInput };
 
