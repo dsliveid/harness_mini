@@ -348,6 +348,7 @@ pub fn run() {
             commands::set_session_project,
             commands::get_messages,
             commands::create_session,
+            commands::fork_session_at_message,
             commands::send_message,
             commands::save_attachment,
             commands::list_queued,
@@ -401,6 +402,7 @@ pub fn run() {
             commands::run_workspace_sop,
             commands::get_token_stats,
             commands::get_session_active_state,
+            commands::read_file_base64,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

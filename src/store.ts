@@ -1,6 +1,13 @@
 import { create } from "zustand";
 import { ipc } from "./ipc";
-import { DRAFT_ID, samePath, type ApprovalReq, type ApprovalRule, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice } from "./types";
+import { DRAFT_ID, samePath, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice } from "./types";
+
+export interface EditingMessageTarget {
+  messageId: string;
+  sessionId: string;
+  text: string;
+  attachments: Attachment[];
+}
 
 export type ToastType = "success" | "error" | "warning" | "info";
 
@@ -56,8 +63,9 @@ export function inferToastType(text: string): ToastType {
 const LAST_SESSION_KEY = "harness_mini.lastSessionId";
 const SESSION_DRAFTS_KEY = "harness_mini.sessionDrafts";
 const SUBAGENT_WIDTH_KEY = "harness_mini.subagentPanelWidth";
-export const SUBAGENT_MIN_PANEL_WIDTH = 560;
-export const SUBAGENT_DEFAULT_PANEL_WIDTH = 600;
+export const MAIN_PANEL_MIN_WIDTH = 460;
+export const SUBAGENT_MIN_PANEL_WIDTH = 380;
+export const SUBAGENT_DEFAULT_PANEL_WIDTH = 480;
 
 function loadSessionDrafts(): Record<string, string> {
   try {
@@ -116,8 +124,20 @@ interface Store {
     accessMode: "confirm" | "full_access";
     /** 会话专属上下文上限（草稿阶段设置，落库时随会话持久化） */
     contextTokenLimit?: number | null;
+    /** 草稿专属生图模型配置 */
+    imageProviderId?: string | null;
+    imageModelId?: string | null;
+    /** 草稿专属视觉感知模型配置 */
+    visionProviderId?: string | null;
+    visionModelId?: string | null;
   } | null;
   setDraftContextTokenLimit: (limit: number | null) => void;
+  setDraftCapabilityModels: (input: {
+    imageProviderId?: string | null;
+    imageModelId?: string | null;
+    visionProviderId?: string | null;
+    visionModelId?: string | null;
+  }) => void;
   /** 临时空间运行时状态（临时目录是否存在 / 是否有变更 / 合并状态），按会话 id 缓存 */
   tempInfo: Record<string, TempInfo>;
   currentProjectId: string | null; // 当前进入的项目（项目视图下发送空对话时落库到该项目）
@@ -204,6 +224,16 @@ interface Store {
   /** 顶栏切换未保存对话的访问模式（仅改草稿，首次发送时落库） */
   setDraftAccessMode: (mode: "confirm" | "full_access") => void;
   selectSession: (id: string, readOnly?: boolean) => Promise<void>;
+  forkSession: (
+    sessionId: string,
+    messageId: string,
+    customTitle?: string,
+    includeTarget?: boolean,
+  ) => Promise<Session | null>;
+  forkAndEditUserMessage: (
+    sessionId: string,
+    message: Message,
+  ) => Promise<Session | null>;
   loadEarlier: (id: string) => Promise<void>;
   reloadMessages: (id: string) => Promise<void>;
   setCurrent: (id: string | null) => void;
@@ -273,6 +303,9 @@ interface Store {
   setShowEditCollaboratorModal: (open: boolean) => void;
   editingCollaboratorId: string | null;
   setEditingCollaboratorId: (id: string | null) => void;
+  /** 当前正在编辑重发的消息目标 */
+  editingMessage: EditingMessageTarget | null;
+  setEditingMessage: (target: EditingMessageTarget | null) => void;
   /** 能力模型分配矩阵弹窗 */
   showModelMatrixModal: boolean;
   modelMatrixSessionId: string | null;
@@ -336,11 +369,41 @@ function upsertToolEvent(list: Message[], ev: ToolEvent, sessionId: string): Mes
   msg = { ...next[idx] };
   const evIdx = msg.toolEvents.findIndex((e) => e.id === ev.id);
   const events = msg.toolEvents.slice();
-  if (evIdx >= 0) events[evIdx] = ev;
+  if (evIdx >= 0) events[evIdx] = { ...events[evIdx], ...ev };
   else events.push(ev);
   msg.toolEvents = events;
   next[idx] = msg;
   return next;
+}
+
+function mergeToolEvents(localEvs: ToolEvent[] = [], fetchedEvs: ToolEvent[] = []): ToolEvent[] {
+  if (!localEvs || localEvs.length === 0) return fetchedEvs || [];
+  if (!fetchedEvs || fetchedEvs.length === 0) return localEvs;
+
+  const localMap = new Map(localEvs.map((e) => [e.id, e]));
+  const merged: ToolEvent[] = [];
+
+  for (const f of fetchedEvs) {
+    const l = localMap.get(f.id);
+    if (!l) {
+      merged.push(f);
+    } else {
+      localMap.delete(f.id);
+      const isLocalPending = l.status === "running" || l.status === "pending_approval";
+      const isFetchedTerminal = f.status !== "running" && f.status !== "pending_approval";
+      if (isLocalPending && isFetchedTerminal) {
+        merged.push({ ...l, ...f });
+      } else {
+        merged.push({ ...f, ...l });
+      }
+    }
+  }
+
+  for (const l of localMap.values()) {
+    merged.push(l);
+  }
+
+  return merged;
 }
 
 /**
@@ -358,7 +421,7 @@ function mergeSessionMessages(local: Message[] | undefined, fetched: Message[]):
       ...m,
       content: (l.content?.length ?? 0) >= (m.content?.length ?? 0) ? l.content : m.content,
       reasoning: (l.reasoning?.length ?? 0) >= (m.reasoning?.length ?? 0) ? l.reasoning : m.reasoning,
-      toolEvents: l.toolEvents.length >= m.toolEvents.length ? l.toolEvents : m.toolEvents,
+      toolEvents: mergeToolEvents(l.toolEvents, m.toolEvents),
       toolCalls: (m.toolCalls?.length ?? 0) > 0 ? m.toolCalls : l.toolCalls,
     };
   });
@@ -424,6 +487,7 @@ export const useStore = create<Store>((set, get) => ({
   showCreateCollaboratorModal: false,
   showEditCollaboratorModal: false,
   editingCollaboratorId: null,
+  editingMessage: null,
   showModelMatrixModal: false,
   modelMatrixSessionId: null,
   subprocesses: {},
@@ -742,9 +806,14 @@ export const useStore = create<Store>((set, get) => ({
         // 模式继承上一条对话；无可继承来源时用设置页的新对话默认值
         accessMode: (inherit ? prev?.accessMode : undefined) ?? st.settings.globalAccessMode,
         contextTokenLimit: inherit ? prev?.contextTokenLimit ?? null : null,
+        imageProviderId: inherit ? prev?.imageProviderId ?? null : null,
+        imageModelId: inherit ? prev?.imageModelId ?? null : null,
+        visionProviderId: inherit ? prev?.visionProviderId ?? null : null,
+        visionModelId: inherit ? prev?.visionModelId ?? null : null,
       },
       currentId: DRAFT_ID,
       readOnly: false,
+      editingMessage: null,
       messages: { ...get().messages, [DRAFT_ID]: [] },
       activeCollaboratorId: null,
       activeSubprocessId: null,
@@ -766,9 +835,14 @@ export const useStore = create<Store>((set, get) => ({
           // 临时空间对话同样继承上一条对话的访问模式
           accessMode: prev?.accessMode ?? st.settings.globalAccessMode,
           contextTokenLimit: prev?.contextTokenLimit ?? null,
+          imageProviderId: prev?.imageProviderId ?? null,
+          imageModelId: prev?.imageModelId ?? null,
+          visionProviderId: prev?.visionProviderId ?? null,
+          visionModelId: prev?.visionModelId ?? null,
         },
         currentId: DRAFT_ID,
         readOnly: false,
+        editingMessage: null,
         messages: { ...get().messages, [DRAFT_ID]: [] },
         activeCollaboratorId: null,
         activeSubprocessId: null,
@@ -798,6 +872,20 @@ export const useStore = create<Store>((set, get) => ({
     set({ draft: { ...d, contextTokenLimit: limit } });
   },
 
+  setDraftCapabilityModels(input) {
+    const d = get().draft;
+    if (!d) return;
+    set({
+      draft: {
+        ...d,
+        imageProviderId: input.imageProviderId !== undefined ? input.imageProviderId : d.imageProviderId,
+        imageModelId: input.imageModelId !== undefined ? input.imageModelId : d.imageModelId,
+        visionProviderId: input.visionProviderId !== undefined ? input.visionProviderId : d.visionProviderId,
+        visionModelId: input.visionModelId !== undefined ? input.visionModelId : d.visionModelId,
+      },
+    });
+  },
+
   async selectSession(id, readOnly = false) {
     // 先取消息、后原子切换：避免「currentId 已切换、消息未到达」期间消息区整块空白的闪现
     try {
@@ -805,6 +893,7 @@ export const useStore = create<Store>((set, get) => ({
       set((st) => ({
         currentId: id,
         readOnly,
+        editingMessage: null,
         messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], msgs) },
         hasMore: { ...st.hasMore, [id]: msgs.length >= 200 },
       }));
@@ -861,6 +950,33 @@ export const useStore = create<Store>((set, get) => ({
       }
     } catch (e) {
       get().pushToast(String(e));
+    }
+  },
+
+  async forkSession(sessionId, messageId, customTitle, includeTarget = true) {
+    try {
+      const newSession = await ipc.forkSessionAtMessage(sessionId, messageId, customTitle, includeTarget);
+      await get().refreshSessions();
+      await get().selectSession(newSession.id);
+      get().pushToast(`🌿 已创建分支「${newSession.title}」`, "success");
+      return newSession;
+    } catch (e) {
+      get().pushToast(`创建分支失败: ${e}`, "error");
+      return null;
+    }
+  },
+
+  async forkAndEditUserMessage(sessionId, message) {
+    try {
+      const newSession = await ipc.forkSessionAtMessage(sessionId, message.id, undefined, false);
+      await get().refreshSessions();
+      await get().selectSession(newSession.id);
+      get().setSessionDraft(newSession.id, message.content ?? "");
+      get().pushToast(`🌿 已创建分支，提问内容已预填入输入框`, "success");
+      return newSession;
+    } catch (e) {
+      get().pushToast(`创建分支失败: ${e}`, "error");
+      return null;
     }
   },
 
@@ -1436,6 +1552,7 @@ export const useStore = create<Store>((set, get) => ({
         activeSubagentId: st.activeSubagentId === deleted ? null : st.activeSubagentId,
         activeCollaboratorId: st.activeCollaboratorId === deleted ? null : st.activeCollaboratorId,
         activeSubprocessId: st.activeSubprocessId === deleted ? null : st.activeSubprocessId,
+        editingMessage: st.editingMessage?.sessionId === deleted ? null : st.editingMessage,
         ...(st.currentId === deleted ? { currentId: null, readOnly: false } : {}),
       };
     });
@@ -1627,6 +1744,10 @@ export const useStore = create<Store>((set, get) => ({
 
   setEditingCollaboratorId(id: string | null) {
     set({ editingCollaboratorId: id, showEditCollaboratorModal: id !== null });
+  },
+
+  setEditingMessage(target: EditingMessageTarget | null) {
+    set({ editingMessage: target });
   },
 
   openModelMatrixModal(sessionId) {
@@ -1876,7 +1997,7 @@ export const useStore = create<Store>((set, get) => ({
 
   setSubagentPanelWidth(width: number) {
     const minAllowed = SUBAGENT_MIN_PANEL_WIDTH;
-    const maxAllowed = Math.max(minAllowed, window.innerWidth - 240 - 380);
+    const maxAllowed = Math.max(minAllowed, window.innerWidth - 240 - MAIN_PANEL_MIN_WIDTH);
     const clamped = Math.max(minAllowed, Math.min(width, maxAllowed));
     localStorage.setItem(SUBAGENT_WIDTH_KEY, String(clamped));
     set({ subagentPanelWidth: clamped });

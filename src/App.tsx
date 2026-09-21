@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { useAppEvents } from "./events";
-import { useStore, SUBAGENT_MIN_PANEL_WIDTH } from "./store";
+import { useStore, SUBAGENT_MIN_PANEL_WIDTH, MAIN_PANEL_MIN_WIDTH } from "./store";
 import { ArchiveModal } from "./components/ArchiveModal";
 import { ChatView } from "./components/ChatView";
 import { Composer } from "./components/Composer";
@@ -73,9 +73,12 @@ export default function App() {
   return (
     <div className="h-full flex flex-col text-[14px]">
       <WindowHeader />
-      <div className="flex-1 min-h-0 flex">
+      <div className="flex-1 min-h-0 flex overflow-x-auto scrollbar-none">
         <Sidebar />
-        <div className="flex-1 flex flex-col min-w-0 md:min-w-[380px] relative">
+        <div
+          style={{ minWidth: `${MAIN_PANEL_MIN_WIDTH}px` }}
+          className="flex-1 flex flex-col relative overflow-hidden"
+        >
           <TopBar />
           <CollaboratorBar />
           <ChatView />
@@ -98,7 +101,10 @@ export default function App() {
           <>
             <SubagentResizeHandle />
             <div
-              style={{ width: `${subagentPanelWidth}px`, minWidth: `${SUBAGENT_MIN_PANEL_WIDTH}px` }}
+              style={{
+                width: `${Math.max(SUBAGENT_MIN_PANEL_WIDTH, Math.min(subagentPanelWidth, window.innerWidth - 240 - MAIN_PANEL_MIN_WIDTH))}px`,
+                minWidth: `${SUBAGENT_MIN_PANEL_WIDTH}px`,
+              }}
               className="shrink-0 flex flex-col min-h-0 overflow-hidden"
             >
               <CollaboratorView collaboratorId={activeSideId} />

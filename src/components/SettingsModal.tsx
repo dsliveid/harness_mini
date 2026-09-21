@@ -6,6 +6,7 @@ import { formatTokens, resolveModelContextLimit, resolveModelCapabilities, hasMo
 import { DataDirSection } from "./DataDirSection";
 import { ModalActions, ModalClose } from "./ModalActions";
 import { ModelContextModal } from "./ModelContextModal";
+import { ModelCapabilitySelect } from "./ModelCapabilitySelect";
 
 const MODEL_CAP_OPTIONS = [
   { id: "chat", label: "对话", icon: "💬" },
@@ -818,100 +819,82 @@ export function SettingsModal() {
                   </div>
                 </section>
 
-                {/* 默认生图模型配置 */}
+                {/* 默认能力模型配置 */}
                 <section>
                   <div className="font-medium mb-2 flex items-center justify-between">
                     <div className="flex items-center gap-2">
-                      <span>全局默认生图模型</span>
+                      <span>全局默认能力模型</span>
                       <span className="text-[11px] font-normal text-inkdim">
-                        （当未在协作者中单独指定时使用；若留空则主进程默认不直接提供生图工具，引导调度协作者）
+                        （当未在对话或协作者中单独指定时使用；若留空则主进程默认不直接提供生图工具，引导调度协作者）
                       </span>
                     </div>
                   </div>
                   <div className="bg-panel border border-edge rounded-xl p-3 flex flex-col gap-2.5">
                     <div className="flex items-center gap-3">
                       <span className="text-inkdim text-[12px] shrink-0 w-24">执行生图模型</span>
-                      <select
-                        className={`${inputCls} flex-1`}
-                        value={
-                          local.activeImageProviderId && local.activeImageModelId
-                            ? `${local.activeImageProviderId}::${local.activeImageModelId}`
-                            : ""
-                        }
-                        onChange={(e) => {
-                          const val = e.target.value;
-                          if (!val) {
-                            setLocal((cur) => ({
-                              ...cur,
-                              activeImageProviderId: null,
-                              activeImageModelId: null,
-                            }));
-                          } else {
-                            const [pid, mid] = val.split("::");
-                            setLocal((cur) => ({
-                              ...cur,
-                              activeImageProviderId: pid,
-                              activeImageModelId: mid,
-                            }));
+                      <div className="flex-1">
+                        <ModelCapabilitySelect
+                          capability="image_gen"
+                          value={
+                            local.activeImageProviderId && local.activeImageModelId
+                              ? `${local.activeImageProviderId}::${local.activeImageModelId}`
+                              : ""
                           }
-                        }}
-                      >
-                        <option value="">未配置（推荐：由专门的图像生成协作者承接生图，避免主进程模型冲突）</option>
-                        {local.providers.map((p) => (
-                          <optgroup key={p.id} label={p.name}>
-                            {p.models.map((m) => {
-                              const isImg = hasModelCapability(local, p.id, m, "image_gen");
-                              return (
-                                <option key={`${p.id}::${m}`} value={`${p.id}::${m}`}>
-                                  {isImg ? "🎨 " : ""}{m} ({p.name}){isImg ? " [已标生图]" : ""}
-                                </option>
-                              );
-                            })}
-                          </optgroup>
-                        ))}
-                      </select>
+                          onChange={(val) => {
+                            if (!val) {
+                              setLocal((cur) => ({
+                                ...cur,
+                                activeImageProviderId: null,
+                                activeImageModelId: null,
+                              }));
+                            } else {
+                              const [pid, mid] = val.split("::");
+                              setLocal((cur) => ({
+                                ...cur,
+                                activeImageProviderId: pid,
+                                activeImageModelId: mid,
+                              }));
+                            }
+                          }}
+                          providers={local.providers}
+                          settings={local}
+                          allowInherit={true}
+                          inheritLabel="未配置（推荐：由专门的图像生成协作者承接生图，避免主进程模型冲突）"
+                        />
+                      </div>
                     </div>
                     <div className="flex items-center gap-3">
                       <span className="text-inkdim text-[12px] shrink-0 w-24">视觉感知模型</span>
-                      <select
-                        className={`${inputCls} flex-1`}
-                        value={
-                          local.activeVisionProviderId && local.activeVisionModelId
-                            ? `${local.activeVisionProviderId}::${local.activeVisionModelId}`
-                            : ""
-                        }
-                        onChange={(e) => {
-                          const val = e.target.value;
-                          if (!val) {
-                            setLocal((cur) => ({
-                              ...cur,
-                              activeVisionProviderId: null,
-                              activeVisionModelId: null,
-                            }));
-                          } else {
-                            const [pid, mid] = val.split("::");
-                            setLocal((cur) => ({
-                              ...cur,
-                              activeVisionProviderId: pid,
-                              activeVisionModelId: mid,
-                            }));
+                      <div className="flex-1">
+                        <ModelCapabilitySelect
+                          capability="vision"
+                          value={
+                            local.activeVisionProviderId && local.activeVisionModelId
+                              ? `${local.activeVisionProviderId}::${local.activeVisionModelId}`
+                              : ""
                           }
-                        }}
-                      >
-                        <option value="">未配置（跟随当前对话模型或回落多模态模型）</option>
-                        {local.providers.map((p) => (
-                          <optgroup key={p.id} label={p.name}>
-                            {p.models.map((m) => {
-                              const isVis = hasModelCapability(local, p.id, m, "vision");
-                              return (
-                                <option key={`${p.id}::${m}`} value={`${p.id}::${m}`}>
-                                  {isVis ? "👁️ " : ""}{m} ({p.name}){isVis ? " [已标视觉]" : ""}
-                                </option>
-                              );
-                            })}
-                          </optgroup>
-                        ))}
-                      </select>
+                          onChange={(val) => {
+                            if (!val) {
+                              setLocal((cur) => ({
+                                ...cur,
+                                activeVisionProviderId: null,
+                                activeVisionModelId: null,
+                              }));
+                            } else {
+                              const [pid, mid] = val.split("::");
+                              setLocal((cur) => ({
+                                ...cur,
+                                activeVisionProviderId: pid,
+                                activeVisionModelId: mid,
+                              }));
+                            }
+                          }}
+                          providers={local.providers}
+                          settings={local}
+                          allowInherit={true}
+                          inheritLabel="未配置（跟随当前对话模型或回落多模态模型）"
+                        />
+                      </div>
                     </div>
                     <div className="text-[11px] text-inkdim flex items-center gap-1.5 leading-relaxed bg-panel3/40 rounded-lg px-2.5 py-1.5 border border-edge/40">
                       <Sparkles size={13} className="text-accent shrink-0" />

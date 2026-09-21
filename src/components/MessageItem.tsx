@@ -5,7 +5,8 @@ import type { Message, ToolEvent, TurnMetrics } from "../types";
 import { Markdown } from "./Markdown";
 import { ToolCard } from "./ToolCard";
 import { SubprocessBranchTree } from "./SubprocessBranchTree";
-import { Brain, ChevronRight, Pencil, Copy, Check, Clock, Zap, File } from "./Icons";
+import { SafeImage } from "./SafeImage";
+import { Brain, ChevronRight, Pencil, Copy, Check, Clock, Zap, File, GitBranch, GitFork } from "./Icons";
 import { toAssetUrl, formatFileSize } from "../utils/image";
 
 function formatDuration(ms?: number | null): string {
@@ -126,22 +127,29 @@ export function MessageItem({
   running,
   editBlocked,
   turnMetrics,
+  isProcessStep,
 }: {
   msg: Message;
-  isLastUser: boolean;
-  streaming: boolean;
-  readOnly: boolean;
-  running: boolean;
+  isLastUser?: boolean;
+  streaming?: boolean;
+  readOnly?: boolean;
+  running?: boolean;
   /** 临时空间对话：合并点（含）之前的消息不可编辑重发 */
   editBlocked?: boolean;
   turnMetrics?: TurnMetrics;
+  isProcessStep?: boolean;
 }) {
   const pushToast = useStore((s) => s.pushToast);
   const setShowTokenStatsModal = useStore((s) => s.setShowTokenStatsModal);
   const setLightboxImage = useStore((s) => s.setLightboxImage);
-  const [editing, setEditing] = useState(false);
-  const [editText, setEditText] = useState("");
+  const sessionWorkspace = useStore((s) => s.sessions.find((sess) => sess.id === msg.sessionId)?.workspacePath);
+  const setEditingMessage = useStore((s) => s.setEditingMessage);
+  const isBeingEdited = useStore((s) => s.editingMessage?.messageId === msg.id);
+  const forkSession = useStore((s) => s.forkSession);
+  const forkAndEditUserMessage = useStore((s) => s.forkAndEditUserMessage);
   const [copied, setCopied] = useState(false);
+  const [forking, setForking] = useState(false);
+  const [showUserForkMenu, setShowUserForkMenu] = useState(false);
   const [streamDuration, setStreamDuration] = useState<number>(0);
   const [liveTurnDuration, setLiveTurnDuration] = useState<number>(0);
 
@@ -189,67 +197,96 @@ export function MessageItem({
   }
 
   if (msg.role === "user") {
-    if (editing) {
-      return (
-        <div className="flex justify-end">
-          <div className="max-w-[85%] w-full">
-            <div className="bg-panel2 border border-accent/60 rounded-xl p-3 shadow-md">
-              <textarea
-                autoFocus
-                className="w-full bg-transparent outline-none resize-none text-[14px] leading-relaxed min-h-[60px]"
-                value={editText}
-                onChange={(e) => setEditText(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.altKey && !(e.nativeEvent as any).isComposing) {
-                    e.preventDefault();
-                    void ipc
-                      .editAndResend(msg.sessionId, msg.id, editText)
-                      .then(() => setEditing(false))
-                      .catch((err) => {
-                        pushToast(String(err));
-                      });
-                  } else if (e.key === "Escape") {
-                    setEditing(false);
-                  }
-                }}
-              />
-              <div className="flex justify-end gap-2 mt-2">
-                <button className="px-3 py-1.5 rounded-lg text-inkdim hover:bg-panel3 text-[13px] transition-colors" onClick={() => setEditing(false)}>
-                  取消
-                </button>
-                <button
-                  className="px-3 py-1.5 rounded-lg bg-accent hover:bg-blue-500 text-white text-[13px] transition-colors shadow-sm"
-                  onClick={() =>
-                    void ipc
-                      .editAndResend(msg.sessionId, msg.id, editText)
-                      .then(() => setEditing(false))
-                      .catch((err) => pushToast(String(err)))
-                  }
-                >
-                  重新发送
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      );
-    }
     return (
       <div className="flex justify-end group relative">
         <div className="max-w-[85%] flex items-start gap-2">
-          {isLastUser && !running && !readOnly && !editBlocked && (
-            <button
-              className="opacity-0 group-hover:opacity-100 mt-2 w-7 h-7 rounded-lg hover:bg-panel3 flex items-center justify-center text-inkdim hover:text-ink shrink-0 transition-opacity"
-              title="编辑并重新发送（其后的消息将被作废）"
-              onClick={() => {
-                setEditText(msg.content ?? "");
-                setEditing(true);
-              }}
-            >
-              <Pencil size={13} />
-            </button>
-          )}
-          <div className="bg-panel2 border border-edge rounded-2xl px-4 py-2.5 shadow-sm text-ink max-w-full">
+          {/* 操作按钮组：分支与编辑 */}
+          <div className="flex items-center gap-1 mt-2 shrink-0">
+            {!running && !readOnly && (
+              <div className="relative">
+                <button
+                  className={`w-7 h-7 rounded-lg hover:bg-panel3 flex items-center justify-center text-inkdim hover:text-accent transition-all ${
+                    showUserForkMenu ? "opacity-100 text-accent bg-panel3" : "opacity-0 group-hover:opacity-100"
+                  }`}
+                  title="从此提问节点分叉新对话"
+                  onClick={() => setShowUserForkMenu(!showUserForkMenu)}
+                  disabled={forking}
+                >
+                  <GitBranch size={13} className={forking ? "animate-spin text-accent" : ""} />
+                </button>
+                {showUserForkMenu && (
+                  <>
+                    <div className="fixed inset-0 z-20" onClick={() => setShowUserForkMenu(false)} />
+                    <div className="absolute right-0 top-full mt-1 z-30 min-w-[210px] rounded-xl border border-edge bg-panel2 p-1.5 shadow-xl text-left">
+                      <button
+                        className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-[12px] text-ink hover:bg-panel3 transition-colors"
+                        onClick={async () => {
+                          setShowUserForkMenu(false);
+                          setForking(true);
+                          await forkAndEditUserMessage(msg.sessionId, msg);
+                          setForking(false);
+                        }}
+                      >
+                        <GitBranch size={14} className="text-accent shrink-0" />
+                        <div>
+                          <div className="font-medium text-ink">分叉并修改此提问</div>
+                          <div className="text-[10.5px] text-inkdim mt-0.5">复制前序历史，内容预填至输入框</div>
+                        </div>
+                      </button>
+                      <button
+                        className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-[12px] text-ink hover:bg-panel3 transition-colors mt-0.5"
+                        onClick={async () => {
+                          setShowUserForkMenu(false);
+                          setForking(true);
+                          await forkSession(msg.sessionId, msg.id, undefined, true);
+                          setForking(false);
+                        }}
+                      >
+                        <GitFork size={14} className="text-purple-400 shrink-0" />
+                        <div>
+                          <div className="font-medium text-ink">完整分叉到此处</div>
+                          <div className="text-[10.5px] text-inkdim mt-0.5">完整包含此提问及对应回复</div>
+                        </div>
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+            {isLastUser && !running && !readOnly && !editBlocked && (
+              <button
+                className={`w-7 h-7 rounded-lg hover:bg-panel3 flex items-center justify-center text-inkdim hover:text-ink shrink-0 transition-opacity ${
+                  isBeingEdited ? "opacity-100 text-accent bg-accent/10" : "opacity-0 group-hover:opacity-100"
+                }`}
+                title="编辑并重新发送（其后的消息将被作废）"
+                onClick={() => {
+                  if (isBeingEdited) {
+                    setEditingMessage(null);
+                  } else {
+                    setEditingMessage({
+                      messageId: msg.id,
+                      sessionId: msg.sessionId,
+                      text: msg.content ?? "",
+                      attachments: msg.attachments ? [...msg.attachments] : [],
+                    });
+                  }
+                }}
+              >
+                <Pencil size={13} />
+              </button>
+            )}
+          </div>
+          <div
+            className={`bg-panel2 border rounded-2xl px-4 py-2.5 shadow-sm text-ink max-w-full transition-all ${
+              isBeingEdited ? "border-accent ring-2 ring-accent/30 shadow-md" : "border-edge"
+            }`}
+          >
+            {isBeingEdited && (
+              <div className="flex items-center gap-1.5 text-[11.5px] font-medium text-accent mb-2 pb-1.5 border-b border-accent/20 select-none">
+                <Pencil size={12} className="animate-pulse shrink-0" />
+                <span>正在下方输入框编辑中…</span>
+              </div>
+            )}
             {/* 附件展示：图片网格与文件列表 */}
             {msg.attachments && msg.attachments.length > 0 && (
               <div className="space-y-2 mb-2">
@@ -264,8 +301,8 @@ export function MessageItem({
                           onClick={() => setLightboxImage({ src: att.path, title: att.name })}
                           className="group/img relative rounded-xl overflow-hidden border border-edge/80 bg-panel3/40 aspect-square cursor-zoom-in shadow-2xs hover:border-accent/60 transition-all"
                         >
-                          <img
-                            src={toAssetUrl(att.path)}
+                          <SafeImage
+                            src={att.path}
                             alt={att.name}
                             className="w-full h-full object-cover group-hover/img:scale-105 transition-transform duration-200"
                           />
@@ -334,26 +371,32 @@ export function MessageItem({
 
     return (
       <div className="flex flex-col gap-2">
+        {hasReasoning && <ReasoningBlock text={msg.reasoning!} streaming={!!streaming} />}
+        {hasContent && (
+          <div
+            className={`group relative ${
+              isProcessStep
+                ? "text-[13px] text-ink/90 leading-relaxed bg-panel2/40 border border-edge/40 rounded-xl px-3.5 py-2 mb-0.5"
+                : ""
+            }`}
+          >
+            <Markdown content={msg.content!} workspacePath={sessionWorkspace} />
+            {streaming && <span className="stream-cursor" />}
+          </div>
+        )}
         {toolGroups.map((g) => {
           if (g.type === "subprocess_group") {
             return <SubprocessBranchTree key={g.id} events={g.events} />;
           }
           return <ToolCard key={g.id} ev={g.event} />;
         })}
-        {hasReasoning && <ReasoningBlock text={msg.reasoning!} streaming={streaming} />}
-        {hasContent && (
-          <div className="group relative">
-            <Markdown content={msg.content!} />
-            {streaming && <span className="stream-cursor" />}
-          </div>
-        )}
 
-        {/* 对话状态与指标栏：复制、耗时（整轮与单步）、Token 消耗 */}
-        {(hasContent || hasTokens || showDuration || isRunningTurn || streaming) && (
-          <div className="flex items-center gap-2.5 text-[11px] text-inkdim select-none mt-0.5 px-0.5">
+        {/* 对话状态与指标栏：复制、耗时（整轮与单步）、Token 消耗（执行过程明细中隐藏消息级复制按钮，仅保留在最终回复） */}
+        {!isProcessStep && (hasContent || hasTokens || showDuration || isRunningTurn || streaming) && (
+          <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[11px] text-inkdim select-none mt-0.5 px-0.5">
             {!streaming && hasContent && (
               <button
-                className="inline-flex items-center gap-1 transition-opacity select-none px-1.5 py-0.5 rounded hover:bg-panel2 hover:text-ink"
+                className="inline-flex items-center gap-1 transition-opacity select-none px-1.5 py-0.5 rounded hover:bg-panel2 hover:text-ink shrink-0"
                 onClick={() => {
                   navigator.clipboard.writeText(msg.content ?? "").then(
                     () => {
@@ -371,23 +414,39 @@ export function MessageItem({
               </button>
             )}
 
+            {!streaming && !readOnly && (
+              <button
+                className="inline-flex items-center gap-1 transition-opacity select-none px-1.5 py-0.5 rounded hover:bg-panel2 hover:text-accent disabled:opacity-50 shrink-0"
+                onClick={async () => {
+                  setForking(true);
+                  await forkSession(msg.sessionId, msg.id);
+                  setForking(false);
+                }}
+                disabled={forking}
+                title="以此回复为截止点分叉创建新会话"
+              >
+                <GitBranch size={12} className={forking ? "animate-spin text-accent" : "text-accent/80"} />
+                <span>{forking ? "分叉中..." : "分支"}</span>
+              </button>
+            )}
+
             {/* 耗时显示：区分整轮执行总耗时与单步耗时，正在执行中持续跳动 */}
             {isRunningTurn ? (
               <span
-                className="inline-flex items-center gap-1 text-accent font-mono cursor-default select-none animate-pulse"
+                className="inline-flex items-center gap-1 text-accent font-mono cursor-default select-none animate-pulse shrink-0"
                 title="整轮执行持续耗时：从发送消息起，持续跨越所有工具执行与计划步骤"
               >
                 <Clock size={12} className="animate-spin text-accent" />
                 <span>正在执行... {formatDuration(liveTurnDuration) || "0.1s"}</span>
               </span>
             ) : streaming ? (
-              <span className="inline-flex items-center gap-1 text-accent font-mono">
+              <span className="inline-flex items-center gap-1 text-accent font-mono shrink-0">
                 <Clock size={12} className="animate-spin" />
                 <span>{formatDuration(streamDuration) || "0.1s"}</span>
               </span>
             ) : isTurnEnd && hasTurnDuration ? (
               <span
-                className="inline-flex items-center gap-1 text-inkdim/90 hover:text-ink transition-colors font-mono cursor-default select-none"
+                className="inline-flex items-center gap-1 text-inkdim/90 hover:text-ink transition-colors font-mono cursor-default select-none shrink-0"
                 title={`本次完整处理耗时: ${turnDuration} ms\n从用户发送消息到计划全部执行完毕${stepCount > 1 ? `\n包含 ${stepCount} 个执行步骤` : ""}\n本次总消耗: ${(Number(turnTokens) || 0).toLocaleString()} tokens`}
               >
                 <Clock size={12} className="text-emerald-400/90" />
@@ -398,7 +457,7 @@ export function MessageItem({
               </span>
             ) : !isTurnEnd && hasStepDuration ? (
               <span
-                className="inline-flex items-center gap-1 text-inkdim/70 hover:text-ink transition-colors font-mono cursor-default select-none"
+                className="inline-flex items-center gap-1 text-inkdim/70 hover:text-ink transition-colors font-mono cursor-default select-none shrink-0"
                 title={`第 ${stepIndex} 步耗时: ${stepDuration} ms\n本步骤消耗: ${(Number(totalTokens) || 0).toLocaleString()} tokens`}
               >
                 <Clock size={12} className="text-inkdim/60" />
@@ -414,7 +473,7 @@ export function MessageItem({
                     role="button"
                     tabIndex={0}
                     onClick={() => setShowTokenStatsModal(true)}
-                    className="inline-flex items-center gap-1 text-inkdim/80 hover:text-ink transition-colors font-mono cursor-pointer select-none"
+                    className="inline-flex items-center gap-1 text-inkdim/80 hover:text-ink transition-colors font-mono cursor-pointer select-none shrink-0"
                     title={`本次对话累计消耗: ${(Number(turnTokens) || 0).toLocaleString()} tokens${
                       (turnMetrics?.turnPromptTokens ?? 0) > 0 || (turnMetrics?.turnCompletionTokens ?? 0) > 0
                         ? `\n输入: ${(Number(turnMetrics?.turnPromptTokens ?? promptTokens) || 0).toLocaleString()} · 输出: ${(Number(turnMetrics?.turnCompletionTokens ?? completionTokens) || 0).toLocaleString()}`
@@ -434,7 +493,7 @@ export function MessageItem({
                     role="button"
                     tabIndex={0}
                     onClick={() => setShowTokenStatsModal(true)}
-                    className="inline-flex items-center gap-1 text-inkdim/70 hover:text-ink transition-colors font-mono cursor-pointer select-none"
+                    className="inline-flex items-center gap-1 text-inkdim/70 hover:text-ink transition-colors font-mono cursor-pointer select-none shrink-0"
                     title={`本步骤消耗: ${(Number(totalTokens) || 0).toLocaleString()} tokens\n输入: ${(Number(promptTokens) || 0).toLocaleString()} · 输出: ${(Number(completionTokens) || 0).toLocaleString()}\n点击打开 Token 消耗统计看板`}
                   >
                     <Zap size={12} className="text-amber-400/60 shrink-0" />

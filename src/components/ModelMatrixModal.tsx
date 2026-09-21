@@ -3,13 +3,21 @@ import { ipc } from "../ipc";
 import { useStore } from "../store";
 import { Cpu, Sparkles, X, Check } from "./Icons";
 import { ModelCapabilitySelect } from "./ModelCapabilitySelect";
-import { MODEL_CAPABILITY_METAS, Session } from "../types";
+import {
+  MODEL_CAPABILITY_METAS,
+  Session,
+  resolveActiveImageModel,
+  resolveActiveVisionModel,
+} from "../types";
 
 export function ModelMatrixModal() {
   const show = useStore((s) => s.showModelMatrixModal);
   const targetSessionId = useStore((s) => s.modelMatrixSessionId);
+  const currentId = useStore((s) => s.currentId);
+  const draft = useStore((s) => s.draft);
   const close = useStore((s) => s.closeModelMatrixModal);
   const setSessionModels = useStore((s) => s.setSessionModels);
+  const setDraftCapabilityModels = useStore((s) => s.setDraftCapabilityModels);
   const settings = useStore((s) => s.settings);
   const setSettingsLocal = useStore((s) => s.setSettingsLocal);
   const pushToast = useStore((s) => s.pushToast);
@@ -32,11 +40,23 @@ export function ModelMatrixModal() {
       null;
   }
 
-  const isConfiguringSession = Boolean(targetSession && targetSession.id !== "draft");
+  // 是否为草稿会话（新对话）配置
+  const isDraft = targetSessionId === "draft" || (!targetSession && currentId === "draft");
+  const isConfiguringSession = Boolean(targetSession && targetSession.id !== "draft") || isDraft;
 
   const [imageKey, setImageKey] = useState("");
   const [visionKey, setVisionKey] = useState("");
   const [submitting, setSubmitting] = useState(false);
+
+  // 解析全局实际生效的能力模型，供跟随全局时展示具体模型名称
+  const activeImage = resolveActiveImageModel(settings);
+  const activeImageDesc = activeImage
+    ? `${activeImage.model} (${activeImage.provider.name})`
+    : "未配置";
+  const activeVision = resolveActiveVisionModel(settings);
+  const activeVisionDesc = activeVision
+    ? `${activeVision.model} (${activeVision.provider.name})`
+    : "回落主对话模型";
 
   // 当前主对话模型显示名
   const currentChatModelName =
@@ -48,7 +68,16 @@ export function ModelMatrixModal() {
   useEffect(() => {
     if (!show) return;
 
-    if (isConfiguringSession && targetSession) {
+    if (isDraft && draft) {
+      // 从草稿中读取已设置的能力模型
+      const ip = draft.imageProviderId || "";
+      const im = draft.imageModelId || "";
+      setImageKey(ip && im ? `${ip}::${im}` : "");
+
+      const vp = draft.visionProviderId || "";
+      const vm = draft.visionModelId || "";
+      setVisionKey(vp && vm ? `${vp}::${vm}` : "");
+    } else if (isConfiguringSession && targetSession) {
       const ip = targetSession.imageProviderId || targetSession.image_provider_id || "";
       const im = targetSession.imageModelId || targetSession.image_model_id || "";
       setImageKey(ip && im ? `${ip}::${im}` : "");
@@ -66,7 +95,7 @@ export function ModelMatrixModal() {
       const vm = settings.activeVisionModelId || "";
       setVisionKey(vp && vm ? `${vp}::${vm}` : "");
     }
-  }, [show, targetSessionId, isConfiguringSession, targetSession, settings]);
+  }, [show, targetSessionId, isDraft, draft, isConfiguringSession, targetSession, settings]);
 
   if (!show) return null;
 
@@ -85,6 +114,19 @@ export function ModelMatrixModal() {
     try {
       const [imagePid, imageMid] = parseKey(imageKey);
       const [visionPid, visionMid] = parseKey(visionKey);
+
+      if (isDraft) {
+        // 当前为未落库的新对话草稿：将能力模型保存到草稿中，首发消息创建会话时随之落库
+        setDraftCapabilityModels({
+          imageProviderId: imagePid,
+          imageModelId: imageMid,
+          visionProviderId: visionPid,
+          visionModelId: visionMid,
+        });
+        pushToast("当前对话能力模型配置已保存");
+        close();
+        return;
+      }
 
       if (isConfiguringSession && targetSession) {
         // 仅更新当前会话专属配置（保留会话现有的主对话模型不变）
@@ -146,7 +188,7 @@ export function ModelMatrixModal() {
                 <span>能力模型设置 (生图与视觉)</span>
                 {isConfiguringSession ? (
                   <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-accent/10 border border-accent/20 text-accent truncate max-w-[200px]">
-                    当前会话: {targetSession?.title}
+                    当前会话: {isDraft ? "新对话" : targetSession?.title}
                   </span>
                 ) : (
                   <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-purple-500/10 border border-purple-500/20 text-purple-400">
@@ -194,7 +236,7 @@ export function ModelMatrixModal() {
                 </span>
               </div>
               <span className="text-[11px] text-pink-400/80">
-                {imageKey ? "已指定专属模型" : "未单独指定"}
+                {imageKey ? "已指定专属模型" : `跟随全局: ${activeImageDesc}`}
               </span>
             </div>
             <p className="text-[11px] text-inkdim leading-relaxed">
@@ -207,7 +249,7 @@ export function ModelMatrixModal() {
               providers={settings.providers}
               settings={settings}
               allowInherit={true}
-              inheritLabel="跟随全局默认生图模型 / 未配置"
+              inheritLabel={`跟随全局 (${activeImageDesc})`}
             />
           </div>
 
@@ -224,7 +266,7 @@ export function ModelMatrixModal() {
                 </span>
               </div>
               <span className="text-[11px] text-purple-400/80">
-                {visionKey ? "已指定专属模型" : "回落对话模型"}
+                {visionKey ? "已指定专属模型" : `跟随全局: ${activeVisionDesc}`}
               </span>
             </div>
             <p className="text-[11px] text-inkdim leading-relaxed">
@@ -237,7 +279,7 @@ export function ModelMatrixModal() {
               providers={settings.providers}
               settings={settings}
               allowInherit={true}
-              inheritLabel="跟随全局默认视觉模型 / 回落主对话模型"
+              inheritLabel={`跟随全局 (${activeVisionDesc})`}
             />
           </div>
         </div>

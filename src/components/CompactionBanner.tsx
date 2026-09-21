@@ -306,8 +306,9 @@ export function CompactedHistoryCard({
 
       {expanded && (
         <div className="px-4 pb-4 pt-2 border-t border-edge/60 bg-panel/50 text-[13px] leading-relaxed animate-in fade-in duration-150">
-          <div className="text-[11px] text-inkdim mb-2 font-mono">
-            压缩生成时间：{new Date(compaction.createdAt).toLocaleString("zh-CN")}
+          <div className="text-[11px] text-inkdim mb-2 font-mono flex items-center justify-between">
+            <span>压缩生成时间：{new Date(compaction.createdAt).toLocaleString("zh-CN")}</span>
+            <span className="text-[11px] text-accent/80 font-sans">前序原始对话已完整保留展示在上方</span>
           </div>
           <Markdown content={compaction.summaryMarkdown} />
         </div>

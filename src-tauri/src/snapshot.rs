@@ -159,6 +159,7 @@ mod tests {
             status: "running".into(),
             approval_scope: None,
             created_at: "2026-09-17T00:00:00Z".into(),
+            subprocess_id: None,
         };
         store.upsert_tool_event(sid, ev);
         assert_eq!(store.get(sid).active_tool_events.len(), 1);

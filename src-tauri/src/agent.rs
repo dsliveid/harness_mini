@@ -440,7 +440,16 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
                     "parentSessionId": parent_id,
                 }));
 
-                if s.session_type == "collaborator" && s.auto_report.unwrap_or(true) && matches!(last_outcome, RunOutcome::Done) && !parent_id.is_empty() {
+                let is_dispatched_by_parent = store::get_kv(&db, &session_id, "dispatched_by_parent")
+                    .ok()
+                    .flatten()
+                    .map(|v| v == "true")
+                    .unwrap_or(false);
+
+                if is_dispatched_by_parent {
+                    // 本次任务由主进程 dispatch_collaborator 主动委派，主进程在 wait_collaborators 中拉取结果，跳过自动推送
+                    let _ = store::set_kv(&db, &session_id, "dispatched_by_parent", "false");
+                } else if s.session_type == "collaborator" && s.auto_report.unwrap_or(true) && matches!(last_outcome, RunOutcome::Done) && !parent_id.is_empty() {
                     auto_report_task = Some((session_id.clone(), true));
                 }
             }
@@ -785,13 +794,25 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         if let Some(ref notice) = truncation_notice {
             let _ = app.emit("context:truncated", notice);
         }
-        let messages = match messages {
+        let mut messages = match messages {
             Ok(m) => m,
             Err(e) => {
                 emit_error(app, session_id, "context", e);
                 return (RunOutcome::Failed, last_assistant_id, run_tokens);
             }
         };
+
+        // 临界步数倒计时收敛提醒：当步数接近上限时注入高优先级系统收敛提示，防止达到 maxSteps 硬性强杀导致无输出
+        let remaining_steps = max_steps.saturating_sub(_step);
+        if remaining_steps <= 3 && max_steps > 3 {
+            let warn_content = format!(
+                "【⚠️ 临界步数紧急预警：当前仅剩最后 {remaining_steps} 步，即将达到最大步数上限（{max_steps}）！严禁继续调用任何探索、排查或读取类工具！必须立即根据目前已掌握的所有信息，按规定结构化格式输出最终总结与交付回复！】"
+            );
+            messages.push(json!({
+                "role": "user",
+                "content": warn_content,
+            }));
+        }
 
         // ---- 步骤 3：流式调用 LLM（先预占 assistant 消息位，供增量事件引用） ----
         let step_start = Instant::now();
@@ -1437,6 +1458,8 @@ async fn handle_tool_call(
             }
         }
     }
+    ev.status = status.clone();
+    ev.result_text = Some(text.clone());
     {
         let db = state.db.lock().unwrap();
         // todo 工具：保存会话任务清单快照
@@ -2269,12 +2292,17 @@ fn system_prompt(session: &Session, project_section: Option<&str>, disabled_sops
         if is_sop_enabled("safe_code_edit") {
             rules.push(format!("{rule_num}. 修改文件前必须先用 read_file 读取相关内容，用 edit_file 做精确修改；新文件用 write_file。"));
             rule_num += 1;
-            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir 探索并理解代码结构。"));
+            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir / file_outline 探索并理解代码结构。"));
             rule_num += 1;
             rules.push(format!("{rule_num}. 修改完成后，尽量用 run_command 运行构建或测试验证改动。"));
             rule_num += 1;
         } else {
-            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir 探索并理解代码结构。"));
+            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir / file_outline 探索并理解代码结构。"));
+            rule_num += 1;
+        }
+
+        if is_sop_enabled("surgical_code_reading") {
+            rules.push(format!("{rule_num}. 【精益代码研读与克制探索 SOP（必须严格遵守）】：\n   - 探索业务与代码时遵循漏斗式递进：先用 glob 查目录骨架，对源码文件优先用 file_outline 提取结构大纲与行号，再用 grep 定位关键词；\n   - 严禁对大型文件进行多轮循环分页切片（offset_line）式逐行深挖；\n   - 深入阅读时以函数/局部逻辑为靶标，通过 offset_line 与 max_lines 精读最小必要上下文（建议 50~100 行）；修改前必须局部 read_file 确认原文，严禁盲猜。"));
             rule_num += 1;
         }
 
@@ -2307,7 +2335,13 @@ fn system_prompt(session: &Session, project_section: Option<&str>, disabled_sops
         let mut rules = Vec::new();
         let mut rule_num = 1;
 
-        rules.push(format!("{rule_num}. 专注于完成上述分配给你的专属任务。当前合法工作区根目录为【{}】，所有工具（read_file / write_file / edit_file / glob / grep / list_dir / run_command / record_memory / read_memory）均以该根目录为基准。根目录下的全局构建与配置文件（如 pom.xml / package.json / Cargo.toml / README 等）及各级子目录均在合法可访问范围内。", session.workspace_path));
+        rules.push(format!("{rule_num}. 专注于完成上述分配给你的专属任务。当前合法工作区根目录与主会话严格保持完全一致【{}】，所有工具（read_file / write_file / edit_file / glob / grep / list_dir / file_outline / run_command / record_memory / read_memory）均以该根目录为基准。若任务描述中指明了重点关注的子目录或模块，请优先在该目录下展开工作。", session.workspace_path));
+        rule_num += 1;
+
+        rules.push(format!("{rule_num}. 【快速收敛与步数预算原则（必须严格遵守）】：\n   - 探索与调研类任务建议在 10~15 步内完成收敛并给出总结；\n   - 代码探索阶段优先使用 glob、file_outline 和 grep 进行模式匹配与宏观架构定位，辅以少量关键核心文件的阅读；严禁对大型代码文件进行无休止的分页切片（offset_line）式逐行深挖；\n   - 一旦掌握关键代码位置或排查到核心结论，必须立即收敛，直接整理并输出最终报告，禁止拖延死磕细节。"));
+        rule_num += 1;
+
+        rules.push(format!("{rule_num}. 【严格职责边界原则】：严格局限于分配的角色定位【{role}】和任务目标开展工作，严禁跨界反查工作区内与当前任务职责无关的其他模块（例如前端调研专注前端组件与接口，严禁反查后端源码/数据库，该部分由主进程统筹）。"));
         rule_num += 1;
 
         if is_sop_enabled("plan_first") {
@@ -2323,12 +2357,17 @@ fn system_prompt(session: &Session, project_section: Option<&str>, disabled_sops
         if is_sop_enabled("safe_code_edit") {
             rules.push(format!("{rule_num}. 修改文件前必须先用 read_file 读取相关内容，用 edit_file 做基于精确原文的最小化修改；新文件才用 write_file。"));
             rule_num += 1;
-            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir 探索并理解代码结构。"));
+            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir / file_outline 探索并理解代码结构。"));
             rule_num += 1;
             rules.push(format!("{rule_num}. 修改完成后，尽量用 run_command 运行构建或测试来验证改动。"));
             rule_num += 1;
         } else {
-            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir 探索并理解代码结构。"));
+            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir / file_outline 探索并理解代码结构。"));
+            rule_num += 1;
+        }
+
+        if is_sop_enabled("surgical_code_reading") {
+            rules.push(format!("{rule_num}. 【精益代码研读与克制探索 SOP（必须严格遵守）】：\n   - 探索业务与代码时遵循漏斗式递进：先用 glob 查目录骨架，对源码文件优先用 file_outline 提取结构大纲与行号，再用 grep 定位关键词；\n   - 严禁对大型代码文件进行无休止的分页切片（offset_line）式逐行深挖；\n   - 阅读范围必须收敛在最小必要上下文（建议 50~100 行）；修改前必须局部 read_file 确认原文，严禁盲猜。"));
             rule_num += 1;
         }
 
@@ -2376,12 +2415,19 @@ fn system_prompt(session: &Session, project_section: Option<&str>, disabled_sops
         if is_sop_enabled("safe_code_edit") {
             rules.push(format!("{rule_num}. 修改文件前必须先用 read_file 读取相关内容，用 edit_file 做基于精确原文的最小化修改；新文件才用 write_file。"));
             rule_num += 1;
-            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir 探索并理解代码结构。"));
+            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir / file_outline 探索并理解代码结构。"));
             rule_num += 1;
             rules.push(format!("{rule_num}. 修改完成后，尽量用 run_command 运行构建或测试来验证改动。"));
             rule_num += 1;
         } else {
-            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir 探索并理解代码结构。"));
+            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir / file_outline 探索并理解代码结构。"));
+            rule_num += 1;
+        }
+
+        if is_sop_enabled("surgical_code_reading") {
+            rules.push(format!(
+                "{rule_num}. 【精益代码研读与克制探索 SOP（必须严格遵守）】：\n   - 漏斗式探索原则：探索项目架构与业务逻辑时，优先使用 glob / list_dir 查看目录与配置文件，对源码文件优先调用 `file_outline` 获取结构骨架（类/接口/结构体/函数签名及行号），结合 `grep` 定位关键线索；严禁在未摸清线索前盲目通读业务源码。\n   - 严禁连续切片漫游：严禁对超过 300 行的大型文件进行无休止、多轮递增的分页切片（offset_line）式逐行深挖；若需了解具体实现，必须以函数/模块为靶标，通过 offset_line 与 max_lines 精读最小必要上下文（建议 50~100 行）。\n   - 修改前的精确性保障：克制阅读不等于凭空臆断。在调用 edit_file 前，必须通过局部 read_file 确认要替换的原文及行号，严禁在未读取目标代码的情况下凭记忆或猜测修改。"
+            ));
             rule_num += 1;
         }
 
@@ -2398,7 +2444,7 @@ fn system_prompt(session: &Session, project_section: Option<&str>, disabled_sops
 
         if is_sop_enabled("subagent_orchestration") {
             rules.push(format!(
-                "{rule_num}. 【团队协作者优先委派原则（最高优先级准则）】：\n   - 角色定位：你作为总架构师与统筹协调者，拥有专属的常驻专家团队（见下方【可用项目协作者名录】）。\n   - 强制委派机制：在接收到用户指令后，你必须首先对照各协作者的【主进程调度触发规则】；只要当前任务命中了某位空闲协作者的专属职责（例如涉及画图/生图/Logo制作命中【AI 绘画师】、涉及PRD/需求分析命中【产品经理】、涉及前端界面开发命中【前端开发】等），你【必须无条件优先且立即调用 `dispatch_collaborator` 工具】将任务委派给该协作者，并在调用后紧接着调用 `wait_collaborators` 等待成果汇报！\n   - 严禁越俎代庖：当名录中存在对应领域的专职协作者时，严禁自行直接执行！让专职角色做专职的事，你专注把控全局架构与成果汇总验收；\n   - 临时子进程协作：若面对一次性复杂探索或无专属常驻协作者覆盖的独立排查，可调用 `spawn_subprocess` 派生专属子进程并行处理。"
+                "{rule_num}. 【团队协作者优先委派原则与轻量探索自决准则】：\n   - 角色定位：你作为总架构师与统筹协调者，拥有专属的常驻专家团队（见下方【可用项目协作者名录】）。\n   - 强制委派机制：在接收到用户指令后，你必须首先对照各协作者的【主进程调度触发规则】；只要当前任务命中了某位空闲协作者的专属职责（例如涉及画图/生图/Logo制作命中【AI 绘画师】、涉及PRD/需求分析命中【产品经理】、涉及前端界面开发命中【前端开发】等），你【必须无条件优先且立即调用 `dispatch_collaborator` 工具】将任务委派给该协作者，并在调用后紧接着调用 `wait_collaborators` 等待成果汇报！\n   - 严禁越俎代庖：当名录中存在对应领域的专职协作者时，严禁自行直接执行！让专职角色做专职的事，你专注把控全局架构与成果汇总验收；\n   - 临时子进程轻量协作：若面对独立并行的重型排查或开发任务，可调用 `spawn_subprocess` 派生临时子进程处理。子进程物理工作区与当前会话严格一致，若需处理特定子目录，请直接在 `task` 参数中说明目标相对路径与明确目标。注意：对于仅需查看 2~3 个文件或执行简单 grep/glob 确认的轻量探索，严禁派生子进程，由你直接在主会话中快速查验完成，避免小题大做造成时间与 Token 浪费。"
             ));
             rule_num += 1;
         }
@@ -2785,8 +2831,9 @@ mod tests {
         let all_enabled = system_prompt(&session, None, &[]);
         assert!(all_enabled.contains("方案先行"));
         assert!(all_enabled.contains("边读边记与强制沉淀 SOP"));
-        assert!(all_enabled.contains("子进程协作与总架构编排"));
+        assert!(all_enabled.contains("团队协作者优先委派原则"));
         assert!(all_enabled.contains("修改文件前必须先用 read_file 读取相关内容"));
+        assert!(all_enabled.contains("精益代码研读与克制探索 SOP"));
         assert!(all_enabled.contains("todo 工具列出计划"));
 
         let disabled = vec![
@@ -2794,13 +2841,15 @@ mod tests {
             "memory_distill".to_string(),
             "todo_lifecycle".to_string(),
             "safe_code_edit".to_string(),
+            "surgical_code_reading".to_string(),
         ];
         let filtered = system_prompt(&session, None, &disabled);
         assert!(!filtered.contains("方案先行"));
         assert!(!filtered.contains("边读边记与强制沉淀 SOP"));
         assert!(!filtered.contains("todo 工具列出计划"));
         assert!(!filtered.contains("修改文件前必须先用 read_file 读取相关内容"));
-        assert!(filtered.contains("子进程协作与总架构编排"));
+        assert!(!filtered.contains("精益代码研读与克制探索 SOP"));
+        assert!(filtered.contains("团队协作者优先委派原则"));
     }
 
     #[test]

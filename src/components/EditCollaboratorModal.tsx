@@ -437,7 +437,6 @@ export function EditCollaboratorModal() {
                     providers={providers}
                     settings={settings}
                     allowInherit={true}
-                    inheritLabel="未指定 (跟随全局或同厂商)"
                   />
                 </div>
 
@@ -462,7 +461,6 @@ export function EditCollaboratorModal() {
                     providers={providers}
                     settings={settings}
                     allowInherit={true}
-                    inheritLabel="未指定 (回落主对话模型)"
                   />
                 </div>
               </div>

@@ -125,7 +125,7 @@ export function CollaboratorBar() {
           {anyRunning ? (
             <button
               onClick={handleStopAll}
-              className="flex items-center gap-1 px-2 py-1 rounded-md text-amber-400 hover:bg-amber-500/10 border border-amber-500/20 transition-colors cursor-pointer"
+              className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-amber-400 hover:bg-amber-500/10 border border-amber-500/20 transition-colors cursor-pointer text-[11.5px]"
               title="一键停止所有正在运行的协作者"
             >
               <Square size={11} fill="currentColor" />
@@ -134,7 +134,7 @@ export function CollaboratorBar() {
           ) : (
             <button
               onClick={() => void restartAllSubagents(currentId)}
-              className="flex items-center gap-1 px-2 py-1 rounded-md text-inkdim hover:text-ink hover:bg-panel2 border border-edge transition-colors cursor-pointer"
+              className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-inkdim hover:text-ink hover:bg-panel2 border border-edge transition-colors cursor-pointer text-[11.5px]"
               title="一键唤醒并重启协作者"
             >
               <RefreshCw size={11} />

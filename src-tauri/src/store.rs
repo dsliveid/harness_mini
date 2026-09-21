@@ -236,9 +236,12 @@ fn init(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "sessions", "image_model_id", "image_model_id TEXT")?;
     ensure_column(conn, "sessions", "vision_provider_id", "vision_provider_id TEXT")?;
     ensure_column(conn, "sessions", "vision_model_id", "vision_model_id TEXT")?;
+    ensure_column(conn, "sessions", "forked_from_session_id", "forked_from_session_id TEXT")?;
+    ensure_column(conn, "sessions", "forked_from_message_id", "forked_from_message_id TEXT")?;
     ensure_column(conn, "messages", "attachments_json", "attachments_json TEXT")?;
     ensure_column(conn, "tool_events", "subprocess_id", "subprocess_id TEXT")?;
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_trigger_tool ON sessions(trigger_tool_event_id)", []);
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_forked_from ON sessions(forked_from_session_id)", []);
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_tool_events_subprocess ON tool_events(subprocess_id)", []);
     let _ = backfill_message_tokens(conn);
     Ok(())
@@ -660,6 +663,7 @@ mod tests {
             status: "running".into(),
             approval_scope: None,
             created_at: now(),
+            subprocess_id: None,
         };
         insert_tool_event(&conn, &ev).unwrap();
 
@@ -689,6 +693,7 @@ mod tests {
             status: "running".into(),
             approval_scope: None,
             created_at: now(),
+            subprocess_id: None,
         };
         insert_tool_event(&conn, &ev2).unwrap();
         cleanup_orphaned_running_states(&conn).unwrap();
@@ -762,6 +767,28 @@ mod tests {
         let got = get_project(&conn, &p.id).unwrap().unwrap();
         assert_eq!(got.constraints, "使用 pnpm；禁止改 dist/");
         assert!(list_projects(&conn).unwrap().iter().any(|x| x.id == p.id));
+    }
+
+    #[test]
+    fn test_collaborator_dispatched_flag_lifecycle() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let p = create_session(&conn, "D:\\ws", None, "parent_session", "confirm").unwrap();
+        let c = create_collaborator_session(&conn, &p.id, "designer", "图像生成", "生图", None, "D:\\ws", None, None, true, None, None, None, None, None, None).unwrap();
+
+        // 1. 初始状态未被主进程委派
+        let is_dispatched = get_kv(&conn, &c.id, "dispatched_by_parent").unwrap().map(|v| v == "true").unwrap_or(false);
+        assert!(!is_dispatched);
+
+        // 2. 主进程委派时标记为 true
+        set_kv(&conn, &c.id, "dispatched_by_parent", "true").unwrap();
+        let is_dispatched = get_kv(&conn, &c.id, "dispatched_by_parent").unwrap().map(|v| v == "true").unwrap_or(false);
+        assert!(is_dispatched);
+
+        // 3. 运行完毕后消费该标记重置为 false
+        set_kv(&conn, &c.id, "dispatched_by_parent", "false").unwrap();
+        let is_dispatched = get_kv(&conn, &c.id, "dispatched_by_parent").unwrap().map(|v| v == "true").unwrap_or(false);
+        assert!(!is_dispatched);
     }
 
     #[test]
@@ -1056,6 +1083,208 @@ mod tests {
         let got = get_session(&conn, "s1").unwrap().unwrap();
         assert_eq!(got.access_mode.as_deref(), Some("full_access"));
     }
+
+    #[test]
+    fn test_fork_session_at_message() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let s = create_session(&conn, "D:\\workspace", None, "主会话", "confirm").unwrap();
+
+        let m1 = Message {
+            id: "m1".into(),
+            session_id: s.id.clone(),
+            run_id: None,
+            seq: 1,
+            role: "user".into(),
+            content: Some("你好".into()),
+            reasoning: None,
+            tool_calls: None,
+            tool_call_id: None,
+            queued: false,
+            usage: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            tool_events: vec![],
+            duration_ms: None,
+            turn_duration_ms: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            attachments: None,
+        };
+        insert_message(&conn, &m1).unwrap();
+
+        let tc = serde_json::json!([{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]);
+        let m2 = Message {
+            id: "m2".into(),
+            session_id: s.id.clone(),
+            run_id: None,
+            seq: 2,
+            role: "assistant".into(),
+            content: Some("思考中".into()),
+            reasoning: Some("我需要读文件".into()),
+            tool_calls: Some(tc),
+            tool_call_id: None,
+            queued: false,
+            usage: None,
+            created_at: "2026-01-01T00:00:01Z".into(),
+            tool_events: vec![],
+            duration_ms: None,
+            turn_duration_ms: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            attachments: None,
+        };
+        insert_message(&conn, &m2).unwrap();
+
+        let ev1 = ToolEvent {
+            id: "ev1".into(),
+            message_id: "m2".into(),
+            tool_name: "read_file".into(),
+            tool_call_id: Some("call_1".into()),
+            params: serde_json::json!({"path": "a.txt"}),
+            result_text: Some("file contents".into()),
+            status: "success".into(),
+            approval_scope: None,
+            created_at: "2026-01-01T00:00:02Z".into(),
+            subprocess_id: None,
+        };
+        insert_tool_event(&conn, &ev1).unwrap();
+
+        let m3 = Message {
+            id: "m3".into(),
+            session_id: s.id.clone(),
+            run_id: None,
+            seq: 3,
+            role: "tool".into(),
+            content: Some("file contents".into()),
+            reasoning: None,
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            queued: false,
+            usage: None,
+            created_at: "2026-01-01T00:00:02Z".into(),
+            tool_events: vec![],
+            duration_ms: None,
+            turn_duration_ms: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            attachments: None,
+        };
+        insert_message(&conn, &m3).unwrap();
+
+        let m4 = Message {
+            id: "m4".into(),
+            session_id: s.id.clone(),
+            run_id: None,
+            seq: 4,
+            role: "assistant".into(),
+            content: Some("这是文件结果".into()),
+            reasoning: None,
+            tool_calls: None,
+            tool_call_id: None,
+            queued: false,
+            usage: None,
+            created_at: "2026-01-01T00:00:03Z".into(),
+            tool_events: vec![],
+            duration_ms: None,
+            turn_duration_ms: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            attachments: None,
+        };
+        insert_message(&conn, &m4).unwrap();
+
+        let m5 = Message {
+            id: "m5".into(),
+            session_id: s.id.clone(),
+            run_id: None,
+            seq: 5,
+            role: "user".into(),
+            content: Some("第二轮问题".into()),
+            reasoning: None,
+            tool_calls: None,
+            tool_call_id: None,
+            queued: false,
+            usage: None,
+            created_at: "2026-01-01T00:00:04Z".into(),
+            tool_events: vec![],
+            duration_ms: None,
+            turn_duration_ms: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            attachments: None,
+        };
+        insert_message(&conn, &m5).unwrap();
+
+        add_session_rule(&conn, &s.id, "tool", "read_file").unwrap();
+
+        // 1. 从 m4 (Assistant) 创建分支
+        let forked = fork_session_at_message(&conn, &s.id, "m4", None, true).unwrap();
+        assert_eq!(forked.title, "[分支] 主会话");
+        assert_eq!(forked.forked_from_session_id.as_deref(), Some(s.id.as_str()));
+        assert_eq!(forked.forked_from_message_id.as_deref(), Some("m4"));
+        assert_eq!(forked.workspace_path, "D:\\workspace");
+
+        let forked_msgs = all_messages(&conn, &forked.id).unwrap();
+        assert_eq!(forked_msgs.len(), 4);
+        assert_eq!(forked_msgs[0].seq, 1);
+        assert_eq!(forked_msgs[0].role, "user");
+        assert_eq!(forked_msgs[1].seq, 2);
+        assert_eq!(forked_msgs[1].role, "assistant");
+        assert_eq!(forked_msgs[1].tool_events.len(), 1);
+        assert_eq!(forked_msgs[1].tool_events[0].tool_name, "read_file");
+        assert_eq!(forked_msgs[1].tool_events[0].message_id, forked_msgs[1].id);
+        assert_ne!(forked_msgs[1].tool_events[0].id, "ev1");
+
+        assert_eq!(forked_msgs[2].seq, 3);
+        assert_eq!(forked_msgs[2].role, "tool");
+        assert_eq!(forked_msgs[3].seq, 4);
+        assert_eq!(forked_msgs[3].role, "assistant");
+
+        let rules = list_session_rules(&conn, &forked.id).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].pattern, "read_file");
+
+        // 2. 从 m5 (User) 且 include_target=false 创建分支（分叉并修改此提问场景）
+        let forked_user = fork_session_at_message(&conn, &s.id, "m5", Some("新探索"), false).unwrap();
+        assert_eq!(forked_user.title, "新探索");
+        let forked_user_msgs = all_messages(&conn, &forked_user.id).unwrap();
+        assert_eq!(forked_user_msgs.len(), 4);
+    }
+
+    #[test]
+    fn test_create_session_with_models_persists_capability_models() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let s = create_session_with_models(
+            &conn,
+            "D:\\workspace",
+            None,
+            "能力模型测试会话",
+            "confirm",
+            Some("volcengine"),
+            Some("doubao-seedream-5.0-lite"),
+            Some("openai"),
+            Some("gpt-4o"),
+        )
+        .unwrap();
+
+        assert_eq!(s.image_provider_id.as_deref(), Some("volcengine"));
+        assert_eq!(s.image_model_id.as_deref(), Some("doubao-seedream-5.0-lite"));
+        assert_eq!(s.vision_provider_id.as_deref(), Some("openai"));
+        assert_eq!(s.vision_model_id.as_deref(), Some("gpt-4o"));
+
+        // 从数据库重新读取验证
+        let loaded = get_session(&conn, &s.id).unwrap().unwrap();
+        assert_eq!(loaded.image_provider_id.as_deref(), Some("volcengine"));
+        assert_eq!(loaded.image_model_id.as_deref(), Some("doubao-seedream-5.0-lite"));
+        assert_eq!(loaded.vision_provider_id.as_deref(), Some("openai"));
+        assert_eq!(loaded.vision_model_id.as_deref(), Some("gpt-4o"));
+    }
 }
 
 pub fn remove_project(conn: &Connection, id: &str) -> Result<(), String> {
@@ -1229,6 +1458,8 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         image_model_id: r.get(27)?,
         vision_provider_id: r.get(28)?,
         vision_model_id: r.get(29)?,
+        forked_from_session_id: r.get(30)?,
+        forked_from_message_id: r.get(31)?,
     })
 }
 
@@ -1237,7 +1468,8 @@ const SESSION_COLS: &str =
      is_temp, temp_code, temp_root, source_workspace, merged_seq, merged_pending, \
      parent_session_id, session_type, subagent_role, subagent_task, context_token_limit, \
      last_reported_msg_id, auto_report, trigger_tool_event_id, provider_id, model_id, \
-     dispatch_rule, image_provider_id, image_model_id, vision_provider_id, vision_model_id";
+     dispatch_rule, image_provider_id, image_model_id, vision_provider_id, vision_model_id, \
+     forked_from_session_id, forked_from_message_id";
 
 fn attach_session_tokens(conn: &Connection, sessions: &mut [Session]) -> Result<(), String> {
     if sessions.is_empty() {
@@ -1407,6 +1639,30 @@ pub fn create_session(
     title: &str,
     access_mode: &str,
 ) -> Result<Session, String> {
+    create_session_with_models(
+        conn,
+        workspace_path,
+        project_id,
+        title,
+        access_mode,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+pub fn create_session_with_models(
+    conn: &Connection,
+    workspace_path: &str,
+    project_id: Option<&str>,
+    title: &str,
+    access_mode: &str,
+    image_provider_id: Option<&str>,
+    image_model_id: Option<&str>,
+    vision_provider_id: Option<&str>,
+    vision_model_id: Option<&str>,
+) -> Result<Session, String> {
     let t = now();
     let s = Session {
         id: uuid::Uuid::new_v4().to_string(),
@@ -1439,18 +1695,21 @@ pub fn create_session(
         provider_id: None,
         model_id: None,
         dispatch_rule: None,
-        image_provider_id: None,
-        image_model_id: None,
-        vision_provider_id: None,
-        vision_model_id: None,
+        image_provider_id: image_provider_id.map(|s| s.to_string()),
+        image_model_id: image_model_id.map(|s| s.to_string()),
+        vision_provider_id: vision_provider_id.map(|s| s.to_string()),
+        vision_model_id: vision_model_id.map(|s| s.to_string()),
+        forked_from_session_id: None,
+        forked_from_message_id: None,
     };
     conn.execute(
         "INSERT INTO sessions(
             id, title, workspace_path, access_mode, project_id, status, 
             last_message_at, created_at, updated_at, 
             parent_session_id, session_type, subagent_role, subagent_task,
-            last_reported_msg_id, auto_report
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,'main',NULL,NULL,NULL,NULL)",
+            last_reported_msg_id, auto_report,
+            image_provider_id, image_model_id, vision_provider_id, vision_model_id
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,'main',NULL,NULL,NULL,NULL,?10,?11,?12,?13)",
         params![
             s.id,
             s.title,
@@ -1461,6 +1720,10 @@ pub fn create_session(
             s.last_message_at,
             s.created_at,
             s.updated_at,
+            s.image_provider_id,
+            s.image_model_id,
+            s.vision_provider_id,
+            s.vision_model_id,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -1521,6 +1784,8 @@ pub fn create_collaborator_session(
         image_model_id: image_model_id.map(|s| s.to_string()),
         vision_provider_id: vision_provider_id.map(|s| s.to_string()),
         vision_model_id: vision_model_id.map(|s| s.to_string()),
+        forked_from_session_id: None,
+        forked_from_message_id: None,
     };
     conn.execute(
         "INSERT INTO sessions(
@@ -1697,6 +1962,8 @@ pub fn create_subprocess_session(
         image_model_id: None,
         vision_provider_id: None,
         vision_model_id: None,
+        forked_from_session_id: None,
+        forked_from_message_id: None,
     };
     conn.execute(
         "INSERT INTO sessions(
@@ -1747,6 +2014,298 @@ pub fn create_subagent_session(
         project_id,
         trigger_tool_event_id,
     )
+}
+
+pub fn fork_session_at_message(
+    conn: &Connection,
+    source_session_id: &str,
+    target_message_id: &str,
+    new_title: Option<&str>,
+    include_target: bool,
+) -> Result<Session, String> {
+    let source_session = get_session(conn, source_session_id)?
+        .ok_or_else(|| format!("未找到原会话: {}", source_session_id))?;
+
+    let (target_seq, target_role): (i64, String) = conn
+        .query_row(
+            "SELECT seq, role FROM messages WHERE id = ?1 AND session_id = ?2",
+            params![target_message_id, source_session_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| format!("未找到指定消息节点: {}", e))?;
+
+    let max_seq = if !include_target {
+        target_seq - 1
+    } else if target_role == "assistant" {
+        let mut check_seq = target_seq;
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, role FROM messages WHERE session_id = ?1 AND seq > ?2 ORDER BY seq ASC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![source_session_id, target_seq], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows.flatten() {
+            if row.1 == "tool" {
+                check_seq = row.0;
+            } else {
+                break;
+            }
+        }
+        check_seq
+    } else {
+        target_seq
+    };
+
+    let title = if let Some(t) = new_title.filter(|s| !s.trim().is_empty()) {
+        t.trim().to_string()
+    } else {
+        format!("[分支] {}", source_session.title)
+    };
+
+    let new_session_id = uuid::Uuid::new_v4().to_string();
+    let now_str = now();
+
+    let ws_path = if source_session.is_temp {
+        source_session
+            .source_workspace
+            .clone()
+            .unwrap_or_else(|| source_session.workspace_path.clone())
+    } else {
+        source_session.workspace_path.clone()
+    };
+
+    conn.execute(
+        "INSERT INTO sessions (
+            id, title, workspace_path, access_mode, project_id, status,
+            last_message_at, created_at, updated_at, is_temp,
+            temp_code, temp_root, source_workspace, merged_seq, merged_pending,
+            parent_session_id, session_type, subagent_role, subagent_task,
+            context_token_limit, last_reported_msg_id, auto_report,
+            trigger_tool_event_id, provider_id, model_id, dispatch_rule,
+            image_provider_id, image_model_id, vision_provider_id, vision_model_id,
+            forked_from_session_id, forked_from_message_id
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, 'active',
+            ?6, ?6, ?6, 0,
+            NULL, NULL, NULL, NULL, 0,
+            NULL, 'main', NULL, NULL,
+            ?7, NULL, 1,
+            NULL, ?8, ?9, NULL,
+            ?10, ?11, ?12, ?13,
+            ?14, ?15
+        )",
+        params![
+            new_session_id,
+            title,
+            ws_path,
+            source_session.access_mode,
+            source_session.project_id,
+            now_str,
+            source_session.context_token_limit.map(|v| v as i64),
+            source_session.provider_id,
+            source_session.model_id,
+            source_session.image_provider_id,
+            source_session.image_model_id,
+            source_session.vision_provider_id,
+            source_session.vision_model_id,
+            source_session_id,
+            target_message_id,
+        ],
+    )
+    .map_err(|e| format!("创建分支会话失败: {}", e))?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id,
+                    queued, usage_json, created_at, prompt_tokens, completion_tokens,
+                    total_tokens, duration_ms, turn_duration_ms, attachments_json
+             FROM messages
+             WHERE session_id = ?1 AND seq <= ?2 AND queued = 0
+             ORDER BY seq ASC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let old_msgs = stmt
+        .query_map(params![source_session_id, max_seq], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, i64>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, String>(10)?,
+                r.get::<_, Option<i64>>(11)?,
+                r.get::<_, Option<i64>>(12)?,
+                r.get::<_, Option<i64>>(13)?,
+                r.get::<_, Option<i64>>(14)?,
+                r.get::<_, Option<i64>>(15)?,
+                r.get::<_, Option<String>>(16)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    let mut id_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut new_seq: i64 = 1;
+
+    for old in &old_msgs {
+        let old_id = &old.0;
+        let new_id = uuid::Uuid::new_v4().to_string();
+        id_map.insert(old_id.clone(), new_id.clone());
+
+        conn.execute(
+            "INSERT INTO messages (
+                id, session_id, run_id, seq, role, content, reasoning,
+                tool_calls_json, tool_call_id, queued, usage_json, created_at,
+                prompt_tokens, completion_tokens, total_tokens, duration_ms,
+                turn_duration_ms, attachments_json
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16,
+                ?17, ?18
+            )",
+            params![
+                new_id,
+                new_session_id,
+                old.1,
+                new_seq,
+                old.3,
+                old.4,
+                old.5,
+                old.6,
+                old.7,
+                old.8,
+                old.9,
+                old.10,
+                old.11,
+                old.12,
+                old.13,
+                old.14,
+                old.15,
+                old.16,
+            ],
+        )
+        .map_err(|e| format!("复制消息失败: {}", e))?;
+
+        new_seq += 1;
+    }
+
+    for (old_id, new_id) in &id_map {
+        let mut ev_stmt = conn
+            .prepare(
+                "SELECT tool_name, tool_call_id, params_json, result_text, status,
+                        approval_scope, created_at, subprocess_id
+                 FROM tool_events WHERE message_id = ?1 ORDER BY rowid ASC",
+            )
+            .map_err(|e| e.to_string())?;
+
+        let ev_rows = ev_stmt
+            .query_map(params![old_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+
+        for ev in ev_rows {
+            let new_ev_id = uuid::Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO tool_events (
+                    id, message_id, tool_name, tool_call_id, params_json,
+                    result_text, status, approval_scope, created_at, subprocess_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    new_ev_id,
+                    new_id,
+                    ev.0,
+                    ev.1,
+                    ev.2,
+                    ev.3,
+                    ev.4,
+                    ev.5,
+                    ev.6,
+                    ev.7,
+                ],
+            )
+            .map_err(|e| format!("复制工具事件失败: {}", e))?;
+        }
+    }
+
+    let mut comp_stmt = conn
+        .prepare(
+            "SELECT start_seq, end_seq, summary_markdown, tokens_before, created_at
+             FROM session_compactions WHERE session_id = ?1 AND end_seq <= ?2 ORDER BY end_seq ASC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let comp_rows = comp_stmt
+        .query_map(params![source_session_id, max_seq], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    for c in comp_rows {
+        let new_comp_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO session_compactions (
+                id, session_id, start_seq, end_seq, summary_markdown, tokens_before, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![new_comp_id, new_session_id, c.0, c.1, c.2, c.3, c.4],
+        )
+        .map_err(|e| format!("复制压缩备忘失败: {}", e))?;
+    }
+
+    let mut rules_stmt = conn
+        .prepare("SELECT kind, pattern, created_at FROM session_rules_t WHERE session_id = ?1")
+        .map_err(|e| e.to_string())?;
+
+    let rule_rows = rules_stmt
+        .query_map(params![source_session_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    for r in rule_rows {
+        let new_rule_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO session_rules_t (id, session_id, kind, pattern, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![new_rule_id, new_session_id, r.0, r.1, r.2],
+        )
+        .map_err(|e| format!("复制审批规则失败: {}", e))?;
+    }
+
+    get_session(conn, &new_session_id)?.ok_or_else(|| "无法获取新创建的分支会话".to_string())
 }
 
 pub fn touch_session(conn: &Connection, id: &str) -> Result<(), String> {
@@ -2017,6 +2576,31 @@ pub fn update_message_content(
             tt as i64,
             dur as i64,
         ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 更新消息内容与附件列表（用于编辑重发）
+pub fn update_message_content_and_attachments(
+    conn: &Connection,
+    id: &str,
+    content: &str,
+    attachments: Option<&[Attachment]>,
+) -> Result<(), String> {
+    let att_json = attachments.and_then(|v| {
+        if v.is_empty() {
+            None
+        } else {
+            serde_json::to_string(v).ok()
+        }
+    });
+    conn.execute(
+        "UPDATE messages SET
+            content = ?2,
+            attachments_json = ?3
+         WHERE id = ?1",
+        params![id, content, att_json],
     )
     .map_err(|e| e.to_string())?;
     Ok(())

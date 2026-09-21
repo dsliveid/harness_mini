@@ -294,9 +294,9 @@ sequenceDiagram
 | **典型表现** | `cargo check`, `npm run test` 等自动化验证脚本 | 方案先行、边读边记、子进程协作、克制修改等 |
 | **管理入口** | 顶栏「🌱 成长中心」->「🛡️ 交付自检 SOP」 | 顶栏「设置」->「Agent SOP」 |
 
-### 2. 五大标准作业程序（SOP）规范定义
+### 2. 六大标准作业程序（SOP）规范定义
 
-系统全面规范并导出了五大标准作业程序（详见 [`src/types.ts`](file:///d:/WorkSpace/Other/harness_mini/src/types.ts) 中的 `AGENT_SOPS`）：
+系统全面规范并导出了六大标准作业程序（详见 [`src/types.ts`](file:///d:/WorkSpace/Other/harness_mini/src/types.ts) 中的 `AGENT_SOPS`）：
 
 | 标识 (ID) | 规范中文名 | 类别 | 详细规范要求 | 禁用后效果 |
 | :--- | :--- | :--- | :--- | :--- |
@@ -304,6 +304,7 @@ sequenceDiagram
 | **`memory_distill`** | 边读边记规范 | 知识资产 | 优先基于已有记忆秒级回答；深入探索后必须调用 `record_memory` 沉淀；任务完成后自动萃取 digests。 | 移除强制记录约束，会话结束后不再触发后台自动提炼。 |
 | **`subagent_orchestration`** | 子进程编排规范 | 协同体系 | 面对复杂多模块任务时，遵循“规划拆解 ➔ 派生子进程 ➔ 汇聚等待 ➔ 全局验收”标准流程。 | 停用子进程协同强指引，Agent 倾向在单主进程内串行处理全部工作。 |
 | **`safe_code_edit`** | 代码克制规范 | 工程质量 | 改动前必须 `read_file`，优先使用 `edit_file` 精确修改；动手前全面探索；改动后运行验证。 | 移除最小化精确修改与构建验证的强指引。 |
+| **`surgical_code_reading`** | 精益代码研读规范 | 工程质量 | 探索业务时遵循漏斗式渐进探索（目录 ➔ `file_outline` 骨架 ➔ `grep` 线索 ➔ 局部靶向精读）；严禁无目的连续多轮分页切片（`offset_line`）式遍历大文件；修改前只精读最小必要上下文，严禁凭空盲猜。 | 允许 Agent 自由阅读大段源码，解除对连续分页通读与精益读取的强约束。 |
 | **`todo_lifecycle`** | 任务清单规范 | 任务规划 | 多步任务先建立 todo 清单并实时推进；最终回复前必须将任务收尾为 `done`（杜绝遗留 `in_progress`）。 | 允许模型自由推进，不强制调用 todo 工具维护状态清单。 |
 
 ### 3. 数据持久化与后端动态提示词装配

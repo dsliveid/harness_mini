@@ -90,6 +90,14 @@ export const AGENT_SOPS: AgentSopInfo[] = [
     disableEffect: "禁用后：移除代码最小化精确修改与构建验证的强指引约束。",
   },
   {
+    id: "surgical_code_reading",
+    name: "精益代码研读规范",
+    category: "quality",
+    categoryLabel: "工程质量",
+    description: "探索业务与代码时遵循漏斗式渐进探索（目录/清单 ➔ file_outline 骨架 ➔ grep 线索 ➔ 局部靶向精读）；严禁对大型文件进行多轮无休止的分页切片（offset_line）式逐行通读；修改前只精读最小必要上下文，严禁凭空盲猜。",
+    disableEffect: "禁用后：允许 Agent 自由阅读大段源码，解除对连续分页通读与精益读取的强约束。",
+  },
+  {
     id: "todo_lifecycle",
     name: "任务清单全生命周期规范",
     category: "workflow",
@@ -187,6 +195,12 @@ export interface Session {
   /** 专属视觉模型 ID */
   visionModelId?: string | null;
   vision_model_id?: string | null;
+  /** 分支来源会话 ID */
+  forkedFromSessionId?: string | null;
+  forked_from_session_id?: string | null;
+  /** 分支来源消息 ID */
+  forkedFromMessageId?: string | null;
+  forked_from_message_id?: string | null;
 }
 
 export interface SubagentCreateInput {
@@ -248,6 +262,10 @@ export interface SessionCreateInput {
   accessMode?: string;
   contextTokenLimit?: number | null;
   temp?: TempAlloc;
+  imageProviderId?: string | null;
+  imageModelId?: string | null;
+  visionProviderId?: string | null;
+  visionModelId?: string | null;
 }
 
 /** 临时空间中被拷贝的单个项目条目（主项目 key="main"，关联项目 key="link:<id>"） */

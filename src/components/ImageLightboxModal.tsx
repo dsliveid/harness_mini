@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useStore } from "../store";
-import { toAssetUrl } from "../utils/image";
+import { SafeImage } from "./SafeImage";
 import { X, ZoomIn, ZoomOut, RotateCcw, Copy, Check } from "./Icons";
 
 export function ImageLightboxModal() {
@@ -31,8 +31,6 @@ export function ImageLightboxModal() {
   }, [lightboxImage, setLightboxImage]);
 
   if (!lightboxImage) return null;
-
-  const assetUrl = toAssetUrl(lightboxImage.src);
 
   const handleCopyPath = async () => {
     try {
@@ -139,8 +137,8 @@ export function ImageLightboxModal() {
         className="max-w-[90vw] max-h-[85vh] overflow-hidden flex items-center justify-center"
         onClick={(e) => e.stopPropagation()}
       >
-        <img
-          src={assetUrl}
+        <SafeImage
+          src={lightboxImage.src}
           alt={lightboxImage.alt || "图片预览"}
           style={{ transform: `scale(${scale})` }}
           className="max-w-[85vw] max-h-[80vh] object-contain rounded-lg shadow-2xl transition-transform duration-100 ease-out cursor-zoom-in"

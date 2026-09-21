@@ -196,8 +196,9 @@ pub fn estimate_value_tokens(val: &serde_json::Value) -> usize {
   - 杜绝“后续任务已经继续执行，前端却依然能点击‘继续下一步’导致逻辑重入冲突”。
 
 ### 4. 历史归档与会话折叠展示
-- 一旦某段历史被成功压缩，在后续的聊天界面（[`ChatView.tsx`](file:///d:/WorkSpace/Other/harness_mini/src/components/ChatView.tsx)）中，`seq <= end_seq` 的原始消息将被收起，替换为整洁的 [`CompactedHistoryCard`](file:///d:/WorkSpace/Other/harness_mini/src/components/CompactionBanner.tsx)。
-- 用户可随时点击卡片展开查阅已被持久化的技术备忘录。
+- 一旦某段历史被成功压缩，聊天界面（[`ChatView.tsx`](file:///f:/WorkSpace/Other/harness_mini/src/components/ChatView.tsx)）将**完整保留所有历史对话记录**，确保用户可随时向上回溯查阅历史发言与工具执行详情。
+- 压缩卡片 [`CompactedHistoryCard`](file:///f:/WorkSpace/Other/harness_mini/src/components/CompactionBanner.tsx) 会作为阶段性里程碑内联插入在对应轮次之间（`seq = end_seq` 之后），醒目标注该阶段历史已被压缩提炼为技术备忘录并注入后续上下文。
+- 用户可随时点击卡片展开查阅已被持久化的技术备忘录与压缩生成时间。
 
 ---
 

@@ -3,6 +3,7 @@ import { useStore } from "../store";
 import { computeTurnMetrics, type Session, type Message } from "../types";
 import { ipc } from "../ipc";
 import { MessageItem } from "./MessageItem";
+import { ExecutionProcessBlock, groupTimelineItems } from "./ExecutionProcessBlock";
 import { askConfirm } from "./PromptModal";
 import {
   X,
@@ -21,6 +22,7 @@ import {
   Cpu,
   Eye,
   Pencil,
+  MoreHorizontal,
 } from "./Icons";
 
 function formatTokens(n?: number | null): string {
@@ -87,6 +89,26 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
   const boxRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const stickRef = useRef(true);
+  const headerRef = useRef<HTMLDivElement>(null);
+  const [headerWidth, setHeaderWidth] = useState(500);
+  const [openMoreMenu, setOpenMoreMenu] = useState(false);
+
+  useEffect(() => {
+    const el = headerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        setHeaderWidth(entry.contentRect.width);
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const isWide = headerWidth >= 520;
+  const isCompact = headerWidth < 520;
+  const isAutoReportVisible = headerWidth >= 390;
+  const isVeryCompact = headerWidth < 380;
 
   // 异步自动拉取与状态同步：若本地尚未命中，立即从后端重试同步
   useEffect(() => {
@@ -131,6 +153,10 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
   }, [collaboratorId]);
 
   const turnMetricsMap = useMemo(() => computeTurnMetrics(msgs, isRunning), [msgs, isRunning]);
+  const groupedItems = useMemo(() => {
+    const visible = msgs.filter((m) => m.role !== "tool").map((m) => ({ type: "message" as const, msg: m }));
+    return groupTimelineItems(visible, turnMetricsMap, isRunning);
+  }, [msgs, turnMetricsMap, isRunning]);
 
   // 实时聚合会话 Token（结合已完结轮次、历史持久化值与流式中的动态粗估）
   const tokenStats = useMemo(() => {
@@ -305,67 +331,85 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
   return (
     <div className="flex-1 flex flex-col min-h-0 w-full bg-panel border-l border-edge relative z-10">
       {/* Top Header */}
-      <div className="h-12 border-b border-edge bg-panel2/60 backdrop-blur px-3.5 flex items-center justify-between shrink-0 select-none gap-2">
+      <div
+        ref={headerRef}
+        className="relative z-30 h-12 border-b border-edge/60 bg-panel px-3 sm:px-3.5 flex items-center justify-between shrink-0 select-none gap-2"
+      >
         {/* Left: Role info + Title + Status */}
-        <div className="flex items-center gap-2 min-w-0 flex-1">
-          {isSubprocess && (
-            <div className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-indigo-500/15 text-indigo-400 border border-indigo-500/30 text-[10px] font-medium shrink-0">
-              <Cpu size={11} />
+        <div className="flex items-center gap-1.5 min-w-0 shrink overflow-hidden">
+          {isSubprocess && !isCompact && (
+            <div className="flex items-center gap-1 h-8 px-2 rounded-lg bg-indigo-500/15 text-indigo-400 border border-indigo-500/30 text-[11px] font-medium shrink-0">
+              <Cpu size={12} />
               <span>子进程</span>
             </div>
           )}
 
-          <span className={`px-2 py-0.5 rounded-md text-[11px] font-medium border flex items-center gap-1.5 shrink-0 ${roleInfo.color}`}>
+          <span
+            className={`h-8 ${isCompact ? "px-2" : "px-2.5"} rounded-lg text-[12px] font-medium border flex items-center gap-1.5 shrink-0 ${roleInfo.color}`}
+            title={`角色: ${roleInfo.label}`}
+          >
             <span className="text-[12px]">{roleInfo.icon}</span>
-            <span className="whitespace-nowrap">{roleInfo.label}</span>
+            {!isCompact && <span className="whitespace-nowrap">{roleInfo.label}</span>}
           </span>
 
-          <span className="font-medium text-[13px] text-ink truncate min-w-0 max-w-[150px]" title={collab.title}>
+          <span
+            className="font-medium text-[12.5px] text-ink truncate min-w-0 max-w-[80px] sm:max-w-[130px]"
+            title={collab.title}
+          >
             {collab.title}
           </span>
 
           {isRunning ? (
-            <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-accent/10 border border-accent/20 text-accent shrink-0 animate-pulse whitespace-nowrap">
-              <Loader2 size={11} className="animate-spin" />
-              <span>运行中</span>
-            </span>
+            <div
+              className="flex items-center gap-1.5 h-8 px-2 sm:px-2.5 rounded-lg text-[12px] shrink-0 select-none bg-emerald-500/10 text-emerald-400 font-medium border border-emerald-500/20"
+              title="任务执行中"
+            >
+              <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-emerald-400 animate-pulse shadow-[0_0_6px_rgba(52,211,153,0.8)]" />
+              {!isCompact && <span>运行中</span>}
+            </div>
           ) : collab.status === "failed" ? (
-            <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium bg-rose-500/10 border border-rose-500/20 text-rose-400 shrink-0 whitespace-nowrap">
-              <AlertCircle size={11} />
-              <span>异常</span>
-            </span>
+            <div
+              className="flex items-center gap-1.5 h-8 px-2 sm:px-2.5 rounded-lg text-[12px] shrink-0 select-none bg-rose-500/10 text-rose-400 font-medium border border-rose-500/20"
+              title="执行异常"
+            >
+              <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-rose-400" />
+              {!isCompact && <span>异常</span>}
+            </div>
           ) : (
-            <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 shrink-0 whitespace-nowrap">
-              <CheckCircle2 size={11} />
-              <span>就绪</span>
-            </span>
+            <div
+              className="flex items-center gap-1.5 h-8 px-2 rounded-lg text-[12px] shrink-0 select-none text-inkdim/60"
+              title="当前空闲待命"
+            >
+              <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-inkdim/40" />
+              {!isCompact && <span>就绪</span>}
+            </div>
           )}
         </div>
 
         {/* Right Header Action Buttons */}
-        <div className="flex items-center gap-1.5 shrink-0 whitespace-nowrap">
-          {/* 子进程专属：只读流程提示标签 */}
-          {isSubprocess && (
-            <span className="hidden sm:inline-flex items-center gap-1 text-[10px] text-inkdim bg-panel border border-edge/60 px-1.5 py-0.5 rounded">
-              <Eye size={10} className="opacity-70" />
-              <span>只读执行</span>
+        <div className="flex items-center gap-1.5 shrink-0 select-none ml-auto">
+          {/* 子进程专属：只读流程提示标签（宽屏展示） */}
+          {isSubprocess && !isCompact && (
+            <span className="inline-flex items-center gap-1 h-8 px-2 rounded-lg text-[11px] text-inkdim bg-panel2/60 border border-edge/60 shrink-0">
+              <Eye size={11} className="opacity-70" />
+              <span>只读</span>
             </span>
           )}
 
-          {/* 协作者专属：自动汇报开关（子进程不需要手动汇报，由主 Agent 自动汇聚） */}
-          {!isSubprocess && (
+          {/* 协作者专属：自动汇报开关（渐进式缩放：>= 520px 显示「自动汇报: 开/关」，390px~520px 缩放为「汇报: 开/关」，< 390px 收进更多操作） */}
+          {!isSubprocess && isAutoReportVisible && (
             <button
               type="button"
               onClick={handleToggleAutoReport}
-              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-medium border transition-colors cursor-pointer shrink-0 whitespace-nowrap ${
+              className={`flex items-center gap-1.5 h-8 ${isWide ? "px-2.5" : "px-2"} rounded-lg text-[12px] font-medium border transition-colors cursor-pointer shrink-0 ${
                 isAutoReport
                   ? "bg-accent/10 border-accent/30 text-accent hover:bg-accent/20"
                   : "bg-panel2/80 hover:bg-panel2 border-edge text-inkdim hover:text-ink"
               }`}
-              title={isAutoReport ? "已开启：协作者执行完毕后将自动向主任务提交增量汇报（点击切换）" : "已关闭：需手动点击「汇报成果」向主任务汇报（点击切换）"}
+              title={isAutoReport ? "自动汇报：开启（任务完成后自动提交增量汇报）\n点击切换" : "自动汇报：关闭（需手动点击「汇报成果」）\n点击切换"}
             >
               <span className={`w-1.5 h-1.5 rounded-full ${isAutoReport ? "bg-accent" : "bg-zinc-500"}`} />
-              <span>自动汇报: {isAutoReport ? "开" : "关"}</span>
+              <span>{isWide ? `自动汇报: ${isAutoReport ? "开" : "关"}` : `汇报: ${isAutoReport ? "开" : "关"}`}</span>
             </button>
           )}
 
@@ -374,25 +418,25 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
             <button
               type="button"
               onClick={() => void stopSubagent(collaboratorId)}
-              className="flex items-center gap-1 px-2.5 py-1 rounded-md text-amber-400 hover:bg-amber-500/10 border border-amber-500/30 text-[11px] font-medium transition-colors cursor-pointer shrink-0 whitespace-nowrap"
+              className="flex items-center gap-1 h-8 px-2.5 rounded-lg text-amber-400 hover:bg-amber-500/10 border border-amber-500/20 text-[12px] font-medium transition-colors cursor-pointer shrink-0"
               title={isSubprocess ? "终止当前子进程运行" : "停止当前协作者"}
             >
               <Square size={11} fill="currentColor" />
-              <span>停止</span>
+              {!isVeryCompact && <span>停止</span>}
             </button>
           )}
 
-          {/* 协作者专属：手动增量汇报按钮（子进程由主会话工具自动等待汇聚） */}
+          {/* 协作者专属：手动增量汇报按钮 */}
           {!isSubprocess && !isRunning && msgs.some((m) => m.role === "assistant") && (
             <button
               type="button"
               onClick={handleReport}
               disabled={reporting}
-              className="flex items-center gap-1 px-2.5 py-1 rounded-md text-emerald-400 hover:bg-emerald-500/15 border border-emerald-500/30 text-[11px] font-medium transition-colors cursor-pointer shrink-0 whitespace-nowrap disabled:opacity-50"
+              className="flex items-center gap-1 h-8 px-2 sm:px-2.5 rounded-lg text-emerald-400 hover:bg-emerald-500/15 border border-emerald-500/20 text-[12px] font-medium transition-colors cursor-pointer shrink-0 disabled:opacity-50"
               title="手动将自上次汇报以来的增量产出与改动汇报给主会话"
             >
-              {reporting ? <Loader2 size={11} className="animate-spin" /> : <Send size={11} />}
-              <span>{reporting ? "汇报中…" : "汇报成果"}</span>
+              {reporting ? <Loader2 size={12} className="animate-spin" /> : <Send size={12} />}
+              {!isVeryCompact && <span>{reporting ? "汇报中…" : "汇报成果"}</span>}
             </button>
           )}
 
@@ -401,51 +445,153 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
             <button
               type="button"
               onClick={() => void restartSubagent(collaboratorId)}
-              className="flex items-center gap-1 px-2.5 py-1 rounded-md text-inkdim hover:text-ink hover:bg-panel2 border border-edge text-[11px] font-medium transition-colors cursor-pointer shrink-0 whitespace-nowrap"
+              className="flex items-center gap-1 h-8 px-2.5 rounded-lg text-inkdim hover:text-ink hover:bg-panel2 border border-edge text-[12px] font-medium transition-colors cursor-pointer shrink-0"
               title={isSubprocess ? "重新启动 / 继续该子进程" : "重启 / 继续当前协作者"}
             >
               <RefreshCw size={11} />
-              <span>重启</span>
+              {!isVeryCompact && <span>重启</span>}
             </button>
           )}
 
-          {/* 协作者专属：编辑配置按钮 */}
-          {!isSubprocess && (
-            <button
-              type="button"
-              onClick={() => {
-                useStore.getState().setEditingCollaboratorId(collaboratorId);
-                useStore.getState().setShowEditCollaboratorModal(true);
-              }}
-              className="flex items-center gap-1 px-2.5 py-1 rounded-md text-inkdim hover:text-ink hover:bg-panel2 border border-edge text-[11px] font-medium transition-colors cursor-pointer shrink-0 whitespace-nowrap"
-              title="编辑协作者配置（名称、角色、驱动模型、生图模型、调度规则等）"
-            >
-              <Pencil size={11} />
-              <span>编辑</span>
-            </button>
+          {/* 宽屏直接展示：编辑与删除按钮 */}
+          {!isCompact && (
+            <>
+              {!isSubprocess && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    useStore.getState().setEditingCollaboratorId(collaboratorId);
+                    useStore.getState().setShowEditCollaboratorModal(true);
+                  }}
+                  className="w-8 h-8 rounded-lg border border-edge/60 text-inkdim hover:text-ink hover:bg-panel2 flex items-center justify-center transition-colors cursor-pointer shrink-0"
+                  title="编辑协作者配置（名称、角色、驱动模型、生图模型、调度规则等）"
+                >
+                  <Pencil size={12} />
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={handleDelete}
+                className="w-8 h-8 rounded-lg hover:bg-rose-500/10 hover:text-rose-400 text-inkdim flex items-center justify-center transition-colors shrink-0 cursor-pointer"
+                title={isSubprocess ? "移除子进程" : "移除协作者"}
+              >
+                <Trash2 size={13} />
+              </button>
+            </>
+          )}
+
+          {/* 窄屏/缩放时收起为：更多操作下拉菜单（包含自动汇报切换、编辑、移除） */}
+          {isCompact && (
+            <div className="relative shrink-0">
+              <button
+                type="button"
+                onClick={() => setOpenMoreMenu((v) => !v)}
+                className={`w-8 h-8 rounded-lg border border-edge/60 hover:bg-panel2 flex items-center justify-center transition-colors cursor-pointer shrink-0 ${
+                  openMoreMenu ? "bg-panel2 border-accent/50 text-accent ring-1 ring-accent/20" : "text-inkdim hover:text-ink"
+                }`}
+                title="更多操作（自动汇报设置、配置编辑、移除）"
+              >
+                <MoreHorizontal size={14} />
+              </button>
+
+              {openMoreMenu && (
+                <>
+                  <div
+                    className="fixed inset-0 z-40"
+                    onMouseDown={(e) => {
+                      e.stopPropagation();
+                      setOpenMoreMenu(false);
+                    }}
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                  <div
+                    className="absolute right-0 top-10 z-50 w-[180px] bg-panel2 border border-edge/80 rounded-xl shadow-2xl p-1 animate-in fade-in zoom-in-95 duration-100 select-none"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div className="px-2 py-1 text-[10.5px] font-medium text-inkdim">更多操作</div>
+                    {!isSubprocess && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void handleToggleAutoReport();
+                            setOpenMoreMenu(false);
+                          }}
+                          className="w-full text-left px-2.5 py-1.5 rounded-lg text-[12px] hover:bg-panel3 transition-colors flex items-center justify-between text-ink/90 hover:text-ink cursor-pointer"
+                          title="执行完毕后自动提交增量汇报给主任务"
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className={`w-1.5 h-1.5 rounded-full ${isAutoReport ? "bg-accent" : "bg-zinc-500"}`} />
+                            <span>自动汇报</span>
+                          </div>
+                          <span className={`text-[11px] font-medium ${isAutoReport ? "text-accent" : "text-inkdim"}`}>
+                            {isAutoReport ? "开" : "关"}
+                          </span>
+                        </button>
+
+                        {!isRunning && msgs.some((m) => m.role === "assistant") && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setOpenMoreMenu(false);
+                              void handleReport();
+                            }}
+                            disabled={reporting}
+                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-[12px] hover:bg-panel3 transition-colors flex items-center gap-2 text-emerald-400 hover:text-emerald-300 cursor-pointer disabled:opacity-50"
+                            title="手动将自上次汇报以来的增量产出与改动汇报给主会话"
+                          >
+                            {reporting ? <Loader2 size={12} className="animate-spin" /> : <Send size={12} />}
+                            <span>{reporting ? "汇报中…" : "汇报成果"}</span>
+                          </button>
+                        )}
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            useStore.getState().setEditingCollaboratorId(collaboratorId);
+                            useStore.getState().setShowEditCollaboratorModal(true);
+                            setOpenMoreMenu(false);
+                          }}
+                          className="w-full text-left px-2.5 py-1.5 rounded-lg text-[12px] hover:bg-panel3 transition-colors flex items-center gap-2 text-ink/90 hover:text-ink cursor-pointer"
+                          title="编辑角色、模型分配与调度规则"
+                        >
+                          <Pencil size={12} className="text-inkdim" />
+                          <span>编辑配置</span>
+                        </button>
+                        <div className="my-1 border-t border-edge/50" />
+                      </>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void handleDelete();
+                        setOpenMoreMenu(false);
+                      }}
+                      className="w-full text-left px-2.5 py-1.5 rounded-lg text-[12px] hover:bg-rose-500/10 text-rose-400 hover:text-rose-300 transition-colors flex items-center gap-2 cursor-pointer"
+                      title={isSubprocess ? "移除该子进程及其执行数据" : "移除该协作者及其执行数据"}
+                    >
+                      <Trash2 size={12} />
+                      <span>{isSubprocess ? "移除子进程" : "移除协作者"}</span>
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
           )}
 
           {/* Divider */}
-          <div className="h-3.5 w-px bg-edge/80 shrink-0 mx-0.5" />
-
-          {/* Delete Button */}
-          <button
-            type="button"
-            onClick={handleDelete}
-            className="w-7 h-7 rounded-md hover:bg-rose-500/10 hover:text-rose-400 text-inkdim flex items-center justify-center transition-colors shrink-0 cursor-pointer"
-            title={isSubprocess ? "移除子进程" : "移除协作者"}
-          >
-            <Trash2 size={13} />
-          </button>
+          <div className="h-4 w-px bg-edge/80 shrink-0 mx-0.5" />
 
           {/* Close Panel Button */}
           <button
             type="button"
             onClick={() => setActiveCollaboratorId(null)}
-            className="w-7 h-7 rounded-md hover:bg-panel2 text-inkdim hover:text-ink flex items-center justify-center transition-colors shrink-0 cursor-pointer"
+            className="w-8 h-8 rounded-lg hover:bg-panel2 text-inkdim hover:text-ink flex items-center justify-center transition-colors shrink-0 cursor-pointer"
             title="关闭分屏面板"
           >
-            <X size={15} />
+            <X size={14} />
           </button>
         </div>
       </div>
@@ -507,9 +653,24 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
             </div>
           </div>
         ) : (
-          msgs
-            .filter((m) => m.role !== "tool")
-            .map((m) => (
+          groupedItems.map((item) => {
+            if (item.type === "compaction") return null;
+            if (item.type === "process") {
+              return (
+                <ExecutionProcessBlock
+                  key={item.id}
+                  steps={item.steps}
+                  isRunning={isRunning && item.steps.some((s) => s.id === msgs[msgs.length - 1]?.id)}
+                  sessionWorkspace={collab.workspacePath}
+                  streamingMsgId={isRunning ? msgs[msgs.length - 1]?.id : undefined}
+                  turnMetrics={item.turnMetrics}
+                  readOnly={isSubprocess}
+                  turnMetricsMap={turnMetricsMap}
+                />
+              );
+            }
+            const m = item.msg;
+            return (
               <MessageItem
                 key={m.id}
                 msg={m}
@@ -519,7 +680,8 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
                 running={isRunning}
                 turnMetrics={turnMetricsMap.get(m.id)}
               />
-            ))
+            );
+          })
         )}
       </div>
 

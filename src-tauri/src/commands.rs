@@ -436,6 +436,28 @@ pub fn get_messages(
 }
 
 #[tauri::command]
+pub fn fork_session_at_message(
+    app: AppHandle,
+    state: State<'_, crate::AppState>,
+    session_id: String,
+    message_id: String,
+    new_title: Option<String>,
+    include_target: Option<bool>,
+) -> Result<Session, String> {
+    let db = state.db.lock().unwrap();
+    let s = store::fork_session_at_message(
+        &db,
+        &session_id,
+        &message_id,
+        new_title.as_deref(),
+        include_target.unwrap_or(true),
+    )?;
+    let _ = app.emit("sessions:changed", json!({"created": s.id}));
+    let _ = app.emit("session:update", &s);
+    Ok(s)
+}
+
+#[tauri::command]
 pub fn create_session(
     app: AppHandle,
     state: State<'_, crate::AppState>,
@@ -445,6 +467,10 @@ pub fn create_session(
     access_mode: Option<String>,
     context_token_limit: Option<usize>,
     temp: Option<TempAlloc>,
+    image_provider_id: Option<String>,
+    image_model_id: Option<String>,
+    vision_provider_id: Option<String>,
+    vision_model_id: Option<String>,
 ) -> Result<Session, String> {
     let access_mode = crate::models::normalize_access_mode(access_mode.as_deref().unwrap_or("confirm"));
     let title = title
@@ -469,7 +495,17 @@ pub fn create_session(
                 return Err(format!("临时空间路径非法: {}", p.temp));
             }
         }
-        let s = store::create_session(&db, &t.main_temp, Some(&proj_id), &title, &access_mode)?;
+        let s = store::create_session_with_models(
+            &db,
+            &t.main_temp,
+            Some(&proj_id),
+            &title,
+            &access_mode,
+            image_provider_id.as_deref(),
+            image_model_id.as_deref(),
+            vision_provider_id.as_deref(),
+            vision_model_id.as_deref(),
+        )?;
         if let Some(lim) = context_token_limit {
             let _ = store::set_session_context_limit(&db, &s.id, Some(lim));
         }
@@ -497,7 +533,17 @@ pub fn create_session(
         let _ = app.emit("projects:changed", &p);
         Some(pid)
     };
-    let s = store::create_session(&db, &ws, project_id.as_deref(), &title, &access_mode)?;
+    let s = store::create_session_with_models(
+        &db,
+        &ws,
+        project_id.as_deref(),
+        &title,
+        &access_mode,
+        image_provider_id.as_deref(),
+        image_model_id.as_deref(),
+        vision_provider_id.as_deref(),
+        vision_model_id.as_deref(),
+    )?;
     if let Some(lim) = context_token_limit {
         let _ = store::set_session_context_limit(&db, &s.id, Some(lim));
     }
@@ -531,6 +577,10 @@ pub fn send_message(
     access_mode: Option<String>,
     context_token_limit: Option<usize>,
     attachments: Option<Vec<crate::models::Attachment>>,
+    image_provider_id: Option<String>,
+    image_model_id: Option<String>,
+    vision_provider_id: Option<String>,
+    vision_model_id: Option<String>,
 ) -> Result<SendResult, String> {
     let text = text.trim().to_string();
     let has_attachments = attachments.as_ref().map(|a| !a.is_empty()).unwrap_or(false);
@@ -570,7 +620,17 @@ pub fn send_message(
                 } else {
                     "新对话".into()
                 };
-                let s = store::create_session(&db, &t.main_temp, Some(&proj_id), &title, &access_mode)?;
+                let s = store::create_session_with_models(
+                    &db,
+                    &t.main_temp,
+                    Some(&proj_id),
+                    &title,
+                    &access_mode,
+                    image_provider_id.as_deref(),
+                    image_model_id.as_deref(),
+                    vision_provider_id.as_deref(),
+                    vision_model_id.as_deref(),
+                )?;
                 if let Some(lim) = context_token_limit {
                     let _ = store::set_session_context_limit(&db, &s.id, Some(lim));
                 }
@@ -606,7 +666,17 @@ pub fn send_message(
                     let _ = app.emit("projects:changed", &p);
                     Some(pid)
                 };
-                let s = store::create_session(&db, &ws, project_id.as_deref(), &title, &access_mode)?;
+                let s = store::create_session_with_models(
+                    &db,
+                    &ws,
+                    project_id.as_deref(),
+                    &title,
+                    &access_mode,
+                    image_provider_id.as_deref(),
+                    image_model_id.as_deref(),
+                    vision_provider_id.as_deref(),
+                    vision_model_id.as_deref(),
+                )?;
                 if let Some(lim) = context_token_limit {
                     let _ = store::set_session_context_limit(&db, &s.id, Some(lim));
                 }
@@ -778,8 +848,8 @@ pub fn spawn_subagent(
     role: String,
     title: String,
     task: String,
-    subpath: Option<String>,
-    workspace_path: Option<String>,
+    _subpath: Option<String>,
+    _workspace_path: Option<String>,
 ) -> Result<Session, String> {
     let parent = {
         let db = state.db.lock().unwrap();
@@ -789,19 +859,8 @@ pub fn spawn_subagent(
         return Err("子 Agent 不允许再创建子 Agent".into());
     }
 
-    // 关键修复：确定子 Agent 的物理工作区根目录
-    // 1. 若显式指定了 workspace_path，使用指定的独立根目录；
-    // 2. 缺省时严格继承父会话的完整工作区根目录，绝不能将 subpath 拼接到根目录上！
-    let sub_workspace = if let Some(ref ws) = workspace_path.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let p = std::path::Path::new(ws);
-        if p.is_absolute() {
-            ws.to_string()
-        } else {
-            std::path::Path::new(&parent.workspace_path).join(p).to_string_lossy().to_string()
-        }
-    } else {
-        parent.workspace_path.clone()
-    };
+    // 子 Agent 工作区严格继承父会话工作区根目录
+    let sub_workspace = parent.workspace_path.clone();
 
     let (sub, user_msg) = {
         let db = state.db.lock().unwrap();
@@ -816,11 +875,8 @@ pub fn spawn_subagent(
             parent.project_id.as_deref(),
             None,
         )?;
-        let focus_info = subpath.as_ref().map(|p| {
-            format!("\n\n重点关注子目录：`{p}`\n（提示：请优先深入该子目录开展探索与修改；当前工作区根目录依然为完整的 `{sub_workspace}`，根目录下的全局构建与配置文件如 pom.xml / package.json / README 等均在合法访问范围内，需要时可直接读取）")
-        }).unwrap_or_default();
         let initial_prompt = format!(
-            "【子 Agent 协作任务】\n角色定位：{role}\n任务标题：{title}\n工作区根目录：{sub_workspace}\n\n详细需求描述：\n{task}{focus_info}"
+            "【子 Agent 协作任务】\n角色定位：{role}\n任务标题：{title}\n工作区根目录：{sub_workspace}\n\n详细需求描述：\n{task}"
         );
         let user_msg = store::new_message(&db, &sub.id, "user", Some(initial_prompt), false)?;
         (sub, user_msg)
@@ -1214,6 +1270,10 @@ pub fn do_report_collaborator_increment(
         None,
         None,
         None,
+        None,
+        None,
+        None,
+        None,
     )?;
 
     {
@@ -1295,13 +1355,15 @@ pub fn edit_and_resend(
     session_id: String,
     message_id: String,
     new_text: String,
+    attachments: Option<Vec<crate::models::Attachment>>,
 ) -> Result<(), String> {
     if is_run_active(&state, &session_id) {
         return Err("Agent 正在运行，无法编辑重发".into());
     }
     let text = new_text.trim().to_string();
-    if text.is_empty() {
-        return Err("消息不能为空".into());
+    let has_attachments = attachments.as_ref().map(|a| !a.is_empty()).unwrap_or(false);
+    if text.is_empty() && !has_attachments {
+        return Err("消息内容与附件不能同时为空".into());
     }
     {
         let db = state.db.lock().unwrap();
@@ -1316,7 +1378,7 @@ pub fn edit_and_resend(
                 }
             }
         }
-        store::update_message_content(&db, &message_id, &text, None)?;
+        store::update_message_content_and_attachments(&db, &message_id, &text, attachments.as_deref())?;
         store::delete_messages_after(&db, &session_id, m.seq)?;
         store::touch_session(&db, &session_id)?;
     }
@@ -1934,6 +1996,169 @@ pub fn get_session_active_state(
 ) -> Result<crate::snapshot::SessionActiveState, String> {
     Ok(state.snapshot.get(&session_id))
 }
+
+#[tauri::command]
+pub async fn read_file_base64(state: State<'_, crate::AppState>, path: String) -> Result<String, String> {
+    read_file_base64_inner(Some(&state), &path).await
+}
+
+pub async fn read_file_base64_inner(state: Option<&crate::AppState>, path: &str) -> Result<String, String> {
+    let mut clean = path.trim().to_string();
+
+    // 1. 剔除常见的网络/协议前缀
+    if let Some(stripped) = clean.strip_prefix("asset://localhost/") {
+        clean = stripped.to_string();
+    } else if let Some(stripped) = clean.strip_prefix("asset://") {
+        clean = stripped.to_string();
+    } else if let Some(stripped) = clean.strip_prefix("http://asset.localhost/") {
+        clean = stripped.to_string();
+    } else if let Some(stripped) = clean.strip_prefix("https://asset.localhost/") {
+        clean = stripped.to_string();
+    } else if let Some(stripped) = clean.strip_prefix("file:///") {
+        clean = stripped.to_string();
+    } else if let Some(stripped) = clean.strip_prefix("file://") {
+        clean = stripped.to_string();
+    }
+
+    // 2. URL 百分号解码（如 %20, %3A, %5C 等）
+    if clean.contains('%') {
+        let mut out = Vec::with_capacity(clean.len());
+        let bytes = clean.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                if let Ok(val) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..=i + 2]).unwrap_or(""), 16) {
+                    out.push(val);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        if let Ok(decoded) = String::from_utf8(out) {
+            clean = decoded;
+        }
+    }
+
+    // 3. 针对 Windows 驱动器路径前有多余斜杠的处理，如 /D:/xxx -> D:/xxx
+    if clean.starts_with('/') && clean.len() >= 3 && clean.chars().nth(2) == Some(':') {
+        clean = clean[1..].to_string();
+    }
+
+    let file_path = PathBuf::from(&clean);
+    let resolved_path = if file_path.exists() {
+        Some(file_path)
+    } else if let Some(st) = state {
+        let db = st.db.lock().unwrap();
+        let mut candidate = None;
+        // 1. 尝试使用 settings.last_workspace_path 拼接相对路径
+        if let Ok(settings) = store::get_settings(&db) {
+            if let Some(ref ws) = settings.last_workspace_path {
+                let p = Path::new(ws).join(&clean);
+                if p.exists() {
+                    candidate = Some(p);
+                }
+            }
+        }
+        // 2. 尝试从所有已保存项目中匹配工作区路径拼接
+        if candidate.is_none() {
+            if let Ok(projects) = store::list_projects(&db) {
+                for p in projects {
+                    if let Some(ref ws) = p.path {
+                        let cand = Path::new(ws).join(&clean);
+                        if cand.exists() {
+                            candidate = Some(cand);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // 3. 尝试从数据目录或 generated_images 目录查找
+        if candidate.is_none() {
+            let data_dir = st.data_dir.lock().unwrap().clone().unwrap_or_else(|| st.default_data_dir.clone());
+            let cand1 = data_dir.join(&clean);
+            if cand1.exists() {
+                candidate = Some(cand1);
+            } else {
+                let cand2 = data_dir.join("generated_images").join(&clean);
+                if cand2.exists() {
+                    candidate = Some(cand2);
+                }
+            }
+        }
+        candidate
+    } else {
+        None
+    };
+
+    let target_file = resolved_path.ok_or_else(|| format!("文件不存在: {}", clean))?;
+
+    let bytes = tokio::fs::read(&target_file)
+        .await
+        .map_err(|e| format!("读取图片文件失败: {e}"))?;
+
+    let ext = target_file
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        _ => "image/png",
+    };
+
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{mime};base64,{b64}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_read_file_base64_logic() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("test_read_base64.png");
+        let sample_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        tokio::fs::write(&test_file, sample_bytes).await.unwrap();
+
+        let path_str = test_file.to_string_lossy().to_string();
+
+        // 1. 原生路径读取
+        let res = read_file_base64_inner(None, &path_str).await.unwrap();
+        assert!(res.starts_with("data:image/png;base64,"));
+
+        // 2. 带 file:/// 前缀读取
+        let file_url = format!("file:///{}", path_str.replace('\\', "/"));
+        let res2 = read_file_base64_inner(None, &file_url).await.unwrap();
+        assert_eq!(res, res2);
+
+        // 3. 不存在的文件测试
+        let bad = read_file_base64_inner(None, "D:/non_existent_file_xyz_123.png").await;
+        assert!(bad.is_err());
+
+        // 4. 真实混合分隔符路径测试（若存在）
+        let real_path = "D:\\WorkSpace\\IDEA\\yx-medical-manager\\generated_images/tech_dark_background.png";
+        if std::path::Path::new(real_path).exists() {
+            let res_real = read_file_base64_inner(None, real_path).await.unwrap();
+            assert!(res_real.starts_with("data:image/png;base64,"));
+        }
+
+        let _ = tokio::fs::remove_file(test_file).await;
+    }
+}
+
+
 
 
 

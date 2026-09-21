@@ -1,6 +1,12 @@
 import React from "react";
 import type { ModelCapability, Provider, Settings } from "../types";
-import { hasModelCapability, MODEL_CAPABILITY_METAS } from "../types";
+import {
+  hasModelCapability,
+  MODEL_CAPABILITY_METAS,
+  resolveActiveImageModel,
+  resolveActiveVisionModel,
+  resolveActiveModel,
+} from "../types";
 
 export interface ModelCapabilitySelectProps {
   capability: ModelCapability;
@@ -21,7 +27,7 @@ export function ModelCapabilitySelect({
   providers,
   settings,
   allowInherit = true,
-  inheritLabel = "跟随系统全局默认",
+  inheritLabel,
   className = "",
   disabled = false,
 }: ModelCapabilitySelectProps) {
@@ -30,6 +36,29 @@ export function ModelCapabilitySelect({
     label: capability,
     icon: "⚙️",
   };
+
+  // 计算全局生效模型名作为跟随全局的标签
+  let defaultInherit = "";
+  if (capability === "image_gen") {
+    const act = resolveActiveImageModel(settings);
+    defaultInherit = act
+      ? `跟随全局 (${act.model} · ${act.provider.name})`
+      : "跟随全局 (未配置)";
+  } else if (capability === "vision") {
+    const act = resolveActiveVisionModel(settings);
+    defaultInherit = act
+      ? `跟随全局 (${act.model} · ${act.provider.name})`
+      : "跟随全局 (回落主对话模型)";
+  } else if (capability === "chat") {
+    const act = resolveActiveModel(settings);
+    defaultInherit = act
+      ? `跟随全局 (${act.model} · ${act.provider.name})`
+      : "跟随全局 (未配置)";
+  } else {
+    defaultInherit = "跟随系统全局默认";
+  }
+
+  const effectiveInheritLabel = inheritLabel ?? defaultInherit;
 
   // 检查当前选中项是否具备能力
   let isCurrentValid = true;
@@ -54,7 +83,7 @@ export function ModelCapabilitySelect({
       >
         {allowInherit && (
           <option value="" className="text-inkdim bg-panel2">
-            {inheritLabel}
+            {effectiveInheritLabel}
           </option>
         )}
 

@@ -3,6 +3,7 @@ import { useStore } from "../store";
 import { computeTurnMetrics } from "../types";
 import { ipc } from "../ipc";
 import { MessageItem } from "./MessageItem";
+import { ExecutionProcessBlock, groupTimelineItems } from "./ExecutionProcessBlock";
 import {
   X,
   Square,
@@ -92,6 +93,23 @@ export function SubprocessView({ subprocessId }: { subprocessId: string }) {
   const boxRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const stickRef = useRef(true);
+  const headerRef = useRef<HTMLDivElement>(null);
+  const [headerWidth, setHeaderWidth] = useState(500);
+
+  useEffect(() => {
+    const el = headerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        setHeaderWidth(entry.contentRect.width);
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const isCompact = headerWidth < 460;
+  const isVeryCompact = headerWidth < 380;
 
   // 异步主动拉取重试：如果本地暂时未命中，向后端主动拉取最新子进程列表
   useEffect(() => {
@@ -139,6 +157,10 @@ export function SubprocessView({ subprocessId }: { subprocessId: string }) {
   }, [realSubId]);
 
   const turnMetricsMap = useMemo(() => computeTurnMetrics(msgs, isRunning), [msgs, isRunning]);
+  const groupedItems = useMemo(() => {
+    const visible = msgs.filter((m) => m.role !== "tool").map((m) => ({ type: "message" as const, msg: m }));
+    return groupTimelineItems(visible, turnMetricsMap, isRunning);
+  }, [msgs, turnMetricsMap, isRunning]);
 
   // 实时聚合子进程 Token
   const tokenStats = useMemo(() => {
@@ -297,25 +319,33 @@ export function SubprocessView({ subprocessId }: { subprocessId: string }) {
   return (
     <div className="flex-1 flex flex-col min-h-0 bg-panel border-l border-edge relative z-10">
       {/* Top Header */}
-      <div className="h-12 border-b border-edge bg-panel2/60 backdrop-blur px-3.5 flex items-center justify-between shrink-0 select-none">
-        <div className="flex items-center gap-2 min-w-0 flex-1 mr-2">
-          <div className="flex items-center gap-1.5 px-1.5 py-0.5 rounded bg-indigo-500/15 text-indigo-400 border border-indigo-500/30 text-[10px] font-medium shrink-0">
-            <Cpu size={11} />
-            <span>子进程</span>
-          </div>
+      <div
+        ref={headerRef}
+        className="relative z-30 h-12 border-b border-edge/60 bg-panel px-3 sm:px-3.5 flex items-center justify-between shrink-0 select-none gap-2"
+      >
+        <div className="flex items-center gap-1.5 min-w-0 shrink overflow-hidden">
+          {!isCompact && (
+            <div className="flex items-center gap-1 h-8 px-2 rounded-lg bg-indigo-500/15 text-indigo-400 border border-indigo-500/30 text-[11px] font-medium shrink-0">
+              <Cpu size={12} />
+              <span>子进程</span>
+            </div>
+          )}
 
-          <span className={`px-2 py-0.5 rounded-md text-[11px] font-medium border flex items-center gap-1 shrink-0 ${roleMeta.color}`}>
-            <span>{roleMeta.icon}</span>
-            <span>{roleMeta.label}</span>
+          <span
+            className={`h-8 ${isCompact ? "px-2" : "px-2.5"} rounded-lg text-[12px] font-medium border flex items-center gap-1.5 shrink-0 ${roleMeta.color}`}
+            title={`角色: ${roleMeta.label}`}
+          >
+            <span className="text-[12px]">{roleMeta.icon}</span>
+            {!isCompact && <span className="whitespace-nowrap">{roleMeta.label}</span>}
           </span>
 
-          <span className="font-medium text-[13px] text-ink truncate" title={sub.title}>
+          <span className="font-medium text-[12.5px] text-ink truncate min-w-0 max-w-[80px] sm:max-w-[130px]" title={sub.title}>
             {sub.title}
           </span>
 
-          {sub.workspacePath && (
+          {sub.workspacePath && !isCompact && (
             <span
-              className="hidden lg:inline-flex items-center gap-1 text-[11px] text-inkdim bg-panel2/80 px-1.5 py-0.5 rounded border border-edge/60 max-w-[160px] truncate shrink-0 cursor-default"
+              className="hidden lg:inline-flex items-center gap-1 h-8 px-2 rounded-lg text-[11px] text-inkdim bg-panel2/80 border border-edge/60 max-w-[160px] truncate shrink-0 cursor-default"
               title={`工作区路径: ${sub.workspacePath}`}
             >
               <Folder size={11} className="shrink-0 opacity-70" />
@@ -324,59 +354,70 @@ export function SubprocessView({ subprocessId }: { subprocessId: string }) {
           )}
 
           {isRunning ? (
-            <span className="flex items-center gap-1 text-[11px] text-accent font-medium shrink-0 animate-pulse">
-              <Loader2 size={12} className="animate-spin" />
-              <span>运行中</span>
-            </span>
+            <div
+              className="flex items-center gap-1.5 h-8 px-2 sm:px-2.5 rounded-lg text-[12px] shrink-0 select-none bg-emerald-500/10 text-emerald-400 font-medium border border-emerald-500/20"
+              title="任务执行中"
+            >
+              <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-emerald-400 animate-pulse shadow-[0_0_6px_rgba(52,211,153,0.8)]" />
+              {!isCompact && <span>运行中</span>}
+            </div>
           ) : sub.status === "failed" ? (
-            <span className="flex items-center gap-1 text-[11px] text-rose-400 font-medium shrink-0">
-              <AlertCircle size={12} />
-              <span>已终止</span>
-            </span>
+            <div
+              className="flex items-center gap-1.5 h-8 px-2 sm:px-2.5 rounded-lg text-[12px] shrink-0 select-none bg-rose-500/10 text-rose-400 font-medium border border-rose-500/20"
+              title="执行已终止/异常"
+            >
+              <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-rose-400" />
+              {!isCompact && <span>已终止</span>}
+            </div>
           ) : (
-            <span className="flex items-center gap-1 text-[11px] text-emerald-400 font-medium shrink-0">
-              <CheckCircle2 size={12} />
-              <span>已完成</span>
-            </span>
+            <div
+              className="flex items-center gap-1.5 h-8 px-2 rounded-lg text-[12px] shrink-0 select-none text-inkdim/60"
+              title="任务已完成"
+            >
+              <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-emerald-400/70" />
+              {!isCompact && <span>已完成</span>}
+            </div>
           )}
         </div>
 
         {/* Top Header Controls */}
-        <div className="flex items-center gap-1.5 shrink-0">
-          <span className="hidden sm:inline-flex items-center gap-1 text-[10px] text-inkdim bg-panel border border-edge/60 px-1.5 py-0.5 rounded">
-            <Eye size={10} className="opacity-70" />
-            <span>只读流程</span>
-          </span>
+        <div className="flex items-center gap-1.5 shrink-0 select-none ml-auto">
+          {!isCompact && (
+            <span className="inline-flex items-center gap-1 h-8 px-2 rounded-lg text-[11px] text-inkdim bg-panel2/60 border border-edge/60 shrink-0">
+              <Eye size={11} className="opacity-70" />
+              <span>只读</span>
+            </span>
+          )}
 
           {isRunning && (
             <button
               onClick={handleStop}
               disabled={stopping}
-              className="flex items-center gap-1 px-2 py-1 rounded-md text-red-400 hover:bg-red-500/10 border border-red-500/30 text-[11px] transition-colors cursor-pointer"
+              className="flex items-center gap-1 h-8 px-2.5 rounded-lg text-red-400 hover:bg-red-500/10 border border-red-500/20 text-[12px] font-medium transition-colors cursor-pointer shrink-0"
               title="终止该子进程运行"
             >
               <Square size={11} fill="currentColor" />
-              <span>{stopping ? "停止中…" : "终止"}</span>
+              {!isVeryCompact && <span>{stopping ? "停止中…" : "终止"}</span>}
             </button>
           )}
 
           {!isRunning && (
             <button
               onClick={() => void restartSubagent(realSubId)}
-              className="flex items-center gap-1 px-2 py-1 rounded-md text-inkdim hover:text-ink hover:bg-panel2 border border-edge text-[11px] transition-colors"
+              className="flex items-center gap-1 h-8 px-2.5 rounded-lg text-inkdim hover:text-ink hover:bg-panel2 border border-edge text-[12px] font-medium transition-colors cursor-pointer shrink-0"
               title="重新启动 / 继续该子进程"
             >
               <RefreshCw size={11} />
-              <span>重试</span>
+              {!isVeryCompact && <span>重试</span>}
             </button>
           )}
 
           <button
             onClick={() => setActiveSubprocessId(null)}
-            className="w-7 h-7 rounded-md hover:bg-panel2 text-inkdim hover:text-ink flex items-center justify-center transition-colors ml-1"
+            className="w-8 h-8 rounded-lg hover:bg-panel2 text-inkdim hover:text-ink flex items-center justify-center transition-colors shrink-0 cursor-pointer"
             title="关闭子进程分屏"
           >
-            <X size={15} />
+            <X size={14} />
           </button>
         </div>
       </div>
@@ -407,9 +448,24 @@ export function SubprocessView({ subprocessId }: { subprocessId: string }) {
             </div>
           </div>
         ) : (
-          msgs
-            .filter((m) => m.role !== "tool")
-            .map((m) => (
+          groupedItems.map((item) => {
+            if (item.type === "compaction") return null;
+            if (item.type === "process") {
+              return (
+                <ExecutionProcessBlock
+                  key={item.id}
+                  steps={item.steps}
+                  isRunning={isRunning && item.steps.some((s) => s.id === msgs[msgs.length - 1]?.id)}
+                  sessionWorkspace={sub?.workspacePath}
+                  streamingMsgId={isRunning ? msgs[msgs.length - 1]?.id : undefined}
+                  turnMetrics={item.turnMetrics}
+                  readOnly={true}
+                  turnMetricsMap={turnMetricsMap}
+                />
+              );
+            }
+            const m = item.msg;
+            return (
               <MessageItem
                 key={m.id}
                 msg={m}
@@ -419,7 +475,8 @@ export function SubprocessView({ subprocessId }: { subprocessId: string }) {
                 running={isRunning}
                 turnMetrics={turnMetricsMap.get(m.id)}
               />
-            ))
+            );
+          })
         )}
       </div>
 

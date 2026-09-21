@@ -1,9 +1,10 @@
 import { useEffect, useRef, useMemo } from "react";
 import { currentMessages, currentSession, useStore } from "../store";
-import { DRAFT_ID, computeTurnMetrics } from "../types";
+import { DRAFT_ID, computeTurnMetrics, type Message, type SessionCompaction } from "../types";
 import { FloatingTaskPanel } from "./FloatingTaskPanel";
 import { GrowthCard } from "./GrowthCard";
 import { MessageItem } from "./MessageItem";
+import { ExecutionProcessBlock, groupTimelineItems } from "./ExecutionProcessBlock";
 import { ToolRetryBanner } from "./ToolRetryBanner";
 import { CompactionBanner, CompactedHistoryCard } from "./CompactionBanner";
 import { TruncationNoticeList } from "./TruncationNoticeCard";
@@ -37,6 +38,59 @@ export function ChatView() {
 
   // ⚠️ 所有 hooks 必须在任何条件 return 之前调用
   const turnMetricsMap = useMemo(() => computeTurnMetrics(msgs, running), [msgs, running]);
+
+  // 构建包含消息和历史压缩卡片的时间线序列（历史消息保持完整展示，压缩卡片内联在对应阶段）
+  const timelineItems = useMemo(() => {
+    const visibleMsgs = msgs.filter((m) => m.role !== "tool");
+    if (compactions.length === 0) {
+      return visibleMsgs.map((m) => ({ type: "message" as const, msg: m }));
+    }
+
+    const sortedCompactions = [...compactions].sort((a, b) => a.endSeq - b.endSeq);
+    const items: (
+      | { type: "message"; msg: Message }
+      | { type: "compaction"; compaction: SessionCompaction }
+    )[] = [];
+
+    let compIdx = 0;
+
+    // 若有更早的压缩记录（其 endSeq 小于当前已加载的最早一条消息的 seq），先置于顶部展示
+    const firstMsgSeq = visibleMsgs[0]?.seq;
+    if (firstMsgSeq != null) {
+      while (compIdx < sortedCompactions.length && sortedCompactions[compIdx].endSeq < firstMsgSeq) {
+        items.push({ type: "compaction", compaction: sortedCompactions[compIdx] });
+        compIdx++;
+      }
+    }
+
+    for (let i = 0; i < visibleMsgs.length; i++) {
+      const m = visibleMsgs[i];
+      items.push({ type: "message", msg: m });
+
+      const nextMsgSeq = visibleMsgs[i + 1]?.seq ?? Infinity;
+      while (
+        compIdx < sortedCompactions.length &&
+        sortedCompactions[compIdx].endSeq >= m.seq &&
+        sortedCompactions[compIdx].endSeq < nextMsgSeq
+      ) {
+        items.push({ type: "compaction", compaction: sortedCompactions[compIdx] });
+        compIdx++;
+      }
+    }
+
+    // 兜底：处理剩余的压缩卡片
+    while (compIdx < sortedCompactions.length) {
+      items.push({ type: "compaction", compaction: sortedCompactions[compIdx] });
+      compIdx++;
+    }
+
+    return items;
+  }, [msgs, compactions]);
+
+  // 按轮次将连续多步 assistant 工具执行过程聚合成折叠抽屉卡片，突出最终交付答复
+  const groupedItems = useMemo(() => {
+    return groupTimelineItems(timelineItems, turnMetricsMap, running);
+  }, [timelineItems, turnMetricsMap, running]);
 
   useEffect(() => {
     const el = boxRef.current;
@@ -130,13 +184,27 @@ export function ChatView() {
               加载更早的消息
             </button>
           )}
-          {/* 已压缩历史折叠备忘录卡片 */}
-          {compactions.map((c) => (
-            <CompactedHistoryCard key={c.id} compaction={c} />
-          ))}
-          {msgs
-            .filter((m) => m.role !== "tool" && m.seq > compactions.reduce((max, c) => Math.max(max, c.endSeq), 0))
-            .map((m) => (
+          {/* 按时间线渲染全部历史对话消息、执行过程聚合抽屉卡片与内联压缩卡片 */}
+          {groupedItems.map((item) => {
+            if (item.type === "compaction") {
+              return <CompactedHistoryCard key={item.compaction.id} compaction={item.compaction} />;
+            }
+            if (item.type === "process") {
+              return (
+                <ExecutionProcessBlock
+                  key={item.id}
+                  steps={item.steps}
+                  isRunning={running && item.steps.some((s) => s.id === msgs[msgs.length - 1]?.id)}
+                  sessionWorkspace={session?.workspacePath}
+                  streamingMsgId={running ? msgs[msgs.length - 1]?.id : undefined}
+                  turnMetrics={item.turnMetrics}
+                  readOnly={readOnly}
+                  turnMetricsMap={turnMetricsMap}
+                />
+              );
+            }
+            const m = item.msg;
+            return (
               <MessageItem
                 key={m.id}
                 msg={m}
@@ -147,7 +215,8 @@ export function ChatView() {
                 editBlocked={mergedBoundary != null && m.seq <= mergedBoundary}
                 turnMetrics={turnMetricsMap.get(m.id)}
               />
-            ))}
+            );
+          })}
           {/* 当前会话待审阅的成长提案卡片 */}
           {proposals.map((item) => (
             <GrowthCard key={item.id} item={item} />

@@ -333,6 +333,14 @@ pub async fn dispatch_rpc(
             let res = commands::get_messages(st, session_id, before_seq, limit)?;
             Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
         }
+        "fork_session_at_message" => {
+            let session_id = params.get("sessionId").and_then(|v| v.as_str()).ok_or("缺少 sessionId")?.to_string();
+            let message_id = params.get("messageId").and_then(|v| v.as_str()).ok_or("缺少 messageId")?.to_string();
+            let new_title = params.get("newTitle").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let include_target = params.get("includeTarget").and_then(|v| v.as_bool());
+            let res = commands::fork_session_at_message(app.clone(), st, session_id, message_id, new_title, include_target)?;
+            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+        }
         "send_message" => {
             let session_id = params.get("sessionId").and_then(|v| v.as_str()).map(|s| s.to_string());
             let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -342,7 +350,11 @@ pub async fn dispatch_rpc(
             let access_mode = params.get("accessMode").and_then(|v| v.as_str()).map(|s| s.to_string());
             let context_token_limit = params.get("contextTokenLimit").and_then(|v| v.as_u64()).map(|s| s as usize);
             let attachments: Option<Vec<crate::models::Attachment>> = params.get("attachments").and_then(|v| serde_json::from_value(v.clone()).ok());
-            let res = commands::send_message(st, app.clone(), session_id, text, workspace_path, project_id, temp, access_mode, context_token_limit, attachments)?;
+            let image_provider_id = params.get("imageProviderId").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let image_model_id = params.get("imageModelId").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let vision_provider_id = params.get("visionProviderId").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let vision_model_id = params.get("visionModelId").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let res = commands::send_message(st, app.clone(), session_id, text, workspace_path, project_id, temp, access_mode, context_token_limit, attachments, image_provider_id, image_model_id, vision_provider_id, vision_model_id)?;
             Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
         }
         "list_queued" => {
@@ -380,7 +392,8 @@ pub async fn dispatch_rpc(
             let session_id = params.get("sessionId").and_then(|v| v.as_str()).ok_or("缺少 sessionId")?.to_string();
             let message_id = params.get("messageId").and_then(|v| v.as_str()).ok_or("缺少 messageId")?.to_string();
             let new_text = params.get("newText").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            commands::edit_and_resend(st, app.clone(), session_id, message_id, new_text)?;
+            let attachments: Option<Vec<crate::models::Attachment>> = params.get("attachments").and_then(|v| serde_json::from_value(v.clone()).ok());
+            commands::edit_and_resend(st, app.clone(), session_id, message_id, new_text, attachments)?;
             Ok(Value::Null)
         }
 

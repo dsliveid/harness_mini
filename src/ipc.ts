@@ -40,6 +40,17 @@ export const ipc = {
       accessMode: input.accessMode ?? null,
       contextTokenLimit: input.contextTokenLimit ?? null,
       temp: input.temp ?? null,
+      imageProviderId: input.imageProviderId ?? null,
+      imageModelId: input.imageModelId ?? null,
+      visionProviderId: input.visionProviderId ?? null,
+      visionModelId: input.visionModelId ?? null,
+    }),
+  forkSessionAtMessage: (sessionId: string, messageId: string, newTitle?: string, includeTarget: boolean = true) =>
+    invoke<Session>("fork_session_at_message", {
+      sessionId,
+      messageId,
+      newTitle: newTitle ?? null,
+      includeTarget,
     }),
   listArchived: () => invoke<Session[]>("list_archived"),
   renameSession: (id: string, title: string) => invoke<void>("rename_session", { id, title }),
@@ -81,6 +92,10 @@ export const ipc = {
     accessMode?: string,
     contextTokenLimit?: number | null,
     attachments?: Attachment[] | null,
+    imageProviderId?: string | null,
+    imageModelId?: string | null,
+    visionProviderId?: string | null,
+    visionModelId?: string | null,
   ) =>
     invoke<{ sessionId: string; messageId: string; queued: boolean; session?: Session | null }>("send_message", {
       sessionId,
@@ -91,6 +106,10 @@ export const ipc = {
       accessMode: accessMode ?? null,
       contextTokenLimit: contextTokenLimit ?? null,
       attachments: attachments ?? null,
+      imageProviderId: imageProviderId ?? null,
+      imageModelId: imageModelId ?? null,
+      visionProviderId: visionProviderId ?? null,
+      visionModelId: visionModelId ?? null,
     }),
   listQueued: (sessionId: string) => invoke<Message[]>("list_queued", { sessionId }),
   guideMessage: (sessionId: string, messageId: string) =>
@@ -174,8 +193,13 @@ export const ipc = {
     invoke<string>("report_subagent_to_parent", { subagentId }),
   killCommand: (eventId: string) => invoke<void>("kill_command", { eventId }),
   listRunningSessions: () => invoke<RunningSession[]>("list_running_sessions"),
-  editAndResend: (sessionId: string, messageId: string, newText: string) =>
-    invoke<void>("edit_and_resend", { sessionId, messageId, newText }),
+  editAndResend: (sessionId: string, messageId: string, newText: string, attachments?: Attachment[]) =>
+    invoke<void>("edit_and_resend", {
+      sessionId,
+      messageId,
+      newText,
+      attachments: attachments && attachments.length > 0 ? attachments : undefined,
+    }),
 
   respondApproval: (eventId: string, decision: string, reason?: string) =>
     invoke<void>("respond_approval", { eventId, decision, reason: reason ?? null }),
@@ -235,6 +259,7 @@ export const ipc = {
     invoke<TokenStatsReport>("get_token_stats", { projectId: projectId ?? null, days: days ?? null }),
   getSessionActiveState: (sessionId: string) =>
     invoke<SessionActiveState>("get_session_active_state", { sessionId }),
+  readFileBase64: (path: string) => invoke<string>("read_file_base64", { path }),
 };
 
 export type { Message, Session, SessionActiveState, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport, CollaboratorCreateInput, CollaboratorUpdateInput, SessionCreateInput, SessionModelsUpdateInput };

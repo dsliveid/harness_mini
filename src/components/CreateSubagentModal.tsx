@@ -1,6 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { useStore, currentSession } from "../store";
-import { Layers, X, Loader2, Sparkles, Folder } from "./Icons";
+import { Layers, X, Loader2, Sparkles } from "./Icons";
 
 const ROLE_PRESETS = [
   {
@@ -57,15 +57,7 @@ export function CreateSubagentModal() {
   const [selectedRole, setSelectedRole] = useState("frontend");
   const [title, setTitle] = useState("前端开发任务");
   const [taskPrompt, setTaskPrompt] = useState(ROLE_PRESETS[0].defaultPrompt);
-  const [workspacePath, setWorkspacePath] = useState(session?.workspacePath ?? "");
-  const [subpath, setSubpath] = useState("");
   const [submitting, setSubmitting] = useState(false);
-
-  useEffect(() => {
-    if (show && session?.workspacePath) {
-      setWorkspacePath(session.workspacePath);
-    }
-  }, [show, session?.workspacePath]);
 
   if (!show || !currentId || !session) return null;
 
@@ -89,11 +81,8 @@ export function CreateSubagentModal() {
         role: selectedRole,
         title: title.trim() || undefined,
         taskPrompt: taskPrompt.trim(),
-        subpath: subpath.trim() || undefined,
-        workspacePath: workspacePath.trim() || undefined,
       });
       handleRoleSelect("frontend");
-      setSubpath("");
     } finally {
       setSubmitting(false);
     }
@@ -165,56 +154,21 @@ export function CreateSubagentModal() {
             />
           </div>
 
-          {/* Workspace Path & Focus Subpath */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-            <div>
-              <label className="block text-[13px] font-medium text-ink mb-1.5 flex items-center justify-between">
-                <span className="flex items-center gap-1">
-                  <Folder size={13} className="text-inkdim" />
-                  <span>工作区根目录</span>
-                </span>
-                <span className="text-[11px] text-inkdim font-normal">执行基准根</span>
-              </label>
-              <input
-                type="text"
-                value={workspacePath}
-                onChange={(e) => setWorkspacePath(e.target.value)}
-                placeholder={session.workspacePath || "继承当前主项目根目录"}
-                className="w-full px-3 py-2 rounded-xl bg-panel2/60 border border-edge text-ink text-[12px] font-mono focus:outline-none focus:border-accent"
-                title="子 Agent 物理执行根目录，默认继承当前项目根目录，具备访问根目录下全局构建与配置文件的权限"
-              />
-            </div>
-            <div>
-              <label className="block text-[13px] font-medium text-ink mb-1.5 flex items-center justify-between">
-                <span>重点关注子目录</span>
-                <span className="text-[11px] text-inkdim font-normal">可选范围指引</span>
-              </label>
-              <input
-                type="text"
-                value={subpath}
-                onChange={(e) => setSubpath(e.target.value)}
-                placeholder="例如：src 或 backend/api"
-                className="w-full px-3 py-2 rounded-xl bg-panel2/60 border border-edge text-ink text-[12px] font-mono focus:outline-none focus:border-accent"
-                title="引导子 Agent 优先聚焦该子目录开展工作，不会剥夺其对项目根目录下文件的访问权"
-              />
-            </div>
-          </div>
-
           {/* Task prompt */}
           <div>
             <label className="block text-[13px] font-medium text-ink mb-1.5">
               任务目标与详细要求 <span className="text-rose-400">*</span>
             </label>
             <textarea
-              rows={4}
+              rows={5}
               value={taskPrompt}
               onChange={(e) => setTaskPrompt(e.target.value)}
-              placeholder="详细描述需要该子 Agent 完成的目标、涉及的文件范围或期望产物..."
+              placeholder="详细描述需要该子 Agent 完成的目标与具体要求。工作区物理根目录将与主项目保持严格一致；如需聚焦特定子目录（如 src/components），直接在此描述中指明即可..."
               className="w-full px-3 py-2.5 rounded-xl bg-panel2/60 border border-edge text-ink text-[13px] focus:outline-none focus:border-accent resize-none"
             />
             <div className="flex items-center gap-1 text-[11px] text-inkdim mt-1">
               <Sparkles size={12} className="text-accent shrink-0" />
-              <span>子 Agent 将获得独立上下文空间与工具执行能力，不会污染主进程上下文。</span>
+              <span>工作区与主会话严格保持一致；子 Agent 将获得独立上下文空间与工具执行能力。</span>
             </div>
           </div>
         </div>

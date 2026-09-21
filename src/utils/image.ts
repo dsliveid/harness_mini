@@ -2,7 +2,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 
 export function toAssetUrl(path: string): string {
   if (!path) return "";
-  const trimmed = path.trim();
+  let trimmed = path.trim();
   if (
     trimmed.startsWith("http://") ||
     trimmed.startsWith("https://") ||
@@ -11,6 +11,18 @@ export function toAssetUrl(path: string): string {
   ) {
     return trimmed;
   }
+  // 剥离 file:/// 或 file:// 前缀
+  if (trimmed.startsWith("file:///")) {
+    trimmed = trimmed.slice(8);
+  } else if (trimmed.startsWith("file://")) {
+    trimmed = trimmed.slice(7);
+  }
+  // URL 百分号解码（如将 %20 解码为空格）
+  try {
+    trimmed = decodeURIComponent(trimmed);
+  } catch {}
+  // Windows 反斜杠规范化为正斜杠，避免 URL 路径解析错误
+  trimmed = trimmed.replace(/\\/g, "/");
   return convertFileSrc(trimmed);
 }
 

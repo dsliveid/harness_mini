@@ -45,6 +45,8 @@ export {
   Search,
   GitCompare,
   GitMerge,
+  GitBranch,
+  GitFork,
   Trash2,
   Trash,
   RotateCw,

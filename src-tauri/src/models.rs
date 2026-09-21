@@ -577,6 +577,12 @@ pub struct Session {
     /// 会话专属视觉感知模型标识（为空则跟随全局）
     #[serde(default)]
     pub vision_model_id: Option<String>,
+    /// 分支来源会话 ID（若从某个会话节点分叉出来）
+    #[serde(default)]
+    pub forked_from_session_id: Option<String>,
+    /// 分支来源消息 ID
+    #[serde(default)]
+    pub forked_from_message_id: Option<String>,
 }
 
 fn default_auto_report() -> Option<bool> {
@@ -623,6 +629,8 @@ impl Default for Session {
             image_model_id: None,
             vision_provider_id: None,
             vision_model_id: None,
+            forked_from_session_id: None,
+            forked_from_message_id: None,
         }
     }
 }

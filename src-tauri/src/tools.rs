@@ -96,14 +96,14 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "read_file",
-            description: "读取工作区内文本文件的内容（带行号）。修改文件前必须先用它确认精确原文。",
+            description: "读取工作区内文本文件的局部或全部内容（带行号）。修改文件前必须先用它确认精确原文。推荐配合 offset_line 与 max_lines 外科手术式精读局部，严禁对大型文件进行多轮循环分页遍历。",
             risk: Risk::ReadOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "相对于工作区的文件路径"},
                     "offset_line": {"type": "integer", "description": "起始行（1 开始，默认 1）"},
-                    "max_lines": {"type": "integer", "description": "最多读取行数（默认 2000）"}
+                    "max_lines": {"type": "integer", "description": "最多读取行数（默认 300，避免单次返回过多噪音与 Token 消耗）"}
                 },
                 "required": ["path"]
             }),
@@ -117,6 +117,18 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "path": {"type": "string", "description": "相对于工作区的目录路径，默认根目录"}
                 }
+            }),
+        },
+        ToolSpec {
+            name: "file_outline",
+            description: "提取代码文件的结构骨架与大纲（包含类、结构体、接口、枚举、函数签名及起始行号），过滤具体实现细节。在深入阅读代码前优先用它获取全局地图，以极低 Token 掌握全貌并精准定位目标行号。",
+            risk: Risk::ReadOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "相对于工作区的文件路径"}
+                },
+                "required": ["path"]
             }),
         },
         ToolSpec {
@@ -134,14 +146,15 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "grep",
-            description: "在工作区文件内容中按正则搜索，返回 `路径:行号: 内容` 列表。",
+            description: "在工作区文件内容中按正则搜索，返回 `路径:行号: 内容` 列表。支持返回匹配行周边的上下文行数（context_lines），便于快速看清代码逻辑而无需频繁调用 read_file。",
             risk: Risk::ReadOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "正则表达式"},
                     "path": {"type": "string", "description": "搜索起始目录，默认工作区根目录"},
-                    "include": {"type": "string", "description": "文件名过滤 glob，如 *.rs"}
+                    "include": {"type": "string", "description": "文件名过滤 glob，如 *.rs"},
+                    "context_lines": {"type": "integer", "description": "可选：匹配行前后额外展示的上下文行数（0~5，默认 0）。若大于 0，将在结果中呈现匹配行及其前后的关联代码"}
                 },
                 "required": ["pattern"]
             }),
@@ -347,16 +360,14 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "spawn_subprocess",
-            description: "创建并启动一个独立的临时子进程并行执行特定任务（如探索、排查、独立测试等）。子进程拥有独立上下文与工具环境，执行完成后其成果直接内嵌在主对话流中呈现。外部用户无法干预子进程，任务完成后自动销毁/归档。",
+            description: "创建并启动一个独立的临时子进程并行执行特定任务（如探索、排查、独立测试等）。子进程拥有独立上下文与工具环境，物理工作区与主进程严格保持一致，执行完成后其成果直接内嵌在主对话流中呈现。外部用户无法干预子进程，任务完成后自动销毁/归档。",
             risk: Risk::ReadOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
                     "role": {"type": "string", "description": "子任务角色定位，例如：技术调研、单元测试、独立排查"},
-                    "title": {"type": "string", "description": "子任务简明标题，如 排查数据库连接泄漏"},
-                    "task": {"type": "string", "description": "分配给子进程的具体任务详细要求"},
-                    "workspace": {"type": "string", "description": "可选：独立的工作区绝对路径，缺省时继承主工作区"},
-                    "subpath": {"type": "string", "description": "可选：专注子目录（如 src/utils/）"}
+                    "title": {"type": "string", "description": "子任务简明标题，如 排查审批流程组件"},
+                    "task": {"type": "string", "description": "分配给子进程的具体任务详细要求。如需处理特定子目录，请在此参数中明确说明目标目录相对路径与工作目标，建议任务简明聚焦"}
                 },
                 "required": ["role", "title", "task"]
             }),
@@ -620,6 +631,7 @@ pub async fn execute(
     match name {
         "read_file" => read_file(args, ctx).await,
         "list_dir" => list_dir(args, ctx).await,
+        "file_outline" => file_outline(args, ctx).await,
         "glob" => glob(args, ctx).await,
         "grep" => grep(args, ctx).await,
         "write_file" => write_file(args, ctx).await,
@@ -658,7 +670,7 @@ async fn read_file(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     }
     let text = String::from_utf8_lossy(&bytes);
     let offset = args.get("offset_line").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
-    let max_lines = args.get("max_lines").and_then(|v| v.as_u64()).unwrap_or(2000) as usize;
+    let max_lines = args.get("max_lines").and_then(|v| v.as_u64()).unwrap_or(300) as usize;
 
     let mut out = String::new();
     let mut count = 0usize;
@@ -668,7 +680,10 @@ async fn read_file(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
             continue;
         }
         if count >= max_lines {
-            out.push_str(&format!("\n[已达到 max_lines={max_lines}，从第 {offset} 行起未展示完]\n"));
+            let end_line = offset + count - 1;
+            out.push_str(&format!(
+                "\n[已达到单次读取上限 max_lines={max_lines}（当前展示至第 {end_line} 行），文件尚未读完。若需了解代码结构，请优先使用 file_outline 提取大纲，或结合 grep 定位目标函数后用 offset_line 局部精读，严禁连续循环分页遍历]\n"
+            ));
             break;
         }
         use std::fmt::Write;
@@ -683,6 +698,185 @@ async fn read_file(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         out = "(空文件或范围为空)".into();
     }
     Ok(truncate_result(&out))
+}
+
+async fn file_outline(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let rel = args.get("path").and_then(|v| v.as_str()).ok_or("缺少 path")?;
+    let path = resolve(ctx, rel);
+    let bytes = tokio::fs::read(&path).await.map_err(|e| format!("读取失败: {e}"))?;
+    if is_binary(&bytes) {
+        return Err("疑似二进制文件，无法提取代码大纲".into());
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let outline = extract_outline(&text, &ext);
+    if outline.is_empty() {
+        return Ok("(文件中未识别出类、结构体、接口、函数或标题等符号定义)".into());
+    }
+    Ok(truncate_result(&outline))
+}
+
+fn extract_outline(text: &str, ext: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let mut total = 0usize;
+
+    for (i, raw_line) in text.lines().enumerate() {
+        let lineno = i + 1;
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let is_symbol = match ext {
+            "rs" => {
+                if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+                    false
+                } else {
+                    let words: Vec<&str> = trimmed.split_whitespace().collect();
+                    is_rust_symbol(&words)
+                }
+            }
+            "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => {
+                if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+                    false
+                } else {
+                    is_ts_js_symbol(trimmed)
+                }
+            }
+            "py" => {
+                if trimmed.starts_with('#') {
+                    false
+                } else {
+                    trimmed.starts_with("def ")
+                        || trimmed.starts_with("async def ")
+                        || trimmed.starts_with("class ")
+                }
+            }
+            "go" => {
+                if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+                    false
+                } else {
+                    trimmed.starts_with("func ")
+                        || (trimmed.starts_with("type ")
+                            && (trimmed.contains("struct") || trimmed.contains("interface")))
+                }
+            }
+            "java" | "cs" | "cpp" | "c" | "h" | "hpp" => {
+                if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+                    false
+                } else {
+                    is_c_like_symbol(trimmed)
+                }
+            }
+            "md" | "markdown" => {
+                trimmed.starts_with('#') && trimmed.chars().take_while(|&c| c == '#').count() <= 6
+            }
+            _ => {
+                !raw_line.starts_with(' ')
+                    && !raw_line.starts_with('\t')
+                    && !trimmed.starts_with("//")
+                    && !trimmed.starts_with('#')
+                    && (trimmed.contains("fn ")
+                        || trimmed.contains("func ")
+                        || trimmed.contains("def ")
+                        || trimmed.contains("class ")
+                        || trimmed.contains("interface ")
+                        || trimmed.contains("struct "))
+            }
+        };
+
+        if is_symbol {
+            let disp: String = raw_line.trim_end().chars().take(200).collect();
+            let _ = writeln!(out, "{lineno:>6}\t{disp}");
+            total += 1;
+            if total >= 400 || out.len() > crate::models::TOOL_RESULT_LIMIT {
+                out.push_str("\n[符号大纲过多，已截断前 400 个]\n");
+                break;
+            }
+        }
+    }
+
+    out
+}
+
+fn is_rust_symbol(words: &[&str]) -> bool {
+    if words.is_empty() {
+        return false;
+    }
+    for (idx, &w) in words.iter().enumerate() {
+        match w {
+            "fn" | "struct" | "enum" | "trait" | "type" | "mod" | "macro_rules!" => {
+                let valid_modifiers = words[..idx].iter().all(|&m| {
+                    m == "pub"
+                        || m.starts_with("pub(")
+                        || m == "async"
+                        || m == "const"
+                        || m == "unsafe"
+                        || m == "extern"
+                        || m == "default"
+                });
+                if valid_modifiers {
+                    return true;
+                }
+            }
+            "impl" => {
+                return idx == 0 || (idx == 1 && words[0] == "unsafe");
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn is_ts_js_symbol(trimmed: &str) -> bool {
+    let t = if trimmed.starts_with("export default ") {
+        &trimmed["export default ".len()..]
+    } else if trimmed.starts_with("export ") {
+        &trimmed["export ".len()..]
+    } else {
+        trimmed
+    };
+
+    if t.starts_with("class ")
+        || t.starts_with("interface ")
+        || t.starts_with("type ")
+        || t.starts_with("enum ")
+        || t.starts_with("function ")
+        || t.starts_with("async function ")
+    {
+        return true;
+    }
+
+    if trimmed.starts_with("export const ") || trimmed.starts_with("export let ") {
+        return true;
+    }
+
+    if t.starts_with("const ") || t.starts_with("let ") {
+        if t.contains("=>") || t.contains("function(") || t.contains("function (") {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_c_like_symbol(trimmed: &str) -> bool {
+    trimmed.starts_with("class ")
+        || trimmed.starts_with("struct ")
+        || trimmed.starts_with("enum ")
+        || trimmed.starts_with("interface ")
+        || trimmed.starts_with("public ")
+        || trimmed.starts_with("private ")
+        || trimmed.starts_with("protected ")
+        || trimmed.starts_with("internal ")
+        || trimmed.starts_with("void ")
+        || (trimmed.contains('(') && trimmed.contains(')') && !trimmed.ends_with(';'))
 }
 
 async fn list_dir(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
@@ -769,6 +963,11 @@ async fn grep(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let pattern = args.get("pattern").and_then(|v| v.as_str()).ok_or("缺少 pattern")?;
     let rel = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
     let include = args.get("include").and_then(|v| v.as_str());
+    let context_lines = args
+        .get("context_lines")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(5) as usize;
     let base = resolve(ctx, rel);
     let re = regex::Regex::new(pattern).map_err(|e| format!("正则无效: {e}"))?;
     let include_re = include
@@ -815,14 +1014,62 @@ async fn grep(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         }
         let text = String::from_utf8_lossy(&bytes);
         use std::fmt::Write;
-        for (i, line) in text.lines().enumerate() {
-            if re.is_match(line) {
-                let disp: String = line.trim().chars().take(240).collect();
-                let _ = writeln!(out, "{rel_path}:{}: {disp}", i + 1);
-                total += 1;
-                if total >= 200 || out.len() > crate::models::TOOL_RESULT_LIMIT {
-                    out.push_str("\n[匹配过多，结果已截断]");
-                    return Ok(truncate_result(&out));
+
+        if context_lines == 0 {
+            for (i, line) in text.lines().enumerate() {
+                if re.is_match(line) {
+                    let disp: String = line.trim().chars().take(240).collect();
+                    let _ = writeln!(out, "{rel_path}:{}: {disp}", i + 1);
+                    total += 1;
+                    if total >= 200 || out.len() > crate::models::TOOL_RESULT_LIMIT {
+                        out.push_str("\n[匹配过多，结果已截断]");
+                        return Ok(truncate_result(&out));
+                    }
+                }
+            }
+        } else {
+            let lines: Vec<&str> = text.lines().collect();
+            let mut match_indices = Vec::new();
+            for (i, line) in lines.iter().enumerate() {
+                if re.is_match(line) {
+                    match_indices.push(i);
+                }
+            }
+
+            if !match_indices.is_empty() {
+                let mut ranges: Vec<(usize, usize)> = Vec::new();
+                for &idx in &match_indices {
+                    let start = idx.saturating_sub(context_lines);
+                    let end = (idx + context_lines).min(lines.len().saturating_sub(1));
+                    if let Some(last) = ranges.last_mut() {
+                        if start <= last.1 + 1 {
+                            last.1 = last.1.max(end);
+                            continue;
+                        }
+                    }
+                    ranges.push((start, end));
+                }
+
+                let match_set: std::collections::HashSet<usize> = match_indices.into_iter().collect();
+                for (start, end) in ranges {
+                    for line_idx in start..=end {
+                        let is_m = match_set.contains(&line_idx);
+                        let disp: String = lines[line_idx].trim_end().chars().take(240).collect();
+                        let lineno = line_idx + 1;
+                        if is_m {
+                            let _ = writeln!(out, "{rel_path}:{lineno}: {disp}");
+                            total += 1;
+                        } else {
+                            let _ = writeln!(out, "{rel_path}-{lineno}- {disp}");
+                        }
+                        if total >= 200 || out.len() > crate::models::TOOL_RESULT_LIMIT {
+                            out.push_str("\n[匹配过多，结果已截断]");
+                            return Ok(truncate_result(&out));
+                        }
+                    }
+                    if end + 1 < lines.len() {
+                        let _ = writeln!(out, "--");
+                    }
                 }
             }
         }
@@ -1258,13 +1505,6 @@ async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
     let role = args.get("role").and_then(|v| v.as_str()).ok_or("缺少 role 参数")?;
     let title = args.get("title").and_then(|v| v.as_str()).ok_or("缺少 title 参数")?;
     let task = args.get("task").and_then(|v| v.as_str()).ok_or("缺少 task 参数")?;
-    let subpath = args.get("subpath").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let workspace_arg = args
-        .get("workspace")
-        .or_else(|| args.get("workspace_path"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty());
 
     let state = host.app.state::<crate::AppState>();
     let parent_id = &host.session_id;
@@ -1284,19 +1524,8 @@ async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
         return Err("子 Agent 数量已达上限 (10)，请等待部分子任务完成或停止后再创建。".into());
     }
 
-    // 关键修复：确定子 Agent 的物理工作区根目录
-    // 1. 若显式指定了 workspace（如跨项目调用），使用指定的独立根目录；
-    // 2. 缺省时严格继承父会话的完整工作区根目录，绝不能将 subpath 拼接到根目录上！
-    let sub_workspace = if let Some(ws) = workspace_arg {
-        let p = Path::new(ws);
-        if p.is_absolute() {
-            ws.to_string()
-        } else {
-            std::path::Path::new(&parent_session.workspace_path).join(p).to_string_lossy().to_string()
-        }
-    } else {
-        parent_session.workspace_path.clone()
-    };
+    // 子 Agent 工作区严格与父会话保持完全一致
+    let sub_workspace = parent_session.workspace_path.clone();
 
     let (sub, user_msg) = {
         let db = state.db.lock().unwrap();
@@ -1324,11 +1553,8 @@ async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
                 Some(&params_with_id.to_string()),
             );
         }
-        let focus_info = subpath.as_ref().map(|p| {
-            format!("\n\n重点关注子目录：`{p}`\n（提示：请优先深入该子目录开展探索与修改；当前工作区根目录依然为完整的 `{sub_workspace}`，根目录下的全局构建与配置文件如 pom.xml / package.json / README 等均在合法访问范围内，需要时可直接读取）")
-        }).unwrap_or_default();
         let initial_prompt = format!(
-            "【子 Agent 协作任务】\n角色定位：{role}\n任务标题：{title}\n工作区根目录：{sub_workspace}\n\n详细需求描述：\n{task}{focus_info}"
+            "【子 Agent 协作任务】\n角色定位：{role}\n任务标题：{title}\n工作区根目录：{sub_workspace}\n\n详细需求描述：\n{task}"
         );
         let user_msg = crate::store::new_message(&db, &sub.id, "user", Some(initial_prompt), false)?;
         (sub, user_msg)
@@ -1486,6 +1712,21 @@ async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
             .and_then(|m| m.content.as_deref())
             .unwrap_or("(未产生文本回复)");
 
+        let last_asst = msgs.iter().rev().find(|m| m.role == "assistant");
+        let has_terminal_reply = last_asst.map(|m| {
+            m.tool_calls.is_none()
+                || m.tool_calls.as_ref().map(|t| t.is_null() || t.as_array().map(|a| a.is_empty()).unwrap_or(false)).unwrap_or(false)
+        }).unwrap_or(false);
+        let has_max_steps_msg = msgs.iter().rev().any(|m| m.role == "system" && m.content.as_deref().unwrap_or("").contains("已达到最大步数"));
+
+        let display_reply = if has_max_steps_msg {
+            format!("⚠️ 该子任务已达到最大步数上限中止，未生成最终交付报告。最后思考或动作：\n{}", last_reply)
+        } else if !is_running && !has_terminal_reply && last_reply != "(未产生文本回复)" {
+            format!("⚠️ 该子任务执行中断或未完全收敛交付。最后思考或动作：\n{}", last_reply)
+        } else {
+            last_reply.to_string()
+        };
+
         let mut touched_files = std::collections::BTreeSet::new();
         for m in &msgs {
             for te in &m.tool_events {
@@ -1512,7 +1753,7 @@ async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
                 || title_str.contains("技术栈") || title_str.contains("架构")
                 || task_str.contains("技术栈") || task_str.contains("依赖分析")
         };
-        if is_tech_analysis && !is_running && last_reply.len() > 50 && last_reply != "(未产生文本回复)" {
+        if is_tech_analysis && !is_running && has_terminal_reply && last_reply.len() > 50 && last_reply != "(未产生文本回复)" {
             let already_recorded = msgs.iter().any(|m| {
                 m.tool_events.iter().any(|te| te.tool_name == "record_memory")
             });
@@ -1533,7 +1774,7 @@ async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
             if is_running { "🟡 仍在运行" } else { "🟢 已完成" },
             s.total_tokens.unwrap_or(0),
             touched_line,
-            last_reply
+            display_reply
         ));
     }
 
@@ -1576,6 +1817,7 @@ async fn dispatch_collaborator_tool(args: &Value, ctx: &ToolCtx) -> Result<Strin
     let user_prompt = format!("【主进程委派任务】\n{task}");
     let user_msg = {
         let db = state.db.lock().unwrap();
+        let _ = crate::store::set_kv(&db, collaborator_id, "dispatched_by_parent", "true");
         crate::store::new_message(&db, collaborator_id, "user", Some(user_prompt), false)?
     };
 
@@ -1660,7 +1902,12 @@ async fn wait_collaborators_tool(args: &Value, ctx: &ToolCtx) -> Result<String, 
         let last_assistant = slice
             .iter()
             .rev()
-            .find(|m| m.role == "assistant" && !m.content.as_deref().unwrap_or("").is_empty());
+            .find(|m| m.role == "assistant" && !m.content.as_deref().unwrap_or("").is_empty())
+            .copied()
+            .or_else(|| {
+                // 兜底保护：若水位线之后无增量匹配，取该协作者全量消息中最新一条有效回复
+                msgs.iter().rev().find(|m| m.role == "assistant" && !m.content.as_deref().unwrap_or("").is_empty())
+            });
 
         let last_reply = match last_assistant {
             Some(m) => m.content.as_deref().unwrap_or("(未产生文本回复)"),
@@ -1668,7 +1915,12 @@ async fn wait_collaborators_tool(args: &Value, ctx: &ToolCtx) -> Result<String, 
         };
 
         let mut touched_files = std::collections::BTreeSet::new();
-        for m in &slice {
+        let files_source: Vec<&crate::models::Message> = if !slice.is_empty() {
+            slice
+        } else {
+            msgs.iter().collect()
+        };
+        for m in &files_source {
             for te in &m.tool_events {
                 if ["write_file", "edit_file", "apply_diff"].contains(&te.tool_name.as_str()) {
                     if let Some(p) = te.params.get("path").and_then(|v| v.as_str()) {
@@ -1840,7 +2092,8 @@ async fn generate_image_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
 
     tokio::fs::write(&target_path, &img_bytes).await.map_err(|e| format!("写入图片文件失败: {e}"))?;
 
-    let target_str = target_path.to_string_lossy().to_string();
+    let raw_target_str = target_path.to_string_lossy().to_string();
+    let target_str = raw_target_str.replace('\\', "/");
     let size_display = size.unwrap_or("1024x1024");
     let kb = img_bytes.len() / 1024;
 
@@ -1872,5 +2125,56 @@ mod tests {
         assert!(is_high_danger("del /s /q *.tmp"));
         assert!(!is_high_danger("npm run build"));
         assert!(!is_high_danger("cargo test"));
+    }
+
+    #[test]
+    fn test_extract_outline_rust() {
+        let code = r#"
+// Some comment
+pub struct User {
+    pub name: String,
+}
+
+impl User {
+    pub fn new(name: &str) -> Self {
+        Self { name: name.to_string() }
+    }
+}
+
+async fn fetch_data() -> Result<(), ()> {
+    Ok(())
+}
+"#;
+        let outline = extract_outline(code, "rs");
+        assert!(outline.contains("pub struct User"));
+        assert!(outline.contains("impl User"));
+        assert!(outline.contains("pub fn new"));
+        assert!(outline.contains("async fn fetch_data"));
+        assert!(!outline.contains("Some comment"));
+        assert!(!outline.contains("pub name: String"));
+    }
+
+    #[test]
+    fn test_extract_outline_ts() {
+        let code = r#"
+export interface Item {
+  id: string;
+}
+
+export const LIST = [1, 2];
+
+export function getItem(): Item {
+  return { id: "1" };
+}
+
+const handleClick = async () => {
+  console.log("clicked");
+};
+"#;
+        let outline = extract_outline(code, "ts");
+        assert!(outline.contains("export interface Item"));
+        assert!(outline.contains("export const LIST"));
+        assert!(outline.contains("export function getItem"));
+        assert!(outline.contains("const handleClick"));
     }
 }

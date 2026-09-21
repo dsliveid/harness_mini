@@ -1,10 +1,10 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { ipc } from "../ipc";
 import { useStore } from "../store";
 import type { ToolEvent } from "../types";
 import { Markdown } from "./Markdown";
 import { SubprocessBranchTree } from "./SubprocessBranchTree";
-import { toAssetUrl } from "../utils/image";
+import { SafeImage } from "./SafeImage";
 import {
   FileText,
   FileEdit,
@@ -26,6 +26,9 @@ import {
   Cpu,
   Users,
   Image,
+  ZoomIn,
+  Link2,
+  Sparkles,
 } from "./Icons";
 
 function statusBadge(status: string) {
@@ -332,6 +335,246 @@ function CollapsibleResult({ text }: { text: string }) {
   );
 }
 
+function ImageToolView({
+  ev,
+  imagePath,
+  prompt,
+  metadata,
+}: {
+  ev: ToolEvent;
+  imagePath: string | null;
+  prompt: string;
+  metadata: {
+    imagePath?: string | null;
+    model?: string | null;
+    resolution?: string | null;
+    fileSize?: string | null;
+  } | null;
+}) {
+  const setLightboxImage = useStore((s) => s.setLightboxImage);
+  const pushToast = useStore((s) => s.pushToast);
+  const [copiedPrompt, setCopiedPrompt] = useState(false);
+  const [copiedPath, setCopiedPath] = useState(false);
+  const [expandedPrompt, setExpandedPrompt] = useState(false);
+
+  const handleCopyPrompt = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!prompt) return;
+    navigator.clipboard.writeText(prompt).then(
+      () => {
+        setCopiedPrompt(true);
+        setTimeout(() => setCopiedPrompt(false), 1500);
+        pushToast("提示词已复制到剪贴板");
+      },
+      () => pushToast("复制失败")
+    );
+  };
+
+  const handleCopyPath = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const p = metadata?.imagePath || imagePath;
+    if (!p) return;
+    navigator.clipboard.writeText(p).then(
+      () => {
+        setCopiedPath(true);
+        setTimeout(() => setCopiedPath(false), 1500);
+        pushToast("图片路径已复制到剪贴板");
+      },
+      () => pushToast("复制失败")
+    );
+  };
+
+  // 1. 执行中状态：骨架加载与提示词引导
+  if (ev.status === "running") {
+    return (
+      <div className="mt-2.5 rounded-xl border border-pink-500/20 bg-pink-500/5 p-6 flex flex-col items-center justify-center gap-2.5 text-inkdim select-none">
+        <div className="relative flex items-center justify-center">
+          <Loader2 size={26} className="animate-spin text-pink-400" />
+          <Sparkles size={12} className="absolute text-pink-300 animate-pulse" />
+        </div>
+        <div className="text-[13px] font-medium text-ink">正在绘制图像，请稍候…</div>
+        {prompt && (
+          <div className="text-[11.5px] text-inkdim/80 text-center max-w-md line-clamp-2 italic px-2">
+            “{prompt}”
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // 2. 失败/拒绝/超时状态：展示具体报错
+  if (ev.status === "failed" || ev.status === "denied" || ev.status === "timeout") {
+    return (
+      <div className="mt-2.5 rounded-xl border border-red-500/30 bg-red-500/10 p-3.5 text-red-300">
+        <div className="font-medium text-[12.5px] flex items-center gap-1.5 mb-1.5 text-red-400">
+          <ShieldAlert size={15} />
+          <span>图片生成失败</span>
+        </div>
+        <div className="text-[12px] font-mono whitespace-pre-wrap text-red-300/90 max-h-40 overflow-y-auto selection:bg-red-500/30">
+          {ev.resultText || "未知错误"}
+        </div>
+      </div>
+    );
+  }
+
+  // 3. 成功状态但未获取到图片路径：兜底展示返回文本
+  if (!imagePath) {
+    return (
+      <div className="mt-2.5 rounded-xl border border-edge/80 bg-panel3/30 p-3 text-[12.5px] text-ink/90">
+        {ev.resultText || "图片已生成，但未获取到展示路径"}
+      </div>
+    );
+  }
+
+  const isLongPrompt = prompt.length > 120;
+
+  return (
+    <div className="mt-2.5 rounded-xl overflow-hidden border border-edge/80 bg-panel3/25 shadow-sm">
+      {/* 图片展示画布 */}
+      <div
+        className="relative group cursor-zoom-in flex items-center justify-center bg-black/40 py-2.5 px-3 overflow-hidden min-h-[180px]"
+        onClick={() =>
+          setLightboxImage({
+            src: imagePath,
+            title: prompt || "生成图片",
+          })
+        }
+      >
+        <SafeImage
+          src={imagePath}
+          alt={prompt || "生成图片"}
+          className="max-h-[380px] w-auto max-w-full rounded-lg object-contain shadow-lg group-hover:scale-[1.01] transition-transform duration-200"
+        />
+
+        {/* 悬停快捷操作栏 */}
+        <div
+          className="absolute top-2.5 right-2.5 opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1.5 bg-black/75 backdrop-blur-md rounded-lg p-1 shadow-md border border-white/10"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            type="button"
+            className="p-1 rounded hover:bg-white/20 text-white/80 hover:text-white transition-colors cursor-pointer"
+            title="放大预览"
+            onClick={() =>
+              setLightboxImage({
+                src: imagePath,
+                title: prompt || "生成图片",
+              })
+            }
+          >
+            <ZoomIn size={14} />
+          </button>
+          <button
+            type="button"
+            className="p-1 rounded hover:bg-white/20 text-white/80 hover:text-white transition-colors cursor-pointer"
+            title="复制本地路径"
+            onClick={handleCopyPath}
+          >
+            {copiedPath ? <Check size={14} className="text-emerald-400" /> : <Link2 size={14} />}
+          </button>
+          <button
+            type="button"
+            className="p-1 rounded hover:bg-white/20 text-white/80 hover:text-white transition-colors cursor-pointer"
+            title="复制提示词"
+            onClick={handleCopyPrompt}
+          >
+            {copiedPrompt ? <Check size={14} className="text-emerald-400" /> : <Copy size={14} />}
+          </button>
+        </div>
+
+        {/* 悬停指引 */}
+        <div className="absolute bottom-2 inset-x-0 flex justify-center pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+          <span className="px-2.5 py-1 rounded-full bg-black/75 backdrop-blur-md text-[11px] text-white/90 shadow-md flex items-center gap-1.5 border border-white/10">
+            <ZoomIn size={12} />
+            <span>点击查看大图</span>
+          </span>
+        </div>
+      </div>
+
+      {/* 提示词与元数据信息区 */}
+      <div className="p-3 border-t border-edge/60 space-y-2.5 bg-panel2/50">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className="inline-flex items-center gap-1 text-[11px] font-medium text-pink-400 bg-pink-500/10 border border-pink-500/20 px-2 py-0.5 rounded-md">
+              <Sparkles size={11} />
+              <span>提示词</span>
+            </span>
+            {metadata?.model && (
+              <span className="text-[10.5px] font-mono text-inkdim bg-panel3/80 border border-edge/60 px-1.5 py-0.5 rounded-md" title="生图模型">
+                {metadata.model}
+              </span>
+            )}
+            {metadata?.resolution && (
+              <span className="text-[10.5px] font-mono text-inkdim bg-panel3/80 border border-edge/60 px-1.5 py-0.5 rounded-md" title="图片分辨率">
+                {metadata.resolution}
+              </span>
+            )}
+            {metadata?.fileSize && (
+              <span className="text-[10.5px] font-mono text-inkdim bg-panel3/80 border border-edge/60 px-1.5 py-0.5 rounded-md" title="文件体积">
+                {metadata.fileSize}
+              </span>
+            )}
+          </div>
+
+          <div className="flex items-center gap-1.5 shrink-0 ml-auto">
+            {metadata?.imagePath && (
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-panel3 hover:bg-edge text-inkdim hover:text-ink transition-colors text-[11px] cursor-pointer"
+                onClick={handleCopyPath}
+                title="复制图片存储路径"
+              >
+                {copiedPath ? <Check size={11} className="text-emerald-400" /> : <Copy size={11} />}
+                <span>{copiedPath ? "已复制路径" : "复制路径"}</span>
+              </button>
+            )}
+            {prompt && (
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-panel3 hover:bg-edge text-inkdim hover:text-ink transition-colors text-[11px] cursor-pointer"
+                onClick={handleCopyPrompt}
+                title="复制完整提示词"
+              >
+                {copiedPrompt ? <Check size={11} className="text-emerald-400" /> : <Copy size={11} />}
+                <span>{copiedPrompt ? "已复制提示词" : "复制提示词"}</span>
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* 提示词正文 */}
+        {prompt && (
+          <div className="relative rounded-lg bg-panel3/40 border border-edge/40 p-2.5 text-[12.5px] text-ink/90 leading-relaxed font-sans select-text break-words">
+            <div className={!expandedPrompt && isLongPrompt ? "line-clamp-3" : ""}>
+              {prompt}
+            </div>
+            {isLongPrompt && (
+              <div className="mt-1 flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => setExpandedPrompt(!expandedPrompt)}
+                  className="text-[11px] text-accent hover:underline cursor-pointer select-none"
+                >
+                  {expandedPrompt ? "收起提示词" : "展开完整提示词"}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* 本地路径单行展示 */}
+        {metadata?.imagePath && (
+          <div className="flex items-center justify-between text-[11px] text-inkdim/70 font-mono px-0.5 pt-0.5">
+            <span className="truncate flex-1 min-w-0" title={metadata.imagePath}>
+              保存至: {metadata.imagePath}
+            </span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function ToolCard({ ev }: { ev: ToolEvent }) {
   if (ev.toolName === "spawn_subprocess" || ev.toolName === "spawn_subagent") {
     return <SubprocessBranchTree event={ev} />;
@@ -350,14 +593,46 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
   const commandText = isCommandTool ? String(ev.params?.command ?? "") : "";
   const isImageTool = ev.toolName === "generate_image";
   const imagePrompt = isImageTool ? String(ev.params?.prompt ?? "") : "";
-  // 默认收起为一行（标题 + 状态），点击展开查看命令输出/文件内容
-  const [expanded, setExpanded] = useState(false);
+  // 生图工具生成成功默认展开，生成失败默认收起；其他工具默认收起
+  const [expanded, setExpanded] = useState(() => {
+    if (!isImageTool) return false;
+    return ev.status !== "failed" && ev.status !== "timeout" && ev.status !== "denied";
+  });
+
+  // 当生图状态在执行或流转中变为失败时，自动收起卡片；成功时展开
+  useEffect(() => {
+    if (!isImageTool) return;
+    if (ev.status === "failed" || ev.status === "timeout" || ev.status === "denied") {
+      setExpanded(false);
+    } else if (ev.status === "success") {
+      setExpanded(true);
+    }
+  }, [isImageTool, ev.status]);
 
   const generatedImagePath = useMemo(() => {
-    if (ev.toolName !== "generate_image" || ev.status !== "success" || !ev.resultText) return null;
+    if (ev.toolName !== "generate_image" || !ev.resultText) return null;
     const match = ev.resultText.match(/!\[.*?\]\((.*?)\)/);
-    return match ? match[1] : null;
-  }, [ev.toolName, ev.status, ev.resultText]);
+    if (match) return match[1];
+    const pathMatch = ev.resultText.match(/保存路径:\s*`?([^`\n]+)`?/);
+    return pathMatch ? pathMatch[1].trim() : null;
+  }, [ev.toolName, ev.resultText]);
+
+  const imageMetadata = useMemo(() => {
+    if (!isImageTool || !ev.resultText) return null;
+    const text = ev.resultText;
+
+    const pathMatch = text.match(/保存路径:\s*`?([^`\n]+)`?/);
+    const modelMatch = text.match(/使用模型:\s*`?([^`\n]+)`?/);
+    const sizeMatch = text.match(/分辨率:\s*([^\n]+)/);
+    const kbMatch = text.match(/大小:\s*([^\n]+)/);
+
+    return {
+      imagePath: generatedImagePath || (pathMatch ? pathMatch[1].trim() : null),
+      model: modelMatch ? modelMatch[1].trim() : null,
+      resolution: sizeMatch ? sizeMatch[1].trim() : (ev.params?.size ? String(ev.params.size) : null),
+      fileSize: kbMatch ? kbMatch[1].trim() : null,
+    };
+  }, [isImageTool, ev.resultText, generatedImagePath, ev.params]);
 
   const handleCopyCommand = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -399,7 +674,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
   };
 
   const showOutput = ev.status === "running" && output !== undefined;
-  const showResult = !!ev.resultText && (ev.status === "success" || ev.status === "failed" || ev.status === "timeout" || ev.status === "denied");
+  const showResult = !isImageTool && !!ev.resultText && (ev.status === "success" || ev.status === "failed" || ev.status === "timeout" || ev.status === "denied");
 
   return (
     <div
@@ -485,42 +760,14 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
       {/* 审批条是交互入口，保持常显 */}
       {ev.status === "pending_approval" && <ApprovalSection ev={ev} />}
 
-      {/* 生图成果卡片展示 */}
-      {generatedImagePath && (
-        <div className="mt-2.5 rounded-xl overflow-hidden border border-edge/80 bg-panel3/30 p-2.5 shadow-sm">
-          <div
-            className="relative group cursor-zoom-in flex items-center justify-center bg-black/20 rounded-lg overflow-hidden py-1"
-            onClick={() =>
-              setLightboxImage({
-                src: generatedImagePath,
-                title: String(ev.params?.prompt ?? "生成图片"),
-              })
-            }
-          >
-            <img
-              src={toAssetUrl(generatedImagePath)}
-              alt={String(ev.params?.prompt ?? "生成图片")}
-              className="max-h-72 w-auto max-w-full rounded-lg object-contain shadow-md group-hover:scale-[1.01] transition-transform"
-            />
-          </div>
-          <div className="mt-2 flex items-center justify-between px-1 text-[11.5px] text-inkdim gap-2">
-            <span className="truncate flex-1 font-mono" title={String(ev.params?.prompt ?? "")}>
-              🎨 {String(ev.params?.prompt ?? "")}
-            </span>
-            <div className="flex items-center gap-2 shrink-0">
-              <button
-                type="button"
-                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-panel hover:bg-panel3 text-inkdim hover:text-ink transition-colors text-[11px]"
-                onClick={handleCopyPrompt}
-                title="复制提示词"
-              >
-                {copied ? <Check size={11} className="text-green-400" /> : <Copy size={11} />}
-                <span>{copied ? "已复制" : "复制"}</span>
-              </button>
-              <span className="text-[11px] opacity-75">点击放大预览</span>
-            </div>
-          </div>
-        </div>
+      {/* 展开时：若是生图工具，展示专用生图成果与提示词卡片 */}
+      {expanded && isImageTool && (
+        <ImageToolView
+          ev={ev}
+          imagePath={generatedImagePath}
+          prompt={imagePrompt || title}
+          metadata={imageMetadata}
+        />
       )}
 
       {/* 展开时：若是执行命令，先展示完整的命令行（带复制按钮与完整换行支持） */}
@@ -543,30 +790,6 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
           </div>
           <pre className="p-3 text-[12px] font-mono text-emerald-300/90 whitespace-pre-wrap break-all select-text max-h-48 overflow-y-auto selection:bg-emerald-500/30">
             {commandText}
-          </pre>
-        </div>
-      )}
-
-      {/* 展开时：若是生图工具，展示完整提示词（带复制按钮与完整换行支持） */}
-      {expanded && isImageTool && (imagePrompt || title) && (
-        <div className="mt-2.5 rounded-lg border border-edge/60 bg-[#111114] overflow-hidden">
-          <div className="flex items-center justify-between px-3 py-1.5 bg-panel3/40 border-b border-edge/40 text-[11px] text-inkdim select-none">
-            <span className="flex items-center gap-1.5 font-medium text-inkdim">
-              <Image size={12} className="text-pink-400" />
-              <span>完整提示词</span>
-            </span>
-            <button
-              type="button"
-              className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-panel3 hover:bg-edge hover:text-ink text-inkdim transition-colors text-[11px]"
-              onClick={handleCopyPrompt}
-              title="复制提示词"
-            >
-              {copied ? <Check size={12} className="text-green-400" /> : <Copy size={12} />}
-              <span>{copied ? "已复制" : "复制"}</span>
-            </button>
-          </div>
-          <pre className="p-3 text-[12px] font-mono text-pink-300/90 whitespace-pre-wrap break-all select-text max-h-48 overflow-y-auto selection:bg-pink-500/30">
-            {imagePrompt || title}
           </pre>
         </div>
       )}

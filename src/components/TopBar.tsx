@@ -21,6 +21,7 @@ import {
   Sparkles,
   Cpu,
   Sliders,
+  GitBranch,
 } from "./Icons";
 
 type OpenMenu = "ws" | "mode" | "model" | null;
@@ -28,6 +29,12 @@ type OpenMenu = "ws" | "mode" | "model" | null;
 export function TopBar() {
   const session = useStore((s) => currentSession(s));
   const currentId = useStore((s) => s.currentId);
+  const selectSession = useStore((s) => s.selectSession);
+  const parentSession = useStore((s) =>
+    session?.forkedFromSessionId ? s.sessions.find((sess) => sess.id === session.forkedFromSessionId) ?? null : null
+  );
+  const isForked = Boolean(session?.forkedFromSessionId);
+  const isParentDeleted = isForked && !parentSession;
   const draft = useStore((s) => s.draft);
   const settings = useStore((s) => s.settings);
   const projects = useStore((s) => s.projects);
@@ -174,193 +181,222 @@ export function TopBar() {
     }
   };
 
+  const handleParentJump = () => {
+    if (!session?.forkedFromSessionId) return;
+    if (isParentDeleted) {
+      pushToast("来源原对话已被删除，无法跳转");
+      return;
+    }
+    void selectSession(session.forkedFromSessionId);
+  };
+
   return (
-    <div className="relative z-30 h-12 shrink-0 border-b border-edge/60 bg-panel flex items-center gap-2.5 px-3.5 select-none">
-      {/* 左侧：会话标题 + 面包屑导航 */}
-      <div className="flex items-center gap-2 min-w-0 flex-1 overflow-hidden">
-        <div className="flex items-center gap-1.5 text-ink min-w-0 shrink">
-          <MessageSquare size={14} className="text-accent/80 shrink-0" />
+    <div className="relative z-30 h-12 shrink-0 border-b border-edge/60 bg-panel flex items-center justify-between gap-2 px-3.5 select-none">
+      {/* 左侧：会话标题 + 工作区 + 分支血缘指示 面包屑导航 */}
+      <div className="flex items-center gap-1.5 min-w-0 shrink overflow-hidden">
+        {/* 会话标题 */}
+        <div className="flex items-center gap-1.5 text-ink min-w-0 shrink h-8">
+          <MessageSquare size={13} className="text-accent/80 shrink-0" />
           <span
-            className="font-medium text-[13px] truncate max-w-[140px] lg:max-w-[180px]"
+            className="font-medium text-[12.5px] truncate max-w-[85px] sm:max-w-[130px]"
             title={session?.title ?? (currentId === DRAFT_ID ? "新对话（未保存）" : "harness_mini")}
           >
             {session?.title ?? (currentId === DRAFT_ID ? "新对话" : "harness_mini")}
           </span>
           {currentId === DRAFT_ID && (
-            <span className="shrink-0 px-1.5 py-[1px] rounded text-[10px] bg-accent/15 text-accent font-normal border border-accent/25">
+            <span className="shrink-0 px-1.5 py-0.5 rounded text-[10px] bg-accent/15 text-accent font-normal border border-accent/25">
               草稿
             </span>
           )}
         </div>
 
-        <span className="text-inkdim/30 select-none text-[12px] shrink-0">/</span>
+        <span className="text-inkdim/30 select-none text-[11px] shrink-0">/</span>
 
         {/* 工作区（工作区即项目：未保存草稿可选已有项目 / 目录 / 不选择；已保存与临时空间对话只读） */}
         <div className="relative flex items-center gap-1 min-w-0 shrink">
           {isSaved || isTempConv ? (
             <div
-              className="flex items-center gap-1.5 bg-panel2/50 border border-edge/50 rounded-lg px-2.5 py-1 text-[12px] text-inkdim max-w-[160px] lg:max-w-[220px] cursor-default select-none shadow-sm shrink min-w-0"
+              className="flex items-center gap-1.5 h-8 bg-panel2/50 border border-edge/50 rounded-lg px-2.5 text-[12px] text-inkdim max-w-[90px] sm:max-w-[140px] cursor-default select-none shrink min-w-0"
               title={wsTitle}
             >
               {isTempConv ? (
-                <Wind size={13} className="text-amber-400 shrink-0" />
+                <Wind size={12} className="text-amber-400 shrink-0" />
               ) : (
-                <Lock size={13} className="text-zinc-400 shrink-0" />
+                <Lock size={12} className="text-zinc-400 shrink-0" />
               )}
-              <span className="truncate">{wsLabel || "未选择工作区"}</span>
+              <span className="truncate min-w-0 text-left">{wsLabel || "无工作区"}</span>
             </div>
           ) : (
             <button
-              className={`flex items-center gap-1.5 bg-panel2/60 hover:bg-panel2 border border-edge/60 hover:border-accent/40 rounded-lg px-2.5 py-1 text-[12px] text-inkdim hover:text-ink max-w-[160px] lg:max-w-[220px] transition-all shadow-sm shrink min-w-0 ${
+              className={`flex items-center gap-1.5 h-8 bg-panel2/60 hover:bg-panel2 border border-edge/60 hover:border-accent/40 rounded-lg px-2.5 text-[12px] text-inkdim hover:text-ink max-w-[90px] sm:max-w-[140px] transition-all shrink min-w-0 cursor-pointer ${
                 openMenu === "ws" ? "border-accent/50 bg-panel2 ring-1 ring-accent/20" : ""
               }`}
               onClick={() => setOpenMenu(openMenu === "ws" ? null : "ws")}
               title={wsTitle}
             >
-              <FolderOpen size={13} className="text-accent shrink-0" />
-              <span className="truncate">{wsLabel || "未选择工作区"}</span>
-              <ChevronDown size={11} className="opacity-60 shrink-0 ml-0.5" />
+              <FolderOpen size={12} className="text-accent shrink-0" />
+              <span className="truncate min-w-0 text-left">{wsLabel || "选择工作区"}</span>
+              <ChevronDown size={10} className="opacity-50 shrink-0 ml-0.5" />
             </button>
           )}
 
           {workspacePath && !isSaved && !isTempConv && (
             <button
-              className="w-5 h-5 rounded-md text-inkdim hover:text-ink hover:bg-panel2 flex items-center justify-center transition-colors"
+              className="w-5 h-5 shrink-0 rounded text-inkdim hover:text-ink hover:bg-panel2 flex items-center justify-center transition-colors cursor-pointer"
               title="清除工作区（转为纯对话）"
               onClick={() => void clearWorkspace()}
             >
-              <X size={12} />
+              <X size={11} />
             </button>
           )}
 
-          {/* 工作区下拉弹出层 */}
+          {/* 工作区下拉弹出层：精简收窄至 220px，单行展示 */}
           {openMenu === "ws" && !isSaved && !isTempConv && (
             <>
               <div className="fixed inset-0 z-40" onMouseDown={() => setOpenMenu(null)} />
-              <div className="absolute left-0 top-10 z-50 w-[320px] bg-panel2 border border-edge/80 rounded-xl shadow-2xl py-1.5 max-h-[60vh] overflow-y-auto animate-in fade-in zoom-in-95 duration-100">
-                <div className="px-3 py-1 text-[11px] font-medium text-inkdim">选择已有项目</div>
+              <div className="absolute left-0 top-10 z-50 w-[220px] bg-panel2 border border-edge/80 rounded-xl shadow-2xl p-1.5 max-h-[60vh] overflow-y-auto animate-in fade-in zoom-in-95 duration-100">
+                <div className="px-2 py-1 text-[10.5px] font-medium text-inkdim">选择已有项目</div>
                 {sortedProjects.length === 0 && (
-                  <div className="px-3 py-2 text-[12px] text-inkdim">暂无项目 · 选择目录后自动创建</div>
+                  <div className="px-2 py-1.5 text-[11.5px] text-inkdim">暂无项目 · 可选下方目录</div>
                 )}
-                {sortedProjects.map((p) => {
-                  const isActive = samePath(p.path, workspacePath) || (!workspacePath && p.id === boundProjectId);
-                  return (
-                    <button
-                      key={p.id}
-                      className="w-full text-left px-3 py-1.5 hover:bg-panel3 transition-colors flex flex-col gap-0.5"
-                      onClick={() => void applyProject(p)}
-                    >
-                      <div className="text-[13px] text-ink truncate flex items-center gap-1.5">
-                        {p.pinned && <Pin size={12} className="text-accent fill-accent shrink-0" />}
-                        <span className={`truncate ${isActive ? "text-accent font-medium" : ""}`}>{p.name}</span>
-                        {isActive && (
-                          <span className="text-accent ml-auto text-[11px] flex items-center gap-0.5 shrink-0">
-                            <Check size={12} /> 当前
-                          </span>
+                <div className="flex flex-col gap-0.5">
+                  {sortedProjects.map((p) => {
+                    const isActive = samePath(p.path, workspacePath) || (!workspacePath && p.id === boundProjectId);
+                    return (
+                      <button
+                        key={p.id}
+                        className={`w-full text-left px-2.5 py-1.5 rounded-lg text-[12px] hover:bg-panel3 transition-colors flex items-center gap-1.5 cursor-pointer ${
+                          isActive ? "bg-accent/15 text-accent font-medium" : "text-ink/90 hover:text-ink"
+                        }`}
+                        onClick={() => void applyProject(p)}
+                        title={`${p.name}\n${p.path ?? "未绑定目录"}`}
+                      >
+                        {p.pinned ? (
+                          <Pin size={12} className="text-accent fill-accent shrink-0" />
+                        ) : (
+                          <FolderOpen size={12} className="text-inkdim shrink-0" />
                         )}
-                      </div>
-                      <div className="text-[11px] text-inkdim truncate">{p.path ?? "未绑定目录"}</div>
-                    </button>
-                  );
-                })}
-                <div className="my-1.5 border-t border-edge/50" />
-                <button
-                  className="w-full text-left px-3 py-1.5 text-[13px] text-ink hover:bg-panel3 flex items-center gap-2 transition-colors"
-                  onClick={() => void pickDirectory()}
-                >
-                  <FolderOpen size={14} className="text-accent shrink-0" />
-                  <span className="truncate">选择目录…</span>
-                  <span className="text-[11px] text-inkdim ml-auto truncate">自动创建项目</span>
-                </button>
-                <button
-                  className="w-full text-left px-3 py-1.5 text-[13px] text-ink hover:bg-panel3 flex items-center gap-2 transition-colors"
-                  onClick={() => void clearWorkspace()}
-                >
-                  <Ban size={14} className="text-inkdim shrink-0" />
-                  <span>不选择工作区（纯对话）</span>
-                </button>
+                        <span className="truncate flex-1 min-w-0">{p.name}</span>
+                        {isActive && <Check size={12} className="text-accent shrink-0 ml-1" />}
+                      </button>
+                    );
+                  })}
+                </div>
+                <div className="my-1 border-t border-edge/50" />
+                <div className="flex flex-col gap-0.5">
+                  <button
+                    className="w-full text-left px-2.5 py-1.5 text-[12px] text-ink hover:bg-panel3 rounded-lg flex items-center gap-2 transition-colors cursor-pointer"
+                    onClick={() => void pickDirectory()}
+                    title="从本地文件系统选择目录并自动创建项目"
+                  >
+                    <FolderOpen size={13} className="text-accent shrink-0" />
+                    <span className="truncate">选择新目录…</span>
+                  </button>
+                  <button
+                    className="w-full text-left px-2.5 py-1.5 text-[12px] text-inkdim hover:text-ink hover:bg-panel3 rounded-lg flex items-center gap-2 transition-colors cursor-pointer"
+                    onClick={() => void clearWorkspace()}
+                    title="不绑定目录，进行纯文本对话"
+                  >
+                    <Ban size={13} className="shrink-0" />
+                    <span className="truncate">不绑定工作区</span>
+                  </button>
+                </div>
               </div>
             </>
           )}
         </div>
+
+        {/* 分支血缘指示标签：紧凑化收起 */}
+        {isForked && (
+          <>
+            <span className="text-inkdim/30 select-none text-[11px] shrink-0">/</span>
+            <button
+              type="button"
+              onClick={handleParentJump}
+              className={`flex items-center gap-1 h-8 px-2 rounded-lg border text-[11.5px] transition-all select-none max-w-[75px] sm:max-w-[110px] shrink min-w-0 ${
+                isParentDeleted
+                  ? "bg-panel2/40 border-edge/60 text-inkdim/60 cursor-not-allowed opacity-75"
+                  : "bg-accent/10 border-accent/25 text-accent hover:bg-accent/20 cursor-pointer"
+              }`}
+              title={
+                isParentDeleted
+                  ? "来源原对话已被删除，无法跳转"
+                  : `分支自：${parentSession?.title || "原对话"}\n点击跳转回原对话`
+              }
+            >
+              <GitBranch size={12} className={`shrink-0 ${isParentDeleted ? "text-inkdim/60" : "text-accent"}`} />
+              <span className="truncate min-w-0 text-left">
+                {isParentDeleted ? "已删除" : parentSession?.title || "原对话"}
+              </span>
+            </button>
+          </>
+        )}
       </div>
 
       {/* 右侧：访问模式 + 模型选择 + 状态指示 */}
-      <div className="ml-auto flex items-center gap-1.5 shrink-0 select-none">
-        {/* 访问模式选择器（自定义深色下拉） */}
+      <div className="flex items-center gap-1.5 shrink-0 ml-auto select-none">
+        {/* 访问模式选择器（统一 h-8 高度，下拉收窄至 170px） */}
         <div className="relative shrink-0">
           <button
-            className={`flex items-center gap-1 bg-panel2/60 hover:bg-panel2 border border-edge/60 hover:border-accent/40 rounded-lg px-2.5 py-1 text-[12px] whitespace-nowrap shrink-0 transition-all shadow-sm ${
+            className={`flex items-center gap-1.5 h-8 bg-panel2/60 hover:bg-panel2 border border-edge/60 hover:border-accent/40 rounded-lg px-2.5 text-[12px] shrink-0 transition-all cursor-pointer ${
               accessMode === "full_access" ? "text-amber-400 font-medium" : "text-ink"
             } ${openMenu === "mode" ? "border-accent/50 bg-panel2 ring-1 ring-accent/20" : ""}`}
             onClick={() => setOpenMenu(openMenu === "mode" ? null : "mode")}
-            title={`当前访问模式：${selectModeLabel(accessMode)}`}
+            title={accessMode === "full_access" ? "访问模式：完全访问（自动放行）" : "访问模式：变更前确认（操作需审批）"}
           >
             {accessMode === "full_access" ? (
               <Zap size={13} className="text-amber-400 shrink-0" />
             ) : (
               <ShieldCheck size={13} className="text-accent shrink-0" />
             )}
-            <span className="truncate">{selectModeLabel(accessMode)}</span>
-            <ChevronDown size={11} className="opacity-60 shrink-0 ml-0.5 text-inkdim" />
+            <span>{accessMode === "full_access" ? "完全" : "确认"}</span>
+            <ChevronDown size={10} className="opacity-50 shrink-0 ml-0.5 text-inkdim" />
           </button>
 
           {openMenu === "mode" && (
             <>
               <div className="fixed inset-0 z-40" onMouseDown={() => setOpenMenu(null)} />
-              <div className="absolute right-0 top-10 z-50 w-[260px] bg-panel2 border border-edge/80 rounded-xl shadow-2xl p-1.5 animate-in fade-in zoom-in-95 duration-100">
-                <div className="px-2.5 py-1 text-[11px] font-medium text-inkdim">选择访问模式</div>
+              <div className="absolute right-0 top-10 z-50 w-[170px] bg-panel2 border border-edge/80 rounded-xl shadow-2xl p-1 animate-in fade-in zoom-in-95 duration-100">
+                <div className="px-2 py-1 text-[10.5px] font-medium text-inkdim">选择访问模式</div>
 
-                <button
-                  className={`w-full text-left p-2 rounded-lg transition-colors flex items-start gap-2.5 ${
-                    accessMode === "confirm" ? "bg-panel3 text-ink" : "hover:bg-panel3/70 text-ink/90"
-                  }`}
-                  onClick={() => void handleSelectMode("confirm")}
-                >
-                  <div className="p-1 rounded bg-blue-500/15 text-blue-400 mt-0.5 shrink-0">
-                    <ShieldCheck size={14} />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-[12px] font-medium flex items-center justify-between">
-                      <span>变更前确认</span>
-                      {accessMode === "confirm" && <Check size={13} className="text-accent" />}
+                <div className="flex flex-col gap-0.5">
+                  <button
+                    className={`w-full text-left px-2.5 py-1.5 rounded-lg text-[12px] transition-colors flex items-center justify-between cursor-pointer ${
+                      accessMode === "confirm" ? "bg-panel3 text-ink font-medium" : "hover:bg-panel3/70 text-inkdim hover:text-ink"
+                    }`}
+                    onClick={() => void handleSelectMode("confirm")}
+                    title="变更前确认：只读工具自动执行，写入与命令执行需逐项审批"
+                  >
+                    <div className="flex items-center gap-2 min-w-0 truncate">
+                      <ShieldCheck size={13} className="text-accent shrink-0" />
+                      <span className="truncate">变更前确认</span>
                     </div>
-                    <div className="text-[11px] text-inkdim leading-tight mt-0.5">
-                      命令与写操作需审批，安全可控
-                    </div>
-                  </div>
-                </button>
+                    {accessMode === "confirm" && <Check size={13} className="text-accent shrink-0 ml-1" />}
+                  </button>
 
-                <button
-                  className={`w-full text-left p-2 rounded-lg transition-colors flex items-start gap-2.5 mt-1 ${
-                    accessMode === "full_access" ? "bg-panel3 text-amber-400" : "hover:bg-panel3/70 text-ink/90"
-                  }`}
-                  onClick={() => void handleSelectMode("full_access")}
-                >
-                  <div className="p-1 rounded bg-amber-500/15 text-amber-400 mt-0.5 shrink-0">
-                    <Zap size={14} />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-[12px] font-medium flex items-center justify-between">
-                      <span className={accessMode === "full_access" ? "text-amber-400 font-semibold" : ""}>
-                        完全访问
-                      </span>
-                      {accessMode === "full_access" && <Check size={13} className="text-amber-400" />}
+                  <button
+                    className={`w-full text-left px-2.5 py-1.5 rounded-lg text-[12px] transition-colors flex items-center justify-between cursor-pointer ${
+                      accessMode === "full_access" ? "bg-panel3 text-amber-400 font-medium" : "hover:bg-panel3/70 text-inkdim hover:text-ink"
+                    }`}
+                    onClick={() => void handleSelectMode("full_access")}
+                    title="完全访问：所有工具自动放行，连续执行不被打断"
+                  >
+                    <div className="flex items-center gap-2 min-w-0 truncate">
+                      <Zap size={13} className="text-amber-400 shrink-0" />
+                      <span className="truncate">完全访问</span>
                     </div>
-                    <div className="text-[11px] text-inkdim leading-tight mt-0.5">
-                      所有工具自动放行，连续执行不被打断
-                    </div>
-                  </div>
-                </button>
+                    {accessMode === "full_access" && <Check size={13} className="text-amber-400 shrink-0 ml-1" />}
+                  </button>
+                </div>
               </div>
             </>
           )}
         </div>
 
-        {/* 模型切换器 */}
+        {/* 模型切换器（统一 h-8 高度，下拉收窄至 230px） */}
         <div className="relative shrink-0">
           <button
-            className={`flex items-center gap-1.5 bg-panel2/60 hover:bg-panel2 border border-edge/60 hover:border-accent/40 rounded-lg px-2.5 py-1 text-[12px] text-ink whitespace-nowrap shrink-0 transition-all shadow-sm max-w-[170px] lg:max-w-[220px] ${
+            className={`flex items-center gap-1.5 h-8 bg-panel2/60 hover:bg-panel2 border border-edge/60 hover:border-accent/40 rounded-lg px-2.5 text-[12px] text-ink shrink-0 transition-all cursor-pointer max-w-[120px] sm:max-w-[160px] ${
               openMenu === "model" ? "border-accent/50 bg-panel2 ring-1 ring-accent/20" : ""
             }`}
             onClick={() => setOpenMenu(openMenu === "model" ? null : "model")}
@@ -373,61 +409,66 @@ export function TopBar() {
             }
           >
             <Sparkles size={13} className="text-accent shrink-0" />
-            <span className="truncate">{active?.model ?? "选择模型"}</span>
-            {active && (
+            <span className="truncate min-w-0 flex-1 text-left">{active?.model ?? "选择模型"}</span>
+            {isSessionOverridden && (
               <span
-                role="button"
-                className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 transition-all cursor-pointer ${
-                  isSessionOverridden
-                    ? "text-amber-400 bg-amber-500/15 border-amber-500/35 hover:bg-amber-500/25 font-semibold shadow-[0_0_8px_rgba(245,158,11,0.15)]"
-                    : "text-accent/80 bg-accent/10 border-accent/20 hover:bg-accent/20 hover:text-accent hover:border-accent/40"
-                }`}
-                title={`点击调整本次对话上下文上限\n当前有效上限: ${effectiveLimit.toLocaleString()} tokens (~${formatTokens(effectiveLimit)})${
-                  isSessionOverridden ? "\n（★ 本次对话专属自定义，优先级最高）" : "\n（跟随模型默认配置）"
-                }`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setOpenSessionContextModal(true);
-                }}
-                onMouseDown={(e) => e.stopPropagation()}
-              >
-                {formatTokens(effectiveLimit)}{isSessionOverridden ? " · 本次" : ""}
-              </span>
+                className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0"
+                title="已自定义本次对话上下文上限"
+              />
             )}
-            <ChevronDown size={11} className="opacity-60 shrink-0 ml-0.5 text-inkdim" />
+            <ChevronDown size={10} className="opacity-50 shrink-0 ml-0.5 text-inkdim" />
           </button>
 
           {openMenu === "model" && (
             <>
               <div className="fixed inset-0 z-40" onMouseDown={() => setOpenMenu(null)} />
-              <div className="absolute right-0 top-10 z-50 w-[290px] bg-panel2 border border-edge/80 rounded-xl shadow-2xl p-1.5 max-h-[65vh] overflow-y-auto animate-in fade-in zoom-in-95 duration-100">
-                <div className="p-1 mb-1 border-b border-edge/50">
+              <div className="absolute right-0 top-10 z-50 w-[230px] bg-panel2 border border-edge/80 rounded-xl shadow-2xl p-1.5 max-h-[65vh] overflow-y-auto animate-in fade-in zoom-in-95 duration-100">
+                <div className="p-0.5 mb-1 border-b border-edge/50 flex items-center gap-1">
                   <button
-                    className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-accent/10 hover:bg-accent/20 border border-accent/25 text-accent text-[12px] font-medium transition-colors cursor-pointer"
+                    className="flex-1 flex items-center justify-between px-2 py-1 rounded-md bg-accent/10 hover:bg-accent/20 border border-accent/25 text-accent text-[11px] font-medium transition-colors cursor-pointer"
                     onClick={() => {
                       setOpenMenu(null);
                       openModelMatrixModal(currentId);
                     }}
+                    title="配置主模型、图像模型、视觉模型及上下文上限"
                   >
-                    <span className="flex items-center gap-1.5">
-                      <Sliders size={13} />
-                      <span>能力模型设置</span>
+                    <span className="flex items-center gap-1">
+                      <Sliders size={11} />
+                      <span>能力模型</span>
                     </span>
-                    <span className="text-[10.5px] opacity-80">生图 · 视觉 &rarr;</span>
+                    <span className="text-[10px] opacity-80">&rarr;</span>
                   </button>
+                  {active && (
+                    <button
+                      className={`px-1.5 py-1 rounded-md border text-[10.5px] font-mono transition-colors cursor-pointer shrink-0 ${
+                        isSessionOverridden
+                          ? "text-amber-400 bg-amber-500/15 border-amber-500/35 hover:bg-amber-500/25 font-semibold"
+                          : "text-inkdim hover:text-ink bg-panel3 hover:bg-panel border-edge"
+                      }`}
+                      title={`本次有效上限: ${effectiveLimit.toLocaleString()} tokens (~${formatTokens(effectiveLimit)})${
+                        isSessionOverridden ? "\n（★ 本次对话专属自定义）" : "\n（跟随模型默认配置）"
+                      }\n点击调整本次对话专属上限`}
+                      onClick={() => {
+                        setOpenMenu(null);
+                        setOpenSessionContextModal(true);
+                      }}
+                    >
+                      <span>{formatTokens(effectiveLimit)}</span>
+                    </button>
+                  )}
                 </div>
-                <div className="px-2.5 py-1 text-[11px] font-medium text-inkdim flex items-center justify-between">
+                <div className="px-2 py-0.5 text-[10.5px] font-medium text-inkdim flex items-center justify-between">
                   <span>选择对话模型</span>
-                  <span className="text-[10px] text-inkdim/70">
+                  <span className="text-[9.5px] text-inkdim/70">
                     共 {groups.reduce((acc, g) => acc + g.models.length, 0)} 个
                   </span>
                 </div>
                 {groups.length === 0 ? (
-                  <div className="px-3 py-3 text-[12px] text-inkdim text-center">暂未配置可用模型</div>
+                  <div className="px-3 py-3 text-[11.5px] text-inkdim text-center">暂未配置可用模型</div>
                 ) : (
                   groups.map((p, idx) => (
-                    <div key={p.id} className={idx > 0 ? "mt-2 pt-1.5 border-t border-edge/40" : "mt-1"}>
-                      <div className="px-2 py-0.5 text-[10px] font-semibold text-inkdim/80 tracking-wider uppercase">
+                    <div key={p.id} className={idx > 0 ? "mt-1.5 pt-1 border-t border-edge/40" : "mt-0.5"}>
+                      <div className="px-2 py-0.5 text-[9.5px] font-semibold text-inkdim/80 tracking-wider uppercase">
                         {p.name}
                       </div>
                       <div className="flex flex-col gap-0.5 mt-0.5">
@@ -437,7 +478,7 @@ export function TopBar() {
                           return (
                             <button
                               key={m}
-                              className={`w-full text-left px-2.5 py-1.5 rounded-lg text-[12px] transition-colors flex items-center justify-between gap-2 ${
+                              className={`w-full text-left px-2 py-1 rounded-md text-[11.5px] transition-colors flex items-center justify-between gap-1.5 cursor-pointer ${
                                 isSelected
                                   ? "bg-accent/15 text-accent font-medium"
                                   : "hover:bg-panel3 text-ink/90 hover:text-ink"
@@ -445,15 +486,15 @@ export function TopBar() {
                               onClick={() => void handleSelectModel(p.id, m)}
                               title={`${p.name} · ${m}\n上下文上限: ${mLimit.toLocaleString()} tokens`}
                             >
-                              <div className="flex items-center gap-2 truncate min-w-0 flex-1">
-                                <Cpu size={13} className={isSelected ? "text-accent" : "text-inkdim"} />
+                              <div className="flex items-center gap-1.5 truncate min-w-0 flex-1">
+                                <Cpu size={12} className={isSelected ? "text-accent" : "text-inkdim"} />
                                 <span className="truncate">{m}</span>
                               </div>
-                              <div className="flex items-center gap-1.5 shrink-0">
-                                <span className="text-[10px] font-mono text-inkdim bg-panel3 px-1.5 py-0.5 rounded border border-edge/60">
+                              <div className="flex items-center gap-1 shrink-0">
+                                <span className="text-[9.5px] font-mono text-inkdim bg-panel3 px-1 py-0.2 rounded border border-edge/60">
                                   {formatTokens(mLimit)}
                                 </span>
-                                {isSelected && <Check size={13} className="text-accent shrink-0 ml-1" />}
+                                {isSelected && <Check size={12} className="text-accent shrink-0" />}
                               </div>
                             </button>
                           );
@@ -467,21 +508,21 @@ export function TopBar() {
           )}
         </div>
 
-        {/* 状态指示 */}
+        {/* 状态指示（统一 h-8 规格） */}
         <div
-          className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full border text-[11px] whitespace-nowrap shrink-0 select-none transition-all ${
+          className={`flex items-center gap-1.5 h-8 px-2.5 rounded-lg text-[12px] shrink-0 select-none transition-all ${
             running
-              ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400 shadow-[0_0_12px_rgba(16,185,129,0.15)]"
-              : "bg-panel2/50 border-edge/50 text-inkdim"
+              ? "bg-emerald-500/10 text-emerald-400 font-medium border border-emerald-500/20"
+              : "text-inkdim/60 hover:text-inkdim"
           }`}
-          title={running ? "Agent 正在执行任务中" : "当前空闲"}
+          title={running ? "Agent 正在执行任务中" : "当前空闲待命"}
         >
           <span
             className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-              running ? "bg-emerald-400 animate-pulse shadow-[0_0_6px_rgba(52,211,153,0.8)]" : "bg-zinc-500"
+              running ? "bg-emerald-400 animate-pulse shadow-[0_0_6px_rgba(52,211,153,0.8)]" : "bg-inkdim/40"
             }`}
           />
-          <span className="font-medium">{running ? "运行中" : "空闲"}</span>
+          <span>{running ? "运行中" : "空闲"}</span>
         </div>
       </div>
 
