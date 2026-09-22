@@ -249,28 +249,54 @@ pub fn find_plan_file(
                 return Some((path.clone(), meta.clone(), body.clone()));
             }
         }
+        // 如果调用方明确指定了 plan_id，但未匹配到，直接返回 None，不回退到其他计划
+        if plan_id.map(|s| !s.trim().is_empty()).unwrap_or(false) {
+            return None;
+        }
     }
 
-    // 2. 若未指定或没精确匹配，找当前会话且 status == "in_progress" 的最新计划
-    let mut session_active = files
-        .iter()
-        .filter(|(_, meta, _)| !session_id.is_empty() && meta.session_id == session_id && meta.status == "in_progress")
-        .cloned()
-        .collect::<Vec<_>>();
+    // 2. 若未指定或没精确匹配，且指定了 session_id，则只查找当前会话下 status == "in_progress" 的最新计划
+    if !session_id.is_empty() {
+        let mut session_active = files
+            .iter()
+            .filter(|(_, meta, _)| meta.session_id == session_id && meta.status == "in_progress")
+            .cloned()
+            .collect::<Vec<_>>();
 
-    session_active.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
+        session_active.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
 
-    if let Some(active) = session_active.into_iter().next() {
-        return Some(active);
+        if let Some(active) = session_active.into_iter().next() {
+            return Some(active);
+        }
+
+        // 当前会话指定了 session_id 但未找到属于该会话的进行中方案，必须返回 None，严格隔离防止跨会话越权串扰！
+        return None;
     }
 
-    // 3. 兜底容错：若 session_id 为空或未精确匹配，取该工作区下最新更新的进行中方案
+    // 3. 兜底容错：仅当未提供 session_id（session_id 为空）且未提供 plan_id 时，才取该工作区下最新更新的进行中方案
     let mut latest_in_progress = files
         .into_iter()
         .filter(|(_, meta, _)| meta.status == "in_progress")
         .collect::<Vec<_>>();
     latest_in_progress.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
     latest_in_progress.into_iter().next()
+}
+
+fn available_plans_hint(
+    workspace: &Path,
+    session_id: Option<&str>,
+    conn: Option<&rusqlite::Connection>,
+) -> String {
+    let available = list_plans(workspace, session_id, true, conn)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| format!("`{}` ({})", p.id, p.title))
+        .collect::<Vec<_>>();
+    if available.is_empty() {
+        "（当前工作区暂无任何计划文档，可使用 create_plan 创建）".to_string()
+    } else {
+        format!("。当前已有的计划文档包括: [{}]。可用 list_plans 查看详情", available.join(", "))
+    }
 }
 
 /// 同步计划步骤至 session_kv 中的 "todos"
@@ -435,7 +461,8 @@ pub fn update_plan(
     let Some((file_path, mut meta, mut body)) =
         find_plan_file(workspace, session_id, plan_id, conn)
     else {
-        return Err("未找到指定或当前活动的计划文档，无法更新".into());
+        let hint = available_plans_hint(workspace, Some(session_id), conn);
+        return Err(format!("未找到指定或当前活动的计划文档，无法更新{hint}"));
     };
 
     let time_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -469,7 +496,7 @@ pub fn update_plan(
                 for up in updates {
                     let match_idx = up
                         .get("index")
-                        .and_then(|v| v.as_u64())
+                        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
                         .map(|v| v as usize)
                         == Some(step_count);
                     let match_content = up.get("content").and_then(|v| v.as_str()).map(|c| {
@@ -573,7 +600,8 @@ pub fn update_plan_step_status(
     ensure_plans_dir(workspace)?;
     let sid = session_id.unwrap_or_default();
     let Some((file_path, mut meta, body)) = find_plan_file(workspace, sid, plan_id, conn) else {
-        return Err("未找到指定任务方案文档，无法更新步骤".into());
+        let hint = available_plans_hint(workspace, session_id, conn);
+        return Err(format!("未找到指定任务方案文档，无法更新步骤{hint}"));
     };
 
     meta.updated_at = Utc::now().to_rfc3339();
@@ -662,7 +690,8 @@ pub fn switch_plan(
     let Some((target_path, mut target_meta, target_body)) =
         find_plan_file(workspace, session_id, Some(plan_id), conn)
     else {
-        return Err(format!("未找到 ID 或名称为【{plan_id}】的计划文档"));
+        let hint = available_plans_hint(workspace, Some(session_id), conn);
+        return Err(format!("未找到 ID 或名称为【{plan_id}】的计划文档{hint}"));
     };
 
     // 如果原先有其他正在执行的计划，将其置为 suspended
@@ -703,7 +732,11 @@ pub fn read_plan(
     conn: Option<&rusqlite::Connection>,
 ) -> Result<String, String> {
     let Some((_, meta, body)) = find_plan_file(workspace, session_id, plan_id, conn) else {
-        return Err("未找到指定或当前活动的计划文档".into());
+        let hint = available_plans_hint(workspace, Some(session_id), conn);
+        return match plan_id {
+            Some(pid) => Err(format!("未找到 ID 或名称为【{pid}】的计划文档{hint}")),
+            None => Err(format!("当前会话未绑定活动计划，且未找到默认计划{hint}")),
+        };
     };
     Ok(format_with_frontmatter(&meta, &body))
 }
@@ -923,6 +956,77 @@ mod tests {
         assert!(step_res.is_ok());
         let list3 = list_plans(ws, Some(sid), false, None).unwrap();
         assert_eq!(list3[0].completed_steps, 2);
+    }
+
+    #[test]
+    fn test_plan_session_isolation() {
+        let tmp = TempDir::new();
+        let ws = tmp.path();
+        let sid_a = "session-a";
+        let sid_b = "session-b";
+
+        // 1. 会话 A 创建专属计划
+        create_plan(
+            ws,
+            sid_a,
+            "会话A专属计划",
+            "目标A",
+            "架构A",
+            &[],
+            &["步骤A1".into()],
+            None,
+            None,
+        )
+        .unwrap();
+
+        // 2. 会话 A 查询其活动计划：应当能成功找到
+        let plan_a = find_plan_file(ws, sid_a, None, None);
+        assert!(plan_a.is_some());
+        assert_eq!(plan_a.unwrap().1.title, "会话A专属计划");
+
+        // 3. 会话 B 尚未创建计划，查询其活动计划：必须严格隔离返回 None，绝不可泄露会话 A 的计划
+        let plan_b = find_plan_file(ws, sid_b, None, None);
+        assert!(plan_b.is_none());
+
+        // 4. 会话 B 加载 Prompt 计划上下文：也必须返回 None
+        let ctx_b = load_active_plan_context(ws, sid_b, None);
+        assert!(ctx_b.is_none());
+    }
+
+    #[test]
+    fn test_plan_not_found_hints() {
+        let temp = std::env::temp_dir().join(format!("harness_test_plan_hint_{}", uuid::Uuid::new_v4()));
+        let ws = temp.as_path();
+        let sid = "session-test-hint";
+
+        // 没有计划时查询
+        let err1 = read_plan(ws, sid, Some("non_existent_plan"), None).unwrap_err();
+        assert!(err1.contains("暂无任何计划文档"));
+
+        // 创建一个计划
+        create_plan(
+            ws,
+            sid,
+            "用户认证系统重构",
+            "重构认证模块",
+            "JWT 认证架构",
+            &[],
+            &["实现登录接口".into()],
+            None,
+            None,
+        ).unwrap();
+
+        // 再次查询不存在的 plan_id，验证提示包含了现有的计划 ID 和标题
+        let err2 = read_plan(ws, sid, Some("wrong_id"), None).unwrap_err();
+        assert!(err2.contains("用户认证系统重构"));
+        assert!(err2.contains("已有的计划文档包括"));
+
+        // switch_plan 也应包含已有计划提示
+        let err3 = switch_plan(ws, sid, "wrong_id", None).unwrap_err();
+        assert!(err3.contains("用户认证系统重构"));
+        assert!(err3.contains("已有的计划文档包括"));
+
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }
 

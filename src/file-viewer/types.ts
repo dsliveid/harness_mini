@@ -40,5 +40,6 @@ export interface FileViewerStoreState {
   setActiveTab: (tabId: string) => void;
   togglePinTab: (tabId: string) => void;
   reorderTabs: (fromIndex: number, toIndex: number) => void;
+  notifyFileChanged: (filePath: string) => void;
 }
 

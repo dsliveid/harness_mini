@@ -309,6 +309,16 @@ export function DiffViewer({ tab }: { tab: DiffViewerTab }) {
   useEffect(() => {
     void loadDiff();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab.path, tab.sessionId, tab.projectKey, tab.oldContent, tab.newContent, tab.reloadNonce]);
+
+  // 窗口切回焦点时自动静默刷新差量对比
+  useEffect(() => {
+    const handleFocus = () => {
+      void loadDiff();
+    };
+    window.addEventListener("focus", handleFocus);
+    return () => window.removeEventListener("focus", handleFocus);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab.path, tab.sessionId, tab.projectKey, tab.oldContent, tab.newContent]);
 
   // 差异块跳转函数

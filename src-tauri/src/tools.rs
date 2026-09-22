@@ -663,12 +663,80 @@ pub fn is_high_danger(cmd: &str) -> bool {
     patterns.iter().any(|p| regex::Regex::new(p).map(|re| re.is_match(cmd)).unwrap_or(false))
 }
 
+pub fn get_u64_arg(args: &Value, key: &str, default: u64) -> u64 {
+    match args.get(key) {
+        Some(Value::Number(n)) => n.as_u64().unwrap_or(default),
+        Some(Value::String(s)) => s.trim().parse::<u64>().unwrap_or(default),
+        _ => default,
+    }
+}
+
+pub fn get_bool_arg(args: &Value, key: &str, default: bool) -> bool {
+    match args.get(key) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => true,
+            "false" | "0" | "no" => false,
+            _ => default,
+        },
+        Some(Value::Number(n)) => n.as_i64().map(|v| v != 0).unwrap_or(default),
+        _ => default,
+    }
+}
+
+fn find_match_line_numbers(text: &str, target: &str) -> Vec<usize> {
+    let mut line_numbers = Vec::new();
+    let mut cur_line = 1;
+    let mut last_idx = 0;
+    for (byte_idx, _) in text.match_indices(target) {
+        cur_line += text[last_idx..byte_idx].chars().filter(|&c| c == '\n').count();
+        line_numbers.push(cur_line);
+        last_idx = byte_idx;
+    }
+    line_numbers
+}
+
+fn diagnose_edit_mismatch(text: &str, old_string: &str) -> String {
+    let old_lines: Vec<&str> = old_string.lines().collect();
+    if old_lines.is_empty() {
+        return "old_string 不能为空".to_string();
+    }
+    let first_line_trimmed = old_lines[0].trim();
+    if !first_line_trimmed.is_empty() {
+        let mut candidate_lines = Vec::new();
+        for (i, line) in text.lines().enumerate() {
+            if line.trim() == first_line_trimmed {
+                candidate_lines.push(i + 1);
+            }
+        }
+        if !candidate_lines.is_empty() {
+            let candidates_str = candidate_lines
+                .iter()
+                .take(5)
+                .map(|l| format!("第 {l} 行"))
+                .collect::<Vec<_>>()
+                .join("、");
+            return format!(
+                "old_string 未在文件中找到完全匹配的内容。但第 1 行在文件中找到相似行（位于 {candidates_str}）。请检查缩进、空白字符或邻近行内容是否发生变动，或先用 read_file 确认最新内容。"
+            );
+        }
+    }
+    let old_collapsed = old_string.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text_collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text_collapsed.contains(&old_collapsed) {
+        return "old_string 未完全匹配，但忽略缩进与空格差异后存在匹配。请通过 read_file 复制目标位置的精确缩进与空格。".to_string();
+    }
+
+    "old_string 未在文件中找到（提示：系统已自动统一 CRLF/LF 换行符，请使用 read_file 确认精确的内容与缩进）".to_string()
+}
+
 fn resolve(ctx: &ToolCtx, rel: &str) -> PathBuf {
     let p = Path::new(rel);
     if p.is_absolute() {
         p.to_path_buf()
     } else {
-        ctx.workspace.join(p)
+        let clean = rel.trim_start_matches(|c| c == '/' || c == '\\');
+        ctx.workspace.join(clean)
     }
 }
 
@@ -697,7 +765,11 @@ pub fn inside_workspace(ctx: &ToolCtx, rel: &str) -> bool {
 }
 
 fn glob_to_regex(pattern: &str) -> String {
+    #[cfg(windows)]
+    let mut re = String::from("(?i)^");
+    #[cfg(not(windows))]
     let mut re = String::from("^");
+
     let chars: Vec<char> = pattern.chars().collect();
     let mut i = 0;
     while i < chars.len() {
@@ -715,7 +787,39 @@ fn glob_to_regex(pattern: &str) -> String {
                 re.push_str("[^/\\\\]*");
             }
             '?' => re.push_str("[^/\\\\]"),
-            c if "\\.^$|+()[]{}".contains(c) => {
+            '{' => {
+                if let Some(close_idx) = chars[i + 1..].iter().position(|&c| c == '}').map(|pos| i + 1 + pos) {
+                    let inner: String = chars[i + 1..close_idx].iter().collect();
+                    if inner.contains(',') {
+                        let parts: Vec<&str> = inner.split(',').collect();
+                        let regex_parts: Vec<String> = parts
+                            .iter()
+                            .map(|part| {
+                                let mut sub = String::new();
+                                for c in part.chars() {
+                                    match c {
+                                        '*' => sub.push_str("[^/\\\\]*"),
+                                        '?' => sub.push_str("[^/\\\\]"),
+                                        c if "\\.^$|+()[]{}-".contains(c) => {
+                                            sub.push('\\');
+                                            sub.push(c);
+                                        }
+                                        c => sub.push(c),
+                                    }
+                                }
+                                sub
+                            })
+                            .collect();
+                        re.push_str("(?:");
+                        re.push_str(&regex_parts.join("|"));
+                        re.push(')');
+                        i = close_idx + 1;
+                        continue;
+                    }
+                }
+                re.push_str("\\{");
+            }
+            c if "\\.^$|+()[]}".contains(c) => {
                 re.push('\\');
                 re.push(c);
             }
@@ -799,8 +903,8 @@ async fn read_file(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         return Err("疑似二进制文件，无法以文本读取".into());
     }
     let text = String::from_utf8_lossy(&bytes);
-    let offset = args.get("offset_line").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
-    let max_lines = args.get("max_lines").and_then(|v| v.as_u64()).unwrap_or(300) as usize;
+    let offset = get_u64_arg(args, "offset_line", 1).max(1) as usize;
+    let max_lines = get_u64_arg(args, "max_lines", 300) as usize;
 
     let mut out = String::new();
     let mut count = 0usize;
@@ -1054,20 +1158,23 @@ async fn glob(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let re = regex::Regex::new(&glob_to_regex(pattern)).map_err(|e| format!("pattern 无效: {e}"))?;
 
     let mut matches = Vec::new();
-    for entry in walkdir::WalkDir::new(&base)
-        .follow_links(false)
-        .into_iter()
+    let walker = ignore::WalkBuilder::new(&base)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
         .filter_entry(|e| {
-            e.file_name().to_string_lossy() != ".git"
-                && e.file_name().to_string_lossy() != "node_modules"
-                && e.file_name().to_string_lossy() != "target"
+            let name = e.file_name().to_string_lossy();
+            name != ".git" && name != "node_modules" && name != "target"
         })
-    {
+        .build();
+
+    for entry in walker {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
         };
-        if !entry.file_type().is_file() {
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
             continue;
         }
         let rel_path = entry
@@ -1093,37 +1200,45 @@ async fn grep(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let pattern = args.get("pattern").and_then(|v| v.as_str()).ok_or("缺少 pattern")?;
     let rel = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
     let include = args.get("include").and_then(|v| v.as_str());
-    let context_lines = args
-        .get("context_lines")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0)
-        .min(5) as usize;
+    let context_lines = get_u64_arg(args, "context_lines", 0).min(5) as usize;
     let base = resolve(ctx, rel);
-    let re = regex::Regex::new(pattern).map_err(|e| format!("正则无效: {e}"))?;
+    let (re, is_escaped_fallback) = match regex::Regex::new(pattern) {
+        Ok(r) => (r, false),
+        Err(e) => {
+            let escaped = regex::escape(pattern);
+            match regex::Regex::new(&escaped) {
+                Ok(r) => (r, true),
+                Err(_) => return Err(format!("正则无效: {e}")),
+            }
+        }
+    };
     let include_re = include
         .map(|g| regex::Regex::new(&glob_to_regex(g)).ok())
         .flatten();
 
     let mut out = String::new();
     let mut total = 0usize;
-    for entry in walkdir::WalkDir::new(&base)
-        .follow_links(false)
-        .into_iter()
+    let walker = ignore::WalkBuilder::new(&base)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
         .filter_entry(|e| {
-            e.file_name().to_string_lossy() != ".git"
-                && e.file_name().to_string_lossy() != "node_modules"
-                && e.file_name().to_string_lossy() != "target"
-                && e.file_name().to_string_lossy() != "dist"
+            let name = e.file_name().to_string_lossy();
+            name != ".git" && name != "node_modules" && name != "target" && name != "dist"
         })
-    {
+        .build();
+
+    for entry in walker {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
         };
-        if !entry.file_type().is_file() {
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
             continue;
         }
-        if entry.metadata().map(|m| m.len() > 1_000_000).unwrap_or(true) {
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.len() > 1_000_000 {
             continue;
         }
         let rel_path = entry
@@ -1205,7 +1320,13 @@ async fn grep(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
         }
     }
     if total == 0 {
+        if is_escaped_fallback {
+            return Ok(format!("(无匹配。注: 原模式包含特殊符号且不是有效正则，已降级为字面量匹配: \"{pattern}\")"));
+        }
         return Ok("(无匹配)".into());
+    }
+    if is_escaped_fallback {
+        out.push_str(&format!("\n(注: 原 pattern 不是合法正则，已降级为字面量匹配: \"{pattern}\")"));
     }
     Ok(truncate_result(&out))
 }
@@ -1219,13 +1340,19 @@ async fn write_file(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     }
     let old = tokio::fs::read(&path).await.ok();
     let existed = old.is_some();
-    tokio::fs::write(&path, content)
-        .await
-        .map_err(|e| format!("写入失败: {e}"))?;
     let old_str = old
         .map(|b| String::from_utf8_lossy(&b).to_string())
         .unwrap_or_default();
-    let d = diffutil::diff_lines(&old_str, content, 24 * 1024);
+    let is_crlf = old_str.contains("\r\n");
+    let content_to_write = if is_crlf && !content.contains("\r\n") {
+        content.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        content.to_string()
+    };
+    tokio::fs::write(&path, &content_to_write)
+        .await
+        .map_err(|e| format!("写入失败: {e}"))?;
+    let d = diffutil::diff_lines(&old_str, &content_to_write, 24 * 1024);
     let action = if existed { "已覆盖写入" } else { "已创建" };
     Ok(truncate_result(&format!(
         "{action} {rel}（+{} −{}）\n```diff\n{}```",
@@ -1237,28 +1364,55 @@ async fn edit_file(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let rel = args.get("path").and_then(|v| v.as_str()).ok_or("缺少 path")?;
     let old_string = args.get("old_string").and_then(|v| v.as_str()).ok_or("缺少 old_string")?;
     let new_string = args.get("new_string").and_then(|v| v.as_str()).ok_or("缺少 new_string")?;
-    let replace_all = args.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+    let replace_all = get_bool_arg(args, "replace_all", false);
     let path = resolve(ctx, rel);
 
     let bytes = tokio::fs::read(&path).await.map_err(|e| format!("读取失败（请先 read_file 确认内容）: {e}"))?;
-    let text = String::from_utf8_lossy(&bytes).to_string();
+    let raw_text = String::from_utf8_lossy(&bytes).to_string();
 
-    let count = text.matches(old_string).count();
+    let is_crlf = raw_text.contains("\r\n");
+    let text_lf = raw_text.replace("\r\n", "\n");
+    let old_lf = old_string.replace("\r\n", "\n");
+    let new_lf = new_string.replace("\r\n", "\n");
+
+    if old_lf.is_empty() {
+        return Err("old_string 不能为空".into());
+    }
+
+    let count = text_lf.matches(&old_lf).count();
     if count == 0 {
-        return Err("old_string 未在文件中找到（请先 read_file 确认精确内容，注意空白与换行）".into());
+        return Err(diagnose_edit_mismatch(&text_lf, &old_lf));
     }
     if !replace_all && count > 1 {
-        return Err(format!("old_string 出现 {count} 次，需要更长的上下文使其唯一，或设置 replace_all=true"));
+        let match_lines = find_match_line_numbers(&text_lf, &old_lf);
+        let lines_str = match_lines
+            .iter()
+            .take(10)
+            .map(|l| format!("第 {l} 行"))
+            .collect::<Vec<_>>()
+            .join("、");
+        let suffix = if match_lines.len() > 10 { " 等" } else { "" };
+        return Err(format!(
+            "old_string 出现 {count} 次（位于 {lines_str}{suffix}），需要更多上下文行使其唯一，或设置 replace_all=true"
+        ));
     }
-    let new_text = if replace_all {
-        text.replace(old_string, new_string)
+
+    let replaced_lf = if replace_all {
+        text_lf.replace(&old_lf, &new_lf)
     } else {
-        text.replacen(old_string, new_string, 1)
+        text_lf.replacen(&old_lf, &new_lf, 1)
     };
-    tokio::fs::write(&path, &new_text)
+
+    let final_content = if is_crlf {
+        replaced_lf.replace('\n', "\r\n")
+    } else {
+        replaced_lf
+    };
+
+    tokio::fs::write(&path, &final_content)
         .await
         .map_err(|e| format!("写入失败: {e}"))?;
-    let d = diffutil::diff_lines(&text, &new_text, 24 * 1024);
+    let d = diffutil::diff_lines(&raw_text, &final_content, 24 * 1024);
     Ok(truncate_result(&format!(
         "已修改 {rel}（+{} −{}）\n```diff\n{}```",
         d.added, d.removed, d.text
@@ -1328,9 +1482,11 @@ async fn run_command(
 
     #[cfg(windows)]
     let mut cmd = {
-        let mut c = tokio::process::Command::new("cmd");
-        c.arg("/C");
-        c.raw_arg(format!("chcp 65001>nul 2>nul & {command}"));
+        let mut c = tokio::process::Command::new("powershell");
+        c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]);
+        c.arg(format!(
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8; {command}"
+        ));
         c.creation_flags(CREATE_NO_WINDOW);
         c
     };
@@ -1715,7 +1871,7 @@ async fn read_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
 }
 
 async fn list_plans_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
-    let include_archived = args.get("include_archived").and_then(|v| v.as_bool()).unwrap_or(false);
+    let include_archived = get_bool_arg(args, "include_archived", false);
     let session_id = ctx.host.as_ref().map(|h| h.session_id.as_str());
     let app = ctx.host.as_ref().map(|h| &h.app);
     let state = app.map(|a| a.state::<crate::AppState>());
@@ -1873,11 +2029,7 @@ async fn get_subagent_status_tool(args: &Value, ctx: &ToolCtx) -> Result<String,
 
 async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
-    let timeout_secs = args
-        .get("timeout_seconds")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(60)
-        .clamp(5, 300);
+    let timeout_secs = get_u64_arg(args, "timeout_seconds", 60).clamp(5, 300);
     let specified_ids: Option<Vec<String>> = args.get("subagent_ids").and_then(|v| {
         v.as_array().map(|arr| {
             arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()
@@ -2061,11 +2213,7 @@ async fn dispatch_collaborator_tool(args: &Value, ctx: &ToolCtx) -> Result<Strin
 
 async fn wait_collaborators_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
-    let timeout_secs = args
-        .get("timeout_seconds")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(90)
-        .clamp(5, 300);
+    let timeout_secs = get_u64_arg(args, "timeout_seconds", 90).clamp(5, 300);
     let specified_ids: Option<Vec<String>> = args.get("collaborator_ids").and_then(|v| {
         v.as_array().map(|arr| {
             arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()
@@ -2426,5 +2574,125 @@ const handleClick = async () => {
         assert!(inside_workspace(&ctx, "a/b/c/new_file.txt"));
         // 尝试越界
         assert!(!inside_workspace(&ctx, "../../outside_something_abc123"));
+    }
+
+    #[test]
+    fn test_args_helpers() {
+        let json_data = json!({
+            "num": 123,
+            "str_num": "456",
+            "invalid_num": "not_a_num",
+            "bool_val": true,
+            "str_bool_true": "true",
+            "str_bool_false": "FALSE",
+            "num_bool_1": 1,
+            "num_bool_0": 0
+        });
+
+        assert_eq!(get_u64_arg(&json_data, "num", 0), 123);
+        assert_eq!(get_u64_arg(&json_data, "str_num", 0), 456);
+        assert_eq!(get_u64_arg(&json_data, "invalid_num", 99), 99);
+        assert_eq!(get_u64_arg(&json_data, "non_existent", 42), 42);
+
+        assert_eq!(get_bool_arg(&json_data, "bool_val", false), true);
+        assert_eq!(get_bool_arg(&json_data, "str_bool_true", false), true);
+        assert_eq!(get_bool_arg(&json_data, "str_bool_false", true), false);
+        assert_eq!(get_bool_arg(&json_data, "num_bool_1", false), true);
+        assert_eq!(get_bool_arg(&json_data, "num_bool_0", true), false);
+        assert_eq!(get_bool_arg(&json_data, "non_existent", true), true);
+    }
+
+    #[test]
+    fn test_resolve_slash_trim() {
+        let temp = std::env::temp_dir();
+        let ctx = ToolCtx {
+            workspace: temp.clone(),
+            sandbox_root: None,
+            command_timeout: std::time::Duration::from_secs(10),
+            temp: None,
+            host: None,
+            event_id: None,
+        };
+
+        let resolved_normal = resolve(&ctx, "src/main.rs");
+        let resolved_slash = resolve(&ctx, "/src/main.rs");
+        let resolved_backslash = resolve(&ctx, "\\src\\main.rs");
+
+        assert_eq!(resolved_normal, temp.join("src/main.rs"));
+        assert_eq!(resolved_slash, temp.join("src/main.rs"));
+        assert_eq!(resolved_backslash, temp.join("src\\main.rs"));
+    }
+
+    #[test]
+    fn test_glob_to_regex_braces() {
+        let re_str = glob_to_regex("*.{js,ts}");
+        let re = regex::Regex::new(&re_str).unwrap();
+        assert!(re.is_match("index.js"));
+        assert!(re.is_match("index.ts"));
+        assert!(!re.is_match("index.rs"));
+
+        let re_nested = glob_to_regex("src/**/*.{java,kt}");
+        let re2 = regex::Regex::new(&re_nested).unwrap();
+        assert!(re2.is_match("src/models/User.java"));
+        assert!(re2.is_match("src/User.kt"));
+        assert!(!re2.is_match("src/User.cpp"));
+    }
+
+    #[test]
+    fn test_find_match_line_numbers() {
+        let text = "alpha\nbeta\ngamma\nbeta\nomega";
+        let lines = find_match_line_numbers(text, "beta");
+        assert_eq!(lines, vec![2, 4]);
+    }
+
+    #[test]
+    fn test_diagnose_edit_mismatch() {
+        let text = "public class Hello {\n    void run() {\n        System.out.println(\"ok\");\n    }\n}";
+        // 缩进不匹配
+        let old = "  void run() {\n      System.out.println(\"ok\");\n  }";
+        let diag = diagnose_edit_mismatch(text, old);
+        assert!(diag.contains("相似行") || diag.contains("忽略缩进"));
+
+        // 完全没有的
+        let not_found = "class NonExistentFooBarBaz {}";
+        let diag2 = diagnose_edit_mismatch(text, not_found);
+        assert!(diag2.contains("系统已自动统一 CRLF/LF"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_crlf_preservation() {
+        let temp_dir = std::env::temp_dir().join(format!("harness_test_edit_{}", uuid::Uuid::new_v4()));
+        let _ = tokio::fs::create_dir_all(&temp_dir).await;
+        let test_file = temp_dir.join("Test.java");
+
+        // 写入 CRLF 格式原始文件
+        let original_crlf = "public class Test {\r\n    private int a;\r\n}\r\n";
+        tokio::fs::write(&test_file, original_crlf).await.unwrap();
+
+        let ctx = ToolCtx {
+            workspace: temp_dir.clone(),
+            sandbox_root: None,
+            command_timeout: std::time::Duration::from_secs(10),
+            temp: None,
+            host: None,
+            event_id: None,
+        };
+
+        // LLM 发送 LF 换行的 old_string 与 new_string
+        let args = json!({
+            "path": "Test.java",
+            "old_string": "    private int a;\n",
+            "new_string": "    private int a;\n    private int b;\n"
+        });
+
+        let res = edit_file(&args, &ctx).await;
+        assert!(res.is_ok(), "edit_file 应该成功匹配 LF 与 CRLF: {:?}", res.err());
+
+        // 读取磁盘，验证仍为 CRLF
+        let modified = tokio::fs::read_to_string(&test_file).await.unwrap();
+        assert!(modified.contains("\r\n"), "应当保留文件原有的 CRLF 换行格式");
+        assert!(modified.contains("private int b;"));
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

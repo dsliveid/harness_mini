@@ -1292,9 +1292,23 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
             if (tc.name == "write_file" || tc.name == "edit_file") && status == "success" {
                 files_modified = true;
                 sop_verified = false;
+                if let Some(rel) = args.get("path").and_then(|v| v.as_str()) {
+                    let p = std::path::Path::new(rel);
+                    let full_path = if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        std::path::Path::new(&session.workspace_path).join(p)
+                    };
+                    let _ = app.emit("file_viewer:file_changed", serde_json::json!({
+                        "path": full_path.to_string_lossy().to_string()
+                    }));
+                }
             }
-            if tc.name == "create_plan" && status == "success" {
+            if (tc.name == "create_plan" || tc.name == "update_plan") && status == "success" {
                 created_plan_in_this_turn = true;
+                let _ = app.emit("file_viewer:file_changed", serde_json::json!({
+                    "path": format!("{}/.harness/plans", session.workspace_path)
+                }));
             }
             let _ = status;
         }

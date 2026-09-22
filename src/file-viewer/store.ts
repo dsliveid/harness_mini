@@ -78,19 +78,23 @@ export const useFileViewerStore = create<FileViewerStoreState>((set, get) => {
       const { tabs, workspacePath } = get();
       const existingIdx = tabs.findIndex((t) => t.id === tab.id);
 
+      const tabWithNonce: ViewerTabItem = {
+        ...tab,
+        reloadNonce: Date.now(),
+      };
+
       let newTabs: ViewerTabItem[];
       if (existingIdx !== -1) {
-        // 更新现有 tab（如参数发生变化）并激活
+        // 更新现有 tab（如参数发生变化）并激活，同时更新 reloadNonce 触发重新拉取
         newTabs = [...tabs];
-        newTabs[existingIdx] = { ...newTabs[existingIdx], ...tab };
+        newTabs[existingIdx] = { ...newTabs[existingIdx], ...tabWithNonce };
       } else {
-        newTabs = [...tabs, tab];
+        newTabs = [...tabs, tabWithNonce];
       }
 
       set({ tabs: newTabs, activeTabId: tab.id });
       savePersistedTabs(workspacePath || tab.workspacePath || "", newTabs, tab.id);
     },
-
 
     closeTab: (tabId: string) => {
       const { tabs, activeTabId, workspacePath } = get();
@@ -131,9 +135,12 @@ export const useFileViewerStore = create<FileViewerStoreState>((set, get) => {
 
     setActiveTab: (tabId: string) => {
       const { tabs, workspacePath } = get();
-      if (tabs.some((t) => t.id === tabId)) {
-        set({ activeTabId: tabId });
-        savePersistedTabs(workspacePath, tabs, tabId);
+      const targetIdx = tabs.findIndex((t) => t.id === tabId);
+      if (targetIdx !== -1) {
+        const newTabs = [...tabs];
+        newTabs[targetIdx] = { ...newTabs[targetIdx], reloadNonce: Date.now() };
+        set({ tabs: newTabs, activeTabId: tabId });
+        savePersistedTabs(workspacePath, newTabs, tabId);
       }
     },
 
@@ -161,6 +168,24 @@ export const useFileViewerStore = create<FileViewerStoreState>((set, get) => {
       set({ tabs: newTabs });
       savePersistedTabs(workspacePath, newTabs, activeTabId);
     },
+
+    notifyFileChanged: (filePath: string) => {
+      const { tabs, workspacePath, activeTabId } = get();
+      const normalized = filePath.replace(/\\/g, "/").toLowerCase();
+      let hasChanges = false;
+      const newTabs = tabs.map((t) => {
+        const p = "path" in t && typeof t.path === "string" ? t.path.replace(/\\/g, "/").toLowerCase() : "";
+        if (p && (p === normalized || normalized.endsWith(p) || p.endsWith(normalized))) {
+          hasChanges = true;
+          return { ...t, reloadNonce: Date.now() };
+        }
+        return t;
+      });
+      if (hasChanges) {
+        set({ tabs: newTabs });
+        savePersistedTabs(workspacePath, newTabs, activeTabId);
+      }
+    },
   };
 });
 
@@ -180,7 +205,7 @@ export function initFileViewerListeners() {
   }).catch((err) => console.warn("Failed to get initial tab:", err));
 
   // 2. 监听后续主窗口派发的打开 tab 事件
-  let unlistenPromise = listen<ViewerTabItem>("file_viewer:open_tab", (event) => {
+  const unlistenOpenTabPromise = listen<ViewerTabItem>("file_viewer:open_tab", (event) => {
     if (event.payload) {
       const payload = event.payload;
       if (payload.workspacePath) {
@@ -190,7 +215,18 @@ export function initFileViewerListeners() {
     }
   });
 
+  // 3. 监听全局文件变更广播 (Agent 写文件或外部同步)
+  const unlistenChangedPromise = listen<{ path?: string } | string>("file_viewer:file_changed", (event) => {
+    if (event.payload) {
+      const path = typeof event.payload === "string" ? event.payload : event.payload.path;
+      if (path) {
+        useFileViewerStore.getState().notifyFileChanged(path);
+      }
+    }
+  });
+
   return () => {
-    unlistenPromise.then((unlisten) => unlisten());
+    unlistenOpenTabPromise.then((unlisten) => unlisten());
+    unlistenChangedPromise.then((unlisten) => unlisten());
   };
 }

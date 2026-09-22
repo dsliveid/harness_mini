@@ -1139,6 +1139,7 @@ export interface BaseViewerTab {
   subtitle?: string;
   workspacePath?: string;
   pinned?: boolean;
+  reloadNonce?: number;
 }
 
 export interface FileViewerTab extends BaseViewerTab {

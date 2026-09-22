@@ -15,8 +15,25 @@ import {
   Save,
   Eye,
   CheckSquare,
+  ChevronDown,
+  ChevronUp,
 } from "../components/Icons";
 import hljs from "highlight.js";
+
+/** 安全在已有 HTML 中对搜索关键词进行高亮，避开所有 HTML 标签内部的属性和标签名 */
+function highlightSearchInHtml(html: string, query: string, isCurrentMatch: boolean): string {
+  if (!query.trim() || !html) return html;
+  const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const regex = new RegExp(`(<[^>]*>)|(${escaped})`, "gi");
+  const markCls = isCurrentMatch
+    ? "bg-amber-400 text-black font-semibold rounded-xs px-0.5 shadow-xs"
+    : "bg-yellow-400/35 text-inherit rounded-xs px-0.5";
+  return html.replace(regex, (match, tag, text) => {
+    if (tag) return tag;
+    if (text) return `<mark class="${markCls}">${text}</mark>`;
+    return match;
+  });
+}
 
 const KIND_BADGES: Record<string, { label: string; cls: string }> = {
   fn: { label: "fn", cls: "bg-blue-500/15 text-blue-400 border-blue-500/30" },
@@ -37,6 +54,8 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
   const [copied, setCopied] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [showSearch, setShowSearch] = useState(false);
+  const [currentMatchIdx, setCurrentMatchIdx] = useState(0);
+  const searchInputRef = useRef<HTMLInputElement>(null);
 
   // 编辑模式与手动修改状态
   const [isEditing, setIsEditing] = useState(false);
@@ -53,6 +72,74 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
   const isDirty = useMemo(() => {
     return data !== null && editContent !== data.content;
   }, [data, editContent]);
+
+  // 纯文本按行拆分，专用于稳健搜索与行号定位，避免 highlight.js 的 HTML 标签污染
+  const rawLines = useMemo(() => {
+    if (!data || data.isBinary || !data.content) return [];
+    return data.content.split("\n");
+  }, [data]);
+
+  // 匹配行列表 (1-based 行号)
+  const matchedLines = useMemo(() => {
+    if (!searchQuery.trim() || rawLines.length === 0) return [];
+    const q = searchQuery.toLowerCase();
+    const list: number[] = [];
+    rawLines.forEach((line, idx) => {
+      if (line.toLowerCase().includes(q)) {
+        list.push(idx + 1);
+      }
+    });
+    return list;
+  }, [rawLines, searchQuery]);
+
+  const scrollToMatch = (lineNum: number) => {
+    const elem = document.getElementById(`code-line-${lineNum}`);
+    if (elem) {
+      elem.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  };
+
+  const handleNextMatch = () => {
+    if (matchedLines.length === 0) return;
+    const nextIdx = (currentMatchIdx + 1) % matchedLines.length;
+    setCurrentMatchIdx(nextIdx);
+    scrollToMatch(matchedLines[nextIdx]);
+  };
+
+  const handlePrevMatch = () => {
+    if (matchedLines.length === 0) return;
+    const prevIdx = (currentMatchIdx - 1 + matchedLines.length) % matchedLines.length;
+    setCurrentMatchIdx(prevIdx);
+    scrollToMatch(matchedLines[prevIdx]);
+  };
+
+  const handleSearchChange = (val: string) => {
+    setSearchQuery(val);
+    setCurrentMatchIdx(0);
+  };
+
+  const handleSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      if (e.shiftKey) {
+        handlePrevMatch();
+      } else {
+        handleNextMatch();
+      }
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      setSearchQuery("");
+      setShowSearch(false);
+    }
+  };
+
+  // 搜索关键词变动时，自动居中滚动到第一个匹配项
+  useEffect(() => {
+    if (showSearch && searchQuery.trim() && matchedLines.length > 0) {
+      setCurrentMatchIdx(0);
+      scrollToMatch(matchedLines[0]);
+    }
+  }, [searchQuery, showSearch, matchedLines.length]);
 
   // 符号大纲状态
   const [outline, setOutline] = useState<FileOutlineItem[]>([]);
@@ -82,19 +169,20 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
     return null;
   }, [tab.highlightLine, tab.highlightRange, jumpedLine]);
 
-  const loadFile = async () => {
-    setLoading(true);
+  const loadFile = async (silent = false) => {
+    if (!silent) setLoading(true);
     setError(null);
     try {
       const res = await ipc.readTextFile(tab.path);
       setData(res);
-      setEditContent(res.content);
+      // 未被手动编辑时才更新编辑区内容，防止覆盖用户正在输入的内容
+      setEditContent((prev) => (!isDirty ? res.content : prev));
       // 同时提取符号大纲
       void loadOutline();
     } catch (e) {
-      setError(String(e));
+      if (!silent) setError(String(e));
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
@@ -136,9 +224,20 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
     setJumpedLine(null);
     void loadFile();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab.path]);
+  }, [tab.path, tab.reloadNonce]);
 
-  // 监听快捷键：Ctrl+S (保存) / Ctrl+F (搜索) / Ctrl+R or F5 (刷新)
+  // 窗口重新聚焦自动检测刷新（对标 VS Code / Sublime）
+  useEffect(() => {
+    const handleFocus = () => {
+      if (!isDirty && !isEditing) {
+        void loadFile(true);
+      }
+    };
+    window.addEventListener("focus", handleFocus);
+    return () => window.removeEventListener("focus", handleFocus);
+  }, [isDirty, isEditing, tab.path]);
+
+  // 监听快捷键：Ctrl+S (保存) / Ctrl+F (搜索) / F3 or Shift+F3 (下一个/上一个) / Ctrl+R or F5 (刷新)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && (e.key === "s" || e.key === "S")) {
@@ -146,9 +245,22 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
         void handleSave();
       } else if ((e.ctrlKey || e.metaKey) && (e.key === "f" || e.key === "F")) {
         e.preventDefault();
-        setShowSearch((s) => !s);
+        setShowSearch(true);
+        setTimeout(() => {
+          searchInputRef.current?.focus();
+          searchInputRef.current?.select();
+        }, 20);
+      } else if (e.key === "F3") {
+        e.preventDefault();
+        if (e.shiftKey) {
+          handlePrevMatch();
+        } else {
+          handleNextMatch();
+        }
       } else if (e.key === "Escape") {
-        setShowSearch(false);
+        if (showSearch) {
+          setShowSearch(false);
+        }
       } else if ((e.ctrlKey || e.metaKey) && (e.key === "r" || e.key === "R")) {
         e.preventDefault();
         void loadFile();
@@ -159,7 +271,7 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [data, editContent, isSaving]);
+  }, [data, editContent, isSaving, showSearch, matchedLines, currentMatchIdx]);
 
   // 跳转到高亮行或行范围首行
   useEffect(() => {
@@ -309,7 +421,7 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
             type="button"
             className="p-1.5 rounded-lg text-inkdim hover:text-ink hover:bg-panel3 transition-colors cursor-pointer"
             title="刷新 (Ctrl+R / F5)"
-            onClick={loadFile}
+            onClick={() => void loadFile()}
           >
             <RotateCcw size={14} />
           </button>
@@ -350,20 +462,57 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
         </div>
       </div>
 
-      {/* 搜索栏 */}
+      {/* 搜索栏 (对标 VS Code Find Widget) */}
       {showSearch && (
-        <div className="px-4 py-2 border-b border-edge/60 bg-panel3/40 flex items-center gap-2 shrink-0 animate-in slide-in-from-top-1 duration-100">
-          <Search size={13} className="text-inkdim" />
+        <div className="px-3 py-1.5 border-b border-edge/60 bg-panel2 flex items-center gap-2 shrink-0 animate-in slide-in-from-top-1 duration-100">
+          <Search size={13} className="text-inkdim shrink-0" />
           <input
+            ref={searchInputRef}
             autoFocus
-            className="flex-1 bg-panel border border-edge rounded-lg px-2.5 py-1 text-[12px] text-ink outline-none focus:border-accent"
-            placeholder="在当前文件中搜索..."
+            className="flex-1 max-w-sm bg-panel border border-edge rounded-md px-2.5 py-1 text-[12px] text-ink outline-none focus:border-accent font-mono placeholder:text-inkdim/60"
+            placeholder="在当前文件中搜索 (Enter 下一个, Shift+Enter 上一个, Esc 退出)..."
             value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+            onChange={(e) => handleSearchChange(e.target.value)}
+            onKeyDown={handleSearchKeyDown}
           />
+
+          {/* 匹配计数器 */}
+          <span className="text-[11px] text-inkdim font-mono min-w-[56px] text-center select-none">
+            {searchQuery.trim()
+              ? matchedLines.length > 0
+                ? `${currentMatchIdx + 1} / ${matchedLines.length}`
+                : "0 / 0"
+              : ""}
+          </span>
+
+          {/* 上一个 / 下一个 导航按钮 */}
+          <div className="flex items-center gap-0.5 border border-edge/60 rounded-md bg-panel p-0.5">
+            <button
+              type="button"
+              className="p-1 rounded text-inkdim hover:text-ink hover:bg-panel3 transition-colors disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer"
+              title="上一个匹配项 (Shift+Enter / Shift+F3)"
+              disabled={matchedLines.length === 0}
+              onClick={handlePrevMatch}
+            >
+              <ChevronUp size={13} />
+            </button>
+            <button
+              type="button"
+              className="p-1 rounded text-inkdim hover:text-ink hover:bg-panel3 transition-colors disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer"
+              title="下一个匹配项 (Enter / F3)"
+              disabled={matchedLines.length === 0}
+              onClick={handleNextMatch}
+            >
+              <ChevronDown size={13} />
+            </button>
+          </div>
+
+          <div className="h-4 w-px bg-edge/60 mx-0.5" />
+
           <button
             type="button"
-            className="p-1 rounded text-inkdim hover:text-ink hover:bg-panel cursor-pointer"
+            className="p-1 rounded text-inkdim hover:text-ink hover:bg-panel3 transition-colors cursor-pointer"
+            title="关闭 (Esc)"
             onClick={() => {
               setSearchQuery("");
               setShowSearch(false);
@@ -437,7 +586,7 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
                 <div className="text-[13px] font-medium">{error}</div>
                 <button
                   className="mt-2 px-3 py-1 bg-panel3 rounded-lg text-ink text-[12px] hover:bg-edge"
-                  onClick={loadFile}
+                  onClick={() => void loadFile()}
                 >
                   重新加载
                 </button>
@@ -470,7 +619,14 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
                       ? lineNum >= targetRange.start && lineNum <= targetRange.end
                       : false;
                     const isFirstTarget = targetRange?.start === lineNum;
-                    const isMatch = searchQuery && lineHtml.toLowerCase().includes(searchQuery.toLowerCase());
+                    const isMatch = matchedLines.includes(lineNum);
+                    const isCurrentMatch = isMatch && matchedLines[currentMatchIdx] === lineNum;
+
+                    // 若该行匹配且搜索框打开，安全高亮行内的搜索关键词（避开 HTML 标签）
+                    const renderedLineHtml =
+                      showSearch && isMatch && searchQuery.trim()
+                        ? highlightSearchInHtml(lineHtml, searchQuery.trim(), isCurrentMatch)
+                        : lineHtml;
 
                     return (
                       <tr
@@ -478,21 +634,29 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
                         id={`code-line-${lineNum}`}
                         ref={isFirstTarget ? highlightedLineRef : undefined}
                         className={`hover:bg-panel3/50 transition-colors ${
-                          isTarget
+                          isCurrentMatch
+                            ? "bg-amber-500/25 border-l-2 border-amber-400"
+                            : isTarget
                             ? "bg-amber-500/15 border-l-2 border-amber-400"
                             : isMatch
-                            ? "bg-yellow-500/15"
+                            ? "bg-yellow-500/10"
                             : ""
                         }`}
                       >
                         <td className={`w-12 select-none text-right pr-3 pl-2 font-mono text-[11px] align-top border-r border-edge/40 ${
-                          isTarget ? "text-amber-300 font-bold" : "text-inkdim/60"
+                          isCurrentMatch
+                            ? "text-amber-400 font-bold bg-amber-500/20"
+                            : isTarget
+                            ? "text-amber-300 font-bold"
+                            : isMatch
+                            ? "text-yellow-400 font-semibold"
+                            : "text-inkdim/60"
                         }`}>
                           {lineNum}
                         </td>
                         <td
                           className="px-3 whitespace-pre-wrap break-all text-ink select-text font-mono hljs bg-transparent"
-                          dangerouslySetInnerHTML={{ __html: lineHtml || "&nbsp;" }}
+                          dangerouslySetInnerHTML={{ __html: renderedLineHtml || "&nbsp;" }}
                         />
                       </tr>
                     );

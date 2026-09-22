@@ -52,6 +52,16 @@ export function PlanViewer({ tab }: { tab: PlanViewerTab }) {
   useEffect(() => {
     void loadPlan();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab.planId, tab.sessionId, tab.workspacePath, tab.reloadNonce]);
+
+  // 窗口切回焦点时自动刷新最新方案进度
+  useEffect(() => {
+    const handleFocus = () => {
+      void loadPlan();
+    };
+    window.addEventListener("focus", handleFocus);
+    return () => window.removeEventListener("focus", handleFocus);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab.planId, tab.sessionId, tab.workspacePath]);
 
   const handleCopy = () => {

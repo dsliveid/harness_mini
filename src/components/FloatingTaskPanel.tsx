@@ -155,14 +155,24 @@ export function FloatingTaskPanel() {
 
   // 获取当前会话关联的活动计划
   useEffect(() => {
-    if (!currentId) {
-      setActivePlan(null);
-      return;
-    }
+    let cancelled = false;
+    // 切换会话时立即重置活动计划，消除上一会话残留
+    setActivePlan(null);
+
+    if (!currentId) return;
+
     ipc.getActivePlan(currentId).then(
-      (res) => setActivePlan(res),
-      () => setActivePlan(null)
+      (res) => {
+        if (!cancelled) setActivePlan(res);
+      },
+      () => {
+        if (!cancelled) setActivePlan(null);
+      }
     );
+
+    return () => {
+      cancelled = true;
+    };
   }, [currentId, isRunning, todos.length]);
 
   const hasTodos = todos.length > 0;

@@ -46,7 +46,7 @@ export function ImageViewer({ tab }: { tab: ImageViewerTab | FileViewerTab }) {
     setPan({ x: 0, y: 0 });
     setFitMode("fit");
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab.path]);
+  }, [tab.path, tab.reloadNonce]);
 
   const handleImageLoaded = (e: React.SyntheticEvent<HTMLImageElement>) => {
     const img = e.currentTarget;

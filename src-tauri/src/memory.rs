@@ -293,7 +293,23 @@ pub fn read_memory(workspace: &Path, topic: Option<&str>) -> Result<String, Stri
             if path.exists() {
                 fs::read_to_string(&path).map_err(|e| format!("读取碎记失败: {e}"))
             } else {
-                Err(format!("未找到主题【{t}】对应的记忆碎记（路径: {}）", path.display()))
+                let mut existing = Vec::new();
+                if let Ok(entries) = fs::read_dir(digests_dir(workspace)) {
+                    for entry in entries.flatten() {
+                        let ep = entry.path();
+                        if ep.extension().and_then(|s| s.to_str()) == Some("md") {
+                            if let Some(stem) = ep.file_stem().and_then(|s| s.to_str()) {
+                                existing.push(stem.to_string());
+                            }
+                        }
+                    }
+                }
+                let existing_hint = if existing.is_empty() {
+                    "（当前暂无任何已保存的主题碎记，可用 topic: null 查看总览或 record_memory 沉淀新记忆）".to_string()
+                } else {
+                    format!("。当前已有的主题碎记包括: [{}]。可用 topic: null 查看总览", existing.join(", "))
+                };
+                Err(format!("未找到主题【{t}】对应的记忆碎记{existing_hint}"))
             }
         }
         _ => {
@@ -749,5 +765,25 @@ mod tests {
         let skip_raw = r#"{"shouldRecord": false}"#;
         let parsed_skip: AutoDistillOutput = serde_json::from_str(skip_raw).unwrap();
         assert!(!parsed_skip.should_record);
+    }
+
+    #[test]
+    fn test_read_memory_hints() {
+        let temp_dir = std::env::temp_dir().join(format!("harness_test_mem_hint_{}", uuid::Uuid::new_v4()));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        // 尚未写入任何碎记时读取不存在的主题
+        let err1 = read_memory(&temp_dir, Some("non_existent")).unwrap_err();
+        assert!(err1.contains("暂无任何已保存的主题碎记"));
+
+        // 写入一条碎记
+        record_memory(&temp_dir, "database", "数据库连接池配置", "采用 HikariCP 配置").unwrap();
+
+        // 再次读取不存在的主题，验证提示中包含已有的碎记
+        let err2 = read_memory(&temp_dir, Some("non_existent")).unwrap_err();
+        assert!(err2.contains("数据库连接池配置"));
+        assert!(err2.contains("已有的主题碎记包括"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

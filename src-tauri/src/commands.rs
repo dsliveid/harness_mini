@@ -2357,6 +2357,10 @@ pub fn save_text_file(
     }
     std::fs::write(p, &content).map_err(|e| format!("保存文件失败: {e}"))?;
 
+    let _ = app.emit("file_viewer:file_changed", serde_json::json!({
+        "path": p.to_string_lossy().to_string()
+    }));
+
     // 如果保存的是计划 Markdown 文件，重新解析步骤并同步 todos
     let norm_path = raw_trimmed.replace('\\', "/");
     if norm_path.contains("/.harness/plans/") || norm_path.starts_with(".harness/plans/") {
