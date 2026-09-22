@@ -13,12 +13,22 @@ use tokio::sync::watch;
 
 static TASK_CONTROLS: Mutex<Option<HashMap<String, watch::Sender<bool>>>> = Mutex::new(None);
 
-fn set_control(task_id: &str, stop_val: bool) {
+pub fn set_control(task_id: &str, stop_val: bool) {
     let mut map = TASK_CONTROLS.lock().unwrap();
     let controls = map.get_or_insert_with(HashMap::new);
     if let Some(tx) = controls.get(task_id) {
         let _ = tx.send(stop_val);
     }
+}
+
+pub fn get_next_subtask_index(task: &LongTask) -> Option<usize> {
+    if let Some(idx) = task.subtasks.iter().position(|s| s.status == "running" || s.status == "verifying") {
+        return Some(idx);
+    }
+    if task.current_subtask_index < task.subtasks.len() {
+        return Some(task.current_subtask_index);
+    }
+    task.subtasks.iter().position(|s| s.status == "pending" || s.status == "failed" || s.status == "interrupted")
 }
 
 fn register_control(task_id: &str) -> watch::Receiver<bool> {
@@ -131,7 +141,7 @@ pub fn recover_orphaned_tasks(conn: &rusqlite::Connection) -> Result<usize, Stri
     let now = store::now();
     let n = conn
         .execute(
-            "UPDATE long_tasks SET status = 'paused', updated_at = ?1 WHERE status IN ('running', 'planning')",
+            "UPDATE long_tasks SET status = 'interrupted', updated_at = ?1 WHERE status IN ('running', 'planning')",
             rusqlite::params![now],
         )
         .map_err(|e| format!("清理孤儿长任务失败: {e}"))?;
@@ -206,8 +216,18 @@ pub fn pause_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
     let state = app.state::<crate::AppState>();
     let session_id = {
         let db = state.db.lock().unwrap();
-        let task = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
-        store::update_long_task_status(&db, task_id, "paused")?;
+        let mut task = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
+        task.status = "paused".to_string();
+        if let Some(cur_idx) = get_next_subtask_index(&task) {
+            if task.subtasks[cur_idx].status == "running"
+                || task.subtasks[cur_idx].status == "verifying"
+                || task.subtasks[cur_idx].status == "in_progress"
+            {
+                task.subtasks[cur_idx].status = "paused".to_string();
+            }
+        }
+        task.updated_at = store::now();
+        store::update_long_task(&db, &task)?;
         task.session_id
     };
     agent::stop_session(app, &session_id);
@@ -217,7 +237,6 @@ pub fn pause_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
     } {
         let _ = app.emit("task:update", &task);
     }
-    remove_control(task_id);
     Ok(())
 }
 
@@ -227,11 +246,18 @@ pub fn resume_long_task(app: &AppHandle, task_id: &str) -> Result<LongTask, Stri
     let task = {
         let db = state.db.lock().unwrap();
         let mut t = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
-        if t.status != "paused" && t.status != "failed" {
+        if t.status != "paused" && t.status != "failed" && t.status != "interrupted" {
             return Err(format!("任务当前状态为 {}，无法恢复执行", t.status));
         }
         t.status = "running".to_string();
         t.updated_at = store::now();
+        // 如果当前子任务处于 failed/verifying/interrupted/in_progress，重置为 pending 以便重新执行该子任务
+        if let Some(sub) = t.subtasks.get_mut(t.current_subtask_index) {
+            if sub.status == "failed" || sub.status == "in_progress" || sub.status == "verifying" || sub.status == "interrupted" {
+                sub.status = "pending".to_string();
+                sub.error = None;
+            }
+        }
         store::update_long_task(&db, &t)?;
         t
     };
@@ -254,8 +280,18 @@ pub fn cancel_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
     let state = app.state::<crate::AppState>();
     let session_id = {
         let db = state.db.lock().unwrap();
-        let task = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
-        store::update_long_task_status(&db, task_id, "cancelled")?;
+        let mut task = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
+        task.status = "cancelled".to_string();
+        if let Some(cur_idx) = get_next_subtask_index(&task) {
+            if task.subtasks[cur_idx].status == "running"
+                || task.subtasks[cur_idx].status == "verifying"
+                || task.subtasks[cur_idx].status == "in_progress"
+            {
+                task.subtasks[cur_idx].status = "cancelled".to_string();
+            }
+        }
+        task.updated_at = store::now();
+        store::update_long_task(&db, &task)?;
         task.session_id
     };
     agent::stop_session(app, &session_id);
@@ -265,7 +301,6 @@ pub fn cancel_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
     } {
         let _ = app.emit("task:update", &task);
     }
-    remove_control(task_id);
     Ok(())
 }
 
@@ -703,12 +738,54 @@ async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiver<b
         while agent::is_run_active(&state, &task.session_id) {
             if *rx.borrow() {
                 agent::stop_session(&app, &task.session_id);
+                task.subtasks[cur_idx].status = "interrupted".to_string();
+                task.status = "interrupted".to_string();
+                task.updated_at = store::now();
+                {
+                    let db = state.db.lock().unwrap();
+                    let _ = store::update_long_task(&db, &task);
+                }
+                let _ = app.emit("task:update", &task);
                 return;
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
 
         if *rx.borrow() {
+            task.subtasks[cur_idx].status = "interrupted".to_string();
+            task.status = "interrupted".to_string();
+            task.updated_at = store::now();
+            {
+                let db = state.db.lock().unwrap();
+                let _ = store::update_long_task(&db, &task);
+            }
+            let _ = app.emit("task:update", &task);
+            return;
+        }
+
+        // 检查会话最新运行状态或长任务是否被中断：若非正常完成（done），绝不能把该子任务推进为 completed！
+        let (is_interrupted, last_status) = {
+            let db = state.db.lock().unwrap();
+            let lr = store::get_last_run_status(&db, &task.session_id);
+            let tdb = store::get_long_task(&db, &task.id).ok().flatten();
+            let is_paused_or_cancelled = tdb
+                .as_ref()
+                .map(|t| t.status == "interrupted" || t.status == "cancelled" || t.status == "paused")
+                .unwrap_or(false);
+            (is_paused_or_cancelled, lr)
+        };
+
+        if is_interrupted || last_status.as_deref() != Some("done") {
+            let is_failed = last_status.as_deref() == Some("failed");
+            let new_st = if is_failed { "failed" } else { "interrupted" };
+            task.subtasks[cur_idx].status = new_st.to_string();
+            task.status = new_st.to_string();
+            task.updated_at = store::now();
+            {
+                let db = state.db.lock().unwrap();
+                let _ = store::update_long_task(&db, &task);
+            }
+            let _ = app.emit("task:update", &task);
             return;
         }
 

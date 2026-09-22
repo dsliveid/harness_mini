@@ -8,7 +8,7 @@ import { ExecutionProcessBlock, groupTimelineItems } from "./ExecutionProcessBlo
 import { ToolRetryBanner } from "./ToolRetryBanner";
 import { CompactionBanner, CompactedHistoryCard } from "./CompactionBanner";
 import { TruncationNoticeList } from "./TruncationNoticeCard";
-import { Bot, Plus, Sprout, ShieldCheck, AlertTriangle, Loader2 } from "./Icons";
+import { Bot, Plus, Sprout, ShieldCheck, AlertTriangle, Loader2, Play, RotateCcw } from "./Icons";
 
 const EMPTY_PROPOSALS: any[] = [];
 const EMPTY_COMPACTIONS: any[] = [];
@@ -30,6 +30,9 @@ export function ChatView() {
   const currentGrowthStatus = useStore((s) => (s.currentId ? s.growthStatus[s.currentId] : null));
   const currentSopStatus = useStore((s) => (s.currentId ? s.sopStatus[s.currentId] : null));
   const compactions = useStore((s) => (s.currentId ? s.sessionCompactions[s.currentId] : undefined)) ?? EMPTY_COMPACTIONS;
+  const lastRunOutcome = useStore((s) => (s.currentId ? s.lastRunOutcome[s.currentId] : undefined));
+  const retryTurn = useStore((s) => s.retryTurn);
+  const continueTurn = useStore((s) => s.continueTurn);
   // 临时空间对话：合并点（含）之前的消息永久不可编辑重发
   const mergedBoundary = session?.mergedSeq ?? null;
 
@@ -38,6 +41,32 @@ export function ChatView() {
 
   // ⚠️ 所有 hooks 必须在任何条件 return 之前调用
   const turnMetricsMap = useMemo(() => computeTurnMetrics(msgs, running), [msgs, running]);
+
+  const lastMsg = msgs[msgs.length - 1];
+  const isInterruptedOrFailed = useMemo(() => {
+    if (running || !currentId || msgs.length === 0) return false;
+    if (lastRunOutcome === "cancelled" || lastRunOutcome === "interrupted" || lastRunOutcome === "failed" || lastRunOutcome === "error") {
+      return true;
+    }
+    if (lastMsg) {
+      if (lastMsg.role === "user") return true;
+      if (lastMsg.role === "assistant") {
+        const content = lastMsg.content || "";
+        if (
+          content.includes("⚠️") ||
+          content.includes("流读取失败") ||
+          content.includes("Agent 运行出错") ||
+          content.includes("error decoding response body")
+        ) {
+          return true;
+        }
+        if (lastMsg.toolEvents?.some((e) => e.status === "failed" || e.status === "interrupted" || e.status === "running")) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }, [running, currentId, msgs.length, lastRunOutcome, lastMsg]);
 
   // 构建包含消息和历史压缩卡片的时间线序列（历史消息保持完整展示，压缩卡片内联在对应阶段）
   const timelineItems = useMemo(() => {
@@ -252,6 +281,41 @@ export function ChatView() {
               <span>交付前 SOP 自检已通过 (<code className="bg-panel2 px-1.5 py-0.5 rounded text-[12px] font-mono text-emerald-300 border border-emerald-500/20">{currentSopStatus.command}</code>)</span>
             </div>
           )}
+          {/* 中断或异常失败时的恢复操作栏 */}
+          {isInterruptedOrFailed && !readOnly && currentId && (
+            <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3.5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-[13px] shadow-sm animate-in fade-in duration-200">
+              <div className="flex items-center gap-2.5">
+                <AlertTriangle size={18} className="shrink-0 text-amber-400" />
+                <div>
+                  <div className="font-medium text-amber-300">
+                    {lastRunOutcome === "cancelled" ? "对话执行已手动中止" : "对话执行中断或遇到异常"}
+                  </div>
+                  <div className="text-[12px] text-amber-200/70 mt-0.5">
+                    您可以选择重试本轮，或让 Agent 基于当前已有上下文继续向下推进。
+                  </div>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0 self-end sm:self-auto">
+                <button
+                  onClick={() => void retryTurn(currentId)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/30 text-[12px] font-medium transition-colors shadow-sm"
+                  title="清除最后一步未完成的内容，重新发起请求"
+                >
+                  <RotateCcw size={13} />
+                  <span>重试本轮</span>
+                </button>
+                <button
+                  onClick={() => void continueTurn(currentId)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-accent hover:bg-accent/80 text-white text-[12px] font-medium transition-colors shadow-sm"
+                  title="基于当前已产生的结果继续推进任务"
+                >
+                  <Play size={13} />
+                  <span>继续执行</span>
+                </button>
+              </div>
+            </div>
+          )}
+
           {running && (msgs.length === 0 || msgs[msgs.length - 1]?.role === "user") && (
             <div className="text-inkdim text-[13px] flex items-center gap-2 py-2 px-1 animate-in fade-in duration-150">
               <Loader2 size={15} className="animate-spin text-accent" />

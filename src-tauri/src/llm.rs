@@ -34,6 +34,8 @@ fn client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(20))
+            .tcp_keepalive(std::time::Duration::from_secs(15))
+            .pool_idle_timeout(std::time::Duration::from_secs(60))
             .build()
             .expect("reqwest client")
     })

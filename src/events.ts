@@ -14,6 +14,8 @@ export function useAppEvents() {
     const regs: Promise<UnlistenFn>[] = [
       listen<any>("message:delta", (e) => s.onMessageDelta(e.payload)),
       listen<any>("message:reasoning:delta", (e) => s.onMessageReasoningDelta(e.payload)),
+      listen<any>("message:reset", (e) => s.onMessageReset(e.payload)),
+      listen<any>("run:retry", (e) => s.onRunRetry(e.payload)),
       listen<Message>("message:final", (e) => s.onMessageFinal(e.payload as Message)),
       listen<any>("tool:update", (e) => s.onToolUpdate(e.payload)),
       listen<any>("tool:output", (e) => s.onToolOutput(e.payload)),
@@ -48,6 +50,8 @@ export function useAppEvents() {
       listen<any>("collaborator:updated", (e) => s.onCollaboratorUpdate(e.payload)),
       listen<any>("collaborator:reported", (e) => s.onCollaboratorReported(e.payload)),
       listen<any>("subprocesses:changed", (e) => s.loadSubprocesses(e.payload?.parentId || e.payload?.parentSessionId)),
+      listen<any>("subprocess:update", (e) => s.onSubprocessUpdate(e.payload)),
+      listen<any>("subprocess:updated", (e) => s.onSubprocessUpdate(e.payload)),
       listen<any>("subprocess:created", (e) => {
         const pid = e.payload?.parentId || e.payload?.parentSessionId;
         const sub = e.payload?.subprocess;
@@ -93,6 +97,7 @@ export function useAppEvents() {
       listen<any>("task:update", (e) => s.onTaskUpdate(e.payload)),
       listen<any>("task:checkpoint", (e) => s.onTaskCheckpoint(e.payload)),
       listen<any>("task:finished", () => s.pushToast("🎉 长任务已圆满完成！", "success")),
+      listen<any>("run:error", (ev) => s.pushToast(ev.payload?.message || "运行遇到异常", "error")),
       listen<any>("error", (ev) => s.onError(ev.payload)),
     ];
     Promise.all(regs).then((ls) => {

@@ -1683,6 +1683,21 @@ pub fn list_subprocesses(conn: &Connection, parent_session_id: &str) -> Result<V
     Ok(sessions)
 }
 
+/// 查询父会话下的所有衍生子会话（包含 subprocess、subagent、collaborator）
+pub fn list_all_child_sessions(conn: &Connection, parent_session_id: &str) -> Result<Vec<Session>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {SESSION_COLS} FROM sessions WHERE parent_session_id = ?1 ORDER BY created_at ASC"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![parent_session_id], row_to_session)
+        .map_err(|e| e.to_string())?;
+    let mut sessions = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    attach_session_tokens(conn, &mut sessions)?;
+    Ok(sessions)
+}
+
 pub fn update_collaborator_watermark(
     conn: &Connection,
     collaborator_id: &str,
@@ -3137,6 +3152,16 @@ pub fn fail_open_runs(conn: &Connection, session_id: &str) -> Result<(), String>
     Ok(())
 }
 
+/// 查询会话最新一次 Run 的运行状态（如 done / interrupted / failed / cancelled / running 等）
+pub fn get_last_run_status(conn: &Connection, session_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT status FROM runs WHERE session_id = ?1 ORDER BY started_at DESC LIMIT 1",
+        params![session_id],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
 /// 会话退出运行或被中止时兜底：把该会话残留的 running / pending_approval 状态 tool_events 标记为 failed
 pub fn fail_open_tool_events(conn: &Connection, session_id: &str) -> Result<Vec<ToolEvent>, String> {
     let mut stmt = conn
@@ -3919,7 +3944,7 @@ pub fn get_active_long_task(conn: &Connection, session_id: &str) -> Result<Optio
                     current_subtask_index, subtasks_json, max_budget_tokens,
                     total_tokens_used, current_step, max_steps, created_at, updated_at
              FROM long_tasks
-             WHERE session_id = ?1 AND status IN ('planning', 'running', 'paused', 'waiting_approval')
+             WHERE session_id = ?1 AND status IN ('planning', 'running', 'paused', 'waiting_approval', 'failed', 'interrupted')
              ORDER BY updated_at DESC LIMIT 1",
         )
         .map_err(|e| e.to_string())?;
@@ -4084,5 +4109,32 @@ pub fn get_latest_checkpoint(conn: &Connection, task_id: &str) -> Result<Option<
     Ok(res)
 }
 
+/// 应用启动时对齐并收敛上次异常退出/崩溃的遗留状态
+pub fn startup_reconcile(conn: &Connection) -> Result<(), String> {
+    let current_time = now();
+    // 1. 批量收敛残留的 running runs 为 interrupted
+    let _ = conn.execute(
+        "UPDATE runs SET status = 'interrupted', finished_at = ?1 WHERE status = 'running'",
+        params![current_time],
+    );
 
+    // 2. 批量收敛残留的 running tool_events 为 failed
+    let _ = conn.execute(
+        "UPDATE tool_events SET status = 'failed', result_text = '[宿主进程异常退出，工具执行中断]' WHERE status = 'running'",
+        [],
+    );
 
+    // 3. 批量收敛残留的 running/planning long_tasks 为 interrupted
+    let _ = conn.execute(
+        "UPDATE long_tasks SET status = 'interrupted', updated_at = ?1 WHERE status IN ('running', 'planning')",
+        params![current_time],
+    );
+
+    // 4. 批量收敛残留的 running sessions (subprocess, subagent, collaborator) 为 interrupted
+    let _ = conn.execute(
+        "UPDATE sessions SET status = 'interrupted' WHERE status = 'running' AND (session_type IN ('subprocess', 'subagent', 'collaborator') OR parent_session_id IS NOT NULL)",
+        [],
+    );
+
+    Ok(())
+}

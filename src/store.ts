@@ -146,6 +146,7 @@ interface Store {
   hasMore: Record<string, boolean>;
   queues: Record<string, QueuedItem[]>;
   runStatus: Record<string, "idle" | "running">;
+  lastRunOutcome: Record<string, string>;
   approvals: Record<string, ApprovalReq>;
   pendingCompactions: Record<string, CompactionReq>;
   sessionCompactions: Record<string, SessionCompaction[]>;
@@ -211,6 +212,14 @@ interface Store {
   syncSessionActiveState: (sessionId: string) => Promise<void>;
   /** 请求停止会话当前运行：乐观置为空闲，后端会补发 run:status 事件兜底 */
   stopRun: (sessionId: string) => void;
+  /** 重试当前会话最后一步 */
+  retryTurn: (sessionId: string) => Promise<void>;
+  /** 继续推进当前会话任务 */
+  continueTurn: (sessionId: string) => Promise<void>;
+  /** 收到流式回滚重置事件 */
+  onMessageReset: (p: { sessionId: string; messageId: string }) => void;
+  /** 收到网络重试通知事件 */
+  onRunRetry: (p: { sessionId: string; messageId: string; attempt: number; maxRetries: number; reason: string }) => void;
   /** 手动关闭指定正在运行的控制台进程 */
   killCommand: (eventId: string) => Promise<void>;
   refreshSessions: () => Promise<void>;
@@ -334,6 +343,7 @@ interface Store {
   onSubagentsChanged: (p: any) => Promise<void>;
   onSubagentCreated: (subagent: Session) => void;
   onSubagentUpdate: (payload: any) => void;
+  onSubprocessUpdate: (payload: any) => void;
 
   /** 长任务（按会话 id 索引） */
   activeTasks: Record<string, LongTask | null>;
@@ -478,6 +488,7 @@ export const useStore = create<Store>((set, get) => ({
   hasMore: {},
   queues: {},
   runStatus: {},
+  lastRunOutcome: {},
   approvals: {},
   pendingCompactions: {},
   sessionCompactions: {},
@@ -713,12 +724,45 @@ export const useStore = create<Store>((set, get) => ({
       }
       return {
         runStatus: { ...st.runStatus, [sessionId]: "idle" },
+        lastRunOutcome: { ...st.lastRunOutcome, [sessionId]: "cancelled" },
         toolRetryStatus: nextRetry,
         messages: nextMessages,
         toolOutputs: nextOutputs,
       };
     });
     void ipc.stopRun(sessionId).catch((e) => get().pushToast(String(e)));
+  },
+
+  async retryTurn(sessionId) {
+    try {
+      set((st) => {
+        const curMsgs = st.messages[sessionId] ?? [];
+        const lastUserIdx = curMsgs.map((m) => m.role).lastIndexOf("user");
+        const nextMsgs = lastUserIdx >= 0 ? curMsgs.slice(0, lastUserIdx + 1) : curMsgs;
+        return {
+          runStatus: { ...st.runStatus, [sessionId]: "running" },
+          lastRunOutcome: { ...st.lastRunOutcome, [sessionId]: "running" },
+          messages: { ...st.messages, [sessionId]: nextMsgs },
+        };
+      });
+      await ipc.retryTurn(sessionId);
+      get().pushToast("正在重新执行本轮...", "info");
+    } catch (e: any) {
+      get().pushToast(`重试失败: ${e}`, "error");
+    }
+  },
+
+  async continueTurn(sessionId) {
+    try {
+      set((st) => ({
+        runStatus: { ...st.runStatus, [sessionId]: "running" },
+        lastRunOutcome: { ...st.lastRunOutcome, [sessionId]: "running" },
+      }));
+      await ipc.continueTurn(sessionId);
+      get().pushToast("正在继续推进任务...", "info");
+    } catch (e: any) {
+      get().pushToast(`继续失败: ${e}`, "error");
+    }
   },
 
   async killCommand(eventId: string) {
@@ -1210,6 +1254,21 @@ export const useStore = create<Store>((set, get) => ({
     });
   },
 
+  onMessageReset(p) {
+    set((st) => {
+      const list = st.messages[p.sessionId] ?? [];
+      const idx = list.findIndex((m) => m.id === p.messageId);
+      if (idx < 0) return st;
+      const next = list.slice();
+      next[idx] = { ...next[idx], content: "", reasoning: "" };
+      return { messages: { ...st.messages, [p.sessionId]: next } };
+    });
+  },
+
+  onRunRetry(p) {
+    get().pushToast(`网络波动，正在进行第 ${p.attempt}/${p.maxRetries} 次自动重试...`, "warning");
+  },
+
   onMessageFinal(m) {
     if (m.queued) return; // 待执行列表消息由 queue:update 呈现
     set((st) => {
@@ -1468,22 +1527,118 @@ export const useStore = create<Store>((set, get) => ({
         }
       }
       let nextTodos = st.sessionTodos;
-      // 运行完成时增加双重兜底：若任务清单仍有 in_progress，将其自动置为 done
-      if (p.status === "done" && st.sessionTodos[p.sessionId]) {
+      // 运行完成时增加双重兜底：若任务清单仍有 in_progress，根据是否正常完成分别置为 done 或 pending
+      if (st.sessionTodos[p.sessionId]) {
         const cur = st.sessionTodos[p.sessionId];
-        if (cur.some((t) => t.status === "in_progress")) {
-          nextTodos = {
-            ...st.sessionTodos,
-            [p.sessionId]: cur.map((t) => (t.status === "in_progress" ? { ...t, status: "done" } : t)),
+        if (p.status === "done") {
+          if (cur.some((t) => t.status === "in_progress")) {
+            nextTodos = {
+              ...st.sessionTodos,
+              [p.sessionId]: cur.map((t) => (t.status === "in_progress" ? { ...t, status: "done" } : t)),
+            };
+          }
+        } else if (p.status !== "running") {
+          if (cur.some((t) => t.status === "in_progress")) {
+            nextTodos = {
+              ...st.sessionTodos,
+              [p.sessionId]: cur.map((t) => (t.status === "in_progress" ? { ...t, status: "pending" } : t)),
+            };
+          }
+        }
+      }
+
+      // 若当前会话关联长任务且运行被中止/失败，立即将长任务及进行中的子步骤置为 interrupted/failed，严禁变为 completed
+      let nextActiveTasks = st.activeTasks;
+      if (p.status !== "running" && p.status !== "done" && st.activeTasks[p.sessionId]) {
+        const curTask = st.activeTasks[p.sessionId]!;
+        if (curTask.status === "running" || curTask.status === "planning") {
+          const mappedTaskStatus = p.status === "failed" ? "failed" : "interrupted";
+          const updatedSubtasks = (curTask.subtasks || []).map((sub) =>
+            sub.status === "running" || sub.status === "verifying"
+              ? { ...sub, status: mappedTaskStatus }
+              : sub
+          );
+          nextActiveTasks = {
+            ...st.activeTasks,
+            [p.sessionId]: {
+              ...curTask,
+              status: mappedTaskStatus,
+              subtasks: updatedSubtasks,
+            },
           };
         }
       }
+
+      // 同步检查是否为某个父会话的子任务/子进程运行结束，立即同步内存状态
+      let nextSubprocesses = st.subprocesses;
+      let nextSubagents = st.subagents;
+      if (p.status !== "running") {
+        const mappedStatus =
+          p.status === "done" ? "completed" : p.status === "failed" ? "failed" : "cancelled";
+        for (const [pid, list] of Object.entries(st.subprocesses)) {
+          if (list.some((s) => s.id === p.sessionId)) {
+            nextSubprocesses = {
+              ...nextSubprocesses,
+              [pid]: list.map((s) => (s.id === p.sessionId ? { ...s, status: mappedStatus } : s)),
+            };
+            break;
+          }
+        }
+        for (const [pid, list] of Object.entries(st.subagents)) {
+          if (list.some((s) => s.id === p.sessionId)) {
+            nextSubagents = {
+              ...nextSubagents,
+              [pid]: list.map((s) => (s.id === p.sessionId ? { ...s, status: mappedStatus } : s)),
+            };
+            break;
+          }
+        }
+
+        // 若被中止的是父会话自身，将其下所有执行中/待推进的子任务在内存中同步置为 cancelled
+        if (p.status === "cancelled" || p.status === "interrupted") {
+          if (nextSubprocesses[p.sessionId]) {
+            nextSubprocesses = {
+              ...nextSubprocesses,
+              [p.sessionId]: nextSubprocesses[p.sessionId].map((s) =>
+                s.status === "running" || s.status === "pending" || s.status === "in_progress"
+                  ? { ...s, status: "cancelled" }
+                  : s
+              ),
+            };
+          }
+          if (nextSubagents[p.sessionId]) {
+            nextSubagents = {
+              ...nextSubagents,
+              [p.sessionId]: nextSubagents[p.sessionId].map((s) =>
+                s.status === "running" || s.status === "pending" || s.status === "in_progress"
+                  ? { ...s, status: "cancelled" }
+                  : s
+              ),
+            };
+          }
+        }
+      }
+
       return {
         runStatus: { ...st.runStatus, [p.sessionId]: p.status === "running" ? "running" : "idle" },
+        lastRunOutcome: { ...st.lastRunOutcome, [p.sessionId]: p.status },
         toolRetryStatus: nextRetry,
         sessionTodos: nextTodos,
+        activeTasks: nextActiveTasks,
+        subprocesses: nextSubprocesses,
+        subagents: nextSubagents,
       };
     });
+
+    if (p.status !== "running") {
+      for (const [pid, list] of Object.entries(get().subprocesses)) {
+        if (list.some((s) => s.id === p.sessionId)) {
+          void get().loadSubprocesses(pid);
+          void get().loadSubagents(pid);
+          break;
+        }
+      }
+    }
   },
 
   onQueueUpdate(p) {
@@ -1491,7 +1646,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   onSessionUpdate(s) {
-    if (s.status !== "active") {
+    if (s.status === "archived") {
       set((st) => ({
         sessions: st.sessions.filter((x) => x.id !== s.id),
         subagents: Object.fromEntries(
@@ -1500,11 +1655,17 @@ export const useStore = create<Store>((set, get) => ({
             list.filter((x) => x.id !== s.id),
           ])
         ),
+        subprocesses: Object.fromEntries(
+          Object.entries(st.subprocesses).map(([pid, list]) => [
+            pid,
+            list.filter((x) => x.id !== s.id),
+          ])
+        ),
       }));
       return;
     }
     set((st) => {
-      // 若为子 Agent 会话，同步更新至 subagents 映射中，绝不可混入主会话列表 sessions
+      // 若为子 Agent 会话，同步更新至 subagents 和 subprocesses 映射中，绝不可混入主会话列表 sessions
       let parentId = s.parentSessionId;
       if (!parentId) {
         for (const [pid, list] of Object.entries(st.subagents)) {
@@ -1513,17 +1674,31 @@ export const useStore = create<Store>((set, get) => ({
             break;
           }
         }
+        if (!parentId) {
+          for (const [pid, list] of Object.entries(st.subprocesses)) {
+            if (list.some((x) => x.id === s.id)) {
+              parentId = pid;
+              break;
+            }
+          }
+        }
       }
 
-      if (parentId || s.sessionType === "subagent") {
+      if (parentId || s.sessionType === "subagent" || s.sessionType === "subprocess") {
         if (!parentId) return st;
-        const existing = st.subagents[parentId] ?? [];
-        const hasIt = existing.some((x) => x.id === s.id);
-        const nextList = hasIt
-          ? existing.map((x) => (x.id === s.id ? { ...x, ...s } : x))
-          : [...existing, s];
+        const existingSubagents = st.subagents[parentId] ?? [];
+        const nextSubagents = existingSubagents.some((x) => x.id === s.id)
+          ? existingSubagents.map((x) => (x.id === s.id ? { ...x, ...s } : x))
+          : [...existingSubagents, s];
+
+        const existingSubprocs = st.subprocesses[parentId] ?? [];
+        const nextSubprocs = existingSubprocs.some((x) => x.id === s.id)
+          ? existingSubprocs.map((x) => (x.id === s.id ? { ...x, ...s } : x))
+          : [...existingSubprocs, s];
+
         return {
-          subagents: { ...st.subagents, [parentId]: nextList },
+          subagents: { ...st.subagents, [parentId]: nextSubagents },
+          subprocesses: { ...st.subprocesses, [parentId]: nextSubprocs },
         };
       }
 
@@ -2140,7 +2315,7 @@ export const useStore = create<Store>((set, get) => ({
   async onSubagentsChanged(p) {
     const pid = p?.parentSessionId || p?.parentId;
     if (pid) {
-      await get().loadSubagents(pid);
+      await Promise.all([get().loadSubagents(pid), get().loadSubprocesses(pid)]);
     }
   },
 
@@ -2149,42 +2324,78 @@ export const useStore = create<Store>((set, get) => ({
     if (!pid) return;
     set((st) => {
       const existing = st.subagents[pid] ?? [];
-      if (existing.some((s) => s.id === subagent.id)) {
-        return {
-          subagents: {
-            ...st.subagents,
-            [pid]: existing.map((s) => (s.id === subagent.id ? { ...s, ...subagent } : s)),
-          },
-        };
-      }
+      const nextSubs = existing.some((s) => s.id === subagent.id)
+        ? existing.map((s) => (s.id === subagent.id ? { ...s, ...subagent } : s))
+        : [subagent, ...existing];
+
+      const existingProcs = st.subprocesses[pid] ?? [];
+      const nextProcs = existingProcs.some((s) => s.id === subagent.id)
+        ? existingProcs.map((s) => (s.id === subagent.id ? { ...s, ...subagent } : s))
+        : [subagent, ...existingProcs];
+
       return {
-        subagents: {
-          ...st.subagents,
-          [pid]: [subagent, ...existing],
-        },
+        subagents: { ...st.subagents, [pid]: nextSubs },
+        subprocesses: { ...st.subprocesses, [pid]: nextProcs },
       };
     });
   },
 
-  onSubagentUpdate(payload) {
+  onSubprocessUpdate(payload) {
     const pid = payload?.parentSessionId || payload?.parentId;
-    const sid = payload?.subagentId || payload?.id;
-    if (!pid || !sid) return;
+    const sid = payload?.subprocessId || payload?.subagentId || payload?.id;
+    if (!sid) return;
+
+    let targetPid = pid;
+    if (!targetPid) {
+      const st = get();
+      for (const [p, list] of Object.entries(st.subprocesses)) {
+        if (list.some((s) => s.id === sid)) {
+          targetPid = p;
+          break;
+        }
+      }
+      if (!targetPid) {
+        for (const [p, list] of Object.entries(st.subagents)) {
+          if (list.some((s) => s.id === sid)) {
+            targetPid = p;
+            break;
+          }
+        }
+      }
+    }
+
     if (payload.status) {
       set((st) => ({
         runStatus: {
           ...st.runStatus,
           [sid]: payload.status === "running" ? "running" : "idle",
         },
-        subagents: {
-          ...st.subagents,
-          [pid]: (st.subagents[pid] ?? []).map((s) =>
-            s.id === sid ? { ...s, status: payload.status } : s
-          ),
-        },
+        subprocesses: targetPid
+          ? {
+              ...st.subprocesses,
+              [targetPid]: (st.subprocesses[targetPid] ?? []).map((s) =>
+                s.id === sid ? { ...s, status: payload.status } : s
+              ),
+            }
+          : st.subprocesses,
+        subagents: targetPid
+          ? {
+              ...st.subagents,
+              [targetPid]: (st.subagents[targetPid] ?? []).map((s) =>
+                s.id === sid ? { ...s, status: payload.status } : s
+              ),
+            }
+          : st.subagents,
       }));
     }
-    void get().loadSubagents(pid);
+    if (targetPid) {
+      void get().loadSubprocesses(targetPid);
+      void get().loadSubagents(targetPid);
+    }
+  },
+
+  onSubagentUpdate(payload) {
+    get().onSubprocessUpdate(payload);
   },
 
   async startLongTask(sessionId, goal, maxBudgetTokens) {

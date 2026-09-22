@@ -851,6 +851,16 @@ pub fn stop_run(app: AppHandle, session_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn retry_turn(app: AppHandle, session_id: String) -> Result<(), String> {
+    agent::retry_turn(&app, &session_id)
+}
+
+#[tauri::command]
+pub fn continue_turn(app: AppHandle, session_id: String) -> Result<(), String> {
+    agent::continue_turn(&app, &session_id)
+}
+
+#[tauri::command]
 pub fn list_subagents(state: State<'_, crate::AppState>, parent_session_id: String) -> Result<Vec<Session>, String> {
     let db = state.db.lock().unwrap();
     store::list_subagents(&db, &parent_session_id)
@@ -906,6 +916,13 @@ pub fn spawn_subagent(
     let _ = app.emit("subagents:changed", json!({
         "parentId": parent_session_id,
     }));
+    let _ = app.emit("subprocess:created", json!({
+        "parentId": parent_session_id,
+        "subprocess": sub,
+    }));
+    let _ = app.emit("subprocesses:changed", json!({
+        "parentId": parent_session_id,
+    }));
     Ok(sub)
 }
 
@@ -914,16 +931,25 @@ pub fn stop_subagent(app: AppHandle, subagent_id: String) -> Result<(), String> 
     let state = app.state::<crate::AppState>();
     let parent_id = {
         let db = state.db.lock().unwrap();
-        store::get_session(&db, &subagent_id)?.and_then(|s| s.parent_session_id)
+        let pid = store::get_session(&db, &subagent_id)?.and_then(|s| s.parent_session_id);
+        let _ = store::set_session_status(&db, &subagent_id, "cancelled");
+        pid
     };
     agent::stop_session(&app, &subagent_id);
     if let Some(pid) = parent_id {
         let _ = app.emit("subagent:update", json!({
             "parentId": pid,
             "subagentId": subagent_id,
-            "status": "stopped",
+            "status": "cancelled",
+        }));
+        let _ = app.emit("subprocess:update", json!({
+            "parentId": pid,
+            "parentSessionId": pid,
+            "subprocessId": subagent_id,
+            "status": "cancelled",
         }));
         let _ = app.emit("subagents:changed", json!({"parentId": pid}));
+        let _ = app.emit("subprocesses:changed", json!({"parentId": pid}));
     }
     Ok(())
 }

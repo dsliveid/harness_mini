@@ -178,6 +178,8 @@ fn init_real_db(dir: &Path, legacy_dir: Option<&Path>) -> Result<([u8; 32], rusq
     let _ = store::migrate_secrets_from_keyring(&db, &master);
     // 启动时自适应校准临时空间路径至当前数据目录（支持程序/数据迁移后自动重定位）
     let _ = temp::rebase_temp_storage(&db, dir);
+    // 启动时收敛上次崩溃或异常退出的残留状态
+    let _ = store::startup_reconcile(&db);
     Ok((master, db))
 }
 
@@ -360,6 +362,8 @@ pub fn run() {
             commands::guide_message,
             commands::delete_queued_message,
             commands::stop_run,
+            commands::retry_turn,
+            commands::continue_turn,
             commands::list_subagents,
             commands::list_collaborators,
             commands::list_subprocesses,

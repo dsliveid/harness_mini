@@ -76,6 +76,8 @@ pub const SUBAGENT_TOOL_NAMES: &[&str] = &[
     "spawn_subprocess",
     "wait_subprocesses",
     "stop_subprocess",
+    "resume_subprocess",
+    "resume_subagent",
     "dispatch_collaborator",
     "wait_collaborators",
     "get_collaborators",
@@ -533,6 +535,18 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "resume_subprocess",
+            description: "恢复推进指定处于中断、停止或失败状态的临时子进程，使其在当前已有断点处继续执行任务。",
+            risk: Risk::Write,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "subprocess_id": {"type": "string", "description": "要恢复推进的子进程 ID（如 sub-...）"}
+                },
+                "required": ["subprocess_id"]
+            }),
+        },
+        ToolSpec {
             name: "dispatch_collaborator",
             description: "向项目专属的常驻【项目协作者】（如前端专家、测试专家等）委派工作任务。协作者将在独立会话中基于其长远角色设定工作，完成后自动增量汇报主会话。注意：委派前请先调用 get_collaborators 确认其处于空闲状态。",
             risk: Risk::ReadOnly,
@@ -917,6 +931,7 @@ pub async fn execute(
         "get_subagent_status" => get_subagent_status_tool(args, ctx).await,
         "wait_subagents" | "wait_subprocesses" => wait_subagents_tool(args, ctx).await,
         "stop_subagent" | "stop_subprocess" => stop_subagent_tool(args, ctx).await,
+        "resume_subagent" | "resume_subprocess" => resume_subagent_tool(args, ctx).await,
         "dispatch_collaborator" => dispatch_collaborator_tool(args, ctx).await,
         "wait_collaborators" => wait_collaborators_tool(args, ctx).await,
         "get_collaborators" => get_collaborators_tool(ctx).await,
@@ -1479,6 +1494,92 @@ pub fn kill_process_tree(pid: u32) {
     }
 }
 
+/// 将子进程挂载到系统级 Job Object，确保主进程意外退出或崩溃时内核级联强杀孤儿进程
+#[cfg(windows)]
+pub fn assign_pid_to_job(pid: u32) {
+    use std::sync::OnceLock;
+    type HANDLE = *mut std::ffi::c_void;
+    type BOOL = i32;
+    type DWORD = u32;
+
+    #[repr(C)]
+    struct IO_COUNTERS {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: DWORD,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: DWORD,
+        affinity: usize,
+        priority_class: DWORD,
+        scheduling_class: DWORD,
+    }
+
+    #[repr(C)]
+    struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        basic_limit_information: JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        io_info: IO_COUNTERS,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_limit: usize,
+        peak_job_memory_limit: usize,
+    }
+
+    extern "system" {
+        fn CreateJobObjectW(lpJobAttributes: *mut std::ffi::c_void, lpName: *const u16) -> HANDLE;
+        fn SetInformationJobObject(
+            hJob: HANDLE,
+            JobObjectInformationClass: i32,
+            lpJobObjectInformation: *const std::ffi::c_void,
+            cbJobObjectInformationLength: DWORD,
+        ) -> BOOL;
+        fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) -> HANDLE;
+        fn AssignProcessToJobObject(hJob: HANDLE, hProcess: HANDLE) -> BOOL;
+        fn CloseHandle(hObject: HANDLE) -> BOOL;
+    }
+
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: DWORD = 0x2000;
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
+    const PROCESS_SET_QUOTA: DWORD = 0x0100;
+    const PROCESS_TERMINATE: DWORD = 0x0001;
+
+    static GLOBAL_JOB: OnceLock<usize> = OnceLock::new();
+    let job_handle = *GLOBAL_JOB.get_or_init(|| unsafe {
+        let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+        if !job.is_null() {
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let _ = SetInformationJobObject(
+                job,
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                &info as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as DWORD,
+            );
+        }
+        job as usize
+    });
+
+    if job_handle != 0 {
+        unsafe {
+            let h_proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if !h_proc.is_null() {
+                let _ = AssignProcessToJobObject(job_handle as HANDLE, h_proc);
+                let _ = CloseHandle(h_proc);
+            }
+        }
+    }
+}
+
 /// 进程树生命周期守卫：协程被 abort / drop 时兜底强杀进程树
 struct ProcessTreeGuard {
     pid: Option<u32>,
@@ -1539,6 +1640,10 @@ async fn run_command(
 
     let mut child = cmd.spawn().map_err(|e| format!("启动命令失败: {e}"))?;
     let pid = child.id();
+    #[cfg(windows)]
+    if let Some(p) = pid {
+        assign_pid_to_job(p);
+    }
     let mut tree_guard = ProcessTreeGuard::new(pid);
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
@@ -2145,9 +2250,34 @@ async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
     ))
 }
 
+fn determine_subagent_status(
+    is_running: bool,
+    session_status: &str,
+    has_terminal_reply: bool,
+    has_max_steps_msg: bool,
+) -> (&'static str, &'static str) {
+    if is_running {
+        ("running", "🟡 仍在运行 (running)")
+    } else if session_status == "cancelled" {
+        ("cancelled", "⚪ 已取消/停止 (cancelled)")
+    } else if session_status == "failed" {
+        ("failed", "🔴 运行失败出错 (failed - 可调用 resume_subprocess 恢复)")
+    } else if session_status == "interrupted" {
+        ("interrupted", "🟠 执行中断未完成 (interrupted - 可调用 resume_subprocess 恢复)")
+    } else if has_max_steps_msg {
+        ("interrupted", "🟠 已达最大步数上限中止 (max_steps_reached - 可调用 resume_subprocess 继续推进)")
+    } else if !has_terminal_reply {
+        ("interrupted", "🟠 执行中断未完全收敛 (interrupted - 可调用 resume_subprocess 恢复)")
+    } else {
+        ("completed", "🟢 已完成交付 (completed)")
+    }
+}
+
 async fn get_subagent_status_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
-    let target_id = args.get("subagent_id").and_then(|v| v.as_str());
+    let target_id = args.get("subagent_id")
+        .or_else(|| args.get("subprocess_id"))
+        .and_then(|v| v.as_str());
     let state = host.app.state::<crate::AppState>();
     let parent_id = &host.session_id;
 
@@ -2174,13 +2304,27 @@ async fn get_subagent_status_tool(args: &Value, ctx: &ToolCtx) -> Result<String,
     let db = state.db.lock().unwrap();
     for s in filtered {
         let is_running = crate::agent::is_run_active(&state, &s.id);
-        let msgs = crate::store::get_messages(&db, &s.id, None, 10).unwrap_or_default();
+        let msgs = crate::store::get_messages(&db, &s.id, None, 50).unwrap_or_default();
         let last_reply = msgs
             .iter()
             .rev()
             .find(|m| m.role == "assistant" && !m.content.as_deref().unwrap_or("").is_empty())
             .and_then(|m| m.content.as_deref())
             .unwrap_or("(尚在准备或执行工具中)");
+        let last_asst = msgs.iter().rev().find(|m| m.role == "assistant");
+        let has_terminal_reply = last_asst.map(|m| {
+            m.tool_calls.is_none()
+                || m.tool_calls.as_ref().map(|t| t.is_null() || t.as_array().map(|a| a.is_empty()).unwrap_or(false)).unwrap_or(false)
+        }).unwrap_or(false);
+        let has_max_steps_msg = msgs.iter().rev().any(|m| m.role == "system" && m.content.as_deref().unwrap_or("").contains("已达到最大步数"));
+
+        let (_code, status_display) = determine_subagent_status(
+            is_running,
+            &s.status,
+            has_terminal_reply,
+            has_max_steps_msg,
+        );
+
         let preview = if last_reply.len() > 300 {
             format!("{}...", &last_reply[..last_reply.char_indices().nth(300).map(|(i,_)| i).unwrap_or(last_reply.len())])
         } else {
@@ -2192,7 +2336,7 @@ async fn get_subagent_status_tool(args: &Value, ctx: &ToolCtx) -> Result<String,
             s.title,
             s.id,
             s.subagent_role.as_deref().unwrap_or("协作助手"),
-            if is_running { "🟡 运行中 (running)" } else { "🟢 已完成或空闲 (idle)" },
+            status_display,
             s.total_tokens.unwrap_or(0),
             preview
         ));
@@ -2204,11 +2348,13 @@ async fn get_subagent_status_tool(args: &Value, ctx: &ToolCtx) -> Result<String,
 async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
     let timeout_secs = get_u64_arg(args, "timeout_seconds", 60).clamp(5, 300);
-    let specified_ids: Option<Vec<String>> = args.get("subagent_ids").and_then(|v| {
-        v.as_array().map(|arr| {
-            arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()
-        })
-    });
+    let specified_ids: Option<Vec<String>> = args.get("subagent_ids")
+        .or_else(|| args.get("subprocess_ids"))
+        .and_then(|v| {
+            v.as_array().map(|arr| {
+                arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()
+            })
+        });
 
     let state = host.app.state::<crate::AppState>();
     let parent_id = &host.session_id;
@@ -2229,9 +2375,45 @@ async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
 
     let start_wait = std::time::Instant::now();
     let max_wait = std::time::Duration::from_secs(timeout_secs);
+    let mut auto_recovered = std::collections::HashSet::new();
 
     loop {
-        let any_running = target_ids.iter().any(|id| crate::agent::is_run_active(&state, id));
+        let mut any_running = false;
+        for id in &target_ids {
+            let is_running = crate::agent::is_run_active(&state, id);
+            if is_running {
+                any_running = true;
+            } else if !auto_recovered.contains(id) {
+                // 检查是否是非正常中断停止（未交付且未显式取消），若发生意外中断且尚有等待时间，自动触发一次自愈恢复
+                let should_recover = {
+                    let db = state.db.lock().unwrap();
+                    if let Ok(Some(s)) = crate::store::get_session(&db, id) {
+                        if s.status == "interrupted" || s.status == "failed" {
+                            true
+                        } else if s.status != "cancelled" {
+                            let msgs = crate::store::get_messages(&db, id, None, 10).unwrap_or_default();
+                            let last_asst = msgs.iter().rev().find(|m| m.role == "assistant");
+                            let has_terminal_reply = last_asst.map(|m| {
+                                m.tool_calls.is_none()
+                                    || m.tool_calls.as_ref().map(|t| t.is_null() || t.as_array().map(|a| a.is_empty()).unwrap_or(false)).unwrap_or(false)
+                            }).unwrap_or(false);
+                            !has_terminal_reply
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+
+                if should_recover && start_wait.elapsed() < max_wait {
+                    auto_recovered.insert(id.clone());
+                    let _ = crate::agent::restart_subagent(&host.app, id);
+                    any_running = true;
+                }
+            }
+        }
+
         if !any_running || start_wait.elapsed() >= max_wait {
             break;
         }
@@ -2240,15 +2422,17 @@ async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
 
     let mut out = String::new();
     let is_timed_out = start_wait.elapsed() >= max_wait;
-    if is_timed_out {
-        out.push_str(&format!("⚠️ 等待达到超时上限（{timeout_secs}s），部分子 Agent 可能仍在后台继续运行。\n\n"));
-    } else {
-        out.push_str("✅ 所有目标子 Agent 执行完毕！汇总结果如下：\n\n");
-    }
 
     let db = state.db.lock().unwrap();
+    let mut any_interrupted_or_failed = false;
+    let mut any_still_running = false;
+    let mut sub_results = Vec::new();
+
     for id in &target_ids {
         let is_running = crate::agent::is_run_active(&state, id);
+        if is_running {
+            any_still_running = true;
+        }
         let s = crate::store::get_session(&db, id)?.unwrap_or_else(|| {
             crate::models::Session {
                 id: id.clone(),
@@ -2273,9 +2457,19 @@ async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
         }).unwrap_or(false);
         let has_max_steps_msg = msgs.iter().rev().any(|m| m.role == "system" && m.content.as_deref().unwrap_or("").contains("已达到最大步数"));
 
+        let (status_code, status_display) = determine_subagent_status(
+            is_running,
+            &s.status,
+            has_terminal_reply,
+            has_max_steps_msg,
+        );
+        if status_code == "interrupted" || status_code == "failed" {
+            any_interrupted_or_failed = true;
+        }
+
         let display_reply = if has_max_steps_msg {
             format!("⚠️ 该子任务已达到最大步数上限中止，未生成最终交付报告。最后思考或动作：\n{}", last_reply)
-        } else if !is_running && !has_terminal_reply && last_reply != "(未产生文本回复)" {
+        } else if status_code == "interrupted" && last_reply != "(未产生文本回复)" {
             format!("⚠️ 该子任务执行中断或未完全收敛交付。最后思考或动作：\n{}", last_reply)
         } else {
             last_reply.to_string()
@@ -2343,16 +2537,28 @@ async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
             String::new()
         };
 
-        out.push_str(&format!(
+        sub_results.push(format!(
             "### 协同子 Agent: {} ({})\n- 状态: {}\n- Token 消耗: {}\n{}{}- 交付核心结论：\n```markdown\n{}\n```\n\n",
             s.title,
             s.subagent_role.as_deref().unwrap_or("协作助手"),
-            if is_running { "🟡 仍在运行" } else { "🟢 已完成" },
+            status_display,
             s.total_tokens.unwrap_or(0),
             touched_line,
             artifact_line,
             compact_summary
         ));
+    }
+
+    if is_timed_out || any_still_running {
+        out.push_str(&format!("⚠️ 等待达到超时上限（{timeout_secs}s），部分子 Agent 可能仍在后台继续运行。\n\n"));
+    } else if any_interrupted_or_failed {
+        out.push_str("⚠️ 部分子 Agent 执行中断或未完成交付（可在下一步调用 resume_subprocess 继续恢复推进）：\n\n");
+    } else {
+        out.push_str("✅ 所有目标子 Agent 执行完毕！汇总结果如下：\n\n");
+    }
+
+    for sr in sub_results {
+        out.push_str(&sr);
     }
 
     Ok(out)
@@ -2361,13 +2567,57 @@ async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
 async fn stop_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
     let subagent_id = args.get("subagent_id").and_then(|v| v.as_str()).ok_or("缺少 subagent_id 参数")?;
+    {
+        let state = host.app.state::<crate::AppState>();
+        let db = state.db.lock().unwrap();
+        let _ = crate::store::set_session_status(&db, subagent_id, "cancelled");
+    }
     crate::agent::stop_session(&host.app, subagent_id);
     let _ = host.app.emit("subagent:update", json!({
         "parentId": host.session_id,
         "subagentId": subagent_id,
-        "status": "stopped"
+        "status": "cancelled"
+    }));
+    let _ = host.app.emit("subprocess:update", json!({
+        "parentId": host.session_id,
+        "parentSessionId": host.session_id,
+        "subprocessId": subagent_id,
+        "status": "cancelled"
+    }));
+    let _ = host.app.emit("subagents:changed", json!({
+        "parentId": host.session_id
+    }));
+    let _ = host.app.emit("subprocesses:changed", json!({
+        "parentId": host.session_id
     }));
     Ok(format!("已成功停止子 Agent【{subagent_id}】。"))
+}
+
+async fn resume_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
+    let subagent_id = args.get("subagent_id")
+        .or_else(|| args.get("subprocess_id"))
+        .and_then(|v| v.as_str())
+        .ok_or("缺少 subagent_id 或 subprocess_id 参数")?;
+
+    let state = host.app.state::<crate::AppState>();
+    let parent_id = &host.session_id;
+
+    // 校验子 Agent 是否存在且属于当前主会话
+    {
+        let db = state.db.lock().unwrap();
+        let s = crate::store::get_session(&db, subagent_id)?.ok_or("未找到指定的子 Agent")?;
+        if s.parent_session_id.as_deref() != Some(parent_id) {
+            return Err("指定的子 Agent 不属于当前主会话".into());
+        }
+    }
+
+    crate::agent::restart_subagent(&host.app, subagent_id)?;
+
+    Ok(format!(
+        "已成功恢复并重新启动子 Agent【{}】。它正在后台继续推进执行，你可以调用 wait_subagents 工具等待其最新执行成果。",
+        subagent_id
+    ))
 }
 
 async fn dispatch_collaborator_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
@@ -2542,6 +2792,19 @@ async fn wait_collaborators_tool(args: &Value, ctx: &ToolCtx) -> Result<String, 
             String::new()
         };
 
+        let last_asst = msgs.iter().rev().find(|m| m.role == "assistant");
+        let has_terminal_reply = last_asst.map(|m| {
+            m.tool_calls.is_none()
+                || m.tool_calls.as_ref().map(|t| t.is_null() || t.as_array().map(|a| a.is_empty()).unwrap_or(false)).unwrap_or(false)
+        }).unwrap_or(false);
+        let has_max_steps_msg = msgs.iter().rev().any(|m| m.role == "system" && m.content.as_deref().unwrap_or("").contains("已达到最大步数"));
+        let (_code, status_display) = determine_subagent_status(
+            is_running,
+            &s.status,
+            has_terminal_reply,
+            has_max_steps_msg,
+        );
+
         if let Some(m) = last_assistant {
             let _ = crate::store::update_collaborator_watermark(&db, id, &m.id);
         }
@@ -2550,7 +2813,7 @@ async fn wait_collaborators_tool(args: &Value, ctx: &ToolCtx) -> Result<String, 
             "### 协作者: {} ({})\n- 状态: {}\n- Token 消耗: {}\n{}{}- 增量交付结论：\n```markdown\n{}\n```\n\n",
             s.title,
             s.subagent_role.as_deref().unwrap_or("协作者"),
-            if is_running { "🟡 仍在运行" } else { "🟢 已完成" },
+            status_display,
             s.total_tokens.unwrap_or(0),
             touched_line,
             artifact_line,

@@ -119,6 +119,8 @@ export const ipc = {
   deleteQueuedMessage: (sessionId: string, messageId: string) =>
     invoke<void>("delete_queued_message", { sessionId, messageId }),
   stopRun: (sessionId: string) => invoke<void>("stop_run", { sessionId }),
+  retryTurn: (sessionId: string) => invoke<void>("retry_turn", { sessionId }),
+  continueTurn: (sessionId: string) => invoke<void>("continue_turn", { sessionId }),
   // 协作者与子进程协作
   listCollaborators: (parentSessionId: string) =>
     invoke<Session[]>("list_collaborators", { parentSessionId }),

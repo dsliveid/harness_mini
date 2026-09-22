@@ -140,13 +140,29 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
     if cascade_subagents {
         let subs = {
             let db = state.db.lock().unwrap();
-            store::list_subagents(&db, session_id).unwrap_or_default()
+            store::list_all_child_sessions(&db, session_id).unwrap_or_default()
         };
         for sub in subs {
+            {
+                let db = state.db.lock().unwrap();
+                let _ = store::set_session_status(&db, &sub.id, "cancelled");
+            }
             stop_session_ext(app, &sub.id, false);
             let _ = app.emit("subagent:update", json!({
                 "parentId": session_id,
                 "subagentId": sub.id,
+                "status": "cancelled"
+            }));
+            let _ = app.emit("subprocess:update", json!({
+                "parentId": session_id,
+                "parentSessionId": session_id,
+                "subprocessId": sub.id,
+                "status": "cancelled"
+            }));
+            let _ = app.emit("collaborator:update", json!({
+                "parentId": session_id,
+                "parentSessionId": session_id,
+                "collaboratorId": sub.id,
                 "status": "cancelled"
             }));
             let _ = app.emit("run:status", json!({
@@ -154,6 +170,9 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
                 "status": "cancelled"
             }));
         }
+        let _ = app.emit("subagents:changed", json!({"parentId": session_id}));
+        let _ = app.emit("subprocesses:changed", json!({"parentId": session_id}));
+        let _ = app.emit("collaborators:changed", json!({"parentId": session_id}));
     }
 
     // 1. 优先强杀该会话下全部正在运行的控制台进程树（必须在 abort 协程前强杀，防止协程终止后子进程孤立遗留）
@@ -221,6 +240,27 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
         );
     }
 
+    // 4. 若当前会话关联活跃长任务，协同中止长任务，将其运行中的子任务标记为 interrupted
+    {
+        let db = state.db.lock().unwrap();
+        if let Ok(Some(mut lt)) = store::get_active_long_task(&db, session_id) {
+            crate::task::set_control(&lt.id, true);
+            let _ = store::update_long_task_status(&db, &lt.id, "interrupted");
+            if let Some(cur_idx) = crate::task::get_next_subtask_index(&lt) {
+                if lt.subtasks[cur_idx].status == "running"
+                    || lt.subtasks[cur_idx].status == "verifying"
+                    || lt.subtasks[cur_idx].status == "in_progress"
+                {
+                    lt.subtasks[cur_idx].status = "interrupted".to_string();
+                }
+            }
+            lt.status = "interrupted".to_string();
+            lt.updated_at = store::now();
+            let _ = store::update_long_task(&db, &lt);
+            let _ = app.emit("task:update", &lt);
+        }
+    }
+
     // 仅在主会话主动停止且存在排队时消费队列；子会话停止时不自发恢复
     let is_sub = {
         let db = state.db.lock().unwrap();
@@ -245,21 +285,32 @@ pub fn restart_subagent(app: &AppHandle, subagent_id: &str) -> Result<(), String
         let db = state.db.lock().unwrap();
         let s = store::get_session(&db, subagent_id)?.ok_or("子 Agent 不存在")?;
         let msgs = store::all_messages(&db, subagent_id)?;
-        // 找到最后一条 user 消息作为 trigger
-        let user_msg_id = msgs
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .map(|m| m.id.clone())
-            .unwrap_or_else(|| {
-                store::new_message(&db, subagent_id, "user", Some("请继续恢复并执行任务。".into()), false)
-                    .map(|m| m.id)
-                    .unwrap_or_default()
-            });
+        let last_msg = msgs.last();
+        let user_msg_id = match last_msg {
+            Some(m) if m.role == "tool" => {
+                let nm = store::new_message(&db, subagent_id, "user", Some("请根据上述工具执行结果，继续推进并输出最终结论。".into()), false)?;
+                let _ = app.emit("message:final", &nm);
+                nm.id
+            }
+            Some(m) if m.role == "assistant" => {
+                let nm = store::new_message(&db, subagent_id, "user", Some("请承接前文未完成的内容与思路，直接继续往下执行，无需重复前文已输出的内容。".into()), false)?;
+                let _ = app.emit("message:final", &nm);
+                nm.id
+            }
+            Some(m) if m.role == "user" => {
+                m.id.clone()
+            }
+            _ => {
+                let nm = store::new_message(&db, subagent_id, "user", Some("请继续恢复并执行任务。".into()), false)?;
+                let _ = app.emit("message:final", &nm);
+                nm.id
+            }
+        };
         (s.parent_session_id, user_msg_id)
     };
 
     if !trigger_id.is_empty() {
+        let _ = app.emit("messages:changed", json!({"sessionId": subagent_id}));
         spawn_session_task(app.clone(), subagent_id.to_string(), Some(trigger_id));
         if let Some(ref pid) = parent_id {
             let _ = app.emit("subagent:update", json!({
@@ -267,7 +318,14 @@ pub fn restart_subagent(app: &AppHandle, subagent_id: &str) -> Result<(), String
                 "subagentId": subagent_id,
                 "status": "running"
             }));
+            let _ = app.emit("subprocess:update", json!({
+                "parentId": pid,
+                "parentSessionId": pid,
+                "subprocessId": subagent_id,
+                "status": "running"
+            }));
             let _ = app.emit("subagents:changed", json!({"parentId": pid}));
+            let _ = app.emit("subprocesses:changed", json!({"parentId": pid}));
         }
     }
     Ok(())
@@ -289,6 +347,195 @@ pub fn restart_all_subagents(app: &AppHandle, parent_session_id: &str) -> Result
         }
     }
     Ok(count)
+}
+
+/// 重试会话的最后一步（回滚本轮所有后续输出，级联清理本轮子任务，重新触发回复）
+pub fn retry_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
+    let state = app.state::<crate::AppState>();
+    // 先停止当前运行
+    stop_session_ext(app, session_id, false);
+
+    let (trigger_id, user_seq, child_ids_to_clean) = {
+        let db = state.db.lock().unwrap();
+        let msgs = store::all_messages(&db, session_id)?;
+        // 寻找最后一个非排队的 user 消息作为本轮重试的起点
+        let last_user = msgs.iter()
+            .rev()
+            .find(|m| m.role == "user" && !m.queued)
+            .ok_or("未找到可重试的用户消息")?;
+
+        let mut child_ids: Vec<String> = Vec::new();
+        // 查找通过本轮产生（即父消息 seq > user_seq）的 tool_event 派生的子会话，
+        // 或在该 user 消息创建时间之后创建的关联子任务/子进程
+        if let Ok(mut stmt) = db.prepare(
+            "SELECT id FROM sessions 
+             WHERE trigger_tool_event_id IN (
+                 SELECT id FROM tool_events WHERE message_id IN (
+                     SELECT id FROM messages WHERE session_id = ?1 AND seq > ?2
+                 )
+             )
+             OR (parent_session_id = ?1 AND session_type IN ('subprocess', 'subagent') AND created_at >= ?3)"
+        ) {
+            if let Ok(rows) = stmt.query_map(rusqlite::params![session_id, last_user.seq, last_user.created_at], |r| r.get(0)) {
+                for r in rows.flatten() {
+                    child_ids.push(r);
+                }
+            }
+        }
+
+        (last_user.id.clone(), last_user.seq, child_ids)
+    };
+
+    // 1. 级联强杀并清理本轮派生的全部子任务/子进程（防止留下僵尸任务或在重试时出现重复派生）
+    for child_id in &child_ids_to_clean {
+        stop_session_ext(app, child_id, false);
+        {
+            let db = state.db.lock().unwrap();
+            let _ = store::delete_session(&db, child_id);
+        }
+        let _ = app.emit("sessions:changed", json!({"deleted": child_id}));
+    }
+    if !child_ids_to_clean.is_empty() {
+        let _ = app.emit("subprocesses:changed", json!({"parentId": session_id}));
+        let _ = app.emit("subagents:changed", json!({"parentId": session_id}));
+        let _ = app.emit("collaborators:changed", json!({"parentId": session_id}));
+    }
+
+    // 2. 清理该 user 消息之后产生的所有残留消息（包括旧的 assistant 消息、工具事件等）
+    // 防止 LLM 看到末尾的 assistant 消息判定该轮已回答完毕而返回空回复
+    {
+        let db = state.db.lock().unwrap();
+        store::delete_messages_after(&db, session_id, user_seq)?;
+        store::touch_session(&db, session_id)?;
+
+        // 3. 长任务子任务状态协同重置：若当前长任务子步骤处于失败或中断态，重置为 pending
+        if let Ok(Some(mut lt)) = store::get_active_long_task(&db, session_id) {
+            let mut changed = false;
+            for st in &mut lt.subtasks {
+                if st.status == "interrupted" || st.status == "failed" || st.status == "running" {
+                    st.status = "pending".to_string();
+                    st.error = None;
+                    changed = true;
+                }
+            }
+            if changed {
+                let _ = store::update_long_task(&db, &lt);
+                let _ = app.emit("task:update", &lt);
+            }
+        }
+    }
+
+    // 清理该会话挂起的审批请求
+    state
+        .approvals
+        .lock()
+        .unwrap()
+        .retain(|_, p| p.session_id != session_id);
+
+    // 通知前端会话消息已回滚重置
+    let _ = app.emit("messages:changed", json!({"sessionId": session_id}));
+
+    spawn_session_task(app.clone(), session_id.to_string(), Some(trigger_id.clone()));
+    let _ = app.emit(
+        "run:status",
+        json!({"sessionId": session_id, "status": "running", "triggerId": trigger_id}),
+    );
+    Ok(())
+}
+
+/// 继续推进会话（承接上一步未完成内容或工具结果，自动恢复未完成的子任务与长任务）
+pub fn continue_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
+    let state = app.state::<crate::AppState>();
+    if is_run_active(&state, session_id) {
+        return Err("当前会话正在运行中，无需继续".into());
+    }
+
+    // 1. 自动协同恢复关联的未完成子任务/子进程
+    let subs_to_resume = {
+        let db = state.db.lock().unwrap();
+        let subs = store::list_subagents(&db, session_id).unwrap_or_default();
+        subs.into_iter()
+            .filter(|s| s.status == "interrupted" || s.status == "failed" || s.status == "cancelled")
+            .map(|s| s.id)
+            .collect::<Vec<_>>()
+    };
+    for sub_id in subs_to_resume {
+        let _ = restart_subagent(app, &sub_id);
+    }
+
+    // 2. 自动协同恢复关联的未完成长任务
+    {
+        let db = state.db.lock().unwrap();
+        if let Ok(Some(lt)) = store::get_active_long_task(&db, session_id) {
+            if lt.status == "interrupted" || lt.status == "failed" || lt.status == "paused" {
+                drop(db);
+                let _ = crate::task::resume_long_task(app, &lt.id);
+            }
+        }
+    }
+
+    // 3. 为主会话准备触发消息
+    let (trigger_id, new_msg) = {
+        let db = state.db.lock().unwrap();
+        // 清理末尾悬挂的报错系统消息
+        let _ = db.execute(
+            "DELETE FROM messages WHERE session_id = ?1 AND role = 'system' AND content LIKE '⚠️%'",
+            rusqlite::params![session_id],
+        );
+
+        let msgs = store::all_messages(&db, session_id)?;
+        let last_msg = msgs.last();
+
+        match last_msg {
+            Some(m) if m.role == "tool" => {
+                // 上一步工具执行完毕，注入引导让助手做总结回复
+                let new_m = store::new_message(
+                    &db,
+                    session_id,
+                    "user",
+                    Some("请根据上述工具执行结果，继续推进并输出最终结论。".into()),
+                    false,
+                )?;
+                (new_m.id.clone(), Some(new_m))
+            }
+            Some(m) if m.role == "assistant" => {
+                // 助手输出中途停止或已完成，注入接续提示词
+                let new_m = store::new_message(
+                    &db,
+                    session_id,
+                    "user",
+                    Some("请承接前文未完成的内容与思路，直接继续往下执行，无需重复前文已输出的内容。".into()),
+                    false,
+                )?;
+                (new_m.id.clone(), Some(new_m))
+            }
+            Some(m) if m.role == "user" => {
+                (m.id.clone(), None)
+            }
+            _ => {
+                let new_m = store::new_message(
+                    &db,
+                    session_id,
+                    "user",
+                    Some("请继续执行任务。".into()),
+                    false,
+                )?;
+                (new_m.id.clone(), Some(new_m))
+            }
+        }
+    };
+
+    if let Some(ref m) = new_msg {
+        let _ = app.emit("message:final", m);
+    }
+    let _ = app.emit("messages:changed", json!({"sessionId": session_id}));
+
+    spawn_session_task(app.clone(), session_id.to_string(), Some(trigger_id.clone()));
+    let _ = app.emit(
+        "run:status",
+        json!({"sessionId": session_id, "status": "running", "triggerId": trigger_id}),
+    );
+    Ok(())
 }
 
 async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String>) {
@@ -414,6 +661,25 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
         let db = state.db.lock().unwrap();
         if let Ok(Some(s)) = store::get_session(&db, &session_id) {
             if s.session_type == "collaborator" || s.session_type == "subprocess" || s.session_type == "subagent" || s.parent_session_id.is_some() {
+                // 若该会话已被显式取消、终止或中断，严禁反向冲刷为 completed！
+                if s.status == "cancelled" || s.status == "stopped" || s.status == "interrupted" {
+                    return;
+                }
+                let last_run_status = store::get_last_run_status(&db, &session_id);
+                if matches!(last_run_status.as_deref(), Some("interrupted") | Some("cancelled")) {
+                    let _ = store::set_session_status(&db, &session_id, "cancelled");
+                    return;
+                }
+                // 若关联的父会话已被取消、中断或停止，严禁子任务独立冲刷为 completed！
+                if let Some(ref pid) = s.parent_session_id {
+                    if let Ok(Some(ps)) = store::get_session(&db, pid) {
+                        if ps.status == "cancelled" || ps.status == "stopped" || ps.status == "interrupted" {
+                            let _ = store::set_session_status(&db, &session_id, "cancelled");
+                            return;
+                        }
+                    }
+                }
+
                 let parent_id = s.parent_session_id.clone().unwrap_or_default();
                 let sub_status = match last_outcome {
                     RunOutcome::Done => "completed",
@@ -436,6 +702,16 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
                     "status": sub_status,
                 }));
                 let _ = app.emit("subagents:changed", json!({
+                    "parentId": parent_id,
+                    "parentSessionId": parent_id,
+                }));
+                let _ = app.emit("subprocess:update", json!({
+                    "parentId": parent_id,
+                    "parentSessionId": parent_id,
+                    "subprocessId": session_id,
+                    "status": sub_status,
+                }));
+                let _ = app.emit("subprocesses:changed", json!({
                     "parentId": parent_id,
                     "parentSessionId": parent_id,
                 }));
@@ -877,63 +1153,119 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         let app2 = app.clone();
         let sid2 = session_id.to_string();
         let mid2 = assistant_id.clone();
-        let mut last_flush = Instant::now();
         let buf2: std::sync::Arc<Mutex<String>> = std::sync::Arc::new(Mutex::new(String::new()));
         let rbuf2: std::sync::Arc<Mutex<String>> = std::sync::Arc::new(Mutex::new(String::new()));
-        // 正文与思考增量各用一组捕获（闭包互斥持有，不能共享同一组 move 变量）
-        let app_text = app2.clone();
-        let sid_text = sid2.clone();
-        let mid_text = mid2.clone();
-        let app_reason = app2.clone();
-        let sid_reason = sid2.clone();
-        let mid_reason = mid2.clone();
-        let call = llm::chat_stream(
-            &cfg,
-            &messages,
-            &schemas,
-            {
-                let buf2 = buf2.clone();
-                move |delta| {
-                    let mut b = buf2.lock().unwrap();
-                    b.push_str(delta);
-                    app_text.state::<crate::AppState>().emit(
-                        "message:delta",
-                        &json!({"sessionId": sid_text, "messageId": mid_text, "delta": delta}),
-                    );
-                    // 周期性落库，防止崩溃丢失全部内容
-                    if last_flush.elapsed() > Duration::from_millis(800) {
-                        let st = app_text.state::<crate::AppState>();
-                        let db = st.db.lock().unwrap();
-                        let _ = store::update_message_content(&db, &mid_text, &b.clone(), None);
-                        last_flush = Instant::now();
-                    }
-                }
-            },
-            {
-                let rbuf2 = rbuf2.clone();
-                let mut reasoning_flush = Instant::now();
-                move |delta| {
-                    let mut b = rbuf2.lock().unwrap();
-                    b.push_str(delta);
-                    app_reason.state::<crate::AppState>().emit(
-                        "message:reasoning:delta",
-                        &json!({"sessionId": sid_reason, "messageId": mid_reason, "delta": delta}),
-                    );
-                    if reasoning_flush.elapsed() > Duration::from_millis(800) {
-                        let st = app_reason.state::<crate::AppState>();
-                        let db = st.db.lock().unwrap();
-                        let _ = store::update_message_reasoning(&db, &mid_reason, &b.clone());
-                        reasoning_flush = Instant::now();
-                    }
-                }
-            },
-        )
-        .await;
 
-        let mut result = match call {
-            Ok(r) => r,
-            Err(e) => {
-                emit_error(app, session_id, "llm", e);
+        let mut retry_result: Option<llm::LlmResult> = None;
+        let max_stream_retries = 3u32;
+        for attempt in 1..=max_stream_retries {
+            if attempt > 1 {
+                // 回滚上一次尝试中刷入数据库与界面的半截内容
+                buf2.lock().unwrap().clear();
+                rbuf2.lock().unwrap().clear();
+                {
+                    let db = state.db.lock().unwrap();
+                    let _ = store::update_message_content(&db, &assistant_id, "", None);
+                    let _ = store::update_message_reasoning(&db, &assistant_id, "");
+                }
+                let _ = app.emit(
+                    "message:reset",
+                    json!({"sessionId": session_id, "messageId": assistant_id}),
+                );
+                let _ = app.emit(
+                    "run:retry",
+                    json!({
+                        "sessionId": session_id,
+                        "messageId": assistant_id,
+                        "attempt": attempt,
+                        "maxRetries": max_stream_retries,
+                        "reason": "网络波动断开连接，正在自动重试...",
+                    }),
+                );
+                let backoff_ms = 1000u64 * (1u64 << (attempt - 2));
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+
+            let mut last_flush = Instant::now();
+            let app_text = app2.clone();
+            let sid_text = sid2.clone();
+            let mid_text = mid2.clone();
+            let app_reason = app2.clone();
+            let sid_reason = sid2.clone();
+            let mid_reason = mid2.clone();
+
+            let call = llm::chat_stream(
+                &cfg,
+                &messages,
+                &schemas,
+                {
+                    let buf2 = buf2.clone();
+                    move |delta| {
+                        let mut b = buf2.lock().unwrap();
+                        b.push_str(delta);
+                        app_text.state::<crate::AppState>().emit(
+                            "message:delta",
+                            &json!({"sessionId": sid_text, "messageId": mid_text, "delta": delta}),
+                        );
+                        // 周期性落库，防止崩溃丢失全部内容
+                        if last_flush.elapsed() > Duration::from_millis(800) {
+                            let st = app_text.state::<crate::AppState>();
+                            let db = st.db.lock().unwrap();
+                            let _ = store::update_message_content(&db, &mid_text, &b.clone(), None);
+                            last_flush = Instant::now();
+                        }
+                    }
+                },
+                {
+                    let rbuf2 = rbuf2.clone();
+                    let mut reasoning_flush = Instant::now();
+                    move |delta| {
+                        let mut b = rbuf2.lock().unwrap();
+                        b.push_str(delta);
+                        app_reason.state::<crate::AppState>().emit(
+                            "message:reasoning:delta",
+                            &json!({"sessionId": sid_reason, "messageId": mid_reason, "delta": delta}),
+                        );
+                        if reasoning_flush.elapsed() > Duration::from_millis(800) {
+                            let st = app_reason.state::<crate::AppState>();
+                            let db = st.db.lock().unwrap();
+                            let _ = store::update_message_reasoning(&db, &mid_reason, &b.clone());
+                            reasoning_flush = Instant::now();
+                        }
+                    }
+                },
+            )
+            .await;
+
+            match call {
+                Ok(r) => {
+                    retry_result = Some(r);
+                    break;
+                }
+                Err(e) => {
+                    let is_network_error = e.contains("流读取失败")
+                        || e.contains("请求失败")
+                        || e.contains("error decoding response body")
+                        || e.contains("timed out")
+                        || e.contains("connection reset")
+                        || e.contains("429")
+                        || e.contains("502")
+                        || e.contains("503")
+                        || e.contains("504");
+                    if is_network_error && attempt < max_stream_retries {
+                        eprintln!("[Agent LLM Retry] attempt {attempt}/{max_stream_retries} failed: {e}. Retrying...");
+                        continue;
+                    } else {
+                        emit_error(app, session_id, "llm", e);
+                        return (RunOutcome::Failed, last_assistant_id, run_tokens);
+                    }
+                }
+            }
+        }
+
+        let mut result = match retry_result {
+            Some(r) => r,
+            None => {
                 return (RunOutcome::Failed, last_assistant_id, run_tokens);
             }
         };
@@ -944,6 +1276,14 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
                 // 推理思考模型（如 DeepSeek-R1、QwQ 等）可能将汇报输出在思考流中，兜底提取正文，避免误杀
                 result.content = format!("【思考过程汇报】\n{}", result.reasoning.trim());
             } else {
+                // 清理本次为该步骤预占位的空 assistant 消息，防止留在数据库中变成僵尸占位
+                {
+                    let db = state.db.lock().unwrap();
+                    let _ = db.execute(
+                        "DELETE FROM messages WHERE id = ?1 AND (content IS NULL OR content = '') AND tool_calls_json IS NULL",
+                        rusqlite::params![assistant_id],
+                    );
+                }
                 emit_error(
                     app,
                     session_id,
@@ -951,7 +1291,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
                     "模型返回了空回复。请检查设置中的模型名称是否正确、该模型是否支持工具调用（function calling），或更换模型后重试。"
                         .into(),
                 );
-                return (RunOutcome::Done, last_assistant_id, run_tokens);
+                return (RunOutcome::Failed, last_assistant_id, run_tokens);
             }
         }
 
@@ -2277,6 +2617,17 @@ fn build_context(
                 first_preview,
                 created_at: chrono::Utc::now().to_rfc3339(),
             });
+        }
+    }
+
+    // 协议防御：上下文末尾不能以 assistant 消息结束。
+    // 如果末尾是 assistant 消息（例如异常退出残留或历史数据异常），
+    // OpenAI / Claude / DeepSeek 等接口会认为助手已经交付答复，从而直接返回空回复或协议报错。
+    while let Some(last) = out.last() {
+        if last.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            out.pop();
+        } else {
+            break;
         }
     }
 
