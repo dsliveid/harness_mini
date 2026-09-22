@@ -269,7 +269,34 @@ pub fn find_plan_file(
             return Some(active);
         }
 
-        // 当前会话指定了 session_id 但未找到属于该会话的进行中方案，必须返回 None，严格隔离防止跨会话越权串扰！
+        // 2.1 若当前会话未找到进行中方案，且该会话拥有父会话（为子任务或协作者），穿透查找父会话绑定的进行中方案
+        if let Some(c) = conn {
+            if let Ok(Some(sess)) = crate::store::get_session(c, session_id) {
+                if let Some(ref pid) = sess.parent_session_id {
+                    let parent_target_id = get_active_plan_id(conn, pid);
+                    if let Some(ref ptid) = parent_target_id {
+                        for (path, meta, body) in &files {
+                            if meta.id == *ptid
+                                || path.file_stem().and_then(|s| s.to_str()) == Some(ptid.as_str())
+                            {
+                                return Some((path.clone(), meta.clone(), body.clone()));
+                            }
+                        }
+                    }
+                    let mut parent_active = files
+                        .iter()
+                        .filter(|(_, meta, _)| meta.session_id == *pid && meta.status == "in_progress")
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    parent_active.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
+                    if let Some(active) = parent_active.into_iter().next() {
+                        return Some(active);
+                    }
+                }
+            }
+        }
+
+        // 当前会话指定了 session_id 但未找到属于该会话或其父会话的进行中方案，必须返回 None，严格隔离防止跨会话越权串扰！
         return None;
     }
 
@@ -837,21 +864,49 @@ pub fn load_active_plan_context(
         step_lines.join("\n")
     };
 
-    Some(format!(
-        r#"## 当前任务权威执行计划（来自 .harness/plans/{filename}，版本 v{version}）
+    let is_child = if let Some(c) = conn {
+        crate::store::get_session(c, session_id)
+            .ok()
+            .flatten()
+            .map(|s| s.parent_session_id.is_some())
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    if is_child {
+        Some(format!(
+            r#"## 当前项目权威执行计划（继承自父会话，来自 .harness/plans/{filename}，版本 v{version}）
+> ⚠️ 核心准则：此计划是防止多轮需求失真的最高权威基准。你作为协同子任务/协作者，所有工作均是为了推进该计划，必须严格遵从此清单的分步与架构约束。
+- **任务总目标**：{title}
+- **全局推进状态**：执行中 (in_progress) · 完成度 ({done_steps}/{total_steps})
+- **当前执行步骤清单**：
+{steps_text}
+- **子任务协同约束**：严禁擅自修改计划文档或推翻全局既定方案！你只需对照你的具体分配目标实施代码或验证。若在执行中发现原计划存在缺陷，请在最终交付回复中列出《计划调整建议》，由主进程统筹决策。"#,
+            filename = filename,
+            version = meta.version,
+            title = meta.title,
+            done_steps = done_steps,
+            total_steps = total_steps,
+            steps_text = steps_text
+        ))
+    } else {
+        Some(format!(
+            r#"## 当前任务权威执行计划（来自 .harness/plans/{filename}，版本 v{version}）
 > ⚠️ 核心准则：此计划是防止多轮需求失真的最高权威基准。后续所有代码变更必须严格以分步清单为准逐步推进。
 - **任务目标**：{title}
 - **推进状态**：执行中 (in_progress) · 完成度 ({done_steps}/{total_steps})
 - **当前执行步骤清单**：
 {steps_text}
 - **约束声明**：若用户提出需求调整或增删，**必须优先调用 `update_plan` 工具更新计划文档与变更历史，再开始改动代码**；全部执行完成并通过测试后，调用 `update_plan(status="completed")` 结案归档。"#,
-        filename = filename,
-        version = meta.version,
-        title = meta.title,
-        done_steps = done_steps,
-        total_steps = total_steps,
-        steps_text = steps_text
-    ))
+            filename = filename,
+            version = meta.version,
+            title = meta.title,
+            done_steps = done_steps,
+            total_steps = total_steps,
+            steps_text = steps_text
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1027,6 +1082,51 @@ mod tests {
         assert!(err3.contains("已有的计划文档包括"));
 
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_child_session_inherits_parent_plan() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        let tmp = TempDir::new();
+        let ws = tmp.path();
+
+        let parent = crate::store::create_session(&conn, &ws.to_string_lossy(), None, "主会话", "standard").unwrap();
+        let child = crate::store::create_subagent_session(
+            &conn,
+            &parent.id,
+            "后端开发",
+            "实现JWT刷新",
+            "任务详情",
+            &ws.to_string_lossy(),
+            None,
+            None,
+            None,
+        ).unwrap();
+
+        // 1. 父会话创建计划
+        create_plan(
+            ws,
+            &parent.id,
+            "主项目重构方案",
+            "重构认证与授权",
+            "JWT 架构",
+            &[],
+            &["实现登录".into(), "实现刷新".into()],
+            None,
+            Some(&conn),
+        ).unwrap();
+
+        // 2. 子会话查询计划：应该能够穿透查询到父会话的活动计划
+        let plan_opt = find_plan_file(ws, &child.id, None, Some(&conn));
+        assert!(plan_opt.is_some(), "子会话应能穿透查询到父会话的计划");
+        assert_eq!(plan_opt.unwrap().1.title, "主项目重构方案");
+
+        // 3. 子会话加载 Prompt：应该包含继承自父会话及子任务协同约束
+        let ctx = load_active_plan_context(ws, &child.id, Some(&conn)).unwrap();
+        assert!(ctx.contains("继承自父会话"));
+        assert!(ctx.contains("子任务协同约束"));
+        assert!(ctx.contains("严禁擅自修改计划文档"));
     }
 }
 

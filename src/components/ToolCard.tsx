@@ -934,6 +934,41 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
     });
   };
 
+  // 提取子任务/协作者交付报告工件的物理路径（.harness/subtasks/*_report.md）
+  const resolvedSubtaskReportPath = useMemo(() => {
+    if (!["wait_subprocesses", "wait_subagents", "wait_collaborators"].includes(ev.toolName)) {
+      return null;
+    }
+    if (ev.resultText) {
+      const normalized = ev.resultText.replace(/\\/g, "/");
+      const match = normalized.match(/(?:\.harness\/subtasks\/)([^`\s\n"'<>]+\.md)/i);
+      if (match) return `.harness/subtasks/${match[1]}`;
+    }
+    return null;
+  }, [ev.toolName, ev.resultText]);
+
+  const handleOpenSubtaskReport = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!resolvedSubtaskReportPath) return;
+    const cleanRel = resolvedSubtaskReportPath.replace(/\\/g, "/");
+    const absPath =
+      /^[a-zA-Z]:\//.test(cleanRel) || cleanRel.startsWith("/")
+        ? cleanRel
+        : currentWorkspace
+          ? `${currentWorkspace.replace(/\\/g, "/").replace(/\/$/, "")}/${cleanRel.replace(/^\//, "")}`
+          : cleanRel;
+    const fileName = cleanRel.split("/").pop() || "子任务交付报告.md";
+
+    ipc.openFileViewer({
+      id: `file:${absPath}`,
+      type: "file",
+      title: `交付报告: ${fileName}`,
+      path: absPath,
+      workspacePath: currentWorkspace,
+      sessionId: currentSessionId || undefined,
+    });
+  };
+
   const showOutput = ev.status === "running" && output !== undefined;
   const showResult = !isImageTool && !!ev.resultText && (ev.status === "success" || ev.status === "failed" || ev.status === "timeout" || ev.status === "denied");
 
@@ -1045,6 +1080,17 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
             >
               <CheckSquare size={11} />
               <span>{ev.status === "running" ? "方案生成中..." : "方案文档 (MD)"}</span>
+            </button>
+          )}
+          {["wait_subprocesses", "wait_subagents", "wait_collaborators"].includes(ev.toolName) && resolvedSubtaskReportPath && (
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 transition-colors cursor-pointer border border-indigo-500/30"
+              title="在独立窗体中查看完整子任务详细报告"
+              onClick={handleOpenSubtaskReport}
+            >
+              <FileText size={11} />
+              <span>报告工件 (MD)</span>
             </button>
           )}
           {statusBadge(ev.status)}

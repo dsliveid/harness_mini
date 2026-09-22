@@ -478,7 +478,25 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "role": {"type": "string", "description": "子任务角色定位，例如：技术调研、单元测试、独立排查"},
                     "title": {"type": "string", "description": "子任务简明标题，如 排查审批流程组件"},
-                    "task": {"type": "string", "description": "分配给子进程的具体任务详细要求。如需处理特定子目录，请在此参数中明确说明目标目录相对路径与工作目标，建议任务简明聚焦"}
+                    "task": {"type": "string", "description": "分配给子进程的具体任务详细要求。如需处理特定子目录，请在此参数中明确说明目标目录相对路径与工作目标，建议任务简明聚焦"},
+                    "relevant_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选：主进程已知重点关注的文件路径列表（如 [\"src/auth.rs\"]），帮助子进程跳过全局盲目搜索"
+                    },
+                    "pinned_context": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "可选：上下文图钉与行号锚点列表，例如 [{\"path\": \"src/auth.rs\", \"focus_lines\": [120, 150], \"intent\": \"在此处追加方法\"}]"
+                    },
+                    "acceptance_criteria": {
+                        "type": "string",
+                        "description": "可选：交付验收标准或验证命令（如 cargo test test_auth）"
+                    },
+                    "constraints": {
+                        "type": "string",
+                        "description": "可选：严格禁止项与负向约束（如 仅修改该文件，严禁修改已有外部接口入参）"
+                    }
                 },
                 "required": ["role", "title", "task"]
             }),
@@ -493,7 +511,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "subprocess_ids": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "可选：要等待的子进程 ID 列表；缺省时等待全部运行中的子进程"
+                        "description": "可选：要等待的子进程 ID列表；缺省时等待全部运行中的子进程"
                     },
                     "timeout_seconds": {
                         "type": "integer",
@@ -522,7 +540,25 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "collaborator_id": {"type": "string", "description": "目标协作者 ID"},
-                    "task": {"type": "string", "description": "分配给该协作者的具体任务与要求"}
+                    "task": {"type": "string", "description": "分配给该协作者的具体任务与要求"},
+                    "relevant_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选：主进程已知重点关注的文件路径列表，帮助协作者跳过全局盲目搜索"
+                    },
+                    "pinned_context": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "可选：上下文图钉与行号锚点列表"
+                    },
+                    "acceptance_criteria": {
+                        "type": "string",
+                        "description": "可选：交付验收标准或验证命令"
+                    },
+                    "constraints": {
+                        "type": "string",
+                        "description": "可选：严格禁止项与负向约束"
+                    }
                 },
                 "required": ["collaborator_id", "task"]
             }),
@@ -1882,6 +1918,146 @@ async fn list_plans_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> 
     serde_json::to_string_pretty(&list).map_err(|e| e.to_string())
 }
 
+// ---------- 协同简报组装、双轨交付工件与摘要提炼辅助 ----------
+
+fn build_briefing_packet(
+    db: &rusqlite::Connection,
+    workspace: &Path,
+    parent_id: &str,
+    role: &str,
+    title: &str,
+    task: &str,
+    args: &Value,
+) -> String {
+    let mut packet = format!("【任务协同委派简报】\n- 角色定位：{role}\n- 任务标题：{title}\n- 详细需求描述：\n{task}\n");
+
+    // 1. 全局权威计划与进度切片
+    if let Some((plan_path, meta, body)) = crate::plan::find_plan_file(workspace, parent_id, None, Some(db)) {
+        let rel_path = plan_path.strip_prefix(workspace).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| format!(".harness/plans/{}", plan_path.file_name().and_then(|s| s.to_str()).unwrap_or("plan.md")));
+        let steps = crate::plan::parse_steps_from_markdown(&body);
+        let done_count = steps.iter().filter(|s| s.status == "done").count();
+        let in_progress_step = steps.iter().find(|s| s.status == "in_progress").map(|s| format!("第 {} 步: {}", s.index, s.content)).unwrap_or_else(|| "（推进中）".into());
+
+        packet.push_str(&format!(
+            "\n【项目权威计划与全局约束】\n- 计划文档路径：`{rel_path}` (版本: v{})\n- 计划全局总目标：{}\n- 全局推进状态：执行中 ({}/{})\n- 当前主线阶段：{}\n- 协同准则：本任务为上述权威计划的支撑环节。如需了解全局架构，使用 `read_file` 查阅该计划文件；严禁做出违背该计划的改动或推翻全局设计！\n",
+            meta.version, meta.title, done_count, steps.len(), in_progress_step
+        ));
+    }
+
+    // 2. 重点已知文件（显式传入 或 自动从父会话前序最近读写工具中提取）
+    let mut known_files: Vec<String> = args.get("relevant_files")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string())).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+
+    if known_files.is_empty() {
+        if let Ok(msgs) = crate::store::get_messages(db, parent_id, None, 10) {
+            let mut seen = std::collections::BTreeSet::new();
+            for m in msgs.iter().rev() {
+                for te in &m.tool_events {
+                    if ["read_file", "edit_file", "write_file", "file_outline"].contains(&te.tool_name.as_str()) {
+                        if let Some(p) = te.params.get("path").and_then(|v| v.as_str()) {
+                            if !seen.contains(p) {
+                                seen.insert(p.to_string());
+                                known_files.push(p.to_string());
+                                if known_files.len() >= 5 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if known_files.len() >= 5 {
+                    break;
+                }
+            }
+        }
+    }
+
+    if !known_files.is_empty() {
+        packet.push_str("\n【主进程已知重点文件（请直接定位切入，免去盲目探索）】\n");
+        for f in &known_files {
+            packet.push_str(&format!("- `{f}`\n"));
+        }
+    }
+
+    // 3. 上下文图钉 / 行号锚点 (pinned_context)
+    if let Some(pinned) = args.get("pinned_context").and_then(|v| v.as_array()) {
+        if !pinned.is_empty() {
+            packet.push_str("\n【精确上下文图钉与行号锚点】\n");
+            for item in pinned {
+                if let Some(obj) = item.as_object() {
+                    let p = obj.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                    let lines = obj.get("focus_lines").map(|v| v.to_string()).unwrap_or_default();
+                    let intent = obj.get("intent").and_then(|v| v.as_str()).unwrap_or("");
+                    packet.push_str(&format!("- 文件 `{p}` (关注行: {lines}): {intent}\n"));
+                } else if let Some(s) = item.as_str() {
+                    packet.push_str(&format!("- {s}\n"));
+                }
+            }
+        }
+    }
+
+    // 4. 交付验收标准与严格约束
+    if let Some(ac) = args.get("acceptance_criteria").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
+        packet.push_str(&format!("\n【交付验收标准与验证命令】\n{ac}\n"));
+    }
+    if let Some(c) = args.get("constraints").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
+        packet.push_str(&format!("\n【严格禁止项与负向约束】\n{c}\n"));
+    }
+
+    packet.push_str("\n【施工工人准则】：你作为实施工人，请优先对已知目标文件进行手术级精读（read_file 局部 30~50 行）并完成代码修改或验证；严禁脱离蓝图全库漫游！");
+    packet
+}
+
+fn save_subtask_report_artifact(
+    workspace: &Path,
+    subagent_id: &str,
+    title: &str,
+    role: &str,
+    full_content: &str,
+    touched_files: &[String],
+) -> Result<String, String> {
+    if workspace.as_os_str().is_empty() {
+        return Err("工作区为空".into());
+    }
+    let subtasks_dir = workspace.join(".harness").join("subtasks");
+    let _ = std::fs::create_dir_all(&subtasks_dir);
+    let filename = format!("{}_report.md", subagent_id.replace('-', "_"));
+    let file_path = subtasks_dir.join(&filename);
+
+    let files_section = if touched_files.is_empty() {
+        "无".to_string()
+    } else {
+        touched_files.iter().map(|f| format!("- `{f}`")).collect::<Vec<_>>().join("\n")
+    };
+
+    let report_md = format!(
+        "# 协同任务交付报告: {title}\n\n- **子任务 ID**: `{subagent_id}`\n- **角色定位**: {role}\n- **生成时间**: {}\n- **涉及改动文件**:\n{files_section}\n\n---\n\n## 详细报告与产出内容\n\n{full_content}\n",
+        chrono::Utc::now().to_rfc3339()
+    );
+
+    let _ = std::fs::write(&file_path, report_md).map_err(|e| format!("保存工件失败: {e}"))?;
+    Ok(format!(".harness/subtasks/{}", filename))
+}
+
+fn extract_compact_summary(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut count = 0;
+    let mut end_idx = trimmed.len();
+    for (i, _) in trimmed.char_indices() {
+        if count >= max_chars {
+            end_idx = i;
+            break;
+        }
+        count += 1;
+    }
+    format!("{}...\n\n*(注：内容已自动压缩提炼为决策摘要，完整报告细节请查阅上方工件文件)*", &trimmed[..end_idx])
+}
+
 // ---------- 子 Agent 协作工具具体实现 ----------
 
 async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
@@ -1937,9 +2113,7 @@ async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
                 Some(&params_with_id.to_string()),
             );
         }
-        let initial_prompt = format!(
-            "【子 Agent 协作任务】\n角色定位：{role}\n任务标题：{title}\n工作区根目录：{sub_workspace}\n\n详细需求描述：\n{task}"
-        );
+        let initial_prompt = build_briefing_packet(&db, &ctx.workspace, parent_id, role, title, task, args);
         let user_msg = crate::store::new_message(&db, &sub.id, "user", Some(initial_prompt), false)?;
         (sub, user_msg)
     };
@@ -2117,10 +2291,11 @@ async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
                 }
             }
         }
-        let touched_line = if touched_files.is_empty() {
+        let touched_vec: Vec<String> = touched_files.into_iter().collect();
+        let touched_line = if touched_vec.is_empty() {
             String::new()
         } else {
-            let list = touched_files.into_iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ");
+            let list = touched_vec.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ");
             format!("- 涉及改动文件: {}\n", list)
         };
 
@@ -2147,14 +2322,36 @@ async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
             }
         }
 
+        // 双轨交付：将长文本落地到工件文件 .harness/subtasks/{subagent_id}_report.md
+        let artifact_path_opt = if !ctx.workspace.as_os_str().is_empty() && (display_reply.len() > 250 || display_reply.contains("```") || !touched_vec.is_empty()) {
+            save_subtask_report_artifact(
+                &ctx.workspace,
+                id,
+                &s.title,
+                s.subagent_role.as_deref().unwrap_or("协作助手"),
+                &display_reply,
+                &touched_vec,
+            ).ok()
+        } else {
+            None
+        };
+
+        let compact_summary = extract_compact_summary(&display_reply, 350);
+        let artifact_line = if let Some(ref ap) = artifact_path_opt {
+            format!("- 📄 完整技术报告工件: [查看完整详细报告](file:///{})\n", ap.replace('\\', "/"))
+        } else {
+            String::new()
+        };
+
         out.push_str(&format!(
-            "### 协同子 Agent: {} ({})\n- 状态: {}\n- Token 消耗: {}\n{}- 交付成果与回复：\n```markdown\n{}\n```\n\n",
+            "### 协同子 Agent: {} ({})\n- 状态: {}\n- Token 消耗: {}\n{}{}- 交付核心结论：\n```markdown\n{}\n```\n\n",
             s.title,
             s.subagent_role.as_deref().unwrap_or("协作助手"),
             if is_running { "🟡 仍在运行" } else { "🟢 已完成" },
             s.total_tokens.unwrap_or(0),
             touched_line,
-            display_reply
+            artifact_line,
+            compact_summary
         ));
     }
 
@@ -2194,7 +2391,18 @@ async fn dispatch_collaborator_tool(args: &Value, ctx: &ToolCtx) -> Result<Strin
         return Err(format!("协作者【{}】当前正在运行中，请先调用 wait_collaborators 等待其完成，再指派新任务。", collab.title));
     }
 
-    let user_prompt = format!("【主进程委派任务】\n{task}");
+    let user_prompt = {
+        let db = state.db.lock().unwrap();
+        build_briefing_packet(
+            &db,
+            &ctx.workspace,
+            parent_id,
+            collab.subagent_role.as_deref().unwrap_or("协作者"),
+            &collab.title,
+            task,
+            args,
+        )
+    };
     let user_msg = {
         let db = state.db.lock().unwrap();
         let _ = crate::store::set_kv(&db, collaborator_id, "dispatched_by_parent", "true");
@@ -2305,11 +2513,33 @@ async fn wait_collaborators_tool(args: &Value, ctx: &ToolCtx) -> Result<String, 
                 }
             }
         }
-        let touched_line = if touched_files.is_empty() {
+        let touched_vec: Vec<String> = touched_files.into_iter().collect();
+        let touched_line = if touched_vec.is_empty() {
             String::new()
         } else {
-            let list = touched_files.into_iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ");
+            let list = touched_vec.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ");
             format!("- 涉及改动文件: {}\n", list)
+        };
+
+        // 双轨交付：将长文本落地到工件文件 .harness/subtasks/{collaborator_id}_report.md
+        let artifact_path_opt = if !ctx.workspace.as_os_str().is_empty() && (last_reply.len() > 250 || last_reply.contains("```") || !touched_vec.is_empty()) {
+            save_subtask_report_artifact(
+                &ctx.workspace,
+                id,
+                &s.title,
+                s.subagent_role.as_deref().unwrap_or("协作者"),
+                last_reply,
+                &touched_vec,
+            ).ok()
+        } else {
+            None
+        };
+
+        let compact_summary = extract_compact_summary(last_reply, 350);
+        let artifact_line = if let Some(ref ap) = artifact_path_opt {
+            format!("- 📄 完整技术报告工件: [查看完整详细报告](file:///{})\n", ap.replace('\\', "/"))
+        } else {
+            String::new()
         };
 
         if let Some(m) = last_assistant {
@@ -2317,13 +2547,14 @@ async fn wait_collaborators_tool(args: &Value, ctx: &ToolCtx) -> Result<String, 
         }
 
         out.push_str(&format!(
-            "### 协作者: {} ({})\n- 状态: {}\n- Token 消耗: {}\n{}- 增量产出与结论：\n```markdown\n{}\n```\n\n",
+            "### 协作者: {} ({})\n- 状态: {}\n- Token 消耗: {}\n{}{}- 增量交付结论：\n```markdown\n{}\n```\n\n",
             s.title,
             s.subagent_role.as_deref().unwrap_or("协作者"),
             if is_running { "🟡 仍在运行" } else { "🟢 已完成" },
             s.total_tokens.unwrap_or(0),
             touched_line,
-            last_reply
+            artifact_line,
+            compact_summary
         ));
     }
 
@@ -2694,5 +2925,42 @@ const handleClick = async () => {
         assert!(modified.contains("private int b;"));
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[test]
+    fn test_briefing_packet_and_artifact_summary() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        let ws = std::env::temp_dir().join(format!("harness_test_briefing_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let parent_sess = crate::store::create_session(&conn, &ws.to_string_lossy(), None, "主会话", "standard").unwrap();
+
+        // 1. 测试简报生成
+        let args = json!({
+            "relevant_files": ["src/auth.rs", "src/token.rs"],
+            "acceptance_criteria": "cargo test test_auth",
+            "constraints": "严禁修改外部接口"
+        });
+        let packet = build_briefing_packet(&conn, &ws, &parent_sess.id, "后端工程师", "重构JWT", "实现Token无感刷新", &args);
+        assert!(packet.contains("【任务协同委派简报】"));
+        assert!(packet.contains("src/auth.rs"));
+        assert!(packet.contains("src/token.rs"));
+        assert!(packet.contains("cargo test test_auth"));
+        assert!(packet.contains("严禁修改外部接口"));
+        assert!(packet.contains("【施工工人准则】"));
+
+        // 2. 测试工件保存与紧凑摘要截断
+        let touched = vec!["src/auth.rs".to_string()];
+        let full_text = "A".repeat(800);
+        let artifact_path = save_subtask_report_artifact(&ws, "sub_123", "测试任务", "测试角色", &full_text, &touched).unwrap();
+        assert!(artifact_path.contains(".harness/subtasks/sub_123_report.md"));
+        assert!(ws.join(&artifact_path).exists());
+
+        let summary = extract_compact_summary(&full_text, 100);
+        assert!(summary.len() < 250);
+        assert!(summary.contains("内容已自动压缩提炼"));
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }
