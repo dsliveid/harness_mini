@@ -455,7 +455,7 @@ export function SubprocessView({ subprocessId }: { subprocessId: string }) {
                 <ExecutionProcessBlock
                   key={item.id}
                   steps={item.steps}
-                  isRunning={isRunning && item.steps.some((s) => s.id === msgs[msgs.length - 1]?.id)}
+                  isRunning={Boolean(item.isRunning ?? (isRunning && item.turnMetrics?.isCurrentRunningTurn))}
                   sessionWorkspace={sub?.workspacePath}
                   streamingMsgId={isRunning ? msgs[msgs.length - 1]?.id : undefined}
                   turnMetrics={item.turnMetrics}

@@ -1,6 +1,8 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { currentMessages, useStore } from "../store";
-import type { TodoItem, ToolEvent } from "../types";
+import { ipc } from "../ipc";
+import type { ActivePlanDetail, TodoItem, ToolEvent } from "../types";
+import { Markdown } from "./Markdown";
 import {
   CheckSquare,
   CheckCircle2,
@@ -13,6 +15,7 @@ import {
   ChevronRight,
   Copy,
   Check,
+  X,
 } from "./Icons";
 
 /** 从当前会话消息中提取所有正在执行的 run_command 工具事件 */
@@ -137,20 +140,36 @@ function RunningCommandCard({ ev }: { ev: ToolEvent }) {
 
 export function FloatingTaskPanel() {
   const currentId = useStore((s) => s.currentId);
+  const currentWorkspace = useStore((s) => s.sessions.find((x) => x.id === s.currentId)?.workspacePath || "");
   const isRunning = useStore((s) => (s.currentId ? s.runStatus[s.currentId] === "running" : false));
   const rawTodos: TodoItem[] = useStore((s) => (s.currentId ? s.sessionTodos[s.currentId] ?? [] : []));
   const runningCmds = useRunningCommands();
   const [collapsed, setCollapsed] = useState(false);
+  const [activePlan, setActivePlan] = useState<ActivePlanDetail | null>(null);
+  const [showPlanModal, setShowPlanModal] = useState(false);
 
   // 会话处于空闲/结束态时，自动将历史遗留未收尾的 in_progress 任务视为已完成
   const todos = isRunning
     ? rawTodos
     : rawTodos.map((t) => (t.status === "in_progress" ? { ...t, status: "done" } : t));
 
+  // 获取当前会话关联的活动计划
+  useEffect(() => {
+    if (!currentId) {
+      setActivePlan(null);
+      return;
+    }
+    ipc.getActivePlan(currentId).then(
+      (res) => setActivePlan(res),
+      () => setActivePlan(null)
+    );
+  }, [currentId, isRunning, todos.length]);
+
   const hasTodos = todos.length > 0;
   const hasCmds = runningCmds.length > 0;
+  const hasPlan = activePlan !== null;
 
-  if (!currentId || (!hasTodos && !hasCmds)) return null;
+  if (!currentId || (!hasTodos && !hasCmds && !hasPlan)) return null;
 
   // 收起态：靠右吸附抽屉标签
   if (collapsed) {
@@ -166,6 +185,11 @@ export function FloatingTaskPanel() {
             size={13}
             className="text-inkdim group-hover:text-accent transition-transform duration-150 group-hover:-translate-x-0.5 shrink-0"
           />
+          {hasPlan && (
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 font-medium">
+              📋 计划 v{activePlan.meta.version}
+            </span>
+          )}
           {hasCmds && <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse shrink-0" />}
           {hasTodos && (
             <span className="flex items-center gap-1 font-medium">
@@ -173,15 +197,12 @@ export function FloatingTaskPanel() {
               <span className="font-mono text-[11px]">{doneCnt}/{todos.length}</span>
             </span>
           )}
-          {hasCmds && !hasTodos && (
+          {hasCmds && !hasTodos && !hasPlan && (
             <span className="flex items-center gap-1 text-green-400 font-mono">
               <Terminal size={13} className="shrink-0" />
               <span>{runningCmds.length} 进程</span>
             </span>
           )}
-          <span className="text-[10px] text-inkdim/60 group-hover:text-inkdim/90 transition-colors">
-            {hasTodos && hasCmds ? "任务·进程" : hasTodos ? "任务" : "进程"}
-          </span>
         </button>
       </div>
     );
@@ -189,59 +210,130 @@ export function FloatingTaskPanel() {
 
   // 展开态：靠右贴边抽屉面板
   return (
-    <div className="absolute top-3 right-0 z-20 w-[300px] max-w-[calc(100%-1rem)] rounded-l-2xl bg-panel2/95 backdrop-blur-md border-y border-l border-edge shadow-2xl overflow-hidden select-none animate-in fade-in slide-in-from-right-2 duration-150">
-      {/* 标题栏 */}
-      <div className="flex items-center justify-between px-3.5 py-2.5 border-b border-edge bg-panel/50">
-        <span className="text-[11px] text-ink font-medium flex items-center gap-1.5">
-          {hasTodos && hasCmds ? (
-            <>
-              <CheckSquare size={13} className="text-purple-400" />
-              <span>任务 & 进程</span>
-            </>
-          ) : hasTodos ? (
-            <>
-              <CheckSquare size={13} className="text-purple-400" />
-              <span>任务清单</span>
-            </>
-          ) : (
-            <>
-              <Terminal size={13} className="text-emerald-400" />
-              <span>执行中的进程</span>
-            </>
-          )}
-        </span>
-        <button
-          className="flex items-center gap-1 text-[10px] text-inkdim hover:text-ink px-2 py-0.5 rounded-md hover:bg-panel3 transition-colors cursor-pointer"
-          onClick={() => setCollapsed(true)}
-          title="收起至右侧"
-        >
-          <span>收起</span>
-          <ChevronRight size={12} />
-        </button>
-      </div>
+    <>
+      <div className="absolute top-3 right-0 z-20 w-[310px] max-w-[calc(100%-1rem)] rounded-l-2xl bg-panel2/95 backdrop-blur-md border-y border-l border-edge shadow-2xl overflow-hidden select-none animate-in fade-in slide-in-from-right-2 duration-150">
+        {/* 标题栏 */}
+        <div className="flex items-center justify-between px-3.5 py-2.5 border-b border-edge bg-panel/50">
+          <span className="text-[11px] text-ink font-medium flex items-center gap-1.5">
+            <CheckSquare size={13} className="text-emerald-400" />
+            <span>任务与计划总控</span>
+          </span>
+          <button
+            className="flex items-center gap-1 text-[10px] text-inkdim hover:text-ink px-2 py-0.5 rounded-md hover:bg-panel3 transition-colors cursor-pointer"
+            onClick={() => setCollapsed(true)}
+            title="收起至右侧"
+          >
+            <span>收起</span>
+            <ChevronRight size={12} />
+          </button>
+        </div>
 
-      <div className="px-3.5 py-2.5 flex flex-col gap-2.5 max-h-[min(70vh,480px)] overflow-y-auto">
-        {/* 运行中的控制台进程 */}
-        {hasCmds && (
-          <div className="flex flex-col gap-1.5">
-            {runningCmds.length > 0 && hasTodos && (
+        <div className="px-3.5 py-2.5 flex flex-col gap-2.5 max-h-[min(70vh,480px)] overflow-y-auto">
+          {/* 活动计划卡片 */}
+          {activePlan && (
+            <div className="rounded-xl bg-emerald-500/10 border border-emerald-500/20 p-2.5 text-[11.5px] space-y-1.5">
+              <div className="flex items-center justify-between gap-1.5">
+                <span className="font-semibold text-emerald-400 truncate flex-1 min-w-0" title={activePlan.meta.title}>
+                  📋 {activePlan.meta.title}
+                </span>
+                <span className="font-mono text-[10px] text-emerald-300 bg-emerald-500/20 px-1.5 py-0.5 rounded shrink-0">
+                  v{activePlan.meta.version}
+                </span>
+              </div>
+              <div className="text-[11px] text-inkdim flex items-center justify-between gap-1">
+                <span className="truncate font-mono text-[10px]">{activePlan.filename}</span>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    className="text-emerald-400 hover:text-emerald-300 font-medium hover:underline cursor-pointer"
+                    onClick={() => {
+                      const cleanRel = `.harness/plans/${activePlan.filename}`;
+                      const absPath = currentWorkspace
+                        ? `${currentWorkspace.replace(/\\/g, "/").replace(/\/$/, "")}/${cleanRel}`
+                        : cleanRel;
+                      ipc.openFileViewer({
+                        id: `file:${absPath}`,
+                        type: "file",
+                        title: activePlan.filename,
+                        path: absPath,
+                        workspacePath: currentWorkspace,
+                        sessionId: currentId || undefined,
+                      });
+                    }}
+                    title="以 Markdown 文件形式在独立窗体中查看与编辑方案"
+                  >
+                    方案文档 (MD)
+                  </button>
+                  <button
+                    type="button"
+                    className="text-inkdim hover:text-ink hover:underline cursor-pointer"
+                    onClick={() => setShowPlanModal(true)}
+                  >
+                    弹窗
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 运行中的控制台进程 */}
+          {hasCmds && (
+            <div className="flex flex-col gap-1.5">
               <div className="text-[10px] text-inkdim font-medium flex items-center gap-1">
                 <Terminal size={11} className="text-emerald-400" />
                 <span>控制台进程</span>
               </div>
-            )}
-            {runningCmds.map((ev) => (
-              <RunningCommandCard key={ev.id} ev={ev} />
-            ))}
-          </div>
-        )}
+              {runningCmds.map((ev) => (
+                <RunningCommandCard key={ev.id} ev={ev} />
+              ))}
+            </div>
+          )}
 
-        {/* 分隔线 */}
-        {hasCmds && hasTodos && <div className="border-t border-edge" />}
+          {/* 分隔线 */}
+          {hasCmds && hasTodos && <div className="border-t border-edge" />}
 
-        {/* 任务清单 */}
-        {hasTodos && <TodoSection todos={todos} isRunning={isRunning} />}
+          {/* 任务清单 */}
+          {hasTodos && <TodoSection todos={todos} isRunning={isRunning} />}
+        </div>
       </div>
-    </div>
+
+      {/* 完整方案预览弹窗 */}
+      {showPlanModal && activePlan && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-150">
+          <div className="bg-panel rounded-2xl border border-edge shadow-2xl max-w-2xl w-full max-h-[85vh] flex flex-col overflow-hidden">
+            <div className="flex items-center justify-between px-5 py-3.5 border-b border-edge bg-panel2/60">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="text-sm font-semibold text-ink truncate">
+                  {activePlan.meta.title}
+                </span>
+                <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                  v{activePlan.meta.version}
+                </span>
+              </div>
+              <button
+                type="button"
+                className="p-1 rounded-lg hover:bg-panel3 text-inkdim hover:text-ink transition-colors cursor-pointer"
+                onClick={() => setShowPlanModal(false)}
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="p-5 overflow-y-auto flex-1 select-text space-y-3">
+              <Markdown content={activePlan.body} />
+            </div>
+            <div className="px-5 py-3 border-t border-edge bg-panel2/40 flex justify-between items-center text-[11px] text-inkdim">
+              <span className="font-mono">文件：.harness/plans/{activePlan.filename}</span>
+              <button
+                type="button"
+                className="px-3 py-1.5 rounded-lg bg-panel3 hover:bg-edge text-ink text-xs transition-colors cursor-pointer"
+                onClick={() => setShowPlanModal(false)}
+              >
+                关闭
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }

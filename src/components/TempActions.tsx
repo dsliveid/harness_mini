@@ -11,6 +11,7 @@ import {
   Wind,
   ChevronRight,
   ChevronLeft,
+  ExternalLink,
 } from "./Icons";
 
 /**
@@ -139,6 +140,38 @@ export function TempActions() {
             {info?.changedCount ?? 0}
           </span>
         )}
+      </button>
+      <button
+        className={cls(!exists || !hasChanges)}
+        disabled={!exists || !hasChanges}
+        title="在独立窗体中并排对比查看变更"
+        onClick={async () => {
+          if (!session) return;
+          try {
+            const list = await ipc.listTempChanges(session.id);
+            const first = list.projects[0]?.files[0];
+            if (first) {
+              ipc.openFileViewer({
+                id: `diff:${first.path}`,
+                type: "diff",
+                title: `Diff: ${first.name}`,
+                subtitle: first.path,
+                path: first.path,
+                diffSource: "temp",
+                projectKey: list.projects[0].key,
+                sessionId: session.id,
+                workspacePath: session.workspacePath,
+              });
+            } else {
+              pushToast("暂无变更文件");
+            }
+          } catch (e) {
+            pushToast(String(e));
+          }
+        }}
+      >
+        <ExternalLink size={13} className="text-accent shrink-0" />
+        <span>独立窗体</span>
       </button>
       <button
         className={cls(!exists)}

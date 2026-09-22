@@ -54,7 +54,8 @@ fn init(conn: &Connection) -> Result<(), String> {
           created_at TEXT NOT NULL,
           constraints TEXT NOT NULL DEFAULT '',
           sop_verify_cmd TEXT,
-          sop_enabled INTEGER NOT NULL DEFAULT 1
+          sop_enabled INTEGER NOT NULL DEFAULT 1,
+          plan_mode TEXT NOT NULL DEFAULT 'standard'
         );
 
         CREATE TABLE IF NOT EXISTS project_links (
@@ -167,6 +168,36 @@ fn init(conn: &Connection) -> Result<(), String> {
           created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_session_compactions_session ON session_compactions(session_id);
+
+        CREATE TABLE IF NOT EXISTS long_tasks (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          workspace_path TEXT NOT NULL,
+          goal TEXT NOT NULL,
+          status TEXT NOT NULL,
+          current_subtask_index INTEGER NOT NULL DEFAULT 0,
+          subtasks_json TEXT NOT NULL DEFAULT '[]',
+          max_budget_tokens INTEGER,
+          total_tokens_used INTEGER NOT NULL DEFAULT 0,
+          current_step INTEGER NOT NULL DEFAULT 0,
+          max_steps INTEGER NOT NULL DEFAULT 50,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_long_tasks_session ON long_tasks(session_id, status);
+
+        CREATE TABLE IF NOT EXISTS task_checkpoints (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES long_tasks(id) ON DELETE CASCADE,
+          step_number INTEGER NOT NULL,
+          subtask_id TEXT,
+          status TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          working_memory TEXT NOT NULL,
+          git_commit_hash TEXT,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_checkpoints_task ON task_checkpoints(task_id, step_number);
         "#,
     )
     .map_err(|e| e.to_string())?;
@@ -200,6 +231,7 @@ fn init(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "projects", "constraints", "constraints TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "projects", "sop_verify_cmd", "sop_verify_cmd TEXT")?;
     ensure_column(conn, "projects", "sop_enabled", "sop_enabled INTEGER NOT NULL DEFAULT 1")?;
+    ensure_column(conn, "projects", "plan_mode", "plan_mode TEXT NOT NULL DEFAULT 'standard'")?;
     // 临时空间对话字段
     ensure_column(conn, "sessions", "is_temp", "is_temp INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "sessions", "temp_code", "temp_code TEXT")?;
@@ -466,7 +498,8 @@ pub fn list_projects(conn: &Connection) -> Result<Vec<Project>, String> {
         .prepare(
             "SELECT p.id, p.name, p.path, p.pinned, p.created_at, p.constraints,
                     p.sop_verify_cmd, p.sop_enabled,
-                    (SELECT MAX(s.last_message_at) FROM sessions s WHERE s.project_id = p.id)
+                    (SELECT MAX(s.last_message_at) FROM sessions s WHERE s.project_id = p.id),
+                    COALESCE(p.plan_mode, 'standard')
              FROM projects p",
         )
         .map_err(|e| e.to_string())?;
@@ -482,6 +515,7 @@ pub fn list_projects(conn: &Connection) -> Result<Vec<Project>, String> {
                 sop_verify_cmd: r.get(6)?,
                 sop_enabled: r.get::<_, Option<i64>>(7)?.unwrap_or(1) != 0,
                 last_activity_at: r.get(8)?,
+                plan_mode: r.get::<_, Option<String>>(9)?.unwrap_or_else(|| "standard".into()),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -490,7 +524,7 @@ pub fn list_projects(conn: &Connection) -> Result<Vec<Project>, String> {
 
 pub fn get_project(conn: &Connection, id: &str) -> Result<Option<Project>, String> {
     conn.query_row(
-        "SELECT id, name, path, pinned, created_at, constraints, sop_verify_cmd, sop_enabled FROM projects WHERE id = ?1",
+        "SELECT id, name, path, pinned, created_at, constraints, sop_verify_cmd, sop_enabled, COALESCE(plan_mode, 'standard') FROM projects WHERE id = ?1",
         params![id],
         |r| {
             Ok(Project {
@@ -503,6 +537,7 @@ pub fn get_project(conn: &Connection, id: &str) -> Result<Option<Project>, Strin
                 sop_verify_cmd: r.get(6)?,
                 sop_enabled: r.get::<_, Option<i64>>(7)?.unwrap_or(1) != 0,
                 last_activity_at: None,
+                plan_mode: r.get::<_, Option<String>>(8)?.unwrap_or_else(|| "standard".into()),
             })
         },
     )
@@ -521,9 +556,10 @@ pub fn create_project(conn: &Connection, name: &str, path: Option<&str>) -> Resu
         constraints: String::new(),
         sop_verify_cmd: None,
         sop_enabled: true,
+        plan_mode: "standard".to_string(),
     };
     conn.execute(
-        "INSERT INTO projects(id, name, path, pinned, created_at, constraints, sop_verify_cmd, sop_enabled) VALUES(?1,?2,?3,0,?4,'',NULL,1)",
+        "INSERT INTO projects(id, name, path, pinned, created_at, constraints, sop_verify_cmd, sop_enabled, plan_mode) VALUES(?1,?2,?3,0,?4,'',NULL,1,'standard')",
         params![p.id, p.name, p.path, p.created_at],
     )
     .map_err(|e| e.to_string())?;
@@ -576,6 +612,24 @@ pub fn set_project_sop(
     Ok(())
 }
 
+/// 设置项目任务规划与执行策略模式："standard" | "always_plan" | "always_proceed"
+pub fn set_project_plan_mode(
+    conn: &Connection,
+    id: &str,
+    mode: &str,
+) -> Result<(), String> {
+    let m = match mode {
+        "always_plan" | "always_proceed" => mode,
+        _ => "standard",
+    };
+    conn.execute(
+        "UPDATE projects SET plan_mode = ?2 WHERE id = ?1",
+        params![id, m],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,8 +677,10 @@ mod tests {
         ensure_column(&conn, "projects", "constraints", "constraints TEXT NOT NULL DEFAULT ''").unwrap();
         ensure_column(&conn, "projects", "sop_verify_cmd", "sop_verify_cmd TEXT").unwrap();
         ensure_column(&conn, "projects", "sop_enabled", "sop_enabled INTEGER NOT NULL DEFAULT 1").unwrap();
+        ensure_column(&conn, "projects", "plan_mode", "plan_mode TEXT NOT NULL DEFAULT 'standard'").unwrap();
         let p = create_project(&conn, "demo", Some("D:\\demo")).unwrap();
         assert_eq!(p.path.as_deref(), Some("D:\\demo"));
+        assert_eq!(p.plan_mode, "standard");
     }
 
     #[test]
@@ -644,6 +700,27 @@ mod tests {
         let updated2 = get_project(&conn, &p.id).unwrap().unwrap();
         assert_eq!(updated2.sop_verify_cmd, None);
         assert!(!updated2.sop_enabled);
+    }
+
+    #[test]
+    fn test_project_plan_mode_crud() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let p = create_project(&conn, "plan_mode_demo", None).unwrap();
+        assert_eq!(p.plan_mode, "standard");
+
+        set_project_plan_mode(&conn, &p.id, "always_plan").unwrap();
+        let updated = get_project(&conn, &p.id).unwrap().unwrap();
+        assert_eq!(updated.plan_mode, "always_plan");
+
+        set_project_plan_mode(&conn, &p.id, "always_proceed").unwrap();
+        let updated2 = get_project(&conn, &p.id).unwrap().unwrap();
+        assert_eq!(updated2.plan_mode, "always_proceed");
+
+        // 非法值 fallback 为 standard
+        set_project_plan_mode(&conn, &p.id, "invalid_mode").unwrap();
+        let updated3 = get_project(&conn, &p.id).unwrap().unwrap();
+        assert_eq!(updated3.plan_mode, "standard");
     }
 
     #[test]
@@ -3114,6 +3191,10 @@ pub fn cleanup_orphaned_running_states(conn: &Connection) -> Result<(), String> 
         [],
     )
     .map_err(|e| e.to_string())?;
+    let _ = conn.execute(
+        "UPDATE long_tasks SET status = 'paused', updated_at = ?1 WHERE status IN ('running', 'planning')",
+        params![now()],
+    );
     Ok(())
 }
 
@@ -3759,5 +3840,249 @@ pub fn get_token_stats(
         by_session,
     })
 }
+
+// ==================== 长任务（Long-Running Task）存储接口 ====================
+
+pub fn create_long_task(conn: &Connection, task: &LongTask) -> Result<(), String> {
+    let subtasks_json = serde_json::to_string(&task.subtasks).unwrap_or_else(|_| "[]".to_string());
+    conn.execute(
+        "INSERT INTO long_tasks (
+            id, session_id, workspace_path, goal, status,
+            current_subtask_index, subtasks_json, max_budget_tokens,
+            total_tokens_used, current_step, max_steps, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            task.id,
+            task.session_id,
+            task.workspace_path,
+            task.goal,
+            task.status,
+            task.current_subtask_index as i64,
+            subtasks_json,
+            task.max_budget_tokens.map(|b| b as i64),
+            task.total_tokens_used as i64,
+            task.current_step as i64,
+            task.max_steps as i64,
+            task.created_at,
+            task.updated_at,
+        ],
+    )
+    .map_err(|e| format!("创建长任务失败: {e}"))?;
+    Ok(())
+}
+
+pub fn get_long_task(conn: &Connection, id: &str) -> Result<Option<LongTask>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, workspace_path, goal, status,
+                    current_subtask_index, subtasks_json, max_budget_tokens,
+                    total_tokens_used, current_step, max_steps, created_at, updated_at
+             FROM long_tasks WHERE id = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let res = stmt
+        .query_row(params![id], |r| {
+            let subtasks_str: String = r.get(6)?;
+            let subtasks: Vec<TaskSubItem> = serde_json::from_str(&subtasks_str).unwrap_or_default();
+            let budget_tok: Option<i64> = r.get(7)?;
+            let total_tok: i64 = r.get(8)?;
+            let cur_step: i64 = r.get(9)?;
+            let max_s: i64 = r.get(10)?;
+            let cur_sub_idx: i64 = r.get(5)?;
+            Ok(LongTask {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                workspace_path: r.get(2)?,
+                goal: r.get(3)?,
+                status: r.get(4)?,
+                current_subtask_index: cur_sub_idx as usize,
+                subtasks,
+                max_budget_tokens: budget_tok.map(|b| b as u64),
+                total_tokens_used: total_tok as u64,
+                current_step: cur_step as usize,
+                max_steps: max_s as usize,
+                created_at: r.get(11)?,
+                updated_at: r.get(12)?,
+            })
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    Ok(res)
+}
+
+pub fn get_active_long_task(conn: &Connection, session_id: &str) -> Result<Option<LongTask>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, workspace_path, goal, status,
+                    current_subtask_index, subtasks_json, max_budget_tokens,
+                    total_tokens_used, current_step, max_steps, created_at, updated_at
+             FROM long_tasks
+             WHERE session_id = ?1 AND status IN ('planning', 'running', 'paused', 'waiting_approval')
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let res = stmt
+        .query_row(params![session_id], |r| {
+            let subtasks_str: String = r.get(6)?;
+            let subtasks: Vec<TaskSubItem> = serde_json::from_str(&subtasks_str).unwrap_or_default();
+            let budget_tok: Option<i64> = r.get(7)?;
+            let total_tok: i64 = r.get(8)?;
+            let cur_step: i64 = r.get(9)?;
+            let max_s: i64 = r.get(10)?;
+            let cur_sub_idx: i64 = r.get(5)?;
+            Ok(LongTask {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                workspace_path: r.get(2)?,
+                goal: r.get(3)?,
+                status: r.get(4)?,
+                current_subtask_index: cur_sub_idx as usize,
+                subtasks,
+                max_budget_tokens: budget_tok.map(|b| b as u64),
+                total_tokens_used: total_tok as u64,
+                current_step: cur_step as usize,
+                max_steps: max_s as usize,
+                created_at: r.get(11)?,
+                updated_at: r.get(12)?,
+            })
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    Ok(res)
+}
+
+pub fn update_long_task(conn: &Connection, task: &LongTask) -> Result<(), String> {
+    let subtasks_json = serde_json::to_string(&task.subtasks).unwrap_or_else(|_| "[]".to_string());
+    conn.execute(
+        "UPDATE long_tasks SET
+            status = ?1,
+            current_subtask_index = ?2,
+            subtasks_json = ?3,
+            total_tokens_used = ?4,
+            current_step = ?5,
+            max_steps = ?6,
+            updated_at = ?7
+         WHERE id = ?8",
+        params![
+            task.status,
+            task.current_subtask_index as i64,
+            subtasks_json,
+            task.total_tokens_used as i64,
+            task.current_step as i64,
+            task.max_steps as i64,
+            task.updated_at,
+            task.id,
+        ],
+    )
+    .map_err(|e| format!("更新长任务失败: {e}"))?;
+    Ok(())
+}
+
+pub fn update_long_task_status(conn: &Connection, task_id: &str, status: &str) -> Result<(), String> {
+    let now = now();
+    conn.execute(
+        "UPDATE long_tasks SET status = ?1, updated_at = ?2 WHERE id = ?3",
+        params![status, now, task_id],
+    )
+    .map_err(|e| format!("更新长任务状态失败: {e}"))?;
+    Ok(())
+}
+
+pub fn save_task_checkpoint(conn: &Connection, cp: &TaskCheckpoint) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO task_checkpoints (
+            id, task_id, step_number, subtask_id, status,
+            summary, working_memory, git_commit_hash, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            cp.id,
+            cp.task_id,
+            cp.step_number as i64,
+            cp.subtask_id,
+            cp.status,
+            cp.summary,
+            cp.working_memory,
+            cp.git_commit_hash,
+            cp.created_at,
+        ],
+    )
+    .map_err(|e| format!("保存任务检查点失败: {e}"))?;
+    Ok(())
+}
+
+pub fn list_task_checkpoints(conn: &Connection, task_id: &str) -> Result<Vec<TaskCheckpoint>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, task_id, step_number, subtask_id, status,
+                    summary, working_memory, git_commit_hash, created_at
+             FROM task_checkpoints
+             WHERE task_id = ?1
+             ORDER BY step_number ASC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let rows = stmt
+        .query_map(params![task_id], |r| {
+            let step_num: i64 = r.get(2)?;
+            Ok(TaskCheckpoint {
+                id: r.get(0)?,
+                task_id: r.get(1)?,
+                step_number: step_num as usize,
+                subtask_id: r.get(3)?,
+                status: r.get(4)?,
+                summary: r.get(5)?,
+                working_memory: r.get(6)?,
+                git_commit_hash: r.get(7)?,
+                created_at: r.get(8)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut list = Vec::new();
+    for r in rows {
+        if let Ok(cp) = r {
+            list.push(cp);
+        }
+    }
+    Ok(list)
+}
+
+#[allow(dead_code)]
+pub fn get_latest_checkpoint(conn: &Connection, task_id: &str) -> Result<Option<TaskCheckpoint>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, task_id, step_number, subtask_id, status,
+                    summary, working_memory, git_commit_hash, created_at
+             FROM task_checkpoints
+             WHERE task_id = ?1
+             ORDER BY step_number DESC LIMIT 1",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let res = stmt
+        .query_row(params![task_id], |r| {
+            let step_num: i64 = r.get(2)?;
+            Ok(TaskCheckpoint {
+                id: r.get(0)?,
+                task_id: r.get(1)?,
+                step_number: step_num as usize,
+                subtask_id: r.get(3)?,
+                status: r.get(4)?,
+                summary: r.get(5)?,
+                working_memory: r.get(6)?,
+                git_commit_hash: r.get(7)?,
+                created_at: r.get(8)?,
+            })
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    Ok(res)
+}
+
 
 

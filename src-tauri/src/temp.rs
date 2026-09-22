@@ -1610,6 +1610,7 @@ mod tests {
             constraints: String::new(),
             sop_verify_cmd: None,
             sop_enabled: true,
+            plan_mode: "standard".to_string(),
         };
         let links = vec![
             ProjectLink { id: "l1".into(), project_id: "p1".into(), path: "D:\\libs\\core".into(), description: "工具库".into(), created_at: String::new() },

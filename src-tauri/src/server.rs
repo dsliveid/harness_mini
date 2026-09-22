@@ -251,6 +251,12 @@ pub async fn dispatch_rpc(
             commands::set_project_constraints(st, app.clone(), id, constraints)?;
             Ok(Value::Null)
         }
+        "set_project_plan_mode" => {
+            let id = params.get("id").and_then(|v| v.as_str()).ok_or("缺少 id")?.to_string();
+            let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("standard").to_string();
+            commands::set_project_plan_mode(st, app.clone(), id, mode)?;
+            Ok(Value::Null)
+        }
         "list_project_links" => {
             let project_id = params.get("projectId").and_then(|v| v.as_str()).ok_or("缺少 projectId")?.to_string();
             let res = commands::list_project_links(st, project_id)?;

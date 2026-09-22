@@ -7,6 +7,7 @@ import {
   Wrench,
   Clock,
   Coins,
+  Brain,
 } from "./Icons";
 
 export type GroupedTimelineItem =
@@ -17,10 +18,12 @@ export type GroupedTimelineItem =
       id: string;
       steps: Message[];
       turnMetrics?: TurnMetrics;
+      isRunning?: boolean;
     };
 
 /**
  * 将平铺的时间线消息按轮次聚合成：用户提问 -> 中间执行过程 (多步折叠) -> 最终交付成果
+ * 方案 B：执行与思考过程全内置于抽屉内流式生长，运行期间全程保持展开与稳态，任务彻底完成后自动折叠
  */
 export function groupTimelineItems(
   items: (
@@ -28,70 +31,172 @@ export function groupTimelineItems(
     | { type: "compaction"; compaction: SessionCompaction }
   )[],
   turnMetricsMap: Map<string, TurnMetrics>,
-  _running: boolean
+  running: boolean
 ): GroupedTimelineItem[] {
   const result: GroupedTimelineItem[] = [];
   let currentAssistantSteps: Message[] = [];
 
-  const flushAssistantSteps = () => {
+  const hasAnyTools = (msg: Message) =>
+    (msg.toolEvents?.length ?? 0) > 0 ||
+    (Array.isArray(msg.toolCalls) && msg.toolCalls.length > 0);
+
+  const hasAnyReasoning = (msg: Message) =>
+    Boolean(msg.reasoning && msg.reasoning.trim().length > 0);
+
+  // 定位整个时间线中最后一条 assistant 消息的绝对索引
+  let lastAssistantIdx = -1;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    if (it.type === "message" && it.msg.role === "assistant") {
+      lastAssistantIdx = i;
+      break;
+    }
+  }
+
+  const flushAssistantSteps = (isCurrentRunningTurn: boolean) => {
     if (currentAssistantSteps.length === 0) return;
 
-    // 单步 assistant 消息：直接普通消息呈现
-    if (currentAssistantSteps.length === 1) {
+    // ----------------------------------------------------
+    // 场景 1：当前轮次正在运行中 (running === true 且是当前活跃尾部轮次)
+    // ----------------------------------------------------
+    if (isCurrentRunningTurn) {
+      const hasProcessNature =
+        currentAssistantSteps.length > 1 ||
+        currentAssistantSteps.some((m) => hasAnyTools(m) || hasAnyReasoning(m));
+
+      if (hasProcessNature) {
+        // 方案 B 核心：一旦具备执行或思考特征，所有步骤自始至终稳定挂载在同一个抽屉内，流式打字与步骤递增全部内置，绝不在外面闪现
+        const firstId = currentAssistantSteps[0].id;
+        const lastMsg = currentAssistantSteps[currentAssistantSteps.length - 1];
+        const metrics =
+          turnMetricsMap.get(lastMsg.id) ?? turnMetricsMap.get(firstId);
+
+        result.push({
+          type: "process",
+          id: `process-${firstId}`,
+          steps: currentAssistantSteps,
+          turnMetrics: metrics,
+          isRunning: true,
+        });
+        currentAssistantSteps = [];
+        return;
+      }
+
+      // 纯单步极简普通文本流式（无工具、无思考）：直接在外部作为普通消息流式呈现
       result.push({ type: "message", msg: currentAssistantSteps[0] });
       currentAssistantSteps = [];
       return;
     }
 
-    // 多步 assistant 消息：
-    // 判断最后一条消息是否为没有工具调用的交付结果
+    // ----------------------------------------------------
+    // 场景 2：轮次已完结态 (Completed Turn)
+    // ----------------------------------------------------
+    // 2.1 单步 assistant 消息
+    if (currentAssistantSteps.length === 1) {
+      const singleMsg = currentAssistantSteps[0];
+      const hasTools = hasAnyTools(singleMsg);
+      const hasReasoning = hasAnyReasoning(singleMsg);
+
+      if (hasTools) {
+        // 单步工具调用：放入已完成折叠抽屉
+        const metrics = turnMetricsMap.get(singleMsg.id);
+        result.push({
+          type: "process",
+          id: `process-${singleMsg.id}`,
+          steps: [singleMsg],
+          turnMetrics: metrics,
+          isRunning: false,
+        });
+      } else if (hasReasoning && singleMsg.content && singleMsg.content.trim().length > 0) {
+        // 单步同时具备思考过程与回复正文：思考过程收归抽屉并默认折叠，外部仅留干净的正文交付
+        const metrics = turnMetricsMap.get(singleMsg.id);
+        result.push({
+          type: "process",
+          id: `process-${singleMsg.id}`,
+          steps: [{ ...singleMsg, id: `${singleMsg.id}-reasoning`, content: null, toolEvents: [], toolCalls: [] }],
+          turnMetrics: metrics,
+          isRunning: false,
+        });
+        result.push({
+          type: "message",
+          msg: { ...singleMsg, reasoning: null },
+        });
+      } else {
+        // 纯单步普通文本答复
+        result.push({ type: "message", msg: singleMsg });
+      }
+      currentAssistantSteps = [];
+      return;
+    }
+
+    // 2.2 多步 assistant 消息
     const lastMsg = currentAssistantSteps[currentAssistantSteps.length - 1];
-    const lastHasTools =
-      (lastMsg.toolEvents?.length ?? 0) > 0 ||
-      (Array.isArray(lastMsg.toolCalls) && lastMsg.toolCalls.length > 0);
+    const lastHasTools = hasAnyTools(lastMsg);
+    const lastHasReasoning = hasAnyReasoning(lastMsg);
 
     if (!lastHasTools) {
-      // 最后一条是无工具的最终答复：前面所有消息收拢进执行过程，最后一条独立作为最终结果
+      // 最后一条是无工具的交付答复：前序所有步骤（以及最后一条的思考过程，若有）收拢入执行过程，正文作为外部交付成果
       const processSteps = currentAssistantSteps.slice(0, currentAssistantSteps.length - 1);
+      if (lastHasReasoning) {
+        processSteps.push({
+          ...lastMsg,
+          id: `${lastMsg.id}-reasoning`,
+          content: null,
+          toolEvents: [],
+          toolCalls: [],
+        });
+      }
+
       const metrics =
         turnMetricsMap.get(lastMsg.id) ?? turnMetricsMap.get(processSteps[0]?.id);
+
       result.push({
         type: "process",
         id: `process-${processSteps[0].id}`,
         steps: processSteps,
         turnMetrics: metrics,
+        isRunning: false,
       });
-      result.push({ type: "message", msg: lastMsg });
+
+      result.push({
+        type: "message",
+        msg: { ...lastMsg, reasoning: null },
+      });
     } else {
-      // 全部消息均包含工具调用（如正在多步执行中，或中断在工具调用步骤）
+      // 整轮所有步骤均包含工具调用（如中断在工具执行）
       const metrics =
         turnMetricsMap.get(lastMsg.id) ??
         turnMetricsMap.get(currentAssistantSteps[0]?.id);
+
       result.push({
         type: "process",
         id: `process-${currentAssistantSteps[0].id}`,
         steps: currentAssistantSteps,
         turnMetrics: metrics,
+        isRunning: false,
       });
     }
 
     currentAssistantSteps = [];
   };
 
-  for (const item of items) {
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
     if (item.type === "compaction") {
-      flushAssistantSteps();
+      flushAssistantSteps(false);
       result.push(item);
     } else if (item.msg.role === "assistant") {
       currentAssistantSteps.push(item.msg);
     } else {
-      // user 消息或其他角色
-      flushAssistantSteps();
+      // user 消息或其他非 assistant 角色
+      flushAssistantSteps(false);
       result.push(item);
     }
   }
 
-  flushAssistantSteps();
+  // 处理时间线尾部的当前轮次
+  const isTailActive = running && lastAssistantIdx >= 0;
+  flushAssistantSteps(isTailActive);
   return result;
 }
 
@@ -178,12 +283,16 @@ export function ExecutionProcessBlock({
           />
           {isRunning ? (
             <Loader2 size={15} className="text-blue-400 animate-spin shrink-0" />
+          ) : toolCount === 0 ? (
+            <Brain size={15} className="text-purple-400 shrink-0" />
           ) : (
             <Wrench size={15} className="text-accent shrink-0" />
           )}
           <span className="text-[13px] font-medium text-ink truncate">
             {isRunning
-              ? `正在执行第 ${stepCount} 步…`
+              ? (toolCount === 0 && stepCount === 1 ? "正在思考与回复…" : `正在执行第 ${stepCount} 步…`)
+              : toolCount === 0
+              ? `思考过程 (${stepCount} 个步骤)`
               : `执行过程 (${stepCount} 个步骤)`}
           </span>
           {toolCount > 0 && (

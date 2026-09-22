@@ -20,6 +20,43 @@ export interface TodoItem {
   status: "pending" | "in_progress" | "done" | string;
 }
 
+export interface PlanMeta {
+  id: string;
+  title: string;
+  status: "drafting" | "in_progress" | "completed" | "suspended" | "archived" | string;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  session_id: string;
+}
+
+export interface PlanStep {
+  index: number;
+  content: string;
+  status: "pending" | "in_progress" | "done" | string;
+}
+
+export interface PlanSummary {
+  id: string;
+  title: string;
+  status: string;
+  version: number;
+  filename: string;
+  created_at: string;
+  updated_at: string;
+  session_id: string;
+  total_steps: number;
+  completed_steps: number;
+  is_active: boolean;
+}
+
+export interface ActivePlanDetail {
+  meta: PlanMeta;
+  filename: string;
+  body: string;
+  steps: PlanStep[];
+}
+
 export interface ToolInfo {
   name: string;
   description: string;
@@ -59,11 +96,11 @@ export interface AgentSopInfo {
 export const AGENT_SOPS: AgentSopInfo[] = [
   {
     id: "plan_first",
-    name: "方案先行规范",
+    name: "方案先行与计划中枢规范",
     category: "thinking",
     categoryLabel: "思考范式",
-    description: "面对新功能开发、需求实现、架构重构或技术探索时，必须先分析可行性、梳理技术依赖并给出推荐方案向用户征询确认；在用户明确确认前，切勿擅自修改或新增代码文件。",
-    disableEffect: "禁用后：Agent 在接到开发任务后可直接开始写代码，无需先出方案征询确认。",
+    description: "面对大改动任务（3个以上文件）或多轮需求，在 .harness/plans/ 自动建立结构化计划 MD 文档；需求变更时优先更新计划，后续严格根据计划分步执行，防止多轮需求失真与遗忘。",
+    disableEffect: "禁用后：Agent 接到任务后可直接编写代码，不强制在 .harness/plans/ 建立结构化方案文档。",
   },
   {
     id: "memory_distill",
@@ -107,6 +144,8 @@ export const AGENT_SOPS: AgentSopInfo[] = [
   },
 ];
 
+export type PlanMode = "standard" | "always_plan" | "always_proceed";
+
 export interface Project {
   id: string;
   name: string;
@@ -119,6 +158,8 @@ export interface Project {
   constraints?: string | null;
   sopVerifyCmd?: string | null;
   sopEnabled?: boolean;
+  /** 任务规划与执行策略模式："standard" | "always_plan" | "always_proceed" */
+  planMode?: PlanMode;
 }
 
 /** 关联项目：对另一目录的引用 + 说明；对方项目实体存在且已设约束时，其约束一并注入 */
@@ -1075,6 +1116,123 @@ export interface SessionActiveState {
   pendingApproval: ApprovalReq | null;
   pendingCompaction: CompactionReq | null;
 }
+
+// ---------- 文件与变更查看器类型 ----------
+
+export interface FileTextContent {
+  path: string;
+  name: string;
+  content: string;
+  sizeBytes: number;
+  linesCount: number;
+  isBinary: boolean;
+  isTruncated: boolean;
+  language: string;
+}
+
+export type ViewerTabType = "file" | "plan" | "diff" | "image";
+
+export interface BaseViewerTab {
+  id: string;
+  type: ViewerTabType;
+  title: string;
+  subtitle?: string;
+  workspacePath?: string;
+  pinned?: boolean;
+}
+
+export interface FileViewerTab extends BaseViewerTab {
+  type: "file";
+  path: string;
+  highlightLine?: number;
+  highlightRange?: { start: number; end?: number };
+  sessionId?: string;
+}
+
+export interface ImageViewerTab extends BaseViewerTab {
+  type: "image";
+  path: string;
+}
+
+export interface PlanViewerTab extends BaseViewerTab {
+  type: "plan";
+  planId?: string;
+  sessionId?: string;
+  filename?: string;
+}
+
+export interface DiffViewerTab extends BaseViewerTab {
+  type: "diff";
+  diffSource: "temp" | "git" | "custom";
+  path: string;
+  projectKey?: string;
+  sessionId?: string;
+  oldContent?: string;
+  newContent?: string;
+  defaultMode?: "unified" | "split";
+}
+
+export type ViewerTabItem = FileViewerTab | PlanViewerTab | DiffViewerTab | ImageViewerTab;
+
+export interface FileOutlineItem {
+  line: number;
+  symbol: string;
+  kind: string;
+}
+
+// ==================== 长任务（Long-Running Task）类型定义 ====================
+
+export type LongTaskStatus =
+  | "planning"
+  | "running"
+  | "paused"
+  | "waiting_approval"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | string;
+
+export interface TaskSubItem {
+  id: string;
+  index: number;
+  title: string;
+  description?: string | null;
+  status: "pending" | "in_progress" | "verifying" | "completed" | "failed" | "skipped" | string;
+  summary?: string | null;
+  error?: string | null;
+  verifyCommand?: string | null;
+  verifyOutput?: string | null;
+}
+
+export interface LongTask {
+  id: string;
+  sessionId: string;
+  workspacePath: string;
+  goal: string;
+  status: LongTaskStatus;
+  currentSubtaskIndex: number;
+  subtasks: TaskSubItem[];
+  maxBudgetTokens?: number | null;
+  totalTokensUsed: number;
+  currentStep: number;
+  maxSteps: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TaskCheckpoint {
+  id: string;
+  taskId: string;
+  stepNumber: number;
+  subtaskId?: string | null;
+  status: string;
+  summary: string;
+  workingMemory: string;
+  gitCommitHash?: string | null;
+  createdAt: string;
+}
+
+
 
 
 

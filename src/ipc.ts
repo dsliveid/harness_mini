@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, DataStatus, GrowthItem, Message, MergeSummary, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo } from "./types";
+import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, DataStatus, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem } from "./types";
 
 export const ipc = {
   getSettings: () => invoke<Settings>("get_settings"),
@@ -20,9 +20,11 @@ export const ipc = {
   setProjectPinned: (id: string, pinned: boolean) =>
     invoke<void>("set_project_pinned", { id, pinned }),
 
-  // 项目设置：项目约束 / 关联项目
+  // 项目设置：项目约束 / 执行策略 / 关联项目
   setProjectConstraints: (id: string, constraints: string) =>
     invoke<void>("set_project_constraints", { id, constraints }),
+  setProjectPlanMode: (id: string, mode: string) =>
+    invoke<void>("set_project_plan_mode", { id, mode }),
   listProjectLinks: (projectId: string) =>
     invoke<ProjectLink[]>("list_project_links", { projectId }),
   addProjectLink: (projectId: string, path: string, description: string) =>
@@ -260,7 +262,85 @@ export const ipc = {
   getSessionActiveState: (sessionId: string) =>
     invoke<SessionActiveState>("get_session_active_state", { sessionId }),
   readFileBase64: (path: string) => invoke<string>("read_file_base64", { path }),
+
+  // 任务方案计划中枢 (Plans)
+  getActivePlan: (sessionId: string) =>
+    invoke<ActivePlanDetail | null>("get_active_plan", { sessionId }),
+  listWorkspacePlans: (workspacePath: string, sessionId?: string | null, includeArchived?: boolean) =>
+    invoke<PlanSummary[]>("list_workspace_plans", {
+      workspacePath,
+      sessionId: sessionId ?? null,
+      includeArchived: includeArchived ?? false,
+    }),
+  getPlanDetail: (workspacePath: string, sessionId?: string | null, planId?: string | null) =>
+    invoke<ActivePlanDetail | null>("get_plan_detail", {
+      workspacePath,
+      sessionId: sessionId ?? null,
+      planId: planId ?? null,
+    }),
+  updatePlanStepStatus: (
+    workspacePath: string,
+    planId: string | null | undefined,
+    stepIndex: number,
+    status: string,
+    sessionId?: string | null
+  ) =>
+    invoke<void>("update_plan_step_status", {
+      workspacePath,
+      sessionId: sessionId ?? null,
+      planId: planId ?? null,
+      stepIndex,
+      status,
+    }),
+
+  // 文件与变更查看器 (File Viewer)
+  openFileViewer: (payload?: ViewerTabItem) =>
+    invoke<void>("open_file_viewer", { payload: payload ?? null }),
+  getFileViewerInitTab: () =>
+    invoke<ViewerTabItem | null>("get_file_viewer_init_tab"),
+  readTextFile: (path: string, maxBytes?: number) =>
+    invoke<FileTextContent>("read_text_file", { path, maxBytes: maxBytes ?? null }),
+  saveTextFile: (path: string, content: string, sessionId?: string | null) =>
+    invoke<void>("save_text_file", { path, content, sessionId: sessionId ?? null }),
+  getFileDiff: (path: string, oldContent?: string, newContent?: string, workspacePath?: string) =>
+    invoke<TempFileDiff>("get_file_diff", {
+      path,
+      oldContent: oldContent ?? null,
+      newContent: newContent ?? null,
+      workspacePath: workspacePath ?? null,
+    }),
+  openInExternalEditor: (path: string, line?: number) =>
+    invoke<void>("open_in_external_editor", { path, line: line ?? null }),
+  getFileOutline: (path: string) =>
+    invoke<FileOutlineItem[]>("get_file_outline", { path }),
+  revertFileHunk: (path: string, hunk: DiffHunk) =>
+    invoke<void>("revert_file_hunk", { path, hunk }),
+
+  // 长任务（Long-Running Task）
+  startLongTask: (sessionId: string, goal: string, maxBudgetTokens?: number | null) =>
+    invoke<LongTask>("start_long_task", {
+      sessionId,
+      goal,
+      maxBudgetTokens: maxBudgetTokens ?? null,
+    }),
+  pauseLongTask: (taskId: string) =>
+    invoke<void>("pause_long_task", { taskId }),
+  resumeLongTask: (taskId: string) =>
+    invoke<LongTask>("resume_long_task", { taskId }),
+  cancelLongTask: (taskId: string) =>
+    invoke<void>("cancel_long_task", { taskId }),
+  getActiveTask: (sessionId: string) =>
+    invoke<LongTask | null>("get_active_task", { sessionId }),
+  listTaskCheckpoints: (taskId: string) =>
+    invoke<TaskCheckpoint[]>("list_task_checkpoints", { taskId }),
+  rollbackToCheckpoint: (checkpointId: string) =>
+    invoke<LongTask>("rollback_to_checkpoint", { checkpointId }),
+  updateTaskSubtasks: (taskId: string, subtasks: TaskSubItem[]) =>
+    invoke<LongTask>("update_task_subtasks", { taskId, subtasks }),
 };
 
-export type { Message, Session, SessionActiveState, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport, CollaboratorCreateInput, CollaboratorUpdateInput, SessionCreateInput, SessionModelsUpdateInput };
+export type { ActivePlanDetail, PlanSummary, Message, Session, SessionActiveState, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport, CollaboratorCreateInput, CollaboratorUpdateInput, SessionCreateInput, SessionModelsUpdateInput, FileTextContent, ViewerTabItem, FileOutlineItem, DiffHunk, LongTask, TaskCheckpoint, TaskSubItem };
+
+
+
 

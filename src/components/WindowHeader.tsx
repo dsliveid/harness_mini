@@ -14,7 +14,13 @@ function getAppWindow() {
   return null;
 }
 
-export function WindowHeader() {
+export function WindowHeader({
+  title = "HARNESS MINI",
+  subtitle,
+}: {
+  title?: string;
+  subtitle?: string;
+}) {
   const [isMaximized, setIsMaximized] = useState(false);
 
   useEffect(() => {
@@ -72,7 +78,12 @@ export function WindowHeader() {
         <div className="flex h-4 w-4 items-center justify-center rounded bg-accent/20 text-accent">
           <Wind size={11} strokeWidth={2.4} />
         </div>
-        <span className="font-semibold tracking-wider text-[11px] text-ink/90 font-mono">HARNESS MINI</span>
+        <span className="font-semibold tracking-wider text-[11px] text-ink/90 font-mono">{title}</span>
+        {subtitle && (
+          <span className="text-[10px] text-inkdim font-mono truncate max-w-[300px]">
+            {subtitle}
+          </span>
+        )}
       </div>
 
       {/* 中间：可拖拽大区域 */}

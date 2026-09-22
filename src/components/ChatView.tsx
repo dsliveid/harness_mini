@@ -194,7 +194,7 @@ export function ChatView() {
                 <ExecutionProcessBlock
                   key={item.id}
                   steps={item.steps}
-                  isRunning={running && item.steps.some((s) => s.id === msgs[msgs.length - 1]?.id)}
+                  isRunning={Boolean(item.isRunning ?? (running && item.turnMetrics?.isCurrentRunningTurn))}
                   sessionWorkspace={session?.workspacePath}
                   streamingMsgId={running ? msgs[msgs.length - 1]?.id : undefined}
                   turnMetrics={item.turnMetrics}

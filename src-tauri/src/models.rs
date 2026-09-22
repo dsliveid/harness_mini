@@ -475,10 +475,17 @@ pub struct Project {
     /// 是否开启交付前自检
     #[serde(default = "default_true")]
     pub sop_enabled: bool,
+    /// 计划与执行模式："standard" | "always_plan" | "always_proceed"
+    #[serde(default = "default_plan_mode")]
+    pub plan_mode: String,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_plan_mode() -> String {
+    "standard".to_string()
 }
 
 /// 关联项目：当前项目对另一目录的引用 + 说明（Markdown）。
@@ -744,7 +751,7 @@ pub struct TempChanges {
 }
 
 /// diff 行：tag = same | del | add；old_no / new_no 为 1 起始行号（该侧无对应行时为 None）
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffLine {
     pub tag: String,
@@ -754,7 +761,7 @@ pub struct DiffLine {
 }
 
 /// diff 分块（±3 行上下文），同一份数据可渲染统一视图与并排对比
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffHunk {
     pub old_start: usize,
@@ -765,7 +772,7 @@ pub struct DiffHunk {
 }
 
 /// 单文件 diff（弹窗右侧）
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct TempFileDiff {
     pub project_key: String,
@@ -1111,5 +1118,94 @@ pub struct TokenStatsReport {
     pub by_time: Vec<DailyTokenStats>,
     pub by_session: Vec<SessionTokenStats>,
 }
+
+// ==================== 长任务（Long-Running Task）模型 ====================
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum LongTaskStatus {
+    Planning,
+    Running,
+    Paused,
+    WaitingApproval,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl LongTaskStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LongTaskStatus::Planning => "planning",
+            LongTaskStatus::Running => "running",
+            LongTaskStatus::Paused => "paused",
+            LongTaskStatus::WaitingApproval => "waiting_approval",
+            LongTaskStatus::Completed => "completed",
+            LongTaskStatus::Failed => "failed",
+            LongTaskStatus::Cancelled => "cancelled",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "planning" => LongTaskStatus::Planning,
+            "running" => LongTaskStatus::Running,
+            "paused" => LongTaskStatus::Paused,
+            "waiting_approval" => LongTaskStatus::WaitingApproval,
+            "completed" => LongTaskStatus::Completed,
+            "failed" => LongTaskStatus::Failed,
+            "cancelled" => LongTaskStatus::Cancelled,
+            _ => LongTaskStatus::Running,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskSubItem {
+    pub id: String,
+    pub index: usize,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: String, // "pending" | "in_progress" | "verifying" | "completed" | "failed" | "skipped"
+    pub summary: Option<String>,
+    pub error: Option<String>,
+    pub verify_command: Option<String>,
+    pub verify_output: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LongTask {
+    pub id: String,
+    pub session_id: String,
+    pub workspace_path: String,
+    pub goal: String,
+    pub status: String, // "planning" | "running" | "paused" | "waiting_approval" | "completed" | "failed" | "cancelled"
+    pub current_subtask_index: usize,
+    pub subtasks: Vec<TaskSubItem>,
+    pub max_budget_tokens: Option<u64>,
+    pub total_tokens_used: u64,
+    pub current_step: usize,
+    pub max_steps: usize,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCheckpoint {
+    pub id: String,
+    pub task_id: String,
+    pub step_number: usize,
+    pub subtask_id: Option<String>,
+    pub status: String,
+    pub summary: String,
+    pub working_memory: String,
+    pub git_commit_hash: Option<String>,
+    pub created_at: String,
+}
+
 
 

@@ -16,6 +16,7 @@ import {
   Bot,
   Settings as SettingsIcon,
   Pencil,
+  Target,
 } from "./Icons";
 
 function formatTokens(n?: number | null): string {
@@ -47,11 +48,31 @@ export function Composer() {
   const [uploading, setUploading] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [visionWarningOpen, setVisionWarningOpen] = useState(false);
+  const [slashIndex, setSlashIndex] = useState(0);
+  const [isGoalTagActive, setIsGoalTagActive] = useState(false);
+
+  const SLASH_COMMANDS = [
+    {
+      cmd: "/goal",
+      label: "/goal <总任务目标>",
+      desc: "发起长任务：自动拆解多阶段路线图并在独立顶栏中自主推进",
+    },
+    {
+      cmd: "/task",
+      label: "/task <总任务目标>",
+      desc: "发起长任务（/goal 的简写别名）",
+    },
+  ];
 
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const backupDraftRef = useRef<{ text: string; attachments: Attachment[] } | null>(null);
   const prevEditingIdRef = useRef<string | null>(null);
+
+  // 切换会话时重置长任务标签状态
+  useEffect(() => {
+    setIsGoalTagActive(false);
+  }, [activeId]);
 
   // 同步编辑目标到输入框与附件
   useEffect(() => {
@@ -109,15 +130,31 @@ export function Composer() {
   const canSend = !readOnly && !tempBlocked && !uploading && (!editingMessage || !running);
   const hasContent = !!text.trim() || hasAttachments;
 
+  const isGoalCommand = isGoalTagActive || text.trim().startsWith("/goal") || text.trim().startsWith("/task");
+
+  const showSlashMenu =
+    !isGoalTagActive &&
+    text.startsWith("/") &&
+    !text.includes(" ") &&
+    SLASH_COMMANDS.some((c) => c.cmd.toLowerCase().startsWith(text.toLowerCase()));
+
+  const filteredCommands = SLASH_COMMANDS.filter((c) =>
+    c.cmd.toLowerCase().startsWith(text.toLowerCase())
+  );
+
   const placeholder = editingMessage
     ? "正在编辑最后一条消息，Enter 重新发送，Esc 取消编辑…"
     : tempBlocked
     ? "已合并到原项目，清空临时空间后可继续发送消息"
     : readOnly
     ? "已归档会话为只读，取消归档后可继续对话"
+    : isGoalTagActive
+    ? "输入长任务总目标，Enter 发送启动推进，Backspace 删除标签取消…"
+    : isGoalCommand
+    ? "长任务指令：输入总目标，回车将自动拆解为路线图并自主推进执行…"
     : running
     ? "Agent 运行中…输入消息回车将加入待执行列表"
-    : "输入消息，支持 Ctrl+V 粘贴/拖拽文件与图片，Enter 发送…";
+    : "输入消息，输入 /goal 发起长任务，Enter 发送…";
 
   const resize = () => {
     const ta = taRef.current;
@@ -277,6 +314,51 @@ export function Composer() {
       return;
     }
 
+    const trimmed = t.trim();
+
+    // 检查是否触发长任务标签模式或者带 /goal /task 前缀的指令
+    const isGoalSlash = isGoalTagActive || /^\/(goal|task)($|\s+)/i.test(trimmed);
+    if (isGoalSlash) {
+      const goalText = isGoalTagActive
+        ? trimmed
+        : trimmed.replace(/^\/(goal|task)\s*/i, "").trim();
+
+      if (!goalText) {
+        setIsGoalTagActive(true);
+        setSessionDraft(targetId, "");
+        pushToast("长任务指令已激活，请输入长任务总目标", "info");
+        requestAnimationFrame(() => {
+          if (taRef.current) {
+            taRef.current.focus();
+          }
+        });
+        return;
+      }
+
+      setSessionDraft(targetId, "");
+      setPendingAttachments([]);
+      setIsGoalTagActive(false);
+      requestAnimationFrame(resize);
+      try {
+        const st = useStore.getState();
+        let sid = currentId && currentId !== DRAFT_ID ? currentId : null;
+        if (!sid) {
+          const s = await ipc.createSession({
+            workspacePath: st.draft?.workspacePath || undefined,
+            projectId: st.draft?.projectId || undefined,
+            title: goalText.slice(0, 24),
+          });
+          st.onSessionUpdate(s);
+          await st.selectSession(s.id);
+          sid = s.id;
+        }
+        await st.startLongTask(sid, goalText);
+      } catch (e: any) {
+        pushToast(String(e));
+      }
+      return;
+    }
+
     setSessionDraft(targetId, "");
     setPendingAttachments([]);
     requestAnimationFrame(resize);
@@ -313,7 +395,58 @@ export function Composer() {
     }
   };
 
+  const applySlashCommand = (cmd: string) => {
+    if (cmd === "/goal" || cmd === "/task") {
+      setIsGoalTagActive(true);
+      setSessionDraft(activeId, "");
+      requestAnimationFrame(() => {
+        if (taRef.current) {
+          taRef.current.focus();
+          resize();
+        }
+      });
+      return;
+    }
+    setSessionDraft(activeId, `${cmd} `);
+    requestAnimationFrame(() => {
+      if (taRef.current) {
+        taRef.current.focus();
+        const pos = cmd.length + 1;
+        taRef.current.setSelectionRange(pos, pos);
+        resize();
+      }
+    });
+  };
+
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (showSlashMenu && filteredCommands.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setSlashIndex((i) => (i + 1) % filteredCommands.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setSlashIndex((i) => (i - 1 + filteredCommands.length) % filteredCommands.length);
+        return;
+      }
+      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !e.altKey)) {
+        e.preventDefault();
+        applySlashCommand(filteredCommands[slashIndex]?.cmd || "/goal");
+        return;
+      }
+    }
+
+    // 当长任务标签激活且输入框光标在首位时，按 Backspace 删除标签并取消长任务
+    if (e.key === "Backspace" && isGoalTagActive) {
+      const ta = taRef.current;
+      if (ta && ta.selectionStart === 0 && ta.selectionEnd === 0) {
+        e.preventDefault();
+        setIsGoalTagActive(false);
+        return;
+      }
+    }
+
     if (e.key === "Escape" && editingMessage) {
       e.preventDefault();
       cancelEdit();
@@ -437,6 +570,43 @@ export function Composer() {
           </div>
         )}
 
+        {/* Slash Command Suggestions Popover */}
+        {showSlashMenu && filteredCommands.length > 0 && (
+          <div className="mx-3 mb-2 p-1.5 rounded-xl bg-panel2/95 border border-edge backdrop-blur shadow-xl animate-in fade-in slide-in-from-bottom-2 duration-150">
+            <div className="px-2 py-1 text-[11px] font-semibold text-inkdim border-b border-edge/60 flex items-center justify-between">
+              <span>快捷指令 (Enter / Tab 选择)</span>
+              <span className="font-mono text-[10px]">↑↓ 切换</span>
+            </div>
+            <div className="mt-1 space-y-1">
+              {filteredCommands.map((item, idx) => {
+                const isSelected = idx === slashIndex;
+                return (
+                  <div
+                    key={item.cmd}
+                    onClick={() => applySlashCommand(item.cmd)}
+                    onMouseEnter={() => setSlashIndex(idx)}
+                    className={`px-2.5 py-1.5 rounded-lg flex items-center justify-between gap-3 text-[12px] cursor-pointer transition-colors ${
+                      isSelected
+                        ? "bg-purple-500/15 text-purple-300 border border-purple-500/30"
+                        : "hover:bg-panel text-ink"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <div className="p-1 rounded bg-purple-500/10 text-purple-400">
+                        <Target size={13} />
+                      </div>
+                      <span className="font-mono font-medium">{item.label}</span>
+                    </div>
+                    <span className="text-[11px] text-inkdim truncate max-w-[240px]">
+                      {item.desc}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         {/* Text Input Row */}
         <div className="flex items-end gap-2 px-3 py-2">
           {/* Attach Button */}
@@ -450,6 +620,25 @@ export function Composer() {
             <Paperclip size={16} />
           </button>
 
+          {/* Long Task Tag Badge */}
+          {isGoalTagActive && (
+            <div className="shrink-0 flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-purple-500/15 border border-purple-500/35 text-purple-300 text-[12px] font-medium animate-in fade-in zoom-in-95 duration-150 select-none mb-0.5 shadow-xs">
+              <Target size={13} className="shrink-0 text-purple-400 animate-pulse" />
+              <span className="font-mono">/goal</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setIsGoalTagActive(false);
+                  if (taRef.current) taRef.current.focus();
+                }}
+                className="p-0.5 rounded-md hover:bg-purple-500/25 text-purple-400 hover:text-purple-100 transition-colors cursor-pointer"
+                title="删除标签以取消长任务 (Backspace)"
+              >
+                <X size={11} />
+              </button>
+            </div>
+          )}
+
           <textarea
             ref={taRef}
             style={{ height: 32 }}
@@ -460,7 +649,15 @@ export function Composer() {
             disabled={!canSend}
             onPaste={handlePaste}
             onChange={(e) => {
-              setSessionDraft(activeId, e.target.value);
+              const val = e.target.value;
+              // 用户键入或粘贴 /goal 或 /task 加空格时，自动转为长任务标签
+              if (!isGoalTagActive && /^\/(goal|task)\s+/i.test(val)) {
+                const remaining = val.replace(/^\/(goal|task)\s+/i, "");
+                setIsGoalTagActive(true);
+                setSessionDraft(activeId, remaining);
+                return;
+              }
+              setSessionDraft(activeId, val);
             }}
             onKeyDown={onKeyDown}
           />

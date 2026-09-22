@@ -37,6 +37,7 @@ export {
   ArrowUp,
   Square,
   Play,
+  Pause,
   Terminal,
   FileText,
   FileEdit,
@@ -56,6 +57,7 @@ export {
   Edit2,
   Edit3,
   Pencil,
+  Save,
   ExternalLink,
   Link,
   Link2,
@@ -65,6 +67,7 @@ export {
   File,
   ZoomIn,
   ZoomOut,
+  Undo2,
 
   // AI & 状态
   Brain,

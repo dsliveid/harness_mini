@@ -7,6 +7,7 @@ mod llm;
 pub mod memory;
 mod models;
 mod paths;
+pub mod plan;
 mod secrets;
 pub mod server;
 pub mod single_instance;
@@ -14,6 +15,7 @@ mod skills;
 pub mod snapshot;
 mod sop;
 mod store;
+pub mod task;
 mod temp;
 mod tools;
 
@@ -66,6 +68,7 @@ pub struct AppState {
     pub app: OnceLock<tauri::AppHandle>,
     pub snapshot: snapshot::SnapshotStore,
     pub event_bus: tokio::sync::broadcast::Sender<(String, serde_json::Value)>,
+    pub file_viewer_init_tab: Mutex<Option<serde_json::Value>>,
 }
 
 impl AppState {
@@ -260,6 +263,7 @@ pub fn run() {
                 master_key: Mutex::new(master_key),
                 snapshot: snapshot::SnapshotStore::new(),
                 event_bus,
+                file_viewer_init_tab: Mutex::new(None),
             };
             app.manage(state);
             let handle = app.handle().clone();
@@ -332,6 +336,7 @@ pub fn run() {
             commands::remove_project,
             commands::set_project_pinned,
             commands::set_project_constraints,
+            commands::set_project_plan_mode,
             commands::list_project_links,
             commands::add_project_link,
             commands::update_project_link,
@@ -403,6 +408,26 @@ pub fn run() {
             commands::get_token_stats,
             commands::get_session_active_state,
             commands::read_file_base64,
+            commands::get_active_plan,
+            commands::list_workspace_plans,
+            commands::open_file_viewer,
+            commands::get_file_viewer_init_tab,
+            commands::read_text_file,
+            commands::save_text_file,
+            commands::get_file_diff,
+            commands::get_plan_detail,
+            commands::open_in_external_editor,
+            commands::update_plan_step_status,
+            commands::get_file_outline,
+            commands::revert_file_hunk,
+            commands::start_long_task,
+            commands::pause_long_task,
+            commands::resume_long_task,
+            commands::cancel_long_task,
+            commands::get_active_task,
+            commands::list_task_checkpoints,
+            commands::rollback_to_checkpoint,
+            commands::update_task_subtasks,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

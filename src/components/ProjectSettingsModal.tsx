@@ -2,13 +2,13 @@ import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ipc } from "../ipc";
 import { useStore } from "../store";
-import { dirName, samePath, type Project, type ProjectLink } from "../types";
+import { dirName, samePath, type Project, type ProjectLink, type PlanMode } from "../types";
 import { askConfirm } from "./PromptModal";
 import { Markdown } from "./Markdown";
 import { ModalActions, ModalClose } from "./ModalActions";
-import { FileCode, Link2, Plus, Edit3, Trash2, Folder } from "./Icons";
+import { FileCode, Link2, Plus, Edit3, Trash2, Folder, Sliders, ShieldCheck, Zap } from "./Icons";
 
-type Tab = "constraints" | "links";
+type Tab = "constraints" | "links" | "policy";
 
 const inputCls = "bg-panel border border-edge rounded-lg px-2 py-1.5 text-[13px] outline-none focus:border-accent w-full";
 
@@ -240,6 +240,95 @@ function LinksPane({
   );
 }
 
+// ---------- 规划与执行策略页（草稿由外壳统一保存） ----------
+
+function PolicyPane({ value, onChange }: { value: PlanMode; onChange: (v: PlanMode) => void }) {
+  const options: {
+    id: PlanMode;
+    title: string;
+    badge: string;
+    desc: string;
+    detail: string;
+    icon: React.ReactNode;
+  }[] = [
+    {
+      id: "standard",
+      title: "标准模式 (Standard)",
+      badge: "默认模式",
+      desc: "灵活自决。面对复杂大改动由 Agent 根据通用准则自主决定，常规任务直接处理。",
+      detail: "适合日常对话与普通编码任务。不作强制中断与前置门禁，维持轻量灵活体验。",
+      icon: <Sliders size={17} className="text-inkdim" />,
+    },
+    {
+      id: "always_plan",
+      title: "强计划确认模式 (Always Plan)",
+      badge: "严格安全风控",
+      desc: "凡对项目进行较大改动（预计改动 3+ 文件、架构重构、新增功能），必须先生成计划，由您确认后才可实施。",
+      detail: "阶段严格解耦：只读调研 ➔ 物理生成计划并落盘 ➔ 强制停步等待人工确认。未获确认前严格禁止调用任何写入或修改工具。",
+      icon: <ShieldCheck size={17} className="text-emerald-400" />,
+    },
+    {
+      id: "always_proceed",
+      title: "自动推进模式 (Always Proceed)",
+      badge: "敏捷连续交付",
+      desc: "面对较大改动同样必须生成规范计划，但在生成计划后会自动连续编写代码，无需停步等待确认。",
+      detail: "兼顾规范与速度：若您在指令中明确说明“先不改动代码 / 仅出方案”，则仅输出方案；否则出具计划后自动无缝实施修改。",
+      icon: <Zap size={17} className="text-amber-400" />,
+    },
+  ];
+
+  return (
+    <div className="h-full min-h-0 flex flex-col">
+      <div className="flex items-center gap-2 mb-3 shrink-0">
+        <div className="font-medium">规划与执行策略</div>
+        <span className="text-[11px] text-inkdim truncate">
+          控制复杂工程任务中任务方案拟定与代码落地的交互方式
+        </span>
+      </div>
+
+      <div className="flex-1 min-h-0 overflow-y-auto flex flex-col gap-2.5 pr-1">
+        {options.map((opt) => {
+          const selected = value === opt.id;
+          return (
+            <div
+              key={opt.id}
+              onClick={() => onChange(opt.id)}
+              className={`p-3.5 rounded-xl border cursor-pointer transition-all flex flex-col gap-1.5 ${
+                selected
+                  ? "border-accent bg-accent/10 ring-1 ring-accent/30"
+                  : "border-edge bg-panel hover:bg-panel2 hover:border-edge/80"
+              }`}
+            >
+              <div className="flex items-center gap-2.5">
+                {opt.icon}
+                <span className="text-[13px] font-medium text-ink">{opt.title}</span>
+                <span
+                  className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${
+                    selected ? "bg-accent/20 text-accent" : "bg-panel3 text-inkdim"
+                  }`}
+                >
+                  {opt.badge}
+                </span>
+                <div className="ml-auto">
+                  <div
+                    className={`w-4 h-4 rounded-full border flex items-center justify-center transition-colors ${
+                      selected ? "border-accent bg-accent" : "border-edge bg-panel"
+                    }`}
+                  >
+                    {selected && <div className="w-1.5 h-1.5 rounded-full bg-white" />}
+                  </div>
+                </div>
+              </div>
+              <p className="text-[12px] text-ink/90 leading-relaxed pl-6">{opt.desc}</p>
+              <p className="text-[11px] text-inkdim leading-relaxed pl-6">{opt.detail}</p>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 // ---------- 弹窗外壳：左侧菜单 + 右侧内容 + 统一操作条 ----------
 
 export function ProjectSettingsModal() {
@@ -249,8 +338,9 @@ export function ProjectSettingsModal() {
   const refreshProjects = useStore((s) => s.refreshProjects);
   const pushToast = useStore((s) => s.pushToast);
   const [tab, setTab] = useState<Tab>("constraints");
-  // 草稿：约束文本 + 关联项目列表；打开时装载，「应用 / 保存」时统一落库
+  // 草稿：约束文本 + 计划模式 + 关联项目列表；打开时装载，「应用 / 保存」时统一落库
   const [constraints, setConstraints] = useState("");
+  const [planMode, setPlanMode] = useState<PlanMode>("standard");
   const [links, setLinks] = useState<ProjectLink[]>([]);
   const [origLinks, setOrigLinks] = useState<ProjectLink[]>([]);
   const [saving, setSaving] = useState(false);
@@ -261,7 +351,9 @@ export function ProjectSettingsModal() {
   useEffect(() => {
     if (!projectSettingsId) return;
     setTab("constraints");
-    setConstraints(projects.find((x) => x.id === projectSettingsId)?.constraints ?? "");
+    const currentProj = projects.find((x) => x.id === projectSettingsId);
+    setConstraints(currentProj?.constraints ?? "");
+    setPlanMode(currentProj?.planMode ?? "standard");
     let cancelled = false;
     ipc
       .listProjectLinks(projectSettingsId)
@@ -283,15 +375,21 @@ export function ProjectSettingsModal() {
   const linksEqual =
     links.length === origLinks.length &&
     links.every((l, i) => l.id === origLinks[i].id && l.path === origLinks[i].path && l.description === origLinks[i].description);
-  const dirty = constraints !== (project.constraints ?? "") || !linksEqual;
+  const dirty =
+    constraints !== (project.constraints ?? "") ||
+    planMode !== (project.planMode ?? "standard") ||
+    !linksEqual;
 
-  // 应用：把草稿统一写入后端（约束 + 关联项目增/改/删），不关闭窗口
+  // 应用：把草稿统一写入后端（约束 + 计划模式 + 关联项目增/改/删），不关闭窗口
   const apply = async (): Promise<boolean> => {
     setSaving(true);
     let ok = true;
     try {
       if (constraints !== (project.constraints ?? "")) {
         await ipc.setProjectConstraints(projectSettingsId, constraints);
+      }
+      if (planMode !== (project.planMode ?? "standard")) {
+        await ipc.setProjectPlanMode(projectSettingsId, planMode);
       }
       for (const l of links) {
         const orig = origLinks.find((o) => o.id === l.id);
@@ -349,6 +447,12 @@ export function ProjectSettingsModal() {
                 <span>项目约束</span>
               </span>
             </button>
+            <button className={menuCls(tab === "policy")} onClick={() => setTab("policy")}>
+              <span className="flex items-center gap-2">
+                <Sliders size={15} />
+                <span>规划与执行</span>
+              </span>
+            </button>
             <button className={menuCls(tab === "links")} onClick={() => setTab("links")}>
               <span className="flex items-center gap-2">
                 <Link2 size={15} />
@@ -359,6 +463,8 @@ export function ProjectSettingsModal() {
           <main className="flex-1 min-w-0 min-h-0 p-4">
             {tab === "constraints" ? (
               <ConstraintsPane value={constraints} onChange={setConstraints} />
+            ) : tab === "policy" ? (
+              <PolicyPane value={planMode} onChange={setPlanMode} />
             ) : (
               <LinksPane project={project} links={links} setLinks={setLinks} onOpenConstraints={() => setTab("constraints")} />
             )}

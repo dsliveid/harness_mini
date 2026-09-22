@@ -192,6 +192,22 @@ pub fn set_project_constraints(
 }
 
 #[tauri::command]
+pub fn set_project_plan_mode(
+    state: State<'_, crate::AppState>,
+    app: AppHandle,
+    id: String,
+    mode: String,
+) -> Result<(), String> {
+    let project = {
+        let db = state.db.lock().unwrap();
+        store::set_project_plan_mode(&db, &id, &mode)?;
+        store::get_project(&db, &id)?.ok_or("项目不存在")?
+    };
+    let _ = app.emit("projects:changed", &project);
+    Ok(())
+}
+
+#[tauri::command]
 pub fn list_project_links(
     state: State<'_, crate::AppState>,
     project_id: String,
@@ -2121,6 +2137,817 @@ pub async fn read_file_base64_inner(state: Option<&crate::AppState>, path: &str)
     Ok(format!("data:{mime};base64,{b64}"))
 }
 
+// ---------- 任务方案计划中枢 commands ----------
+
+#[tauri::command]
+pub fn get_active_plan(
+    state: State<'_, crate::AppState>,
+    session_id: String,
+) -> Result<Option<Value>, String> {
+    let db = state.db.lock().unwrap();
+    let session = crate::store::get_session(&db, &session_id)?.ok_or("会话不存在")?;
+    if session.workspace_path.is_empty() {
+        return Ok(None);
+    }
+    let ws = std::path::Path::new(&session.workspace_path);
+    if let Some((path, meta, body)) = crate::plan::find_plan_file(ws, &session_id, None, Some(&db)) {
+        let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let steps = crate::plan::parse_steps_from_markdown(&body);
+        Ok(Some(serde_json::json!({
+            "meta": meta,
+            "filename": filename,
+            "body": body,
+            "steps": steps,
+        })))
+    } else {
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+pub fn list_workspace_plans(
+    state: State<'_, crate::AppState>,
+    workspace_path: String,
+    session_id: Option<String>,
+    include_archived: Option<bool>,
+) -> Result<Vec<crate::plan::PlanSummary>, String> {
+    if workspace_path.is_empty() {
+        return Ok(Vec::new());
+    }
+    let db = state.db.lock().unwrap();
+    let ws = std::path::Path::new(&workspace_path);
+    crate::plan::list_plans(ws, session_id.as_deref(), include_archived.unwrap_or(false), Some(&db))
+}
+
+// ---------- 文件与变更查看器 (File Viewer) commands ----------
+
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct FileTextContent {
+    pub path: String,
+    pub name: String,
+    pub content: String,
+    pub size_bytes: u64,
+    pub lines_count: usize,
+    pub is_binary: bool,
+    pub is_truncated: bool,
+    pub language: String,
+}
+
+fn detect_language_by_path(path: &str) -> String {
+    let p = Path::new(path);
+    match p.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("rs") => "rust",
+        Some("ts") => "typescript",
+        Some("tsx") => "typescript",
+        Some("js") | Some("mjs") | Some("cjs") => "javascript",
+        Some("jsx") => "javascript",
+        Some("json") => "json",
+        Some("md") | Some("markdown") => "markdown",
+        Some("py") => "python",
+        Some("html") | Some("htm") => "html",
+        Some("css") | Some("scss") | Some("less") => "css",
+        Some("toml") => "toml",
+        Some("yaml") | Some("yml") => "yaml",
+        Some("sh") | Some("bash") | Some("zsh") => "bash",
+        Some("cmd") | Some("bat") => "bat",
+        Some("sql") => "sql",
+        Some("xml") => "xml",
+        Some("c") | Some("h") | Some("cpp") | Some("hpp") | Some("cc") => "cpp",
+        Some("go") => "go",
+        Some("java") => "java",
+        Some("kt") => "kotlin",
+        Some("php") => "php",
+        Some("rb") => "ruby",
+        Some("swift") => "swift",
+        Some("vue") => "vue",
+        Some("svelte") => "svelte",
+        _ => "plaintext",
+    }.to_string()
+}
+
+#[tauri::command]
+pub async fn open_file_viewer(
+    app: AppHandle,
+    state: State<'_, crate::AppState>,
+    payload: Option<serde_json::Value>,
+) -> Result<(), String> {
+    if let Some(ref p) = payload {
+        *state.file_viewer_init_tab.lock().unwrap() = Some(p.clone());
+    }
+
+    if let Some(win) = app.get_webview_window("file_viewer") {
+        let _ = win.unminimize();
+        let _ = win.show();
+        let _ = win.set_focus();
+        if let Some(ref p) = payload {
+            let _ = win.emit("file_viewer:open_tab", p);
+        }
+        return Ok(());
+    }
+
+    let win = tauri::WebviewWindowBuilder::new(
+        &app,
+        "file_viewer",
+        tauri::WebviewUrl::App("index.html?window=file_viewer".into()),
+    )
+    .title("文件与变更查看器")
+    .inner_size(1220.0, 800.0)
+    .min_inner_size(800.0, 500.0)
+    .center()
+    .decorations(false)
+    .transparent(true)
+    .shadow(true)
+    .build()
+    .map_err(|e| format!("创建文件查看器窗口失败: {e}"))?;
+
+    let _ = win.show();
+    let _ = win.set_focus();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_file_viewer_init_tab(
+    state: State<'_, crate::AppState>,
+) -> Result<Option<serde_json::Value>, String> {
+    let val = state.file_viewer_init_tab.lock().unwrap().take();
+    Ok(val)
+}
+
+#[tauri::command]
+pub fn read_text_file(
+    path: String,
+    max_bytes: Option<usize>,
+) -> Result<FileTextContent, String> {
+    let raw_trimmed = path.trim().trim_start_matches("file:///");
+    let p = Path::new(raw_trimmed);
+    if !p.exists() {
+        return Err(format!("文件不存在: {}", p.display()));
+    }
+    if !p.is_file() {
+        return Err(format!("指定路径不是常规文件: {}", p.display()));
+    }
+
+    let meta = std::fs::metadata(p).map_err(|e| format!("获取文件信息失败: {e}"))?;
+    let size_bytes = meta.len();
+    let limit = max_bytes.unwrap_or(2 * 1024 * 1024);
+
+    let mut file = std::fs::File::open(p).map_err(|e| format!("打开文件失败: {e}"))?;
+    use std::io::Read;
+
+    let mut check_buf = [0u8; 8192];
+    let n = file.read(&mut check_buf).unwrap_or(0);
+    let is_binary = check_buf[..n].contains(&0);
+
+    if is_binary {
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let language = detect_language_by_path(raw_trimmed);
+        return Ok(FileTextContent {
+            path: p.to_string_lossy().to_string(),
+            name,
+            content: String::new(),
+            size_bytes,
+            lines_count: 0,
+            is_binary: true,
+            is_truncated: false,
+            language,
+        });
+    }
+
+    use std::io::Seek;
+    let _ = file.seek(std::io::SeekFrom::Start(0));
+
+    let to_read = std::cmp::min(size_bytes, limit as u64) as usize;
+    let mut buf = vec![0u8; to_read];
+    let actual_read = file.read(&mut buf).map_err(|e| format!("读取内容失败: {e}"))?;
+    buf.truncate(actual_read);
+
+    let is_truncated = size_bytes > (actual_read as u64);
+    let content = String::from_utf8_lossy(&buf).to_string();
+    let lines_count = content.lines().count();
+    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+    let language = detect_language_by_path(raw_trimmed);
+
+    Ok(FileTextContent {
+        path: p.to_string_lossy().to_string(),
+        name,
+        content,
+        size_bytes,
+        lines_count,
+        is_binary: false,
+        is_truncated,
+        language,
+    })
+}
+
+#[tauri::command]
+pub fn save_text_file(
+    app: AppHandle,
+    state: State<'_, crate::AppState>,
+    path: String,
+    content: String,
+    session_id: Option<String>,
+) -> Result<(), String> {
+    let raw_trimmed = path.trim().trim_start_matches("file:///");
+    let p = Path::new(raw_trimmed);
+    if let Some(parent) = p.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建父目录失败: {e}"))?;
+        }
+    }
+    std::fs::write(p, &content).map_err(|e| format!("保存文件失败: {e}"))?;
+
+    // 如果保存的是计划 Markdown 文件，重新解析步骤并同步 todos
+    let norm_path = raw_trimmed.replace('\\', "/");
+    if norm_path.contains("/.harness/plans/") || norm_path.starts_with(".harness/plans/") {
+        let steps = crate::plan::parse_steps_from_markdown(&content);
+        let db = state.db.lock().unwrap();
+        if let Some(ref sid) = session_id {
+            if !sid.is_empty() {
+                crate::plan::sync_steps_to_todos(Some(&db), sid, &steps);
+                let payload: Vec<serde_json::Value> = steps
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "content": s.content,
+                            "status": s.status
+                        })
+                    })
+                    .collect();
+                let _ = app.emit("session:todos", serde_json::json!({
+                    "sessionId": sid,
+                    "todos": payload,
+                }));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn compute_unified_split_diff(
+    old_text: &str,
+    new_text: &str,
+    project_key: &str,
+    project_name: &str,
+    path: &str,
+    name: &str,
+) -> TempFileDiff {
+    let diff = similar::TextDiff::from_lines(old_text, new_text);
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    let mut total_lines = 0usize;
+    let mut truncated = false;
+    let mut hunks = Vec::new();
+
+    const DIFF_MAX_LINES: usize = 4000;
+
+    'outer: for ops in diff.grouped_ops(3) {
+        let mut lines: Vec<DiffLine> = Vec::new();
+        for op in &ops {
+            for ch in diff.iter_changes(op) {
+                let tag = match ch.tag() {
+                    similar::ChangeTag::Delete => "del",
+                    similar::ChangeTag::Insert => "add",
+                    similar::ChangeTag::Equal => "same",
+                };
+                match ch.tag() {
+                    similar::ChangeTag::Insert => added += 1,
+                    similar::ChangeTag::Delete => removed += 1,
+                    similar::ChangeTag::Equal => {}
+                }
+                lines.push(DiffLine {
+                    tag: tag.to_string(),
+                    old_no: ch.old_index().map(|i| i + 1),
+                    new_no: ch.new_index().map(|i| i + 1),
+                    text: ch.value().trim_end_matches('\n').trim_end_matches('\r').to_string(),
+                });
+            }
+        }
+        if lines.is_empty() {
+            continue;
+        }
+        if total_lines + lines.len() > DIFF_MAX_LINES {
+            truncated = true;
+            break 'outer;
+        }
+        let old_start = lines.iter().find_map(|l| l.old_no).unwrap_or(0);
+        let new_start = lines.iter().find_map(|l| l.new_no).unwrap_or(0);
+        let old_lines = lines.iter().filter(|l| l.old_no.is_some()).count();
+        let new_lines = lines.iter().filter(|l| l.new_no.is_some()).count();
+        total_lines += lines.len();
+
+        hunks.push(DiffHunk {
+            old_start,
+            old_lines,
+            new_start,
+            new_lines,
+            lines,
+        });
+    }
+
+    let change = if added > 0 && removed == 0 {
+        "added"
+    } else if removed > 0 && added == 0 {
+        "deleted"
+    } else {
+        "modified"
+    };
+
+    TempFileDiff {
+        project_key: project_key.to_string(),
+        project_name: project_name.to_string(),
+        path: path.to_string(),
+        name: name.to_string(),
+        change: change.to_string(),
+        binary: false,
+        too_large: false,
+        added,
+        removed,
+        truncated,
+        hunks,
+    }
+}
+
+#[tauri::command]
+pub fn get_file_diff(
+    path: String,
+    old_content: Option<String>,
+    new_content: Option<String>,
+    workspace_path: Option<String>,
+) -> Result<TempFileDiff, String> {
+    let raw_trimmed = path.trim().trim_start_matches("file:///");
+    let p = Path::new(raw_trimmed);
+    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+
+    if let (Some(ref old_str), Some(ref new_str)) = (&old_content, &new_content) {
+        return Ok(compute_unified_split_diff(
+            old_str,
+            new_str,
+            "custom",
+            "变更比对",
+            raw_trimmed,
+            &name,
+        ));
+    }
+
+    let disk_content = if p.is_file() {
+        std::fs::read_to_string(p).unwrap_or_default()
+    } else if let Some(ref ws) = workspace_path {
+        let abs_p = Path::new(ws).join(raw_trimmed);
+        if abs_p.is_file() {
+            std::fs::read_to_string(&abs_p).unwrap_or_default()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let actual_new = new_content.unwrap_or(disk_content);
+
+    let actual_old = if let Some(o) = old_content {
+        o
+    } else {
+        let ws_dir = workspace_path
+            .as_deref()
+            .map(Path::new)
+            .or_else(|| p.parent())
+            .unwrap_or_else(|| Path::new("."));
+
+        let rel_path = if let Ok(rel) = p.strip_prefix(ws_dir) {
+            rel.to_string_lossy().replace('\\', "/")
+        } else {
+            raw_trimmed.replace('\\', "/")
+        };
+
+        let output = std::process::Command::new("git")
+            .args(["show", &format!("HEAD:{}", rel_path)])
+            .current_dir(ws_dir)
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                String::from_utf8_lossy(&out.stdout).to_string()
+            }
+            _ => String::new(),
+        }
+    };
+
+    Ok(compute_unified_split_diff(
+        &actual_old,
+        &actual_new,
+        "workspace",
+        "工作区",
+        raw_trimmed,
+        &name,
+    ))
+}
+
+#[tauri::command]
+pub fn get_plan_detail(
+    state: State<'_, crate::AppState>,
+    workspace_path: String,
+    session_id: Option<String>,
+    plan_id: Option<String>,
+) -> Result<Option<Value>, String> {
+    if workspace_path.is_empty() {
+        return Ok(None);
+    }
+    let db = state.db.lock().unwrap();
+    let ws = Path::new(&workspace_path);
+    let sid = session_id.unwrap_or_default();
+    if let Some((path, meta, body)) = crate::plan::find_plan_file(ws, &sid, plan_id.as_deref(), Some(&db)) {
+        let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let steps = crate::plan::parse_steps_from_markdown(&body);
+        Ok(Some(serde_json::json!({
+            "meta": meta,
+            "filename": filename,
+            "body": body,
+            "steps": steps,
+        })))
+    } else {
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+pub fn open_in_external_editor(path: String, line: Option<usize>) -> Result<(), String> {
+    let raw_trimmed = path.trim().trim_start_matches("file:///");
+    let p = Path::new(raw_trimmed);
+    if !p.exists() {
+        return Err(format!("文件不存在: {}", p.display()));
+    }
+
+    let line_num = line.unwrap_or(1);
+    let target_arg = format!("{}:{}", raw_trimmed, line_num);
+
+    // 1. 尝试使用 VS Code 打开并定位行
+    if std::process::Command::new("code")
+        .args(["--goto", &target_arg])
+        .spawn()
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    // 2. 尝试使用 Cursor 打开并定位行
+    if std::process::Command::new("cursor")
+        .args(["--goto", &target_arg])
+        .spawn()
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    // 3. 回退为操作系统默认程序打开
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer")
+            .arg(raw_trimmed)
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .arg(raw_trimmed)
+            .spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open")
+            .arg(raw_trimmed)
+            .spawn();
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn update_plan_step_status(
+    state: State<'_, crate::AppState>,
+    workspace_path: String,
+    session_id: Option<String>,
+    plan_id: Option<String>,
+    step_index: usize,
+    status: String,
+) -> Result<(), String> {
+    if workspace_path.is_empty() {
+        return Err("工作区路径不能为空".into());
+    }
+    let db = state.db.lock().unwrap();
+    let ws = Path::new(&workspace_path);
+    crate::plan::update_plan_step_status(
+        ws,
+        session_id.as_deref(),
+        plan_id.as_deref(),
+        step_index,
+        &status,
+        Some(&db),
+    )
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FileOutlineItem {
+    pub line: usize,
+    pub symbol: String,
+    pub kind: String,
+}
+
+#[tauri::command]
+pub fn get_file_outline(path: String) -> Result<Vec<FileOutlineItem>, String> {
+    let raw_trimmed = path.trim().trim_start_matches("file:///");
+    let p = Path::new(raw_trimmed);
+    if !p.is_file() {
+        return Err(format!("文件不存在: {}", p.display()));
+    }
+
+    let text = std::fs::read_to_string(p).map_err(|e| format!("读取文件失败: {e}"))?;
+    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+
+    let mut items = Vec::new();
+
+    for (i, raw_line) in text.lines().enumerate() {
+        let lineno = i + 1;
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let (is_match, kind) = match ext.as_str() {
+            "rs" => {
+                if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+                    (false, "")
+                } else {
+                    let words: Vec<&str> = trimmed.split_whitespace().collect();
+                    if words.iter().any(|&w| w == "fn") {
+                        (true, "fn")
+                    } else if words.iter().any(|&w| w == "struct") {
+                        (true, "struct")
+                    } else if words.iter().any(|&w| w == "enum") {
+                        (true, "enum")
+                    } else if words.iter().any(|&w| w == "trait") {
+                        (true, "interface")
+                    } else if words.iter().any(|&w| w == "impl") {
+                        (true, "impl")
+                    } else if words.iter().any(|&w| w == "type") {
+                        (true, "type")
+                    } else {
+                        (false, "")
+                    }
+                }
+            }
+            "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => {
+                if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+                    (false, "")
+                } else {
+                    let t = if trimmed.starts_with("export default ") {
+                        &trimmed["export default ".len()..]
+                    } else if trimmed.starts_with("export ") {
+                        &trimmed["export ".len()..]
+                    } else {
+                        trimmed
+                    };
+
+                    if t.starts_with("class ") {
+                        (true, "class")
+                    } else if t.starts_with("interface ") {
+                        (true, "interface")
+                    } else if t.starts_with("type ") {
+                        (true, "type")
+                    } else if t.starts_with("enum ") {
+                        (true, "enum")
+                    } else if t.starts_with("function ") || t.starts_with("async function ") {
+                        (true, "fn")
+                    } else if (t.starts_with("const ") || t.starts_with("let "))
+                        && (t.contains("=>") || t.contains("function(") || t.contains("function ("))
+                    {
+                        (true, "fn")
+                    } else {
+                        (false, "")
+                    }
+                }
+            }
+            "py" => {
+                if trimmed.starts_with('#') {
+                    (false, "")
+                } else if trimmed.starts_with("class ") {
+                    (true, "class")
+                } else if trimmed.starts_with("def ") || trimmed.starts_with("async def ") {
+                    (true, "fn")
+                } else {
+                    (false, "")
+                }
+            }
+            "go" => {
+                if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+                    (false, "")
+                } else if trimmed.starts_with("func ") {
+                    (true, "fn")
+                } else if trimmed.starts_with("type ") && trimmed.contains("struct") {
+                    (true, "struct")
+                } else if trimmed.starts_with("type ") && trimmed.contains("interface") {
+                    (true, "interface")
+                } else if trimmed.starts_with("type ") {
+                    (true, "type")
+                } else {
+                    (false, "")
+                }
+            }
+            "java" | "cs" | "cpp" | "c" | "h" | "hpp" => {
+                if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+                    (false, "")
+                } else if trimmed.starts_with("class ") || trimmed.contains(" class ") {
+                    (true, "class")
+                } else if trimmed.starts_with("interface ") || trimmed.contains(" interface ") {
+                    (true, "interface")
+                } else if trimmed.starts_with("enum ") || trimmed.contains(" enum ") {
+                    (true, "enum")
+                } else if trimmed.starts_with("struct ") || trimmed.contains(" struct ") {
+                    (true, "struct")
+                } else if trimmed.contains('(') && trimmed.contains(')') && !trimmed.ends_with(';') {
+                    (true, "fn")
+                } else {
+                    (false, "")
+                }
+            }
+            "md" | "markdown" => {
+                if trimmed.starts_with('#') && trimmed.chars().take_while(|&c| c == '#').count() <= 6 {
+                    (true, "heading")
+                } else {
+                    (false, "")
+                }
+            }
+            _ => {
+                if !raw_line.starts_with(' ')
+                    && !raw_line.starts_with('\t')
+                    && !trimmed.starts_with("//")
+                    && !trimmed.starts_with('#')
+                {
+                    if trimmed.contains("fn ") || trimmed.contains("func ") || trimmed.contains("def ") {
+                        (true, "fn")
+                    } else if trimmed.contains("class ") {
+                        (true, "class")
+                    } else if trimmed.contains("interface ") {
+                        (true, "interface")
+                    } else if trimmed.contains("struct ") {
+                        (true, "struct")
+                    } else {
+                        (false, "")
+                    }
+                } else {
+                    (false, "")
+                }
+            }
+        };
+
+        if is_match {
+            let clean_symbol = trimmed
+                .trim_end_matches('{')
+                .trim_end_matches(';')
+                .trim()
+                .chars()
+                .take(120)
+                .collect::<String>();
+
+            items.push(FileOutlineItem {
+                line: lineno,
+                symbol: clean_symbol,
+                kind: kind.to_string(),
+            });
+
+            if items.len() >= 300 {
+                break;
+            }
+        }
+    }
+
+    Ok(items)
+}
+
+#[tauri::command]
+pub fn revert_file_hunk(path: String, hunk: DiffHunk) -> Result<(), String> {
+    let raw_trimmed = path.trim().trim_start_matches("file:///");
+    let p = Path::new(raw_trimmed);
+    if !p.is_file() {
+        return Err(format!("目标文件不存在或无法写入: {}", p.display()));
+    }
+
+    let content = std::fs::read_to_string(p).map_err(|e| format!("读取文件失败: {e}"))?;
+    let is_crlf = content.contains("\r\n");
+
+    let expected_lines: Vec<String> = hunk
+        .lines
+        .iter()
+        .filter(|l| l.tag != "del")
+        .map(|l| l.text.clone())
+        .collect();
+
+    let replacement_lines: Vec<String> = hunk
+        .lines
+        .iter()
+        .filter(|l| l.tag != "add")
+        .map(|l| l.text.clone())
+        .collect();
+
+    let file_lines: Vec<String> = content
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
+
+    if expected_lines.is_empty() {
+        return Err("差异块内容为空，无法撤销".into());
+    }
+
+    let exp_len = expected_lines.len();
+    let mut match_idx: Option<usize> = None;
+
+    let target_hint = hunk.new_start.saturating_sub(1);
+    if target_hint + exp_len <= file_lines.len()
+        && file_lines[target_hint..target_hint + exp_len] == expected_lines[..]
+    {
+        match_idx = Some(target_hint);
+    } else {
+        let search_start = target_hint.saturating_sub(150);
+        let search_end = (target_hint + 150).min(file_lines.len().saturating_sub(exp_len));
+        for i in search_start..=search_end {
+            if i + exp_len <= file_lines.len() && file_lines[i..i + exp_len] == expected_lines[..] {
+                match_idx = Some(i);
+                break;
+            }
+        }
+    }
+
+    let Some(start) = match_idx else {
+        return Err("在当前文件中未匹配到该差异块内容，可能文件已被改动，请刷新后再试".into());
+    };
+
+    let mut new_file_lines = Vec::with_capacity(file_lines.len() - exp_len + replacement_lines.len());
+    new_file_lines.extend_from_slice(&file_lines[..start]);
+    new_file_lines.extend(replacement_lines);
+    new_file_lines.extend_from_slice(&file_lines[start + exp_len..]);
+
+    let sep = if is_crlf { "\r\n" } else { "\n" };
+    let mut result_text = new_file_lines.join(sep);
+    if content.ends_with('\n') && !result_text.ends_with('\n') {
+        result_text.push_str(sep);
+    }
+
+    std::fs::write(p, result_text).map_err(|e| format!("写入撤销修改失败: {e}"))?;
+    Ok(())
+}
+
+// ==================== 长任务（Long-Running Task）Commands ====================
+
+#[tauri::command]
+pub fn start_long_task(
+    app: AppHandle,
+    session_id: String,
+    goal: String,
+    max_budget_tokens: Option<u64>,
+) -> Result<LongTask, String> {
+    crate::task::start_long_task(app, session_id, goal, max_budget_tokens)
+}
+
+#[tauri::command]
+pub fn pause_long_task(app: AppHandle, task_id: String) -> Result<(), String> {
+    crate::task::pause_long_task(&app, &task_id)
+}
+
+#[tauri::command]
+pub fn resume_long_task(app: AppHandle, task_id: String) -> Result<LongTask, String> {
+    crate::task::resume_long_task(&app, &task_id)
+}
+
+#[tauri::command]
+pub fn cancel_long_task(app: AppHandle, task_id: String) -> Result<(), String> {
+    crate::task::cancel_long_task(&app, &task_id)
+}
+
+#[tauri::command]
+pub fn get_active_task(app: AppHandle, session_id: String) -> Result<Option<LongTask>, String> {
+    crate::task::get_active_task(&app, &session_id)
+}
+
+#[tauri::command]
+pub fn list_task_checkpoints(app: AppHandle, task_id: String) -> Result<Vec<TaskCheckpoint>, String> {
+    crate::task::list_task_checkpoints(&app, &task_id)
+}
+
+#[tauri::command]
+pub fn rollback_to_checkpoint(app: AppHandle, checkpoint_id: String) -> Result<LongTask, String> {
+    crate::task::rollback_to_checkpoint(&app, &checkpoint_id)
+}
+
+#[tauri::command]
+pub fn update_task_subtasks(
+    app: AppHandle,
+    task_id: String,
+    subtasks: Vec<TaskSubItem>,
+) -> Result<LongTask, String> {
+    crate::task::update_task_subtasks(&app, &task_id, subtasks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2156,7 +2983,42 @@ mod tests {
 
         let _ = tokio::fs::remove_file(test_file).await;
     }
+
+    #[test]
+    fn test_get_file_outline_and_revert_hunk() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join(format!("test_hunk_revert_{}.rs", uuid::Uuid::new_v4()));
+        let initial_code = "pub struct Account {\n    pub id: String,\n}\n\nimpl Account {\n    pub fn new() -> Self {\n        Self { id: \"1\".into() }\n    }\n}\n";
+        std::fs::write(&test_file, initial_code).unwrap();
+        let path_str = test_file.to_string_lossy().to_string();
+
+        // 1. 测试大纲提取
+        let outline = get_file_outline(path_str.clone()).unwrap();
+        assert!(outline.iter().any(|item| item.symbol.contains("struct Account")));
+        assert!(outline.iter().any(|item| item.symbol.contains("impl Account")));
+        assert!(outline.iter().any(|item| item.symbol.contains("fn new")));
+
+        // 2. 修改代码模拟局部变动
+        let modified_code = "pub struct Account {\n    pub id: String,\n}\n\nimpl Account {\n    pub fn new() -> Self {\n        Self { id: \"2_modified\".into() }\n    }\n}\n";
+        std::fs::write(&test_file, modified_code).unwrap();
+
+        // 3. 计算 diff 并获取 hunk
+        let diff = get_file_diff(path_str.clone(), Some(initial_code.into()), Some(modified_code.into()), None).unwrap();
+        assert_eq!(diff.hunks.len(), 1);
+
+        // 4. 执行撤销 revert_file_hunk
+        let res = revert_file_hunk(path_str.clone(), diff.hunks[0].clone());
+        assert!(res.is_ok());
+
+        // 5. 验证文件恢复回 initial_code
+        let reverted_code = std::fs::read_to_string(&test_file).unwrap();
+        assert!(reverted_code.contains("id: \"1\".into()"));
+        assert!(!reverted_code.contains("id: \"2_modified\".into()"));
+
+        let _ = std::fs::remove_file(test_file);
+    }
 }
+
 
 
 

@@ -673,8 +673,35 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
     // system 位于上下文第 0 位且永不截断 → 新对话注入一次、同对话多条消息不重复；
     // 每次运行重建，修改约束 / 关联或知识沉淀后同对话下一条消息就地生效。
     // 临时空间会话改用临时空间说明段（含临时路径映射与优先级 临时空间 > 关联项目 > 项目约束）
-    let project_section = {
+    let (project_section, project_plan_mode, negative_code_intent) = {
         let db = state.db.lock().unwrap();
+        let plan_mode = if let Some(ref pid) = session.project_id {
+            store::get_project(&db, pid)
+                .ok()
+                .flatten()
+                .map(|p| p.plan_mode)
+                .unwrap_or_else(|| "standard".into())
+        } else if !session.workspace_path.is_empty() {
+            store::find_project_by_path(&db, &session.workspace_path)
+                .ok()
+                .flatten()
+                .map(|p| p.plan_mode)
+                .unwrap_or_else(|| "standard".into())
+        } else {
+            "standard".into()
+        };
+
+        let neg_intent = if let Ok(msgs) = store::all_messages(&db, session_id) {
+            msgs.iter()
+                .filter(|m| m.role == "user")
+                .last()
+                .and_then(|m| m.content.as_deref())
+                .map(contains_negative_code_intent)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
         let db_sec = if session.is_temp {
             match crate::temp::load_manifest(&db, session_id) {
                 Ok(Some(m)) => Some(crate::temp::build_prompt_section(&db, &session, &m)),
@@ -746,6 +773,16 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
             None
         };
 
+        let plan_sec = if !session.workspace_path.is_empty() {
+            crate::plan::load_active_plan_context(
+                std::path::Path::new(&session.workspace_path),
+                session_id,
+                Some(&db),
+            )
+        } else {
+            None
+        };
+
         let mut parts = Vec::new();
         if let Some(d) = db_sec {
             parts.push(d);
@@ -753,21 +790,31 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         if let Some(m) = mem_sec {
             parts.push(format!("## 本项目持久化认知与沉淀记忆（来自 .harness/memory/，可秒级召回）\n{}", m));
         }
+        if let Some(p) = plan_sec {
+            parts.push(p);
+        }
         if let Some(c) = collabs_sec {
             parts.push(c);
         }
-        if parts.is_empty() {
+        let sec = if parts.is_empty() {
             None
         } else {
             Some(parts.join("\n\n"))
-        }
+        };
+        (sec, plan_mode, neg_intent)
     };
-    let sys = system_prompt(&session, project_section.as_deref(), &settings.disabled_sops);
+    let sys = system_prompt(
+        &session,
+        project_section.as_deref(),
+        &settings.disabled_sops,
+        &project_plan_mode,
+    );
     let mut files_modified = false;
     let mut sop_retry_count = 0usize;
     let mut sop_verified = false;
     let mut tool_tracker = ToolErrorTracker::new(2);
     let mut has_checked_compaction = false;
+    let mut created_plan_in_this_turn = false;
     for _step in 0..max_steps {
         // ---- 步骤 0：在首步或上下文逼近上限时检测是否触发自动压缩与确认 ----
         if !has_checked_compaction {
@@ -883,7 +930,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         )
         .await;
 
-        let result = match call {
+        let mut result = match call {
             Ok(r) => r,
             Err(e) => {
                 emit_error(app, session_id, "llm", e);
@@ -893,14 +940,19 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
 
         // 空回复防护：模型不支持流式/工具或名称错误时给出明确提示
         if result.tool_calls.is_empty() && result.content.trim().is_empty() {
-            emit_error(
-                app,
-                session_id,
-                "empty_response",
-                "模型返回了空回复。请检查设置中的模型名称是否正确、该模型是否支持工具调用（function calling），或更换模型后重试。"
-                    .into(),
-            );
-            return (RunOutcome::Done, last_assistant_id, run_tokens);
+            if !result.reasoning.trim().is_empty() {
+                // 推理思考模型（如 DeepSeek-R1、QwQ 等）可能将汇报输出在思考流中，兜底提取正文，避免误杀
+                result.content = format!("【思考过程汇报】\n{}", result.reasoning.trim());
+            } else {
+                emit_error(
+                    app,
+                    session_id,
+                    "empty_response",
+                    "模型返回了空回复。请检查设置中的模型名称是否正确、该模型是否支持工具调用（function calling），或更换模型后重试。"
+                        .into(),
+                );
+                return (RunOutcome::Done, last_assistant_id, run_tokens);
+            }
         }
 
         let step_duration_ms = step_start.elapsed().as_millis() as u64;
@@ -1122,18 +1174,54 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
             let args: Value = serde_json::from_str(&tc.args).unwrap_or_else(|_| {
                 json!({"__parse_error": "工具参数不是有效 JSON"})
             });
-            let (status, mut result_text) = handle_tool_call(
-                app,
-                session_id,
-                &assistant_id,
-                &tc.id,
-                &tc.name,
-                &args,
-                &specs,
-                &tool_ctx,
-                &settings.disabled_tools,
-            )
-            .await;
+
+            let is_modifying = tc.name == "write_file" || tc.name == "edit_file";
+            let guard_denied = if is_modifying {
+                if project_plan_mode == "always_plan" && created_plan_in_this_turn {
+                    Some("【模式守卫拦截】: 当前项目启用了「Always Plan 模式」，执行方案刚刚生成，严禁在同一轮次中未经用户确认直接修改代码。请停止调用写入工具，向用户汇报当前计划核心并请求确认。".to_string())
+                } else if project_plan_mode == "always_proceed" && negative_code_intent {
+                    Some("【模式守卫拦截】: 用户在当前任务中明确说明了先不改动代码（仅出方案/评估）。你已完成计划制定，严格禁止在当前轮次修改代码。请向用户输出方案说明并等待用户指示。".to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let (status, mut result_text) = if let Some(reason) = guard_denied {
+                let now = chrono::Utc::now().to_rfc3339();
+                let ev = ToolEvent {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    message_id: assistant_id.clone(),
+                    tool_name: tc.name.clone(),
+                    tool_call_id: Some(tc.id.clone()),
+                    params: args.clone(),
+                    result_text: Some(reason.clone()),
+                    status: "denied".into(),
+                    approval_scope: Some("guard_blocked".into()),
+                    created_at: now,
+                    subprocess_id: None,
+                };
+                {
+                    let db = state.db.lock().unwrap();
+                    let _ = store::insert_tool_event(&db, &ev);
+                }
+                emit_tool(app, session_id, &ev);
+                ("denied".into(), reason)
+            } else {
+                handle_tool_call(
+                    app,
+                    session_id,
+                    &assistant_id,
+                    &tc.id,
+                    &tc.name,
+                    &args,
+                    &specs,
+                    &tool_ctx,
+                    &settings.disabled_tools,
+                )
+                .await
+            };
 
             // 工具自动自纠错机制：非用户审批拒绝的执行失败触发内部微反思引导
             if status == "failed" {
@@ -1204,6 +1292,9 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
             if (tc.name == "write_file" || tc.name == "edit_file") && status == "success" {
                 files_modified = true;
                 sop_verified = false;
+            }
+            if tc.name == "create_plan" && status == "success" {
+                created_plan_in_this_turn = true;
             }
             let _ = status;
         }
@@ -1302,8 +1393,27 @@ async fn handle_tool_call(
     let mut ask_risk = "write";
     let mut force_once = false;
 
+    // 检查是否命中 .harness 目录全量读写白名单（系统记忆、方案、配置、自省目录免审放行）
+    let is_harness_operation = {
+        let is_harness_tool = matches!(
+            tool_name,
+            "create_plan" | "update_plan" | "switch_plan" | "read_plan" | "record_memory"
+        );
+        let is_harness_path = path_arg.map(|p| {
+            let p_norm = p.replace('\\', "/");
+            p_norm.starts_with(".harness/")
+                || p_norm == ".harness"
+                || p_norm.contains("/.harness/")
+                || p_norm.ends_with("/.harness")
+        }).unwrap_or(false);
+        is_harness_tool || is_harness_path
+    };
+
     if full_access && tool_name != "temp_merge" {
         scope = Some("mode");
+    } else if is_harness_operation {
+        // .harness 目录全量读写放行白名单（方案/记忆/治理系统），免去底层写审批
+        scope = Some("harness_whitelist");
     } else {
         let high_danger =
             tool_name == "run_command" && args.get("command").and_then(|c| c.as_str()).map(tools::is_high_danger).unwrap_or(false);
@@ -1458,6 +1568,17 @@ async fn handle_tool_call(
             }
         }
     }
+    if matches!(tool_name, "create_plan" | "update_plan" | "switch_plan" | "read_plan") && status == "success" {
+        let normalized = text.replace('\\', "/");
+        if let Some(pos) = normalized.find(".harness/plans/") {
+            let sub = &normalized[pos..];
+            let end = sub.find(|c: char| c.is_whitespace() || c == '`' || c == ')' || c == '"' || c == '\'').unwrap_or(sub.len());
+            let path_str = sub[..end].trim_end_matches('.');
+            if let Some(obj) = ev.params.as_object_mut() {
+                obj.insert("plan_file_path".into(), json!(path_str));
+            }
+        }
+    }
     ev.status = status.clone();
     ev.result_text = Some(text.clone());
     {
@@ -1588,6 +1709,17 @@ fn build_preview(tool_name: &str, args: &Value) -> String {
             let filename = args.get("filename").and_then(|f| f.as_str()).unwrap_or("自动生成路径");
             format!("根据提示词生成图片：\n提示词: {prompt}\n分辨率: {size}\n目标文件: {filename}")
         }
+        "create_plan" => {
+            let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("未命名计划");
+            let goals = args.get("goals").and_then(|v| v.as_str()).unwrap_or("");
+            let arch = args.get("architecture").and_then(|v| v.as_str()).unwrap_or("");
+            format!("创建任务执行计划【{}】\n目标：{}\n架构设计：{}", title, goals, arch)
+        }
+        "update_plan" => {
+            let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+            let note = args.get("revision_note").and_then(|v| v.as_str()).unwrap_or("");
+            format!("更新任务计划\n调整原因：{}\n变更备注：{}", reason, note)
+        }
         _ => serde_json::to_string_pretty(args).unwrap_or_default(),
     }
 }
@@ -1601,6 +1733,18 @@ fn truncate_preview(s: &str, max_chars: usize) -> String {
     } else {
         truncated
     }
+}
+
+/// 检测用户 Prompt 中是否包含“先不改动代码”的明确否定语义
+fn contains_negative_code_intent(s: &str) -> bool {
+    let text = s.to_lowercase();
+    let keywords = [
+        "先不改代码", "先别改代码", "暂时别改代码", "不要改代码", "暂不改动代码",
+        "先出方案", "只出方案", "先不要改代码", "只给方案", "仅出方案", "先给出方案",
+        "方案我看下", "方案我看看", "只评估", "仅评估", "先评估", "仅设计", "只设计",
+        "don't edit code", "don't modify code", "plan only", "only plan",
+    ];
+    keywords.iter().any(|k| text.contains(k))
 }
 
 async fn check_and_trigger_compaction(
@@ -1910,6 +2054,8 @@ fn build_context(
                     Some(tcs) if !tcs.is_null() && tcs.as_array().map(|a| !a.is_empty()).unwrap_or(false) => {
                         if !content.is_empty() {
                             obj["content"] = Value::String(content.clone());
+                        } else {
+                            obj["content"] = Value::Null;
                         }
                         obj["tool_calls"] = tcs.clone();
                         est += estimate_tokens(&content) + crate::models::estimate_value_tokens(tcs);
@@ -2246,7 +2392,12 @@ fn project_section(
     s
 }
 
-fn system_prompt(session: &Session, project_section: Option<&str>, disabled_sops: &[String]) -> String {
+fn system_prompt(
+    session: &Session,
+    project_section: Option<&str>,
+    disabled_sops: &[String],
+    plan_mode: &str,
+) -> String {
     let os = if cfg!(windows) { "Windows" } else { "Unix-like" };
     let is_collab = session.session_type == "collaborator";
     let is_sub = is_collab || session.session_type == "subprocess" || session.session_type == "subagent" || session.parent_session_id.is_some();
@@ -2398,9 +2549,32 @@ fn system_prompt(session: &Session, project_section: Option<&str>, disabled_sops
         let mut rules = Vec::new();
         let mut rule_num = 1;
 
-        if is_sop_enabled("plan_first") {
+        if plan_mode == "always_plan" {
             rules.push(format!(
-                "{rule_num}. 【方案先行（先分析设计，不急于改代码）】：\n   - 当用户提出新功能开发、需求实现、架构重构或技术探索时，**必须先分析可行性、梳理技术依赖并给出推荐的实现方案与步骤，向用户征询确认；在用户未明确确认修改或要求直接编码前，切勿擅自修改或新增代码文件**。"
+                "{rule_num}. 【严格规划先行与确认门禁准则（Always Plan 模式 - 强安全风控）】：\n   \
+                 - 适用范围：凡是对项目进行较大改动（预计修改 3 个以上文件、架构重构、引入新架构或新增功能特性）：\n   \
+                 - 阶段划分（严禁越界）：\n     \
+                   1. 【只读调研】：仅允许使用只读工具（glob / grep / list_dir / file_outline / read_file）摸清代码逻辑；\n     \
+                   2. 【生成计划】：必须先调用 `create_plan` 工具在 `.harness/plans/` 目录下生成结构化计划 MD 文档；\n     \
+                   3. 【必须停止并等待确认】：**生成计划后，当前轮次严禁调用任何写文件或编辑代码的工具（write_file / edit_file）**！你必须在回复中简明扼要汇报方案核心、涉及文件与分步清单，并明确请用户审阅确认。只有在用户确认计划后，下一轮对话才可开始修改代码。\n   \
+                 - 微小改动（如修改单文件拼写错误、纯问答解释）无需生成计划，可直接处理。"
+            ));
+            rule_num += 1;
+        } else if plan_mode == "always_proceed" {
+            rules.push(format!(
+                "{rule_num}. 【规划先行与自动推进准则（Always Proceed 模式 - 敏捷高效）】：\n   \
+                 - 适用范围：凡是对项目进行较大改动（预计修改 3 个以上文件、跨模块重构、新增功能特性）：\n   \
+                 - 核心流程：\n     \
+                   1. 【必须先有计划】：同样必须调用 `create_plan` 工具生成结构化计划 MD 文档落盘，确立任务锚点与分步 Checklist；\n     \
+                   2. 【自动推进与意图判断】：生成计划后：\n       \
+                      * 若用户在指令中明确说明了“先不改动代码 / 仅出方案 / 暂勿修改 / 先评估”，则生成计划后停止，严禁改动代码；\n       \
+                      * 若用户没有明确说明先不改代码，**生成计划后无需停下来等待用户确认，直接连贯执行计划、调用 edit_file / write_file 编写代码**，按清单逐步推进直至完成并自检！\n   \
+                 - 微小改动（如单文件微调、纯解释）可直接处理。"
+            ));
+            rule_num += 1;
+        } else if is_sop_enabled("plan_first") {
+            rules.push(format!(
+                "{rule_num}. 【方案先行与任务计划中枢治理规范（防需求失真，必须严格遵守）】：\n   - 大改动物理落盘先行：凡是涉及 3 个以上文件修改、架构重构、新增功能模块或预计多轮交互的复杂任务，**严禁在没有计划文档的情况下直接编写/修改代码**。必须先调用 `create_plan` 工具在 `.harness/plans/` 目录下生成结构化计划 MD 文档（明确目标、技术架构、受影响文件清单、分步 Checklist 与验证策略），并向用户呈现确认。\n   - 需求变更优先更新计划：在多轮对话中，一旦用户提出需求调整、增加/减少特性或纠偏，**在改动代码前，必须首先调用 `update_plan` 工具同步更新计划文档内容与变更历史 (Revision History)**，彻底杜绝“口头答应却遗留旧代码/旧逻辑”的需求失真。\n   - 按清单逐步推进与结案：执行阶段严格以计划 Checklist 为基准推进，每完成一个关键步骤，调用 `update_plan` 推进步骤状态；全部任务完成并通过测试后，调用 `update_plan(status: \"completed\")` 结案归档并解除活动挂载。\n   - 多需求隔离与计划流转：在同一会话中开启全新不相关的独立任务时，调用 `create_plan` 开启新的独立计划（旧计划自动挂起，杜绝多任务杂糅）；若需回溯前序任务，调用 `switch_plan` 重新激活。"
             ));
             rule_num += 1;
         }
@@ -2431,7 +2605,9 @@ fn system_prompt(session: &Session, project_section: Option<&str>, disabled_sops
             rule_num += 1;
         }
 
-        rules.push(format!("{rule_num}. 所有路径相对于工作区根目录，不要访问工作区之外的路径。"));
+        rules.push(format!(
+            "{rule_num}. 路径基准说明：所有相对路径默认相对于工作区根目录解析。当前工作区为主要开发上下文；若任务明确需要读取、比对或操作工作区外部文件（如系统配置、全局依赖或关联工程），请使用规范的绝对路径，系统会根据权限策略处理。"
+        ));
         rule_num += 1;
 
         rules.push(format!("{rule_num}. 不要执行破坏性命令（如递归删除、格式化磁盘等），它们会被强制要求用户确认。"));
@@ -2791,10 +2967,10 @@ mod tests {
             auto_report: None,
             ..Default::default()
         };
-        let with = system_prompt(&session, Some("## 项目约束\nX"), &[]);
+        let with = system_prompt(&session, Some("## 项目约束\nX"), &[], "standard");
         assert!(with.contains("工作区根目录：D:\\ws"));
         assert!(with.ends_with("## 项目约束\nX"));
-        let without = system_prompt(&session, None, &[]);
+        let without = system_prompt(&session, None, &[], "standard");
         assert!(!without.contains("项目约束"));
     }
 
@@ -2828,7 +3004,7 @@ mod tests {
             auto_report: None,
             ..Default::default()
         };
-        let all_enabled = system_prompt(&session, None, &[]);
+        let all_enabled = system_prompt(&session, None, &[], "standard");
         assert!(all_enabled.contains("方案先行"));
         assert!(all_enabled.contains("边读边记与强制沉淀 SOP"));
         assert!(all_enabled.contains("团队协作者优先委派原则"));
@@ -2843,13 +3019,41 @@ mod tests {
             "safe_code_edit".to_string(),
             "surgical_code_reading".to_string(),
         ];
-        let filtered = system_prompt(&session, None, &disabled);
+        let filtered = system_prompt(&session, None, &disabled, "standard");
         assert!(!filtered.contains("方案先行"));
         assert!(!filtered.contains("边读边记与强制沉淀 SOP"));
         assert!(!filtered.contains("todo 工具列出计划"));
         assert!(!filtered.contains("修改文件前必须先用 read_file 读取相关内容"));
         assert!(!filtered.contains("精益代码研读与克制探索 SOP"));
         assert!(filtered.contains("团队协作者优先委派原则"));
+    }
+
+    #[test]
+    fn test_system_prompt_plan_mode() {
+        let session = Session {
+            workspace_path: "D:\\ws".into(),
+            ..Default::default()
+        };
+        let prompt_plan = system_prompt(&session, None, &[], "always_plan");
+        assert!(prompt_plan.contains("Always Plan 模式"));
+        assert!(prompt_plan.contains("必须停止并等待确认"));
+
+        let prompt_proc = system_prompt(&session, None, &[], "always_proceed");
+        assert!(prompt_proc.contains("Always Proceed 模式"));
+        assert!(prompt_proc.contains("自动推进与意图判断"));
+
+        let prompt_std = system_prompt(&session, None, &[], "standard");
+        assert!(!prompt_std.contains("Always Plan 模式"));
+        assert!(!prompt_std.contains("Always Proceed 模式"));
+    }
+
+    #[test]
+    fn test_negative_code_intent() {
+        assert!(contains_negative_code_intent("先分析一下，先不要改代码"));
+        assert!(contains_negative_code_intent("先帮我出方案，方案我看下"));
+        assert!(contains_negative_code_intent("请 plan only，先评估"));
+        assert!(!contains_negative_code_intent("帮我实现用户鉴权模块"));
+        assert!(!contains_negative_code_intent("重构数据导出功能"));
     }
 
     #[test]

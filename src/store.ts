@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { ipc } from "./ipc";
-import { DRAFT_ID, samePath, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice } from "./types";
+import { DRAFT_ID, samePath, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem } from "./types";
+
 
 export interface EditingMessageTarget {
   messageId: string;
@@ -333,6 +334,26 @@ interface Store {
   onSubagentsChanged: (p: any) => Promise<void>;
   onSubagentCreated: (subagent: Session) => void;
   onSubagentUpdate: (payload: any) => void;
+
+  /** 长任务（按会话 id 索引） */
+  activeTasks: Record<string, LongTask | null>;
+  /** 任务检查点（按 taskId 索引） */
+  taskCheckpoints: Record<string, TaskCheckpoint[]>;
+  /** 是否打开长任务详情弹窗 */
+  showTaskDetailModal: boolean;
+  setShowTaskDetailModal: (v: boolean) => void;
+
+  startLongTask: (sessionId: string, goal: string, maxBudgetTokens?: number | null) => Promise<LongTask | null>;
+  pauseLongTask: (taskId: string) => Promise<void>;
+  resumeLongTask: (taskId: string) => Promise<LongTask | null>;
+  cancelLongTask: (taskId: string) => Promise<void>;
+  fetchActiveTask: (sessionId: string) => Promise<LongTask | null>;
+  fetchTaskCheckpoints: (taskId: string) => Promise<TaskCheckpoint[]>;
+  rollbackToCheckpoint: (checkpointId: string) => Promise<LongTask | null>;
+  updateTaskSubtasks: (taskId: string, subtasks: TaskSubItem[]) => Promise<LongTask | null>;
+  onTaskUpdate: (task: LongTask) => void;
+  onTaskCheckpoint: (checkpoint: TaskCheckpoint) => void;
+
   onError: (p: any) => void;
 }
 
@@ -500,6 +521,12 @@ export const useStore = create<Store>((set, get) => ({
   view: "project",
   lightboxImage: null,
   setLightboxImage: (img) => set({ lightboxImage: img }),
+
+  activeTasks: {},
+  taskCheckpoints: {},
+  showTaskDetailModal: false,
+  setShowTaskDetailModal: (v) => set({ showTaskDetailModal: v }),
+
 
   async bootstrap() {
     // 数据目录状态优先获取：pending 时启动拦截对话框要在其余数据加载前就绪
@@ -926,6 +953,7 @@ export const useStore = create<Store>((set, get) => ({
       void get().loadCollaborators(id);
       void get().loadSubprocesses(id);
       void get().loadSubagents(id);
+      void get().fetchActiveTask(id);
       // 切换主会话时，如果分屏中的协作者/子 Agent 不属于当前会话，则关闭分屏
       const curCollabId = get().activeCollaboratorId;
       if (curCollabId) {
@@ -2157,6 +2185,130 @@ export const useStore = create<Store>((set, get) => ({
       }));
     }
     void get().loadSubagents(pid);
+  },
+
+  async startLongTask(sessionId, goal, maxBudgetTokens) {
+    try {
+      const task = await ipc.startLongTask(sessionId, goal, maxBudgetTokens);
+      set((st) => ({
+        activeTasks: { ...st.activeTasks, [sessionId]: task },
+      }));
+      get().pushToast(`长任务已启动: ${goal}`, "info");
+      return task;
+    } catch (e: any) {
+      get().pushToast(`启动长任务失败: ${e}`, "error");
+      return null;
+    }
+  },
+
+  async pauseLongTask(taskId) {
+    try {
+      await ipc.pauseLongTask(taskId);
+      get().pushToast("长任务已暂停", "warning");
+    } catch (e: any) {
+      get().pushToast(`暂停长任务失败: ${e}`, "error");
+    }
+  },
+
+  async resumeLongTask(taskId) {
+    try {
+      const task = await ipc.resumeLongTask(taskId);
+      set((st) => ({
+        activeTasks: { ...st.activeTasks, [task.sessionId]: task },
+      }));
+      get().pushToast("长任务已恢复继续推进", "info");
+      return task;
+    } catch (e: any) {
+      get().pushToast(`恢复长任务失败: ${e}`, "error");
+      return null;
+    }
+  },
+
+  async cancelLongTask(taskId) {
+    try {
+      await ipc.cancelLongTask(taskId);
+      get().pushToast("长任务已终止", "info");
+    } catch (e: any) {
+      get().pushToast(`终止长任务失败: ${e}`, "error");
+    }
+  },
+
+  async fetchActiveTask(sessionId) {
+    try {
+      const task = await ipc.getActiveTask(sessionId);
+      set((st) => ({
+        activeTasks: { ...st.activeTasks, [sessionId]: task },
+      }));
+      if (task) {
+        void get().fetchTaskCheckpoints(task.id);
+      }
+      return task;
+    } catch {
+      return null;
+    }
+  },
+
+  async fetchTaskCheckpoints(taskId) {
+    try {
+      const list = await ipc.listTaskCheckpoints(taskId);
+      set((st) => ({
+        taskCheckpoints: { ...st.taskCheckpoints, [taskId]: list },
+      }));
+      return list;
+    } catch {
+      return [];
+    }
+  },
+
+  async rollbackToCheckpoint(checkpointId) {
+    try {
+      const task = await ipc.rollbackToCheckpoint(checkpointId);
+      set((st) => ({
+        activeTasks: { ...st.activeTasks, [task.sessionId]: task },
+      }));
+      // 重新获取该任务的检查点列表
+      void get().fetchTaskCheckpoints(task.id);
+      get().pushToast("已成功回退到指定历史检查点", "info");
+      return task;
+    } catch (e: any) {
+      get().pushToast(`回退快照失败: ${e}`, "error");
+      return null;
+    }
+  },
+
+  async updateTaskSubtasks(taskId, subtasks) {
+    try {
+      const task = await ipc.updateTaskSubtasks(taskId, subtasks);
+      set((st) => ({
+        activeTasks: { ...st.activeTasks, [task.sessionId]: task },
+      }));
+      get().pushToast("子任务路线图已更新", "info");
+      return task;
+    } catch (e: any) {
+      get().pushToast(`更新子任务失败: ${e}`, "error");
+      return null;
+    }
+  },
+
+  onTaskUpdate(task) {
+    set((st) => ({
+      activeTasks: { ...st.activeTasks, [task.sessionId]: task },
+    }));
+  },
+
+  onTaskCheckpoint(checkpoint) {
+    set((st) => {
+      const prev = st.taskCheckpoints[checkpoint.taskId] ?? [];
+      const exists = prev.some((c) => c.id === checkpoint.id);
+      return {
+        taskCheckpoints: {
+          ...st.taskCheckpoints,
+          [checkpoint.taskId]: exists
+            ? prev.map((c) => (c.id === checkpoint.id ? checkpoint : c))
+            : [...prev, checkpoint],
+        },
+      };
+    });
   },
 
   onError(p) {

@@ -299,6 +299,117 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 }
             }),
         },
+        // ---------- 任务方案计划中枢工具集 (.harness/plans/) ----------
+        ToolSpec {
+            name: "create_plan",
+            description: "针对大改动任务（3个以上文件变动/重构）或多轮对话任务，在 .harness/plans/ 下建立规范的结构化计划 MD 文档，作为权威执行锚点。防止需求在多轮对话中失真或遗失。",
+            risk: Risk::Write,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "计划简明标题，如 用户鉴权重构与 JWT 改造计划"},
+                    "goals": {"type": "string", "description": "核心需求背景与业务目标（条理化清晰描述）"},
+                    "architecture": {"type": "string", "description": "架构设计与技术实现方案"},
+                    "files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "预估涉及的文件清单及变更说明，如 [\"[NEW] src/auth/jwt.rs\", \"[MODIFY] src/middleware.rs\"]"
+                    },
+                    "steps": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "分步实施 Checklist 步骤描述列表，如 [\"编写 jwt.rs 核心编解码\", \"替换中间件并测试\"]"
+                    },
+                    "verification": {
+                        "type": "string",
+                        "description": "可选：验收与自检命令或测试策略，如 cargo test --package auth"
+                    }
+                },
+                "required": ["title", "goals", "architecture", "files", "steps"]
+            }),
+        },
+        ToolSpec {
+            name: "update_plan",
+            description: "当用户在多轮对话中调整需求、或任务推进完成某一阶段时，更新计划文档正文、推进分步清单状态，并记录变更历史。在改动代码前务必先同步计划！若任务全部完成并通过测试，请将 status 设为 completed 以结案解除挂载。",
+            risk: Risk::Write,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "调整原因或阶段性说明，如 用户要求增加 Redis 黑名单缓存 / 完成第一阶段编码"},
+                    "plan_id": {"type": "string", "description": "可选：指定更新的计划 ID 或文件名 Slug；缺省时自动更新当前会话的活动计划"},
+                    "status": {
+                        "type": "string",
+                        "enum": ["in_progress", "completed", "suspended"],
+                        "description": "可选：更新计划状态。任务全部完成并通过测试后请设置为 completed"
+                    },
+                    "step_updates": {
+                        "type": "array",
+                        "description": "可选：更新特定步骤的状态",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "index": {"type": "integer", "description": "步骤序号（1 开始）"},
+                                "content": {"type": "string", "description": "步骤匹配关键词（可选）"},
+                                "status": {"type": "string", "enum": ["done", "in_progress", "pending"], "description": "目标状态"}
+                            },
+                            "required": ["status"]
+                        }
+                    },
+                    "modified_sections": {
+                        "type": "object",
+                        "description": "可选：需局部更新的方案段落",
+                        "properties": {
+                            "goals": {"type": "string", "description": "更新后的需求背景与目标"},
+                            "architecture": {"type": "string", "description": "更新后的技术设计方案"},
+                            "files": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "更新后的文件清单"
+                            }
+                        }
+                    },
+                    "revision_note": {
+                        "type": "string",
+                        "description": "可选：追加至需求变更历史 (Revision History) 中的版本备注摘要"
+                    }
+                },
+                "required": ["reason"]
+            }),
+        },
+        ToolSpec {
+            name: "switch_plan",
+            description: "在当前会话的历史任务计划之间快速切换。例如当用户在多需求场景中提出“回到之前的鉴权任务改个参数”时，调用此工具将历史计划重新唤醒为当前活动计划。",
+            risk: Risk::ReadOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "plan_id": {"type": "string", "description": "要激活的目标计划 ID 或文件名 Slug"}
+                },
+                "required": ["plan_id"]
+            }),
+        },
+        ToolSpec {
+            name: "read_plan",
+            description: "查阅指定计划或当前正在执行的活动计划的完整 Markdown 方案文档。",
+            risk: Risk::ReadOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "plan_id": {"type": "string", "description": "可选：目标计划 ID 或文件名 Slug；缺省时查阅当前活动计划"}
+                }
+            }),
+        },
+        ToolSpec {
+            name: "list_plans",
+            description: "列出当前工作区在 .harness/plans/ 中已建立的所有任务计划清单及其推进状态、版本与完成度。",
+            risk: Risk::ReadOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "include_archived": {"type": "boolean", "description": "是否包含已归档至 archive/ 的历史计划，默认 false"}
+                }
+            }),
+        },
         // ---------- 子 Agent 进程协作工具集 ----------
         ToolSpec {
             name: "spawn_subagent",
@@ -565,10 +676,24 @@ fn resolve(ctx: &ToolCtx, rel: &str) -> PathBuf {
 pub fn inside_workspace(ctx: &ToolCtx, rel: &str) -> bool {
     let p = resolve(ctx, rel);
     let root = ctx.sandbox_root.as_ref().unwrap_or(&ctx.workspace);
-    match (p.canonicalize(), root.canonicalize()) {
-        (Ok(p), Ok(w)) => p.starts_with(&w),
-        _ => false,
+    let Ok(root_canon) = root.canonicalize() else {
+        return false;
+    };
+
+    // 若目标已存在，直接比对真实规范化路径
+    if let Ok(p_canon) = p.canonicalize() {
+        return p_canon.starts_with(&root_canon);
     }
+
+    // 若目标尚不存在（如新建文件），向上追溯查找最近的已存在父目录进行比对
+    let mut curr = p.as_path();
+    while let Some(parent) = curr.parent() {
+        if let Ok(parent_canon) = parent.canonicalize() {
+            return parent_canon.starts_with(&root_canon);
+        }
+        curr = parent;
+    }
+    false
 }
 
 fn glob_to_regex(pattern: &str) -> String {
@@ -643,6 +768,11 @@ pub async fn execute(
         "run_skill" => run_skill_tool(args, ctx, on_partial).await,
         "record_memory" => record_memory_tool(args, ctx).await,
         "read_memory" => read_memory_tool(args, ctx).await,
+        "create_plan" => create_plan_tool(args, ctx).await,
+        "update_plan" => update_plan_tool(args, ctx).await,
+        "switch_plan" => switch_plan_tool(args, ctx).await,
+        "read_plan" => read_plan_tool(args, ctx).await,
+        "list_plans" => list_plans_tool(args, ctx).await,
         "spawn_subagent" | "spawn_subprocess" => spawn_subagent_tool(args, ctx).await,
         "get_subagent_status" => get_subagent_status_tool(args, ctx).await,
         "wait_subagents" | "wait_subprocesses" => wait_subagents_tool(args, ctx).await,
@@ -1498,6 +1628,104 @@ async fn read_memory_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String>
     crate::memory::read_memory(&ctx.workspace, topic)
 }
 
+// ---------- 任务方案计划中枢工具实现 ----------
+
+async fn create_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let title = args.get("title").and_then(|v| v.as_str()).ok_or("缺少 title 参数")?;
+    let goals = args.get("goals").and_then(|v| v.as_str()).ok_or("缺少 goals 参数")?;
+    let architecture = args.get("architecture").and_then(|v| v.as_str()).ok_or("缺少 architecture 参数")?;
+    let files: Vec<String> = args
+        .get("files")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let steps: Vec<String> = args
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let verification = args.get("verification").and_then(|v| v.as_str());
+
+    let session_id = ctx.host.as_ref().map(|h| h.session_id.as_str()).unwrap_or("");
+    let app = ctx.host.as_ref().map(|h| &h.app);
+    let state = app.map(|a| a.state::<crate::AppState>());
+    let db_guard = state.as_ref().map(|s| s.db.lock().unwrap());
+    let db_ref = db_guard.as_deref();
+
+    crate::plan::create_plan(
+        &ctx.workspace,
+        session_id,
+        title,
+        goals,
+        architecture,
+        &files,
+        &steps,
+        verification,
+        db_ref,
+    )
+}
+
+async fn update_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let reason = args.get("reason").and_then(|v| v.as_str()).ok_or("缺少 reason 参数")?;
+    let plan_id = args.get("plan_id").and_then(|v| v.as_str());
+    let status = args.get("status").and_then(|v| v.as_str());
+    let step_updates = args.get("step_updates").and_then(|v| v.as_array()).map(|v| v.as_slice());
+    let modified_sections = args.get("modified_sections");
+    let revision_note = args.get("revision_note").and_then(|v| v.as_str());
+
+    let session_id = ctx.host.as_ref().map(|h| h.session_id.as_str()).unwrap_or("");
+    let app = ctx.host.as_ref().map(|h| &h.app);
+    let state = app.map(|a| a.state::<crate::AppState>());
+    let db_guard = state.as_ref().map(|s| s.db.lock().unwrap());
+    let db_ref = db_guard.as_deref();
+
+    crate::plan::update_plan(
+        &ctx.workspace,
+        session_id,
+        plan_id,
+        reason,
+        status,
+        step_updates,
+        modified_sections,
+        revision_note,
+        db_ref,
+    )
+}
+
+async fn switch_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let plan_id = args.get("plan_id").and_then(|v| v.as_str()).ok_or("缺少 plan_id 参数")?;
+    let session_id = ctx.host.as_ref().map(|h| h.session_id.as_str()).unwrap_or("");
+    let app = ctx.host.as_ref().map(|h| &h.app);
+    let state = app.map(|a| a.state::<crate::AppState>());
+    let db_guard = state.as_ref().map(|s| s.db.lock().unwrap());
+    let db_ref = db_guard.as_deref();
+
+    crate::plan::switch_plan(&ctx.workspace, session_id, plan_id, db_ref)
+}
+
+async fn read_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let plan_id = args.get("plan_id").and_then(|v| v.as_str());
+    let session_id = ctx.host.as_ref().map(|h| h.session_id.as_str()).unwrap_or("");
+    let app = ctx.host.as_ref().map(|h| &h.app);
+    let state = app.map(|a| a.state::<crate::AppState>());
+    let db_guard = state.as_ref().map(|s| s.db.lock().unwrap());
+    let db_ref = db_guard.as_deref();
+
+    crate::plan::read_plan(&ctx.workspace, session_id, plan_id, db_ref)
+}
+
+async fn list_plans_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let include_archived = args.get("include_archived").and_then(|v| v.as_bool()).unwrap_or(false);
+    let session_id = ctx.host.as_ref().map(|h| h.session_id.as_str());
+    let app = ctx.host.as_ref().map(|h| &h.app);
+    let state = app.map(|a| a.state::<crate::AppState>());
+    let db_guard = state.as_ref().map(|s| s.db.lock().unwrap());
+    let db_ref = db_guard.as_deref();
+
+    let list = crate::plan::list_plans(&ctx.workspace, session_id, include_archived, db_ref)?;
+    serde_json::to_string_pretty(&list).map_err(|e| e.to_string())
+}
+
 // ---------- 子 Agent 协作工具具体实现 ----------
 
 async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
@@ -2176,5 +2404,27 @@ const handleClick = async () => {
         assert!(outline.contains("export const LIST"));
         assert!(outline.contains("export function getItem"));
         assert!(outline.contains("const handleClick"));
+    }
+
+    #[test]
+    fn test_inside_workspace() {
+        let temp = std::env::temp_dir();
+        let ctx = ToolCtx {
+            workspace: temp.clone(),
+            sandbox_root: None,
+            command_timeout: std::time::Duration::from_secs(10),
+            temp: None,
+            host: None,
+            event_id: None,
+        };
+
+        // 工作区内已存在目录
+        assert!(inside_workspace(&ctx, "."));
+        // 工作区内新建文件（不存在）
+        assert!(inside_workspace(&ctx, "non_existent_file_abc123.txt"));
+        // 工作区内多层不存在子路径
+        assert!(inside_workspace(&ctx, "a/b/c/new_file.txt"));
+        // 尝试越界
+        assert!(!inside_workspace(&ctx, "../../outside_something_abc123"));
     }
 }

@@ -72,6 +72,13 @@ function toolCategoryBadge(name: string) {
       </span>
     );
   }
+  if (["create_plan", "update_plan", "switch_plan", "read_plan", "list_plans"].includes(name)) {
+    return (
+      <span className="text-[10px] px-1.5 py-[0.5px] rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 shrink-0">
+        任务计划
+      </span>
+    );
+  }
   return (
     <span className="text-[10px] px-1.5 py-[0.5px] rounded bg-blue-500/10 text-blue-400 border border-blue-500/20 shrink-0">
       内置
@@ -95,6 +102,12 @@ function ToolIcon({ name }: { name: string }) {
       return <Search size={14} className="text-indigo-400 shrink-0" />;
     case "todo":
       return <CheckSquare size={14} className="text-purple-400 shrink-0" />;
+    case "create_plan":
+    case "update_plan":
+    case "switch_plan":
+    case "read_plan":
+    case "list_plans":
+      return <CheckSquare size={14} className="text-emerald-400 shrink-0" />;
     case "generate_image":
       return <Image size={14} className="text-pink-400 shrink-0" />;
     case "list_skills":
@@ -138,6 +151,16 @@ function paramTitle(ev: ToolEvent): string {
       return String(p.name ?? "");
     case "list_skills":
       return "技能工具库";
+    case "create_plan":
+      return String(p.title ?? "创建任务方案");
+    case "update_plan":
+      return `${p.status === "completed" ? "【已结案】" : ""}${p.reason ?? "更新任务计划"}`;
+    case "switch_plan":
+      return `激活计划 [${p.plan_id ?? ""}]`;
+    case "read_plan":
+      return String(p.plan_id ?? "当前活动计划");
+    case "list_plans":
+      return "项目计划清单";
     case "wait_subprocesses":
     case "wait_subagents":
       return "等待子进程完成汇聚";
@@ -161,6 +184,11 @@ const TOOL_LABELS: Record<string, string> = {
   edit_file: "编辑文件",
   run_command: "执行命令",
   todo: "任务清单",
+  create_plan: "创建计划",
+  update_plan: "更新计划",
+  switch_plan: "切换计划",
+  read_plan: "查阅计划",
+  list_plans: "计划清单",
   generate_image: "生成图片",
   list_skills: "查询技能库",
   save_skill: "固化项目技能",
@@ -181,6 +209,120 @@ const TOOL_LABELS: Record<string, string> = {
   wait_collaborators: "等待协作者汇报",
   get_collaborators: "查询项目协作者",
 };
+
+function PlanCardView({
+  ev,
+  onOpenPlan,
+  planFilePath,
+}: {
+  ev: ToolEvent;
+  onOpenPlan?: (e: React.MouseEvent) => void;
+  planFilePath?: string | null;
+}) {
+  const p = ev.params || {};
+  const isCreate = ev.toolName === "create_plan";
+  const isUpdate = ev.toolName === "update_plan";
+  const isSwitch = ev.toolName === "switch_plan";
+
+  return (
+    <div className="mt-2 text-[12px] bg-panel3/30 border border-edge/60 rounded-lg p-2.5 space-y-1.5">
+      {isCreate && (
+        <>
+          <div className="flex items-center gap-2">
+            <span className="font-semibold text-emerald-400">{p.title || "任务计划"}</span>
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 font-mono">
+              v1 (执行中)
+            </span>
+          </div>
+          {p.goals && (
+            <div className="text-ink text-[11.5px] leading-relaxed">
+              <span className="text-inkdim font-medium">目标：</span>{p.goals}
+            </div>
+          )}
+          {p.architecture && (
+            <div className="text-ink text-[11.5px] leading-relaxed">
+              <span className="text-inkdim font-medium">方案：</span>{p.architecture}
+            </div>
+          )}
+          {Array.isArray(p.steps) && p.steps.length > 0 && (
+            <div className="mt-1 pt-1.5 border-t border-edge/40 space-y-1">
+              <div className="text-[11px] font-medium text-inkdim">分步实施清单 ({p.steps.length} 步)：</div>
+              <div className="space-y-0.5">
+                {p.steps.map((s: string, idx: number) => (
+                  <div key={idx} className="flex items-start gap-1.5 text-ink text-[11.5px]">
+                    <Circle size={12} className="text-inkdim/60 shrink-0 mt-0.5" />
+                    <span>{s}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* 方案文档落盘状态与快捷操作条 */}
+          <div className="mt-2 pt-2 border-t border-edge/40 flex items-center justify-between gap-2 flex-wrap text-[11.5px]">
+            <div className="flex items-center gap-1.5 text-inkdim font-mono text-[11px] truncate max-w-[260px]">
+              {planFilePath ? (
+                <span title={planFilePath} className="truncate text-emerald-400/90 font-mono">
+                  📄 {planFilePath}
+                </span>
+              ) : ev.status === "running" ? (
+                <span className="text-amber-400/90 animate-pulse font-sans">⏳ 方案文档生成中...</span>
+              ) : (
+                <span className="font-sans text-emerald-400/90">📄 方案已物理落盘</span>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2 ml-auto">
+              <button
+                type="button"
+                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors text-[11px] cursor-pointer ${
+                  ev.status === "running"
+                    ? "bg-panel3 text-inkdim/50 cursor-not-allowed border border-edge/40"
+                    : "bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30"
+                }`}
+                onClick={onOpenPlan}
+                disabled={ev.status === "running"}
+                title={ev.status === "running" ? "方案生成中，落盘后即可打开" : "以 Markdown 文件打开并可手动编辑调整"}
+              >
+                <CheckSquare size={12} />
+                <span>{ev.status === "running" ? "生成中..." : "查看/编辑方案 (MD)"}</span>
+              </button>
+            </div>
+          </div>
+          <div className="text-[11px] text-inkdim/80 bg-panel/40 px-2 py-1 rounded border border-edge/30">
+            💡 提示：方案已物理落盘（可点击上方按钮查看/修改）。您可直接在下方对话框中告知 Agent 确认开始执行或提出调整建议。
+          </div>
+        </>
+      )}
+      {isUpdate && (
+        <>
+          <div className="flex items-center gap-2">
+            <span className="font-medium text-amber-400">计划动态更新</span>
+            {p.status === "completed" && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-500/10 text-green-400 border border-green-500/20">
+                已结案完成
+              </span>
+            )}
+            {p.status === "in_progress" && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400 border border-blue-500/20">
+                推进中
+              </span>
+            )}
+          </div>
+          <div className="text-ink text-[11.5px]"><span className="text-inkdim font-medium">调整原因：</span>{p.reason}</div>
+          {p.revision_note && (
+            <div className="text-ink text-[11.5px]"><span className="text-inkdim font-medium">变更记录：</span>{p.revision_note}</div>
+          )}
+        </>
+      )}
+      {isSwitch && (
+        <div className="text-ink text-[11.5px]">
+          已将当前活动计划切换为：<span className="font-mono text-emerald-400">[{p.plan_id}]</span>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function TodoList({ todos, isRunning }: { todos: any[]; isRunning: boolean }) {
   return (
@@ -673,6 +815,125 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
     }
   };
 
+  const currentWorkspace = useStore(
+    (s) =>
+      s.sessions.find((x) => x.id === s.currentId)?.workspacePath ||
+      s.draft?.workspacePath ||
+      s.settings.lastWorkspacePath ||
+      ""
+  );
+  const filePath = ev.params?.path ? String(ev.params.path) : "";
+
+  const handleOpenFileViewer = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!filePath) return;
+    const cleanRel = filePath.replace(/\\/g, "/");
+    const fileName = cleanRel.split("/").pop() || "文件";
+    const absPath =
+      /^[a-zA-Z]:\//.test(cleanRel) || cleanRel.startsWith("/")
+        ? cleanRel
+        : currentWorkspace
+        ? `${currentWorkspace.replace(/\\/g, "/")}/${cleanRel.replace(/^\.\//, "")}`
+        : cleanRel;
+
+    ipc.openFileViewer({
+      id: `file:${absPath}`,
+      type: "file",
+      title: fileName,
+      subtitle: cleanRel,
+      path: absPath,
+      workspacePath: currentWorkspace,
+    });
+  };
+
+  const handleOpenDiffViewer = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!filePath) return;
+    const cleanRel = filePath.replace(/\\/g, "/");
+    const fileName = cleanRel.split("/").pop() || "文件";
+    const absPath =
+      /^[a-zA-Z]:\//.test(cleanRel) || cleanRel.startsWith("/")
+        ? cleanRel
+        : currentWorkspace
+        ? `${currentWorkspace.replace(/\\/g, "/")}/${cleanRel.replace(/^\.\//, "")}`
+        : cleanRel;
+
+    ipc.openFileViewer({
+      id: `diff:${absPath}`,
+      type: "diff",
+      title: `Diff: ${fileName}`,
+      subtitle: cleanRel,
+      path: absPath,
+      diffSource: "git",
+      oldContent: ev.params?.old_string ? String(ev.params.old_string) : undefined,
+      newContent: ev.params?.new_string ? String(ev.params.new_string) : undefined,
+      workspacePath: currentWorkspace,
+    });
+  };
+
+  // 提取方案文件的物理路径（.harness/plans/*.md）
+  const resolvedPlanFilePath = useMemo(() => {
+    if (!["create_plan", "update_plan", "switch_plan", "read_plan"].includes(ev.toolName)) {
+      return null;
+    }
+    // 1. 显式参数传递（如 params 中注入 plan_file_path / planFilePath / path）
+    if (ev.params?.plan_file_path) return String(ev.params.plan_file_path);
+    if (ev.params?.planFilePath) return String(ev.params.planFilePath);
+    if (typeof ev.params?.path === "string" && (ev.params.path.includes(".harness/plans/") || ev.params.path.includes(".harness\\plans\\"))) {
+      return ev.params.path.replace(/\\/g, "/");
+    }
+    // 2. 从 resultText 中提取，支持 Windows 反斜杠、全路径、相对路径
+    if (ev.resultText) {
+      const normalized = ev.resultText.replace(/\\/g, "/");
+      const match = normalized.match(/(?:\.harness\/plans\/|plans\/)([^`\s\n"'<>]+\.md)/i);
+      if (match) return `.harness/plans/${match[1]}`;
+    }
+    return null;
+  }, [ev.toolName, ev.resultText, ev.params]);
+
+  const currentSessionId = useStore((s) => s.currentId);
+
+  const handleOpenPlanFile = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (ev.status === "running") {
+      pushToast("方案文档生成中，落盘后即可打开查看");
+      return;
+    }
+    let targetRel = resolvedPlanFilePath;
+    // 3. 兜底策略：若未能静态解析出路径，异步查询当前会话的活动计划文件
+    if (!targetRel && currentSessionId) {
+      try {
+        const active = await ipc.getActivePlan(currentSessionId);
+        if (active?.filename) {
+          targetRel = `.harness/plans/${active.filename}`;
+        }
+      } catch {
+        // ignore
+      }
+    }
+    if (!targetRel) {
+      pushToast("未找到生成的方案文件路径，请确认计划是否已成功创建");
+      return;
+    }
+    const cleanRel = targetRel.replace(/\\/g, "/");
+    const absPath =
+      /^[a-zA-Z]:\//.test(cleanRel) || cleanRel.startsWith("/")
+        ? cleanRel
+        : currentWorkspace
+          ? `${currentWorkspace.replace(/\\/g, "/").replace(/\/$/, "")}/${cleanRel.replace(/^\//, "")}`
+          : cleanRel;
+    const fileName = cleanRel.split("/").pop() || "任务方案.md";
+
+    ipc.openFileViewer({
+      id: `file:${absPath}`,
+      type: "file",
+      title: String(ev.params?.title ? `${ev.params.title}.md` : fileName),
+      path: absPath,
+      workspacePath: currentWorkspace,
+      sessionId: currentSessionId || undefined,
+    });
+  };
+
   const showOutput = ev.status === "running" && output !== undefined;
   const showResult = !isImageTool && !!ev.resultText && (ev.status === "success" || ev.status === "failed" || ev.status === "timeout" || ev.status === "denied");
 
@@ -744,10 +1005,52 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
               {terminating ? "终止中…" : "终止"}
             </button>
           )}
+          {ev.toolName === "read_file" && filePath && (
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-blue-500/10 hover:bg-blue-500/20 text-blue-300 transition-colors"
+              title="在独立窗体中查看文件全文"
+              onClick={handleOpenFileViewer}
+            >
+              <FileText size={11} />
+              <span>查看</span>
+            </button>
+          )}
+          {(ev.toolName === "write_file" || ev.toolName === "edit_file") && filePath && (
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 transition-colors"
+              title="在独立窗体中查看文件变更对比 (Diff)"
+              onClick={handleOpenDiffViewer}
+            >
+              <GitCompare size={11} />
+              <span>对比 Diff</span>
+            </button>
+          )}
+          {["create_plan", "update_plan", "switch_plan", "read_plan"].includes(ev.toolName) && (
+            <button
+              type="button"
+              className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded transition-colors ${
+                ev.status === "running"
+                  ? "bg-panel3 text-inkdim/50 cursor-not-allowed"
+                  : "bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 cursor-pointer"
+              }`}
+              title={
+                ev.status === "running"
+                  ? "方案文档生成中，落盘后即可打开"
+                  : "以 Markdown 文件打开并可手动调整方案"
+              }
+              onClick={handleOpenPlanFile}
+              disabled={ev.status === "running"}
+            >
+              <CheckSquare size={11} />
+              <span>{ev.status === "running" ? "方案生成中..." : "方案文档 (MD)"}</span>
+            </button>
+          )}
           {statusBadge(ev.status)}
           {ev.approvalScope && ev.approvalScope !== "none" && ev.status !== "pending_approval" && (
             <span className="text-[10px] text-inkdim shrink-0">
-              ({ev.approvalScope === "mode" ? "完全访问" : ev.approvalScope === "once" ? "一次放行" : "会话规则"})
+              ({ev.approvalScope === "mode" ? "完全访问" : ev.approvalScope === "once" ? "一次放行" : ev.approvalScope === "harness_whitelist" ? "系统白名单" : "会话规则"})
             </span>
           )}
         </div>
@@ -755,6 +1058,14 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
 
       {ev.toolName === "todo" && Array.isArray(ev.params?.todos) && (
         <TodoList todos={ev.params.todos} isRunning={isRunning} />
+      )}
+
+      {["create_plan", "update_plan", "switch_plan"].includes(ev.toolName) && (
+        <PlanCardView
+          ev={ev}
+          onOpenPlan={handleOpenPlanFile}
+          planFilePath={resolvedPlanFilePath}
+        />
       )}
 
       {/* 审批条是交互入口，保持常显 */}
