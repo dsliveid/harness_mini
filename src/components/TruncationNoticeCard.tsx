@@ -81,15 +81,15 @@ function TruncationNoticeItem({
       <p className="text-inkdim leading-relaxed">
         由于对话历史超出上下文限制（预估{" "}
         <span className="text-amber-300 font-mono font-medium">
-          {notice.estTokensBefore.toLocaleString()}
+          {(notice.estTokensBefore ?? 0).toLocaleString()}
         </span>{" "}
         / 上限{" "}
         <span className="text-ink font-mono font-medium">
-          {notice.tokenLimit.toLocaleString()}
+          {(notice.tokenLimit ?? 0).toLocaleString()}
         </span>{" "}
         Tokens），系统已按完整轮次安全移出最早历史对话，释放约{" "}
         <span className="text-amber-300 font-mono font-medium">
-          {notice.droppedTokens.toLocaleString()}
+          {(notice.droppedTokens ?? 0).toLocaleString()}
         </span>{" "}
         Tokens。当前对话不受影响，继续正常响应。
       </p>
@@ -99,19 +99,19 @@ function TruncationNoticeItem({
         <div>
           <span className="text-inkdim block text-[10px]">截断前预估</span>
           <span className="text-ink text-[11px]">
-            {notice.estTokensBefore.toLocaleString()}
+            {(notice.estTokensBefore ?? 0).toLocaleString()}
           </span>
         </div>
         <div>
           <span className="text-amber-400/90 block text-[10px]">移出释放</span>
           <span className="text-amber-400 font-medium text-[11px]">
-            -{notice.droppedTokens.toLocaleString()}
+            -{(notice.droppedTokens ?? 0).toLocaleString()}
           </span>
         </div>
         <div>
           <span className="text-emerald-400/90 block text-[10px]">当前上下文</span>
           <span className="text-emerald-400 font-medium text-[11px]">
-            {notice.estTokensAfter.toLocaleString()}
+            {(notice.estTokensAfter ?? 0).toLocaleString()}
           </span>
         </div>
       </div>

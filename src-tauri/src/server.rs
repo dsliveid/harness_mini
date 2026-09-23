@@ -511,11 +511,27 @@ pub async fn dispatch_rpc(
             Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
         }
 
-        // ---- 打开本地目录 ----
+        // ---- 打开本地目录与路径探测 ----
         "open_dir" => {
             let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            commands::open_dir(st, path)?;
+            let workspace_path = params
+                .get("workspacePath")
+                .or_else(|| params.get("workspace_path"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            commands::open_dir(st, path, workspace_path)?;
             Ok(Value::Null)
+        }
+
+        "inspect_path" => {
+            let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let workspace_path = params
+                .get("workspacePath")
+                .or_else(|| params.get("workspace_path"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let res = commands::inspect_path(st, path, workspace_path);
+            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
         }
 
         _ => Err(format!("未知的 RPC 方法: {}", method)),

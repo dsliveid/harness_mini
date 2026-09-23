@@ -339,7 +339,11 @@ export function MessageItem({
                 )}
               </div>
             )}
-            {msg.content && <div className="whitespace-pre-wrap text-[14px] leading-relaxed">{msg.content}</div>}
+            {msg.content && (
+              <div className="text-[14px] leading-relaxed">
+                <Markdown content={msg.content} workspacePath={sessionWorkspace} />
+              </div>
+            )}
           </div>
         </div>
       </div>

@@ -241,6 +241,20 @@ function PlanCardView({
   const isUpdate = ev.toolName === "update_plan";
   const isSwitch = ev.toolName === "switch_plan";
 
+  if (ev.status === "failed" || ev.status === "denied" || ev.status === "timeout") {
+    return (
+      <div className="mt-2 text-[12px] bg-red-500/10 border border-red-500/30 rounded-lg p-2.5 text-red-300 space-y-1">
+        <div className="font-medium flex items-center gap-1.5 text-red-400">
+          <ShieldAlert size={14} />
+          <span>计划操作未完成 ({ev.status})</span>
+        </div>
+        <div className="text-[11.5px] font-mono whitespace-pre-wrap text-red-300/90 max-h-32 overflow-y-auto">
+          {ev.resultText || "执行失败"}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="mt-2 text-[12px] bg-panel3/30 border border-edge/60 rounded-lg p-2.5 space-y-1.5">
       {isCreate && (
@@ -852,21 +866,29 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
   const commandText = isCommandTool ? String(ev.params?.command ?? "") : "";
   const isImageTool = ev.toolName === "generate_image";
   const imagePrompt = isImageTool ? String(ev.params?.prompt ?? "") : "";
-  // 生图工具生成成功默认展开，生成失败默认收起；其他工具默认收起
+  const isPlanTool = ["create_plan", "update_plan", "switch_plan"].includes(ev.toolName);
+  // 计划工具与生图工具生成成功/执行中默认展开，失败默认收起；其他工具默认收起
   const [expanded, setExpanded] = useState(() => {
-    if (!isImageTool) return false;
-    return ev.status !== "failed" && ev.status !== "timeout" && ev.status !== "denied";
+    if (isImageTool || isPlanTool) {
+      return ev.status !== "failed" && ev.status !== "timeout" && ev.status !== "denied";
+    }
+    return false;
   });
 
-  // 当生图状态在执行或流转中变为失败时，自动收起卡片；成功时展开
+  // 当生图状态在执行或流转中变为失败时，自动收起卡片；生图成功展开；计划操作若流转失败也自动收起
   useEffect(() => {
-    if (!isImageTool) return;
-    if (ev.status === "failed" || ev.status === "timeout" || ev.status === "denied") {
-      setExpanded(false);
-    } else if (ev.status === "success") {
-      setExpanded(true);
+    if (isImageTool) {
+      if (ev.status === "failed" || ev.status === "timeout" || ev.status === "denied") {
+        setExpanded(false);
+      } else if (ev.status === "success") {
+        setExpanded(true);
+      }
+    } else if (isPlanTool) {
+      if (ev.status === "failed" || ev.status === "timeout" || ev.status === "denied") {
+        setExpanded(false);
+      }
     }
-  }, [isImageTool, ev.status]);
+  }, [isImageTool, isPlanTool, ev.status]);
 
   const generatedImagePath = useMemo(() => {
     if (ev.toolName !== "generate_image" || !ev.resultText) return null;
@@ -1178,7 +1200,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
   const showOutput = ev.status === "running" && output !== undefined;
   const showResult =
     !isImageTool &&
-    !["record_memory", "read_memory"].includes(ev.toolName) &&
+    !["record_memory", "read_memory", "create_plan", "update_plan", "switch_plan"].includes(ev.toolName) &&
     !!ev.resultText &&
     (ev.status === "success" || ev.status === "failed" || ev.status === "timeout" || ev.status === "denied");
 
@@ -1336,7 +1358,8 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
         <TodoList todos={ev.params.todos} isRunning={isRunning} />
       )}
 
-      {["create_plan", "update_plan", "switch_plan"].includes(ev.toolName) && (
+      {/* 展开时：若是方案计划工具，展示专用计划卡片 */}
+      {expanded && ["create_plan", "update_plan", "switch_plan"].includes(ev.toolName) && (
         <PlanCardView
           ev={ev}
           onOpenPlan={handleOpenPlanFile}

@@ -1474,13 +1474,14 @@ pub fn respond_compaction(
     approved: bool,
     final_summary: String,
 ) -> Result<(), String> {
-    let tx = state.compactions.lock().unwrap().remove(&event_id).map(|p| p.tx);
-    if let Some(tx) = tx {
-        let _ = tx.send(crate::models::CompactionDecision {
+    let pending = state.compactions.lock().unwrap().remove(&event_id);
+    if let Some(p) = pending {
+        state.snapshot.set_pending_compaction(&p.session_id, None);
+        let _ = p.tx.send(crate::models::CompactionDecision {
             approved,
             final_summary,
         });
-        let _ = app.emit("compaction:resolved", json!({ "eventId": event_id, "approved": approved }));
+        let _ = app.emit("compaction:resolved", json!({ "eventId": event_id, "approved": approved, "sessionId": p.session_id }));
         Ok(())
     } else {
         Err("压缩请求不存在或已处理".into())
@@ -1536,6 +1537,26 @@ pub fn get_session_todos(state: State<'_, crate::AppState>, session_id: String) 
             }
             if changed {
                 let _ = store::set_kv(&db, &session_id, "todos", &val.to_string());
+            }
+        }
+    }
+
+    // 若当前会话关联了工作区中的活动计划，以计划文件中的步骤作为权威真理源优先同步
+    if let Ok(Some(sess)) = crate::store::get_session(&db, &session_id) {
+        if !sess.workspace_path.is_empty() {
+            let ws = std::path::Path::new(&sess.workspace_path);
+            if let Some((_, _meta, body)) = crate::plan::find_plan_file(ws, &session_id, None, Some(&db)) {
+                let steps = crate::plan::parse_steps_from_markdown(&body);
+                if !steps.is_empty() {
+                    let todos_val: Vec<Value> = steps.iter().map(|s| {
+                        serde_json::json!({
+                            "content": s.content,
+                            "status": s.status
+                        })
+                    }).collect();
+                    val = serde_json::json!({ "todos": todos_val });
+                    let _ = store::set_kv(&db, &session_id, "todos", &val.to_string());
+                }
             }
         }
     }
@@ -1638,19 +1659,123 @@ pub async fn clear_temp_space(app: AppHandle, session_id: String) -> Result<(), 
     .map_err(|e| format!("清空临时空间任务失败: {e}"))?
 }
 
-// ---------- 打开目录 ----------
+// ---------- 打开目录与路径探测 ----------
 
-/// 在系统文件管理器中打开目录或定位文件
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PathInspectResult {
+    pub exists: bool,
+    pub is_dir: bool,
+    pub is_file: bool,
+    pub abs_path: String,
+    pub file_name: String,
+}
+
+fn find_file_in_workspace(ws: &Path, file_name: &str) -> Option<PathBuf> {
+    let mut dirs = vec![ws.to_path_buf()];
+    let mut depth = 0;
+    while !dirs.is_empty() && depth < 5 {
+        let mut next_dirs = Vec::new();
+        for d in dirs {
+            let Ok(entries) = std::fs::read_dir(&d) else { continue };
+            for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else { continue };
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if ft.is_dir() {
+                    if !name_str.starts_with('.') && name_str != "node_modules" && name_str != "target" && name_str != "dist" {
+                        next_dirs.push(entry.path());
+                    }
+                } else if ft.is_file() && name_str.eq_ignore_ascii_case(file_name) {
+                    return Some(entry.path());
+                }
+            }
+        }
+        dirs = next_dirs;
+        depth += 1;
+    }
+    None
+}
+
+/// 检查路径属性与存在性（支持工作区上下文与快速模糊检索）
 #[tauri::command]
-pub fn open_dir(state: State<'_, crate::AppState>, path: String) -> Result<(), String> {
-    let raw_trimmed = path.trim();
+pub fn inspect_path(
+    state: State<'_, crate::AppState>,
+    path: String,
+    workspace_path: Option<String>,
+) -> PathInspectResult {
+    let raw_trimmed = path.trim().trim_start_matches("file:///");
     let raw_path = Path::new(raw_trimmed);
-    let resolved = if raw_path.is_relative() {
-        if let Some(d) = state.data_dir.lock().unwrap().as_ref() {
+
+    let mut resolved = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else if let Some(ref ws) = workspace_path {
+        if !ws.trim().is_empty() {
+            Path::new(ws.trim()).join(raw_path)
+        } else if let Some(d) = state.data_dir.lock().unwrap().as_ref() {
             d.join(raw_path)
         } else {
             PathBuf::from(raw_trimmed)
         }
+    } else if let Some(d) = state.data_dir.lock().unwrap().as_ref() {
+        d.join(raw_path)
+    } else {
+        PathBuf::from(raw_trimmed)
+    };
+
+    let mut exists = resolved.exists();
+
+    // 如果未直接存在，且在工作区中，并且是一个纯文件名（如 App.tsx），尝试浅层模糊检索
+    if !exists && !raw_trimmed.contains('/') && !raw_trimmed.contains('\\') {
+        if let Some(ref ws) = workspace_path {
+            let ws_p = Path::new(ws.trim());
+            if ws_p.exists() {
+                if let Some(found) = find_file_in_workspace(ws_p, raw_trimmed) {
+                    resolved = found;
+                    exists = true;
+                }
+            }
+        }
+    }
+
+    let is_dir = resolved.is_dir();
+    let is_file = resolved.is_file();
+    let file_name = resolved
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| raw_trimmed.to_string());
+    let abs_path = resolved.to_string_lossy().replace('\\', "/");
+
+    PathInspectResult {
+        exists,
+        is_dir,
+        is_file,
+        abs_path,
+        file_name,
+    }
+}
+
+/// 在系统文件管理器中打开目录或定位文件
+#[tauri::command]
+pub fn open_dir(
+    state: State<'_, crate::AppState>,
+    path: String,
+    workspace_path: Option<String>,
+) -> Result<(), String> {
+    let raw_trimmed = path.trim().trim_start_matches("file:///");
+    let raw_path = Path::new(raw_trimmed);
+    let resolved = if raw_path.is_absolute() {
+        PathBuf::from(raw_trimmed)
+    } else if let Some(ref ws) = workspace_path {
+        if !ws.trim().is_empty() {
+            Path::new(ws.trim()).join(raw_path)
+        } else if let Some(d) = state.data_dir.lock().unwrap().as_ref() {
+            d.join(raw_path)
+        } else {
+            PathBuf::from(raw_trimmed)
+        }
+    } else if let Some(d) = state.data_dir.lock().unwrap().as_ref() {
+        d.join(raw_path)
     } else if !raw_path.exists() && crate::temp::rel_temp_path(raw_path).is_some() {
         if let Some(d) = state.data_dir.lock().unwrap().as_ref() {
             crate::temp::adapt_temp_path(raw_path, d)
@@ -1669,14 +1794,23 @@ pub fn open_dir(state: State<'_, crate::AppState>, path: String) -> Result<(), S
         }
     }
 
-    let target_dir = if p.is_file() {
-        p.parent().unwrap_or(&p)
-    } else {
-        &p
-    };
-
     #[cfg(windows)]
     {
+        if p.is_file() {
+            let win_path = p.to_string_lossy().replace('/', "\\");
+            let arg = format!("/select,{}", win_path);
+            let res = std::process::Command::new("explorer")
+                .arg(arg)
+                .spawn();
+            if res.is_ok() {
+                return Ok(());
+            }
+        }
+        let target_dir = if p.is_file() {
+            p.parent().unwrap_or(&p)
+        } else {
+            &p
+        };
         let win_path = target_dir.to_string_lossy().replace('/', "\\");
         let res = std::process::Command::new("explorer")
             .arg(&win_path)
@@ -1690,6 +1824,19 @@ pub fn open_dir(state: State<'_, crate::AppState>, path: String) -> Result<(), S
     }
     #[cfg(target_os = "macos")]
     {
+        if p.is_file() {
+            let res = std::process::Command::new("open")
+                .args(["-R", &p.to_string_lossy()])
+                .spawn();
+            if res.is_ok() {
+                return Ok(());
+            }
+        }
+        let target_dir = if p.is_file() {
+            p.parent().unwrap_or(&p)
+        } else {
+            &p
+        };
         std::process::Command::new("open")
             .arg(target_dir)
             .spawn()
@@ -1697,6 +1844,11 @@ pub fn open_dir(state: State<'_, crate::AppState>, path: String) -> Result<(), S
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        let target_dir = if p.is_file() {
+            p.parent().unwrap_or(&p)
+        } else {
+            &p
+        };
         std::process::Command::new("xdg-open")
             .arg(target_dir)
             .spawn()
@@ -2655,6 +2807,7 @@ pub fn open_in_external_editor(path: String, line: Option<usize>) -> Result<(), 
 
 #[tauri::command]
 pub fn update_plan_step_status(
+    app: AppHandle,
     state: State<'_, crate::AppState>,
     workspace_path: String,
     session_id: Option<String>,
@@ -2674,7 +2827,25 @@ pub fn update_plan_step_status(
         step_index,
         &status,
         Some(&db),
-    )
+    )?;
+
+    if let Some(ref sid) = session_id {
+        if let Ok(Some(raw)) = crate::store::get_kv(&db, sid, "todos") {
+            if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+                if let Some(todos) = val.get("todos") {
+                    let _ = app.emit(
+                        "session:todos",
+                        serde_json::json!({
+                            "sessionId": sid,
+                            "todos": todos
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -554,7 +554,19 @@ export const useStore = create<Store>((set, get) => ({
       ]);
       const activeModelId = rawSettings.activeModelId ?? rawSettings.activeModel ?? null;
       const settings = { ...rawSettings, activeModelId, activeModel: activeModelId };
-      set({ settings, sessions, projects, ready: true });
+      const initialOutcomes: Record<string, string> = {};
+      for (const s of sessions) {
+        if (s.lastRunStatus) {
+          initialOutcomes[s.id] = s.lastRunStatus;
+        }
+      }
+      set((st) => ({
+        settings,
+        sessions,
+        projects,
+        ready: true,
+        lastRunOutcome: { ...st.lastRunOutcome, ...initialOutcomes },
+      }));
       // 恢复各会话的运行状态（运行状态不持久化在前端，以数据库为准）
       void get().refreshRunStatus();
       // 恢复上次查看的会话；已被删除/归档则回落到列表第一个
@@ -961,12 +973,15 @@ export const useStore = create<Store>((set, get) => ({
     // 先取消息、后原子切换：避免「currentId 已切换、消息未到达」期间消息区整块空白的闪现
     try {
       const msgs = await ipc.getMessages(id, undefined, 200);
+      const curSession = get().sessions.find((s) => s.id === id);
+      const initialOutcome = curSession?.lastRunStatus;
       set((st) => ({
         currentId: id,
         readOnly,
         editingMessage: null,
         messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], msgs) },
         hasMore: { ...st.hasMore, [id]: msgs.length >= 200 },
+        lastRunOutcome: initialOutcome ? { ...st.lastRunOutcome, [id]: initialOutcome } : st.lastRunOutcome,
       }));
       localStorage.setItem(LAST_SESSION_KEY, id);
       const q = await ipc.listQueued(id);
@@ -1393,11 +1408,25 @@ export const useStore = create<Store>((set, get) => ({
         return { toolOutputs: outs };
       });
     }
-    // todo 工具更新时同步任务清单
+    // todo 或方案工具更新时同步任务清单
     if (ev.toolName === "todo" && ev.status === "success" && Array.isArray(ev.params?.todos)) {
       set((st) => ({
         sessionTodos: { ...st.sessionTodos, [p.sessionId]: ev.params.todos },
       }));
+    } else if (
+      (ev.toolName === "create_plan" || ev.toolName === "update_plan" || ev.toolName === "switch_plan") &&
+      ev.status === "success"
+    ) {
+      ipc.getSessionTodos(p.sessionId).then(
+        (val) => {
+          if (Array.isArray(val?.todos)) {
+            set((st) => ({
+              sessionTodos: { ...st.sessionTodos, [p.sessionId]: val.todos },
+            }));
+          }
+        },
+        () => {}
+      );
     }
   },
 
@@ -1527,16 +1556,14 @@ export const useStore = create<Store>((set, get) => ({
         }
       }
       let nextTodos = st.sessionTodos;
-      // 运行完成时增加双重兜底：若任务清单仍有 in_progress，根据是否正常完成分别置为 done 或 pending
+      // 运行完成时增加双重兜底：若对话正常交付完成，收尾全部任务为 done；若中途停止/失败，将进行中任务置为 pending
       if (st.sessionTodos[p.sessionId]) {
         const cur = st.sessionTodos[p.sessionId];
         if (p.status === "done") {
-          if (cur.some((t) => t.status === "in_progress")) {
-            nextTodos = {
-              ...st.sessionTodos,
-              [p.sessionId]: cur.map((t) => (t.status === "in_progress" ? { ...t, status: "done" } : t)),
-            };
-          }
+          nextTodos = {
+            ...st.sessionTodos,
+            [p.sessionId]: cur.map((t) => ({ ...t, status: "done" })),
+          };
         } else if (p.status !== "running") {
           if (cur.some((t) => t.status === "in_progress")) {
             nextTodos = {
@@ -1630,6 +1657,7 @@ export const useStore = create<Store>((set, get) => ({
       return {
         runStatus: { ...st.runStatus, [p.sessionId]: p.status === "running" ? "running" : "idle" },
         lastRunOutcome: { ...st.lastRunOutcome, [p.sessionId]: p.status },
+        sessions: st.sessions.map((s) => (s.id === p.sessionId ? { ...s, lastRunStatus: p.status } : s)),
         toolRetryStatus: nextRetry,
         sessionTodos: nextTodos,
         activeTasks: nextActiveTasks,

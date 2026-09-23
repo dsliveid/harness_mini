@@ -119,4 +119,5 @@ export {
   FlaskConical,
   Palette,
   Bug,
+  Tag,
 } from "lucide-react";

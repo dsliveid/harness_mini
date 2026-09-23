@@ -332,7 +332,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "update_plan",
-            description: "当用户在多轮对话中调整需求、或任务推进完成某一阶段时，更新计划文档正文、推进分步清单状态，并记录变更历史。在改动代码前务必先同步计划！若任务全部完成并通过测试，请将 status 设为 completed 以结案解除挂载。",
+            description: "当用户在多轮对话中调整需求、或任务推进完成某一阶段时，更新计划文档正文、推进分步清单状态，并记录变更历史。在改动代码前务必先同步计划！若计划调整导致步骤发生变动，必须通过 modified_sections.steps 传入更新后的完整执行清单；若任务全部完成并通过测试，请将 status 设为 completed 以结案解除挂载。",
             risk: Risk::Write,
             schema: json!({
                 "type": "object",
@@ -359,7 +359,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     },
                     "modified_sections": {
                         "type": "object",
-                        "description": "可选：需局部更新的方案段落",
+                        "description": "可选：需局部更新的方案段落。若需求调整导致实施步骤变化，必须在此传入全量更新后的 steps 数组",
                         "properties": {
                             "goals": {"type": "string", "description": "更新后的需求背景与目标"},
                             "architecture": {"type": "string", "description": "更新后的技术设计方案"},
@@ -367,6 +367,15 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                                 "type": "array",
                                 "items": {"type": "string"},
                                 "description": "更新后的文件清单"
+                            },
+                            "steps": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "更新后的完整分步实施 Checklist 描述列表（全量替换原步骤）"
+                            },
+                            "verification": {
+                                "type": "string",
+                                "description": "更新后的验证与验收策略"
                             }
                         }
                     },

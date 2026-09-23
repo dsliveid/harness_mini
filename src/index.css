@@ -95,7 +95,7 @@ body {
   @apply mr-2 align-middle accent-accent cursor-default;
 }
 .md-content a {
-  @apply text-accent underline underline-offset-2 hover:opacity-85;
+  @apply text-sky-400 underline underline-offset-2 decoration-sky-400/40 hover:text-sky-300 hover:decoration-sky-300 transition-colors;
 }
 .md-content blockquote {
   @apply border-l-4 border-accent/60 bg-accent/5 pl-3.5 pr-2 py-1.5 text-inkdim my-3 rounded-r-md;
@@ -113,7 +113,7 @@ body {
   @apply bg-panel2/40;
 }
 .md-content code:not(pre code) {
-  @apply bg-panel3 text-accent border border-edge/60 rounded px-1.5 py-0.5 font-mono text-[12px];
+  @apply bg-panel3/90 text-zinc-300 border border-zinc-700/60 rounded-md px-1.5 py-0.5 font-mono text-[12px] inline-block my-0.5;
 }
 .md-content pre {
   @apply bg-[#0d0d10] border border-edge/70 rounded-xl p-3.5 my-3 overflow-x-auto text-[12.5px];

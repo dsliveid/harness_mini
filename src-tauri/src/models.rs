@@ -590,6 +590,9 @@ pub struct Session {
     /// 分支来源消息 ID
     #[serde(default)]
     pub forked_from_message_id: Option<String>,
+    /// 最近一次 Run 的执行终态（'done' | 'failed' | 'interrupted' | 'cancelled' | 'running'）
+    #[serde(default)]
+    pub last_run_status: Option<String>,
 }
 
 fn default_auto_report() -> Option<bool> {
@@ -638,6 +641,7 @@ impl Default for Session {
             vision_model_id: None,
             forked_from_session_id: None,
             forked_from_message_id: None,
+            last_run_status: None,
         }
     }
 }

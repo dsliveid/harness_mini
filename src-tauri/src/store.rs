@@ -1537,6 +1537,7 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         vision_model_id: r.get(29)?,
         forked_from_session_id: r.get(30)?,
         forked_from_message_id: r.get(31)?,
+        last_run_status: None,
     })
 }
 
@@ -1591,6 +1592,30 @@ fn attach_session_tokens(conn: &Connection, sessions: &mut [Session]) -> Result<
     Ok(())
 }
 
+fn attach_session_last_runs(conn: &Connection, sessions: &mut [Session]) -> Result<(), String> {
+    if sessions.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT session_id, status FROM (
+                SELECT session_id, status, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY started_at DESC, id DESC) as rn
+                FROM runs
+            ) WHERE rn = 1",
+        )
+        .map_err(|e| e.to_string())?;
+    let map: std::collections::HashMap<String, String> = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for s in sessions.iter_mut() {
+        s.last_run_status = map.get(&s.id).cloned();
+    }
+    Ok(())
+}
+
 pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>, String> {
     let mut s = conn
         .query_row(
@@ -1602,6 +1627,8 @@ pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>, Strin
         .map_err(|e| e.to_string())?;
 
     if let Some(ref mut session) = s {
+        session.last_run_status = get_last_run_status(conn, id);
+
         let tokens: Option<(u64, u64, u64)> = conn
             .query_row(
                 "SELECT COALESCE(SUM(total_tokens), 0), \
@@ -1638,6 +1665,7 @@ pub fn list_sessions(conn: &Connection, status: &str) -> Result<Vec<Session>, St
         .map_err(|e| e.to_string())?;
     let mut sessions = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
     attach_session_tokens(conn, &mut sessions)?;
+    attach_session_last_runs(conn, &mut sessions)?;
     Ok(sessions)
 }
 
@@ -1652,6 +1680,7 @@ pub fn list_subagents(conn: &Connection, parent_session_id: &str) -> Result<Vec<
         .map_err(|e| e.to_string())?;
     let mut sessions = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
     attach_session_tokens(conn, &mut sessions)?;
+    attach_session_last_runs(conn, &mut sessions)?;
     Ok(sessions)
 }
 
@@ -1666,6 +1695,7 @@ pub fn list_collaborators(conn: &Connection, parent_session_id: &str) -> Result<
         .map_err(|e| e.to_string())?;
     let mut sessions = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
     attach_session_tokens(conn, &mut sessions)?;
+    attach_session_last_runs(conn, &mut sessions)?;
     Ok(sessions)
 }
 
@@ -1680,6 +1710,7 @@ pub fn list_subprocesses(conn: &Connection, parent_session_id: &str) -> Result<V
         .map_err(|e| e.to_string())?;
     let mut sessions = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
     attach_session_tokens(conn, &mut sessions)?;
+    attach_session_last_runs(conn, &mut sessions)?;
     Ok(sessions)
 }
 
@@ -1695,8 +1726,10 @@ pub fn list_all_child_sessions(conn: &Connection, parent_session_id: &str) -> Re
         .map_err(|e| e.to_string())?;
     let mut sessions = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
     attach_session_tokens(conn, &mut sessions)?;
+    attach_session_last_runs(conn, &mut sessions)?;
     Ok(sessions)
 }
+
 
 pub fn update_collaborator_watermark(
     conn: &Connection,
@@ -1793,6 +1826,7 @@ pub fn create_session_with_models(
         vision_model_id: vision_model_id.map(|s| s.to_string()),
         forked_from_session_id: None,
         forked_from_message_id: None,
+        last_run_status: None,
     };
     conn.execute(
         "INSERT INTO sessions(
@@ -1878,6 +1912,7 @@ pub fn create_collaborator_session(
         vision_model_id: vision_model_id.map(|s| s.to_string()),
         forked_from_session_id: None,
         forked_from_message_id: None,
+        last_run_status: None,
     };
     conn.execute(
         "INSERT INTO sessions(
@@ -2056,6 +2091,7 @@ pub fn create_subprocess_session(
         vision_model_id: None,
         forked_from_session_id: None,
         forked_from_message_id: None,
+        last_run_status: None,
     };
     conn.execute(
         "INSERT INTO sessions(

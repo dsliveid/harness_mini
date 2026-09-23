@@ -178,19 +178,19 @@ export function CompactionBanner() {
         <div className="flex flex-col">
           <span className="text-inkdim text-[11px]">压缩起止范围</span>
           <span className="font-mono text-ink font-medium mt-0.5">
-            第 {pending.startSeq} 条 ➔ 第 {pending.endSeq} 条消息
+            第 {pending.startSeq ?? 0} 条 ➔ 第 {pending.endSeq ?? 0} 条消息
           </span>
         </div>
         <div className="flex flex-col">
           <span className="text-inkdim text-[11px]">消息条数与类型</span>
           <span className="text-ink mt-0.5">
-            共 {pending.messageCount} 条（含往期工具调用与交互）
+            共 {pending.messageCount ?? 0} 条（含往期工具调用与交互）
           </span>
         </div>
         <div className="flex flex-col">
           <span className="text-inkdim text-[11px]">原占用 Token 预估</span>
           <span className="text-accent font-mono font-medium mt-0.5">
-            约 {pending.tokensBefore.toLocaleString()} tokens
+            约 {(pending.tokensBefore ?? 0).toLocaleString()} tokens
           </span>
         </div>
       </div>
@@ -292,10 +292,10 @@ export function CompactedHistoryCard({
             <Sparkles size={12} />
           </div>
           <span className="font-medium text-ink">
-            历史对话已压缩（第 {compaction.startSeq} ~ {compaction.endSeq} 条消息）
+            历史对话已压缩（第 {compaction.startSeq ?? 0} ~ {compaction.endSeq ?? 0} 条消息）
           </span>
           <span className="text-inkdim text-[11px]">
-            · 释放约 {compaction.tokensBefore.toLocaleString()} tokens
+            · 释放约 {(compaction.tokensBefore ?? 0).toLocaleString()} tokens
           </span>
         </div>
         <div className="flex items-center gap-1 text-[11px] text-accent">

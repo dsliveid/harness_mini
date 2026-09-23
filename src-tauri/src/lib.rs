@@ -394,6 +394,7 @@ pub fn run() {
             commands::merge_temp_space,
             commands::clear_temp_space,
             commands::open_dir,
+            commands::inspect_path,
             commands::get_data_status,
             commands::set_data_dir,
             commands::reset_data_dir,

@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef, useMemo } from "react";
 import { ipc } from "../ipc";
 import type { FileViewerTab, FileTextContent, FileOutlineItem } from "./types";
+import { useFileViewerStore } from "./store";
 import {
   Copy,
   Check,
@@ -18,6 +19,7 @@ import {
   ChevronDown,
   ChevronUp,
   Code,
+  ListTodo,
 } from "../components/Icons";
 import { Markdown } from "../components/Markdown";
 import hljs from "highlight.js";
@@ -50,6 +52,9 @@ const KIND_BADGES: Record<string, { label: string; cls: string }> = {
 };
 
 export function CodeViewer({ tab }: { tab: FileViewerTab }) {
+  const storeWorkspace = useFileViewerStore((s) => s.workspacePath);
+  const effectiveWorkspace = (tab.workspacePath || storeWorkspace || "").trim();
+
   const [data, setData] = useState<FileTextContent | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -91,6 +96,20 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
     const p = tab.path.replace(/\\/g, "/");
     return p.includes("/.harness/plans/") || p.startsWith(".harness/plans/");
   }, [tab.path]);
+
+  // 打开当前方案的交互式任务看板 (PlanViewer)
+  const handleOpenPlanViewer = () => {
+    const planFileName = tab.path.replace(/\\/g, "/").split("/").pop() || "";
+    const cleanPlanId = planFileName.replace(/\.md$/i, "") || tab.title.replace(/\.md$/i, "");
+    ipc.openFileViewer({
+      id: `plan:${cleanPlanId}`,
+      type: "plan",
+      title: tab.title.replace(/\.md$/i, ""),
+      planId: cleanPlanId,
+      workspacePath: effectiveWorkspace,
+      sessionId: tab.sessionId,
+    });
+  };
 
   // 判定是否是长期记忆 Markdown 文档
   const isMemoryDoc = useMemo(() => {
@@ -477,6 +496,18 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
             )
           )}
 
+          {isPlanDoc && (
+            <button
+              type="button"
+              className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-300 transition-colors text-[11.5px] cursor-pointer"
+              title="在独立看板中打开分步执行与状态切换"
+              onClick={handleOpenPlanViewer}
+            >
+              <ListTodo size={13} />
+              <span>方案看板</span>
+            </button>
+          )}
+
           {/* 保存按钮 (Ctrl+S) */}
           {!data?.isBinary && (
             <button
@@ -753,7 +784,9 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
               {data && !data.isBinary && (data.content || editContent) && (
                 <Markdown
                   content={isDirty ? editContent : (data.content || "")}
-                  workspacePath={tab.workspacePath}
+                  workspacePath={effectiveWorkspace}
+                  currentDocPath={tab.path}
+                  onOpenPlanViewer={isPlanDoc ? handleOpenPlanViewer : undefined}
                 />
               )}
             </div>

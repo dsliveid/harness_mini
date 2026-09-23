@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, DataStatus, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem } from "./types";
+import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, DataStatus, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult } from "./types";
 
 export const ipc = {
   getSettings: () => invoke<Settings>("get_settings"),
@@ -231,7 +231,12 @@ export const ipc = {
   clearTempSpace: (sessionId: string) => invoke<void>("clear_temp_space", { sessionId }),
 
   // 打开目录（系统文件管理器）
-  openDir: (path: string) => invoke<void>("open_dir", { path }),
+  openDir: (path: string, workspacePath?: string | null) =>
+    invoke<void>("open_dir", { path, workspacePath: workspacePath ?? null }),
+
+  // 探测并解析路径属性
+  inspectPath: (path: string, workspacePath?: string | null) =>
+    invoke<PathInspectResult>("inspect_path", { path, workspacePath: workspacePath ?? null }),
 
   // 成长演进 (Growth)
   listGrowths: (projectId?: string | null, status?: string | null) =>
@@ -341,7 +346,7 @@ export const ipc = {
     invoke<LongTask>("update_task_subtasks", { taskId, subtasks }),
 };
 
-export type { ActivePlanDetail, PlanSummary, Message, Session, SessionActiveState, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport, CollaboratorCreateInput, CollaboratorUpdateInput, SessionCreateInput, SessionModelsUpdateInput, FileTextContent, ViewerTabItem, FileOutlineItem, DiffHunk, LongTask, TaskCheckpoint, TaskSubItem };
+export type { ActivePlanDetail, PlanSummary, Message, Session, SessionActiveState, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport, CollaboratorCreateInput, CollaboratorUpdateInput, SessionCreateInput, SessionModelsUpdateInput, FileTextContent, ViewerTabItem, FileOutlineItem, DiffHunk, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult };
 
 
 

@@ -134,7 +134,7 @@ export function ModelContextModal({
             <label className="text-[12px] font-medium text-ink flex items-center justify-between">
               <span>手动微调数值（Tokens）</span>
               <span className="text-[11px] font-mono text-accent font-medium">
-                {formatTokens(val)} ({val.toLocaleString()} tokens)
+                {formatTokens(val || 0)} ({(val || 0).toLocaleString()} tokens)
               </span>
             </label>
             <div className="flex items-center gap-2">
@@ -161,7 +161,7 @@ export function ModelContextModal({
             <div className="flex items-center justify-between">
               <span>自动智能压缩阈值：</span>
               <span className="font-mono text-ink font-medium">
-                约 {compactionThreshold.toLocaleString()} tokens (~75%)
+                约 {(compactionThreshold || 0).toLocaleString()} tokens (~75%)
               </span>
             </div>
             <div className="flex items-center justify-between">
@@ -203,7 +203,7 @@ export function ModelContextModal({
               type="button"
               className="text-[12px] px-2.5 py-1.5 rounded-lg bg-panel hover:bg-edge text-inkdim hover:text-ink flex items-center gap-1.5 transition-colors border border-edge"
               onClick={handleResetToInferred}
-              title={`恢复为智能推断推荐值 (${inferred.toLocaleString()} tokens)`}
+              title={`恢复为智能推断推荐值 (${(inferred || 0).toLocaleString()} tokens)`}
             >
               <RotateCcw size={12} />
               <span>恢复推荐值</span>

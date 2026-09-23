@@ -573,6 +573,62 @@ pub fn update_plan(
                 .join("\n");
             body = replace_markdown_section(&body, "## 三、涉及文件与影响范围", &files_text);
         }
+        if let Some(s) = mods.get("steps").and_then(|v| v.as_array()) {
+            let steps_text = if s.is_empty() {
+                "- [ ] 步骤 1：详细梳理并推进核心任务".to_string()
+            } else {
+                s.iter()
+                    .enumerate()
+                    .map(|(i, val)| {
+                        let raw = val.as_str().unwrap_or("").trim();
+                        let text = raw
+                            .trim_start_matches("- [ ]")
+                            .trim_start_matches("- [x]")
+                            .trim_start_matches("- [/]")
+                            .trim();
+                        let mark = if raw.starts_with("- [x]") {
+                            "- [x]"
+                        } else if raw.starts_with("- [/]") {
+                            "- [/]"
+                        } else {
+                            "- [ ]"
+                        };
+                        format!("{} 步骤 {}：{}", mark, i + 1, text)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            body = replace_markdown_section(&body, "## 四、分步执行清单", &steps_text);
+        }
+        if let Some(v) = mods.get("verification").and_then(|v| v.as_str()) {
+            let v_trimmed = v.trim();
+            let v_text = if v_trimmed.is_empty() {
+                "- 运行项目自检测试与自动化验证脚本".to_string()
+            } else if v_trimmed.starts_with('-') {
+                v_trimmed.to_string()
+            } else {
+                format!("- {}", v_trimmed)
+            };
+            body = replace_markdown_section(&body, "## 五、验证与验收策略", &v_text);
+        }
+    }
+
+    // 若计划标记为 completed，将所有步骤自动闭环为 - [x] 已完成
+    if meta.status == "completed" {
+        let mut completed_lines: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("- [ ]") {
+                let rest = trimmed.strip_prefix("- [ ]").unwrap();
+                completed_lines.push(format!("- [x] {}", rest.trim()));
+            } else if trimmed.starts_with("- [/]") {
+                let rest = trimmed.strip_prefix("- [/]").unwrap();
+                completed_lines.push(format!("- [x] {}", rest.trim()));
+            } else {
+                completed_lines.push(line.to_string());
+            }
+        }
+        body = completed_lines.join("\n");
     }
 
     // 3. 追加变更历史到 ## 六、需求变更历史
@@ -1011,6 +1067,44 @@ mod tests {
         assert!(step_res.is_ok());
         let list3 = list_plans(ws, Some(sid), false, None).unwrap();
         assert_eq!(list3[0].completed_steps, 2);
+
+        // 6. 验证 modified_sections.steps 全量替换分步清单
+        let new_steps_mod = json!({
+            "steps": ["重新梳理的步骤1", "新增的步骤2", "新增的步骤3"],
+            "verification": "cargo test --all"
+        });
+        let mod_res = update_plan(
+            ws,
+            sid,
+            None,
+            "需求调整，更新执行步骤",
+            None,
+            None,
+            Some(&new_steps_mod),
+            None,
+            None,
+        );
+        assert!(mod_res.is_ok());
+        let list4 = list_plans(ws, Some(sid), false, None).unwrap();
+        assert_eq!(list4[0].total_steps, 3);
+        assert_eq!(list4[0].completed_steps, 0); // 重新梳理的新步骤默认为 pending 0
+
+        // 7. 验证标记为 completed 时自动闭环所有步骤为 done [x]
+        let comp_res = update_plan(
+            ws,
+            sid,
+            None,
+            "全部完成交付",
+            Some("completed"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(comp_res.is_ok());
+        let list5 = list_plans(ws, Some(sid), false, None).unwrap();
+        assert_eq!(list5[0].completed_steps, 3);
+        assert_eq!(list5[0].status, "completed");
     }
 
     #[test]

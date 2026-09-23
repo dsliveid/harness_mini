@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { currentMessages, useStore } from "../store";
 import { ipc } from "../ipc";
 import type { ActivePlanDetail, TodoItem, ToolEvent } from "../types";
@@ -16,6 +16,7 @@ import {
   Copy,
   Check,
   X,
+  RotateCcw,
 } from "./Icons";
 
 /** 从当前会话消息中提取所有正在执行的 run_command 工具事件 */
@@ -33,7 +34,15 @@ function useRunningCommands(): ToolEvent[] {
   return result;
 }
 
-function TodoSection({ todos, isRunning }: { todos: TodoItem[]; isRunning: boolean }) {
+function TodoSection({
+  todos,
+  isRunning,
+  onToggle,
+}: {
+  todos: { index: number; content: string; status: string }[];
+  isRunning: boolean;
+  onToggle?: (index: number, currentStatus: string) => void;
+}) {
   const done = todos.filter((t) => t.status === "done").length;
   const total = todos.length;
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
@@ -50,15 +59,22 @@ function TodoSection({ todos, isRunning }: { todos: TodoItem[]; isRunning: boole
         </div>
       </div>
       <div className="flex flex-col gap-1 max-h-[180px] overflow-y-auto pr-1">
-        {todos.map((t, i) => (
-          <div key={i} className="flex items-start gap-1.5 text-[12px] leading-snug">
-            <span className="shrink-0 mt-0.5">
+        {todos.map((t) => (
+          <div
+            key={t.index}
+            className={`group flex items-start gap-1.5 text-[12px] leading-snug p-0.5 rounded transition-colors ${
+              onToggle ? "hover:bg-panel3/60 cursor-pointer select-none" : ""
+            }`}
+            onClick={() => onToggle?.(t.index, t.status)}
+            title={onToggle ? "点击切换完成状态" : undefined}
+          >
+            <span className="shrink-0 mt-0.5 group-hover:scale-110 transition-transform">
               {t.status === "done" ? (
                 <CheckCircle2 size={13} className="text-green-400" />
               ) : t.status === "in_progress" && isRunning ? (
                 <Loader2 size={13} className="text-blue-400 animate-spin" />
               ) : (
-                <Circle size={13} className="text-inkdim/50" />
+                <Circle size={13} className="text-inkdim/50 group-hover:text-inkdim" />
               )}
             </span>
             <span className={t.status === "done" ? "text-inkdim line-through" : "text-ink"}>
@@ -147,35 +163,81 @@ export function FloatingTaskPanel() {
   const [collapsed, setCollapsed] = useState(false);
   const [activePlan, setActivePlan] = useState<ActivePlanDetail | null>(null);
   const [showPlanModal, setShowPlanModal] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+
+  // 获取当前会话关联的活动计划
+  const fetchActivePlan = useCallback(() => {
+    if (!currentId) return;
+    setRefreshing(true);
+    ipc.getActivePlan(currentId).then(
+      (res) => {
+        setActivePlan(res);
+        setRefreshing(false);
+      },
+      () => {
+        setActivePlan(null);
+        setRefreshing(false);
+      }
+    );
+  }, [currentId]);
 
   // 会话处于空闲/结束态时，自动将历史遗留未收尾的 in_progress 任务视为已完成
   const todos = isRunning
     ? rawTodos
     : rawTodos.map((t) => (t.status === "in_progress" ? { ...t, status: "done" } : t));
 
-  // 获取当前会话关联的活动计划
   useEffect(() => {
-    let cancelled = false;
     // 切换会话时立即重置活动计划，消除上一会话残留
     setActivePlan(null);
+    fetchActivePlan();
+  }, [currentId, isRunning, todos.length, fetchActivePlan]);
 
-    if (!currentId) return;
+  // 统一任务清单：优先使用物理方案文件中的步骤 (File-Centric)，无方案时回退到普通 todo
+  const hasPlanSteps = !!(activePlan?.steps && activePlan.steps.length > 0);
+  const effectiveTodos = hasPlanSteps
+    ? activePlan!.steps.map((s) => ({
+        index: s.index,
+        content: `步骤 ${s.index}：${s.content}`,
+        status: s.status,
+      }))
+    : todos.map((t, i) => ({
+        index: i + 1,
+        content: t.content,
+        status: t.status,
+      }));
 
-    ipc.getActivePlan(currentId).then(
-      (res) => {
-        if (!cancelled) setActivePlan(res);
-      },
-      () => {
-        if (!cancelled) setActivePlan(null);
+  const handleToggleStep = async (stepIndex: number, currentStatus: string) => {
+    const nextStatus = currentStatus === "done" ? "pending" : "done";
+    if (hasPlanSteps && activePlan && currentWorkspace) {
+      // 乐观更新 activePlan 本地状态
+      const oldSteps = activePlan.steps;
+      const updatedSteps = oldSteps.map((s) =>
+        s.index === stepIndex ? { ...s, status: nextStatus as "pending" | "done" } : s
+      );
+      setActivePlan({ ...activePlan, steps: updatedSteps });
+      try {
+        await ipc.updatePlanStepStatus(
+          currentWorkspace,
+          activePlan.meta.id,
+          stepIndex,
+          nextStatus,
+          currentId || undefined
+        );
+      } catch (err) {
+        console.error("更新计划步骤状态失败:", err);
+        setActivePlan({ ...activePlan, steps: oldSteps });
       }
-    );
+    } else if (currentId) {
+      const nextRaw = rawTodos.map((t, i) =>
+        i + 1 === stepIndex ? { ...t, status: nextStatus as "pending" | "done" } : t
+      );
+      useStore.setState((st) => ({
+        sessionTodos: { ...st.sessionTodos, [currentId]: nextRaw },
+      }));
+    }
+  };
 
-    return () => {
-      cancelled = true;
-    };
-  }, [currentId, isRunning, todos.length]);
-
-  const hasTodos = todos.length > 0;
+  const hasTodos = effectiveTodos.length > 0;
   const hasCmds = runningCmds.length > 0;
   const hasPlan = activePlan !== null;
 
@@ -183,7 +245,7 @@ export function FloatingTaskPanel() {
 
   // 收起态：靠右吸附抽屉标签
   if (collapsed) {
-    const doneCnt = todos.filter((t) => t.status === "done").length;
+    const doneCnt = effectiveTodos.filter((t) => t.status === "done").length;
     return (
       <div className="absolute top-3 right-0 z-20 select-none">
         <button
@@ -204,7 +266,7 @@ export function FloatingTaskPanel() {
           {hasTodos && (
             <span className="flex items-center gap-1 font-medium">
               <CheckSquare size={13} className="text-purple-400 shrink-0" />
-              <span className="font-mono text-[11px]">{doneCnt}/{todos.length}</span>
+              <span className="font-mono text-[11px]">{doneCnt}/{effectiveTodos.length}</span>
             </span>
           )}
           {hasCmds && !hasTodos && !hasPlan && (
@@ -228,14 +290,24 @@ export function FloatingTaskPanel() {
             <CheckSquare size={13} className="text-emerald-400" />
             <span>任务与计划总控</span>
           </span>
-          <button
-            className="flex items-center gap-1 text-[10px] text-inkdim hover:text-ink px-2 py-0.5 rounded-md hover:bg-panel3 transition-colors cursor-pointer"
-            onClick={() => setCollapsed(true)}
-            title="收起至右侧"
-          >
-            <span>收起</span>
-            <ChevronRight size={12} />
-          </button>
+          <div className="flex items-center gap-1">
+            <button
+              className="flex items-center gap-1 text-[10px] text-inkdim hover:text-ink px-1.5 py-0.5 rounded-md hover:bg-panel3 transition-colors cursor-pointer"
+              onClick={fetchActivePlan}
+              title="重新从磁盘读取方案与任务进度"
+            >
+              <RotateCcw size={11} className={refreshing ? "animate-spin text-emerald-400" : ""} />
+              <span>刷新</span>
+            </button>
+            <button
+              className="flex items-center gap-1 text-[10px] text-inkdim hover:text-ink px-2 py-0.5 rounded-md hover:bg-panel3 transition-colors cursor-pointer"
+              onClick={() => setCollapsed(true)}
+              title="收起至右侧"
+            >
+              <span>收起</span>
+              <ChevronRight size={12} />
+            </button>
+          </div>
         </div>
 
         <div className="px-3.5 py-2.5 flex flex-col gap-2.5 max-h-[min(70vh,480px)] overflow-y-auto">
@@ -303,7 +375,13 @@ export function FloatingTaskPanel() {
           {hasCmds && hasTodos && <div className="border-t border-edge" />}
 
           {/* 任务清单 */}
-          {hasTodos && <TodoSection todos={todos} isRunning={isRunning} />}
+          {hasTodos && (
+            <TodoSection
+              todos={effectiveTodos}
+              isRunning={isRunning}
+              onToggle={handleToggleStep}
+            />
+          )}
         </div>
       </div>
 

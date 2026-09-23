@@ -199,6 +199,8 @@ export interface Session {
   totalTokens?: number;
   promptTokens?: number;
   completionTokens?: number;
+  /** 最近一次 Run 执行终态（done | failed | interrupted | cancelled | running） */
+  lastRunStatus?: "done" | "failed" | "interrupted" | "cancelled" | "running" | null;
   /** 父会话 ID（子 Agent 进程非空） */
   parentSessionId?: string | null;
   /** 会话类型：main | subagent */
@@ -1231,6 +1233,14 @@ export interface TaskCheckpoint {
   workingMemory: string;
   gitCommitHash?: string | null;
   createdAt: string;
+}
+
+export interface PathInspectResult {
+  exists: boolean;
+  isDir: boolean;
+  isFile: boolean;
+  absPath: string;
+  fileName: string;
 }
 
 

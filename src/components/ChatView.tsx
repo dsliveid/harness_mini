@@ -45,21 +45,37 @@ export function ChatView() {
   const lastMsg = msgs[msgs.length - 1];
   const isInterruptedOrFailed = useMemo(() => {
     if (running || !currentId || msgs.length === 0) return false;
-    if (lastRunOutcome === "cancelled" || lastRunOutcome === "interrupted" || lastRunOutcome === "failed" || lastRunOutcome === "error") {
+    // 1. 核心依据：以持久化或实时事件广播的真实执行终态为准
+    if (
+      lastRunOutcome === "cancelled" ||
+      lastRunOutcome === "interrupted" ||
+      lastRunOutcome === "failed" ||
+      lastRunOutcome === "error"
+    ) {
       return true;
     }
+    // 2. 正常交付完成（done / completed）时，绝不展示异常恢复条
+    if (lastRunOutcome === "done" || lastRunOutcome === "completed") {
+      return false;
+    }
+    // 3. 兜底边缘异常
     if (lastMsg) {
+      // 用户发了消息，但由于底层崩溃或未响应连 assistant 消息都没产生
       if (lastMsg.role === "user") return true;
-      if (lastMsg.role === "assistant") {
+      // 系统级致命报错（后端 emit_error 创建 role === 'system' 且内容以 ⚠️ 开头）
+      if (lastMsg.role === "system") {
         const content = lastMsg.content || "";
         if (
-          content.includes("⚠️") ||
+          content.startsWith("⚠️") ||
           content.includes("流读取失败") ||
           content.includes("Agent 运行出错") ||
           content.includes("error decoding response body")
         ) {
           return true;
         }
+      }
+      // 步骤中的工具调用卡死或失败未决
+      if (lastMsg.role === "assistant") {
         if (lastMsg.toolEvents?.some((e) => e.status === "failed" || e.status === "interrupted" || e.status === "running")) {
           return true;
         }

@@ -1102,6 +1102,24 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         if let Some(c) = collabs_sec {
             parts.push(c);
         }
+
+        let last_run_was_interrupted: bool = db
+            .query_row(
+                "SELECT status FROM runs WHERE session_id = ?1 ORDER BY started_at DESC LIMIT 1",
+                rusqlite::params![session_id],
+                |r| r.get::<_, String>(0),
+            )
+            .map(|st| st == "cancelled" || st == "failed" || st == "interrupted")
+            .unwrap_or(false);
+
+        if last_run_was_interrupted {
+            parts.push(
+                "## ⚠️ 断点恢复与进度重对齐提示\n\
+                > 检测到上一轮对话曾被中途停止或异常中断。当前工作区中可能已经实施了部分文件修改或测试。\n\
+                > **重要工作原则**：请在编写新代码前，首先快速核对当前工作区实际已修改的文件与构建状态；若原方案/任务清单中的前序步骤在上一轮已实际完成，请先调用 `update_plan` 推进步骤状态至 done，确保任务清单与实际代码进度严格同步，再继续推进后续任务。"
+                .to_string(),
+            );
+        }
         let sec = if parts.is_empty() {
             None
         } else {
@@ -1674,11 +1692,26 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
                     }));
                 }
             }
-            if (tc.name == "create_plan" || tc.name == "update_plan") && status == "success" {
+            if matches!(tc.name.as_str(), "create_plan" | "update_plan" | "switch_plan") && status == "success" {
                 created_plan_in_this_turn = true;
                 let _ = app.emit("file_viewer:file_changed", serde_json::json!({
                     "path": format!("{}/.harness/plans", session.workspace_path)
                 }));
+                // 计划创建/更新/切换后，同步向前端广播最新任务清单
+                let db = state.db.lock().unwrap();
+                if let Ok(Some(raw)) = store::get_kv(&db, session_id, "todos") {
+                    if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+                        if let Some(todos) = val.get("todos") {
+                            let _ = app.emit(
+                                "session:todos",
+                                json!({
+                                    "sessionId": session_id,
+                                    "todos": todos
+                                }),
+                            );
+                        }
+                    }
+                }
             }
             let _ = status;
         }
@@ -2028,7 +2061,7 @@ async fn handle_tool_call(
     (status, text)
 }
 
-/// 对话正常完成交付时调用：将任务清单中仍处于 in_progress 的任务标记为 done 并持久化，同时广播更新
+/// 对话正常完成交付时调用：将任务清单中仍处于 in_progress 或 pending 的任务标记为 done 并持久化，同时同步物理方案文档并广播更新
 pub fn auto_finish_session_todos(state: &crate::AppState, app: &AppHandle, session_id: &str) {
     let db = state.db.lock().unwrap();
     let raw: Option<String> = store::get_kv(&db, session_id, "todos").ok().flatten();
@@ -2038,7 +2071,8 @@ pub fn auto_finish_session_todos(state: &crate::AppState, app: &AppHandle, sessi
 
     let mut changed = false;
     for item in todos_arr.iter_mut() {
-        if item.get("status").and_then(|s| s.as_str()) == Some("in_progress") {
+        let st = item.get("status").and_then(|s| s.as_str());
+        if st == Some("in_progress") || st == Some("pending") {
             item["status"] = json!("done");
             changed = true;
         }
@@ -2054,6 +2088,40 @@ pub fn auto_finish_session_todos(state: &crate::AppState, app: &AppHandle, sessi
                     "todos": todos
                 }),
             );
+        }
+    }
+
+    // 若当前会话绑定了处于执行中的活动方案文档，同步将文档内所有未完结步骤闭环标记为 - [x]
+    if let Ok(Some(sess)) = store::get_session(&db, session_id) {
+        if !sess.workspace_path.is_empty() {
+            let ws = std::path::Path::new(&sess.workspace_path);
+            if let Some((path, mut meta, body)) = crate::plan::find_plan_file(ws, session_id, None, Some(&db)) {
+                let mut new_lines = Vec::new();
+                let mut body_changed = false;
+                for line in body.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("- [ ]") {
+                        let rest = trimmed.strip_prefix("- [ ]").unwrap();
+                        new_lines.push(format!("- [x] {}", rest.trim()));
+                        body_changed = true;
+                    } else if trimmed.starts_with("- [/]") {
+                        let rest = trimmed.strip_prefix("- [/]").unwrap();
+                        new_lines.push(format!("- [x] {}", rest.trim()));
+                        body_changed = true;
+                    } else {
+                        new_lines.push(line.to_string());
+                    }
+                }
+                if body_changed {
+                    meta.updated_at = chrono::Utc::now().to_rfc3339();
+                    let new_body = new_lines.join("\n");
+                    let updated_content = crate::plan::format_with_frontmatter(&meta, &new_body);
+                    let _ = std::fs::write(&path, updated_content);
+                    let _ = app.emit("file_viewer:file_changed", json!({
+                        "path": path.to_string_lossy().to_string()
+                    }));
+                }
+            }
         }
     }
 }
@@ -2313,14 +2381,19 @@ async fn check_and_trigger_compaction(
         },
     );
 
+    state.snapshot.set_pending_compaction(session_id, Some(req.clone()));
     let _ = app.emit("compaction:request", &req);
 
     // 等待用户在前端查看、补充并确认（默认阻塞等待 30 秒；若 30 秒无操作，则自动应用压缩并继续后续流程）
     let decision = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
-        Ok(Ok(d)) => d,
+        Ok(Ok(d)) => {
+            state.snapshot.set_pending_compaction(session_id, None);
+            d
+        }
         _ => {
             // 超时 30 秒无操作：从待处理 map 中移除，触发超时事件以通知前端（通知保持展示供查阅，但不提供继续执行按钮）
             state.compactions.lock().unwrap().remove(&event_id);
+            state.snapshot.set_pending_compaction(session_id, None);
             let _ = app.emit(
                 "compaction:timeout",
                 &serde_json::json!({
@@ -3020,7 +3093,7 @@ fn system_prompt(
             rule_num += 1;
         } else if is_sop_enabled("plan_first") {
             rules.push(format!(
-                "{rule_num}. 【方案先行与任务计划中枢治理规范（防需求失真，必须严格遵守）】：\n   - 大改动物理落盘先行：凡是涉及 3 个以上文件修改、架构重构、新增功能模块或预计多轮交互的复杂任务，**严禁在没有计划文档的情况下直接编写/修改代码**。必须先调用 `create_plan` 工具在 `.harness/plans/` 目录下生成结构化计划 MD 文档（明确目标、技术架构、受影响文件清单、分步 Checklist 与验证策略），并向用户呈现确认。\n   - 需求变更优先更新计划：在多轮对话中，一旦用户提出需求调整、增加/减少特性或纠偏，**在改动代码前，必须首先调用 `update_plan` 工具同步更新计划文档内容与变更历史 (Revision History)**，彻底杜绝“口头答应却遗留旧代码/旧逻辑”的需求失真。\n   - 按清单逐步推进与结案：执行阶段严格以计划 Checklist 为基准推进，每完成一个关键步骤，调用 `update_plan` 推进步骤状态；全部任务完成并通过测试后，调用 `update_plan(status: \"completed\")` 结案归档并解除活动挂载。\n   - 多需求隔离与计划流转：在同一会话中开启全新不相关的独立任务时，调用 `create_plan` 开启新的独立计划（旧计划自动挂起，杜绝多任务杂糅）；若需回溯前序任务，调用 `switch_plan` 重新激活。"
+                "{rule_num}. 【方案先行与任务计划中枢治理规范（防需求失真，必须严格遵守）】：\n   - 大改动物理落盘先行：凡是涉及 3 个以上文件修改、架构重构、新增功能模块或预计多轮交互的复杂任务，**严禁在没有计划文档的情况下直接编写/修改代码**。必须先调用 `create_plan` 工具在 `.harness/plans/` 目录下生成结构化计划 MD 文档（明确目标、技术架构、受影响文件清单、分步 Checklist 与验证策略），并向用户呈现确认。\n   - 需求变更优先更新计划：在多轮对话中，一旦用户提出需求调整、增加/减少特性或纠偏，**在改动代码前，必须首先调用 `update_plan` 工具同步更新计划文档内容（若执行步骤改变，必须传入 modified_sections.steps 全量更新 Checklist）与变更历史 (Revision History)**，彻底杜绝“口头答应却遗留旧代码/旧步骤”的需求失真。\n   - 按清单逐步推进与结案：执行阶段严格以计划 Checklist 为基准推进，每完成一个关键步骤，调用 `update_plan` 推进步骤状态；全部任务完成并通过测试后，调用 `update_plan(status: \"completed\")` 结案归档并解除活动挂载。\n   - 多需求隔离与计划流转：在同一会话中开启全新不相关的独立任务时，调用 `create_plan` 开启新的独立计划（旧计划自动挂起，杜绝多任务杂糅）；若需回溯前序任务，调用 `switch_plan` 重新激活。"
             ));
             rule_num += 1;
         }
