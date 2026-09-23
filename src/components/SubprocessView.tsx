@@ -368,21 +368,33 @@ export function SubprocessView({ subprocessId }: { subprocessId: string }) {
               <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-emerald-400 animate-pulse shadow-[0_0_6px_rgba(52,211,153,0.8)]" />
               {!isCompact && <span>运行中</span>}
             </div>
-          ) : sub.status === "failed" ? (
+          ) : sub.status === "failed" || sub.status === "cancelled" || sub.status === "interrupted" ? (
             <div
-              className="flex items-center gap-1.5 h-8 px-2 sm:px-2.5 rounded-lg text-[12px] shrink-0 select-none bg-rose-500/10 text-rose-400 font-medium border border-rose-500/20"
-              title="执行已终止/异常"
+              className={`flex items-center gap-1.5 h-8 px-2 sm:px-2.5 rounded-lg text-[12px] shrink-0 select-none border font-medium ${
+                sub.status === "failed"
+                  ? "bg-rose-500/10 text-rose-400 border-rose-500/20"
+                  : "bg-amber-500/10 text-amber-400 border-amber-500/20"
+              }`}
+              title={sub.status === "failed" ? "执行异常" : "执行已终止"}
             >
-              <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-rose-400" />
-              {!isCompact && <span>已终止</span>}
+              <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${sub.status === "failed" ? "bg-rose-400" : "bg-amber-400"}`} />
+              {!isCompact && <span>{sub.status === "failed" ? "异常" : "已终止"}</span>}
+            </div>
+          ) : sub.status === "completed" ? (
+            <div
+              className="flex items-center gap-1.5 h-8 px-2 rounded-lg text-[12px] shrink-0 select-none text-emerald-400 bg-emerald-500/10 border border-emerald-500/20"
+              title="任务已完成"
+            >
+              <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-emerald-400" />
+              {!isCompact && <span>已完成</span>}
             </div>
           ) : (
             <div
               className="flex items-center gap-1.5 h-8 px-2 rounded-lg text-[12px] shrink-0 select-none text-inkdim/60"
-              title="任务已完成"
+              title="待推进"
             >
-              <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-emerald-400/70" />
-              {!isCompact && <span>已完成</span>}
+              <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-inkdim/40" />
+              {!isCompact && <span>待推进</span>}
             </div>
           )}
         </div>
@@ -457,15 +469,6 @@ export function SubprocessView({ subprocessId }: { subprocessId: string }) {
             <div className="text-[12px] max-w-[280px]">
               正在独立上下文中运行，任务结果与改动将自动汇聚至主进程。
             </div>
-            <button
-              type="button"
-              onClick={() => void restartSubagent(realSubId)}
-              className="mt-4 px-4 py-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 text-white text-[12.5px] font-medium flex items-center gap-1.5 transition-all shadow-sm cursor-pointer"
-              title="手动启用该子进程"
-            >
-              <Play size={13} fill="currentColor" />
-              <span>手动启用子进程</span>
-            </button>
           </div>
         ) : (
           groupedItems.map((item) => {

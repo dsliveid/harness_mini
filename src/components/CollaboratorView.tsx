@@ -686,15 +686,6 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
                 ? "正在独立上下文中运行，任务结果与产出将自动汇聚至主进程。"
                 : "已加入协作团队。主进程在安排相关任务时将优先委派，您也可以在下方直接向其派发指令。"}
             </div>
-            <button
-              type="button"
-              onClick={() => void restartSubagent(collaboratorId)}
-              className="mt-4 px-4 py-2 rounded-xl bg-accent hover:bg-blue-500 text-white text-[12.5px] font-medium flex items-center gap-1.5 transition-all shadow-sm cursor-pointer"
-              title="手动启用并开始推进任务"
-            >
-              <Play size={13} fill="currentColor" />
-              <span>{isSubprocess ? "手动启用子进程" : "手动启用协作者"}</span>
-            </button>
           </div>
         ) : (
           groupedItems.map((item) => {

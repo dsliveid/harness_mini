@@ -143,6 +143,28 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
             store::list_all_child_sessions(&db, session_id).unwrap_or_default()
         };
         for sub in subs {
+            // 1. 终态保护：已完成的子任务属于成功终态，严禁被主会话级联停止篡改为 cancelled
+            if sub.status == "completed" {
+                continue;
+            }
+
+            // 2. 活跃状态检测：判断子会话是否当前处于执行中
+            let is_active = is_run_active(&state, &sub.id)
+                || sub.status == "running"
+                || sub.status == "pending"
+                || sub.status == "in_progress";
+
+            // 3. 常驻协作者保护：若为常驻协作者，仅在当前真实处于运行活跃状态时才停止并置为 cancelled；
+            // 若协作者处于空闲待命（active/idle），绝不误杀与篡改状态
+            if sub.session_type == "collaborator" && !is_active {
+                continue;
+            }
+
+            // 4. 幂等性保护：若非活跃且已为终止态，跳过，避免重复派发事件
+            if !is_active && (sub.status == "cancelled" || sub.status == "failed" || sub.status == "interrupted" || sub.status == "stopped") {
+                continue;
+            }
+
             {
                 let db = state.db.lock().unwrap();
                 let _ = store::set_session_status(&db, &sub.id, "cancelled");

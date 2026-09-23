@@ -1579,7 +1579,11 @@ export const useStore = create<Store>((set, get) => ({
           if (list.some((s) => s.id === p.sessionId)) {
             nextSubprocesses = {
               ...nextSubprocesses,
-              [pid]: list.map((s) => (s.id === p.sessionId ? { ...s, status: mappedStatus } : s)),
+              [pid]: list.map((s) => {
+                if (s.id !== p.sessionId) return s;
+                if (s.status === "completed" && mappedStatus === "cancelled") return s;
+                return { ...s, status: mappedStatus };
+              }),
             };
             break;
           }
@@ -1588,7 +1592,11 @@ export const useStore = create<Store>((set, get) => ({
           if (list.some((s) => s.id === p.sessionId)) {
             nextSubagents = {
               ...nextSubagents,
-              [pid]: list.map((s) => (s.id === p.sessionId ? { ...s, status: mappedStatus } : s)),
+              [pid]: list.map((s) => {
+                if (s.id !== p.sessionId) return s;
+                if (s.status === "completed" && mappedStatus === "cancelled") return s;
+                return { ...s, status: mappedStatus };
+              }),
             };
             break;
           }
@@ -2126,7 +2134,11 @@ export const useStore = create<Store>((set, get) => ({
       set((st) => {
         const nextCollabs: Record<string, Session[]> = {};
         for (const [pid, list] of Object.entries(st.collaborators)) {
-          nextCollabs[pid] = list.map((c) => (c.id === cid ? { ...c, status } : c));
+          nextCollabs[pid] = list.map((c) => {
+            if (c.id !== cid) return c;
+            if (c.status === "completed" && status === "cancelled") return c;
+            return { ...c, status };
+          });
         }
         return {
           collaborators: nextCollabs,
@@ -2381,17 +2393,21 @@ export const useStore = create<Store>((set, get) => ({
         subprocesses: targetPid
           ? {
               ...st.subprocesses,
-              [targetPid]: (st.subprocesses[targetPid] ?? []).map((s) =>
-                s.id === sid ? { ...s, status: payload.status } : s
-              ),
+              [targetPid]: (st.subprocesses[targetPid] ?? []).map((s) => {
+                if (s.id !== sid) return s;
+                if (s.status === "completed" && payload.status === "cancelled") return s;
+                return { ...s, status: payload.status };
+              }),
             }
           : st.subprocesses,
         subagents: targetPid
           ? {
               ...st.subagents,
-              [targetPid]: (st.subagents[targetPid] ?? []).map((s) =>
-                s.id === sid ? { ...s, status: payload.status } : s
-              ),
+              [targetPid]: (st.subagents[targetPid] ?? []).map((s) => {
+                if (s.id !== sid) return s;
+                if (s.status === "completed" && payload.status === "cancelled") return s;
+                return { ...s, status: payload.status };
+              }),
             }
           : st.subagents,
       }));
