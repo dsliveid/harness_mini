@@ -120,9 +120,13 @@ export function TopBar() {
   const pickDirectory = async () => {
     setOpenMenu(null);
     if (currentId !== DRAFT_ID) return;
-    const picked = await open({ directory: true, multiple: false, title: "选择工作区目录" });
-    if (typeof picked !== "string") return;
-    setDraftWorkspace(picked, null);
+    try {
+      const picked = await open({ directory: true, multiple: false, title: "选择工作区目录" });
+      if (typeof picked !== "string") return;
+      setDraftWorkspace(picked, null);
+    } catch (err) {
+      pushToast(`打开目录选择失败: ${String(err)}`);
+    }
   };
 
   const clearWorkspace = () => {
@@ -193,7 +197,7 @@ export function TopBar() {
   return (
     <div className="relative z-30 h-12 shrink-0 border-b border-edge/60 bg-panel flex items-center justify-between gap-2 px-3.5 select-none">
       {/* 左侧：会话标题 + 工作区 + 分支血缘指示 面包屑导航 */}
-      <div className="flex items-center gap-1.5 min-w-0 shrink overflow-hidden">
+      <div className="flex items-center gap-1.5 min-w-0 shrink">
         {/* 会话标题 */}
         <div className="flex items-center gap-1.5 text-ink min-w-0 shrink h-8">
           <MessageSquare size={13} className="text-accent/80 shrink-0" />
@@ -216,8 +220,15 @@ export function TopBar() {
         <div className="relative flex items-center gap-1 min-w-0 shrink">
           {isSaved || isTempConv ? (
             <div
-              className="flex items-center gap-1.5 h-8 bg-panel2/50 border border-edge/50 rounded-lg px-2.5 text-[12px] text-inkdim max-w-[90px] sm:max-w-[140px] cursor-default select-none shrink min-w-0"
+              className="flex items-center gap-1.5 h-8 bg-panel2/50 hover:bg-panel2/80 border border-edge/50 hover:border-edge rounded-lg px-2.5 text-[12px] text-inkdim max-w-[90px] sm:max-w-[140px] cursor-pointer select-none shrink min-w-0 transition-colors"
               title={wsTitle}
+              onClick={() => {
+                if (isTempConv) {
+                  pushToast("临时空间对话的工作区为项目临时副本，固定不可切换");
+                } else {
+                  pushToast("当前对话已保存，工作空间为只读；如需切换工作区请新建对话");
+                }
+              }}
             >
               {isTempConv ? (
                 <Wind size={12} className="text-amber-400 shrink-0" />
