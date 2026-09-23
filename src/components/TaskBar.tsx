@@ -13,9 +13,21 @@ import {
   List,
   X,
   Clock,
-  Layers,
-  RotateCcw,
+  RefreshCw,
 } from "./Icons";
+
+const getSubtaskBadge = (role?: string | null) => {
+  const r = (role || "").toLowerCase();
+  if (r.includes("front") || r.includes("ui") || r.includes("前端")) return { label: role || "前端", icon: "🎨" };
+  if (r.includes("back") || r.includes("后端") || r.includes("api")) return { label: role || "后端", icon: "⚙️" };
+  if (r.includes("test") || r.includes("测试")) return { label: role || "测试", icon: "🧪" };
+  if (r.includes("review") || r.includes("审阅") || r.includes("审查")) return { label: role || "审阅", icon: "🔍" };
+  if (r.includes("search") || r.includes("research") || r.includes("调研") || r.includes("探查")) return { label: role || "调研", icon: "🔎" };
+  if (r.includes("doc") || r.includes("文档")) return { label: role || "文档", icon: "📝" };
+  if (r.includes("bug") || r.includes("debug") || r.includes("排查") || r.includes("修复")) return { label: role || "排查", icon: "🐞" };
+  if (r.includes("refactor") || r.includes("重构")) return { label: role || "重构", icon: "♻️" };
+  return { label: role || "子任务", icon: "⚡" };
+};
 
 export function TaskBar() {
   const currentId = useStore((s) => s.currentId);
@@ -28,30 +40,53 @@ export function TaskBar() {
 
   const allSubprocesses = useStore((s) => s.subprocesses);
   const allSubagents = useStore((s) => s.subagents);
+  const allCollaborators = useStore((s) => s.collaborators);
+  const activeSubprocessId = useStore((s) => s.activeSubprocessId);
+  const activeCollaboratorId = useStore((s) => s.activeCollaboratorId);
+  const activeSubagentId = useStore((s) => s.activeSubagentId);
+  const setActiveSubprocessId = useStore((s) => s.setActiveSubprocessId);
+  const setActiveCollaboratorId = useStore((s) => s.setActiveCollaboratorId);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+    if (scrollRef.current) {
+      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+        scrollRef.current.scrollLeft += e.deltaY;
+      }
+    }
+  };
+
   const subprocesses = useMemo(() => {
     if (!currentId || currentId === DRAFT_ID) return [];
     const procs = allSubprocesses[currentId] ?? [];
     const ags = allSubagents[currentId] ?? [];
+    const collabs = allCollaborators[currentId] ?? [];
+    const collabIds = new Set(collabs.map((c) => c.id));
+
     const map = new Map<string, typeof procs[0]>();
-    for (const p of procs) map.set(p.id, p);
+    for (const p of procs) {
+      if (p.sessionType !== "collaborator" && !collabIds.has(p.id)) {
+        map.set(p.id, p);
+      }
+    }
     for (const a of ags) {
-      if (!map.has(a.id)) {
-        map.set(a.id, a);
-      } else {
-        map.set(a.id, { ...map.get(a.id)!, ...a });
+      if (a.sessionType !== "collaborator" && !collabIds.has(a.id)) {
+        if (!map.has(a.id)) {
+          map.set(a.id, a);
+        } else {
+          map.set(a.id, { ...map.get(a.id)!, ...a });
+        }
       }
     }
     return Array.from(map.values());
-  }, [allSubprocesses, allSubagents, currentId]);
+  }, [allSubprocesses, allSubagents, allCollaborators, currentId]);
+
   const restartAllSubagents = useStore((s) => s.restartAllSubagents);
   const stopSubagent = useStore((s) => s.stopSubagent);
   const continueTurn = useStore((s) => s.continueTurn);
   const runStatus = useStore((s) => s.runStatus);
 
   const [elapsed, setElapsed] = useState(0);
-  const [justCompleted, setJustCompleted] = useState(false);
-  const [dismissedSessionId, setDismissedSessionId] = useState<string | null>(null);
-  const wasUncompletedRef = useRef<Record<string, boolean>>({});
 
   // 长任务判定：是否存在未完成的子任务
   const hasUnfinishedLongSubtasks = useMemo(() => {
@@ -62,43 +97,9 @@ export function TaskBar() {
     return subs.some((s) => s.status !== "completed");
   }, [task]);
 
-  // 派生子进程/子任务判定：是否存在未真正完成的子任务（包括执行中、待推进、已中断、异常失败）
-  const uncompletedSubprocesses = useMemo(() => {
-    return subprocesses.filter((s) => s.status !== "completed");
-  }, [subprocesses]);
-
   const totalSubCount = subprocesses.length;
   const completedSubCount = subprocesses.filter((s) => s.status === "completed").length;
   const allSubsCompleted = totalSubCount > 0 && completedSubCount === totalSubCount;
-
-  // 只要检测到该会话有正在推进/未完成的子任务，记录标记
-  useEffect(() => {
-    if (!currentId || currentId === DRAFT_ID) return;
-    if (uncompletedSubprocesses.length > 0) {
-      wasUncompletedRef.current[currentId] = true;
-      setDismissedSessionId(null);
-    }
-  }, [currentId, uncompletedSubprocesses.length]);
-
-  // 仅当子任务由“未完成”真正变为“全部完成 (completed)”时，才触发短暂就绪庆祝态，随后自动消失
-  useEffect(() => {
-    if (!currentId || currentId === DRAFT_ID) return;
-    if (
-      wasUncompletedRef.current[currentId] &&
-      totalSubCount > 0 &&
-      allSubsCompleted &&
-      !hasUnfinishedLongSubtasks
-    ) {
-      setJustCompleted(true);
-      const timer = setTimeout(() => {
-        setJustCompleted(false);
-        wasUncompletedRef.current[currentId] = false;
-      }, 3000);
-      return () => clearTimeout(timer);
-    } else {
-      setJustCompleted(false);
-    }
-  }, [currentId, totalSubCount, allSubsCompleted, hasUnfinishedLongSubtasks]);
 
   // 计时器：任务运行或规划中时累计已耗时
   useEffect(() => {
@@ -118,15 +119,12 @@ export function TaskBar() {
     return () => clearInterval(timer);
   }, [task?.status, task?.id]);
 
-  // 核心显示条件：只要存在未完成的长任务子任务，或者存在未完成/刚完成的协作子任务，就显示该栏
+  // 核心显示条件：只要存在未完成的长任务子任务，或者存在协作子任务，就显示该栏（参照协作者栏）
   if (!currentId || currentId === DRAFT_ID) {
     return null;
   }
 
-  const isDismissed = dismissedSessionId === currentId;
-  const shouldShow =
-    !isDismissed &&
-    (hasUnfinishedLongSubtasks || uncompletedSubprocesses.length > 0 || justCompleted);
+  const shouldShow = hasUnfinishedLongSubtasks || subprocesses.length > 0;
   if (!shouldShow) {
     return null;
   }
@@ -338,12 +336,6 @@ export function TaskBar() {
 
   // 场景 B：当前会话无长任务，但存在派生协作子任务/子进程
   const anySubRunning = subprocesses.some((s) => runStatus[s.id] === "running");
-  const anySubInterrupted = subprocesses.some(
-    (s) => s.status === "cancelled" || s.status === "stopped" || s.status === "interrupted"
-  );
-  const anySubFailed = subprocesses.some((s) => s.status === "failed");
-  const subPct = totalSubCount > 0 ? Math.round((completedSubCount / totalSubCount) * 100) : 0;
-  const activeSub = uncompletedSubprocesses[0];
 
   const handleStopAllSubs = async () => {
     for (const sub of subprocesses) {
@@ -354,120 +346,121 @@ export function TaskBar() {
   };
 
   return (
-    <div className="h-10 border-b border-edge/80 bg-panel/75 backdrop-blur px-3 flex items-center gap-3 select-none shrink-0 text-[12px] shadow-sm animate-in fade-in slide-in-from-top-1 duration-200">
-      <div className="flex items-center gap-2 shrink-0 pr-2 border-r border-edge/60">
-        <div className="p-1 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
-          <Layers size={13} />
-        </div>
-        {anySubRunning ? (
-          <span className="flex items-center gap-1 text-indigo-400 font-medium">
-            <Loader2 size={13} className="animate-spin" />
-            <span>子任务执行中</span>
-          </span>
-        ) : allSubsCompleted ? (
-          <span className="flex items-center gap-1 text-emerald-400 font-medium">
-            <CheckCircle2 size={13} />
-            <span>子任务已全部完成</span>
-          </span>
-        ) : anySubInterrupted ? (
-          <span className="flex items-center gap-1 text-amber-400 font-medium">
-            <AlertCircle size={13} />
-            <span>子任务已中止</span>
-          </span>
-        ) : anySubFailed ? (
-          <span className="flex items-center gap-1 text-rose-400 font-medium">
-            <AlertCircle size={13} />
-            <span>子任务执行异常</span>
-          </span>
-        ) : (
-          <span className="flex items-center gap-1 text-inkdim font-medium">
-            <Clock size={13} />
-            <span>子任务待推进</span>
-          </span>
-        )}
-      </div>
-
-      <div className="flex items-center gap-2 min-w-0 max-w-[280px] shrink-0">
-        <span className="font-medium text-ink truncate max-w-[130px]">
-          协作子任务
-        </span>
-        {activeSub && (
+    <div className="h-10 border-b border-edge/80 bg-panel/60 backdrop-blur px-3 flex items-center gap-2 select-none shrink-0 text-[12px]">
+      {/* 标题标识 */}
+      <div className="flex items-center gap-1.5 text-inkdim font-medium shrink-0 pr-2 border-r border-edge/60">
+        <Sparkles size={14} className="text-accent" />
+        <span className="font-medium text-ink">协作子任务</span>
+        {totalSubCount > 0 && (
           <span
-            className="px-1.5 py-0.5 rounded bg-panel2 border border-edge text-[11px] text-inkdim truncate max-w-[140px]"
-            title={`当前子任务: ${activeSub.title}`}
-          >
-            ⚡ {activeSub.title}
-          </span>
-        )}
-      </div>
-
-      <div className="flex items-center gap-2 flex-1 min-w-[120px] max-w-[320px]">
-        <div className="flex-1 h-1.5 bg-panel3 rounded-full overflow-hidden border border-edge/40">
-          <div
-            className={`h-full rounded-full transition-all duration-500 ${
+            className={`px-1.5 py-0.2 text-[10px] rounded-full border ${
               allSubsCompleted
-                ? "bg-emerald-400"
+                ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
                 : anySubRunning
-                ? "bg-gradient-to-r from-indigo-500 to-purple-400"
-                : anySubFailed
-                ? "bg-rose-400"
-                : anySubInterrupted
-                ? "bg-amber-400"
-                : "bg-inkdim/50"
+                ? "bg-indigo-500/10 text-indigo-400 border-indigo-500/30"
+                : "bg-panel2 border-edge text-inkdim"
             }`}
-            style={{ width: `${allSubsCompleted ? 100 : subPct}%` }}
-          />
-        </div>
-        <span className="text-[11px] font-mono text-inkdim shrink-0">
-          {totalSubCount > 0
-            ? allSubsCompleted
-              ? `${totalSubCount}/${totalSubCount} (100%)`
-              : `${completedSubCount}/${totalSubCount} (${subPct}%)`
-            : "准备中"}
-        </span>
-      </div>
-
-      <div className="flex items-center gap-1.5 shrink-0 ml-auto">
-        {anySubRunning ? (
-          <button
-            onClick={handleStopAllSubs}
-            className="flex items-center gap-1 px-2.5 py-1 rounded-md text-amber-400 hover:bg-amber-500/10 border border-amber-500/30 transition-colors cursor-pointer text-[11px]"
-            title="停止所有正在运行的子任务进程"
+            title={`已完成 ${completedSubCount} / 共 ${totalSubCount} 个子任务`}
           >
-            <Square size={11} fill="currentColor" />
-            <span>全部停止</span>
-          </button>
-        ) : allSubsCompleted ? (
-          <span className="text-[11px] text-emerald-400/90 font-medium px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/20">
-            已就绪
+            {completedSubCount}/{totalSubCount}
           </span>
-        ) : (
-          <button
-            onClick={async () => {
-              await restartAllSubagents(currentId);
-              if (currentId && runStatus[currentId] !== "running") {
-                void continueTurn(currentId);
-              }
-            }}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/35 transition-all font-medium cursor-pointer text-[11px] shadow-xs"
-            title="一键恢复推进所有未完成子任务并协同恢复主会话"
-          >
-            <Play size={12} fill="currentColor" />
-            <span>恢复子任务</span>
-          </button>
-        )}
-
-        {/* 手动关闭状态栏 */}
-        {(!anySubRunning || allSubsCompleted) && (
-          <button
-            onClick={() => setDismissedSessionId(currentId)}
-            title="关闭子任务状态栏"
-            className="p-1 rounded hover:bg-panel3 text-inkdim hover:text-ink transition-colors cursor-pointer ml-1"
-          >
-            <X size={12} />
-          </button>
         )}
       </div>
+
+      {/* 子任务水平平铺滚动列表（无原生滚动条，鼠标滚轮平滑横向滚动，参照协作者） */}
+      <div
+        ref={scrollRef}
+        onWheel={handleWheel}
+        className="flex items-center gap-1.5 flex-1 overflow-x-auto scrollbar-none py-1 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
+      >
+        {subprocesses.map((sub) => {
+          const isRunning = runStatus[sub.id] === "running";
+          const isActive =
+            activeSubprocessId === sub.id ||
+            activeCollaboratorId === sub.id ||
+            activeSubagentId === sub.id;
+          const roleInfo = getSubtaskBadge(sub.subagentRole);
+
+          return (
+            <button
+              key={sub.id}
+              onClick={() => {
+                if (isActive) {
+                  setActiveSubprocessId(null);
+                  setActiveCollaboratorId(null);
+                } else {
+                  setActiveSubprocessId(sub.id);
+                }
+              }}
+              className={`group flex items-center gap-1.5 px-2.5 py-1 rounded-lg border transition-all shrink-0 max-w-[200px] text-left cursor-pointer ${
+                isActive
+                  ? "bg-accent/15 border-accent/60 text-ink shadow-sm ring-1 ring-accent/30"
+                  : "bg-panel2/70 hover:bg-panel2 border-edge text-inkdim hover:text-ink"
+              }`}
+              title={`名称: ${sub.title}\n角色: ${roleInfo.label}\n状态: ${
+                isRunning
+                  ? "运行中"
+                  : sub.status === "completed"
+                  ? "已完成"
+                  : sub.status === "failed"
+                  ? "执行异常"
+                  : sub.status === "cancelled" || sub.status === "interrupted"
+                  ? "已中止"
+                  : "待推进"
+              }`}
+            >
+              <span className="text-[12px]">{roleInfo.icon}</span>
+              <span className="truncate font-medium flex-1">{sub.title}</span>
+              {isRunning ? (
+                <Loader2 size={12} className="shrink-0 animate-spin text-accent" />
+              ) : sub.status === "completed" ? (
+                <CheckCircle2 size={12} className="shrink-0 text-emerald-400" />
+              ) : sub.status === "failed" ? (
+                <AlertCircle size={12} className="shrink-0 text-rose-400" />
+              ) : sub.status === "cancelled" || sub.status === "interrupted" ? (
+                <AlertCircle size={12} className="shrink-0 text-amber-400" />
+              ) : (
+                <span className="w-1.5 h-1.5 rounded-full bg-inkdim/40 shrink-0" />
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* 控制操作按钮区：对齐 CollaboratorBar */}
+      {subprocesses.length > 0 && (
+        <div className="flex items-center gap-1 shrink-0 pl-1 border-l border-edge/60">
+          {anySubRunning ? (
+            <button
+              onClick={handleStopAllSubs}
+              className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-amber-400 hover:bg-amber-500/10 border border-amber-500/20 transition-colors cursor-pointer text-[11.5px]"
+              title="一键停止所有正在运行的子任务进程"
+            >
+              <Square size={11} fill="currentColor" />
+              <span>全部停止</span>
+            </button>
+          ) : allSubsCompleted ? (
+            <span className="flex items-center gap-1 text-[11px] text-emerald-400 font-medium px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/20">
+              <CheckCircle2 size={12} />
+              <span>已就绪</span>
+            </span>
+          ) : (
+            <button
+              onClick={async () => {
+                await restartAllSubagents(currentId);
+                if (currentId && runStatus[currentId] !== "running") {
+                  void continueTurn(currentId);
+                }
+              }}
+              className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-inkdim hover:text-ink hover:bg-panel2 border border-edge transition-colors cursor-pointer text-[11.5px]"
+              title="一键唤醒并恢复推进未完成子任务"
+            >
+              <RefreshCw size={11} />
+              <span>全部重启</span>
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

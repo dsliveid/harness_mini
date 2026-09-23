@@ -74,6 +74,7 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
   const isRunning = runStatus[collaboratorId] === "running";
 
   const setActiveCollaboratorId = useStore((s) => s.setActiveCollaboratorId);
+  const setActiveSubprocessId = useStore((s) => s.setActiveSubprocessId);
   const setCollaboratorAutoReport = useStore((s) => s.setCollaboratorAutoReport);
   const reportCollaboratorIncrement = useStore((s) => s.reportCollaboratorIncrement);
   const stopSubagent = useStore((s) => s.stopSubagent);
@@ -277,6 +278,7 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
     if (confirmed) {
       await deleteCollaborator(collaboratorId);
       setActiveCollaboratorId(null);
+      setActiveSubprocessId(null);
     }
   };
 
@@ -315,7 +317,10 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
           <Bot size={32} className="mx-auto mb-2 opacity-40" />
           <div className="text-[13px]">未找到该会话或已被移除</div>
           <button
-            onClick={() => setActiveCollaboratorId(null)}
+            onClick={() => {
+              setActiveCollaboratorId(null);
+              setActiveSubprocessId(null);
+            }}
             className="mt-3 px-3 py-1.5 rounded-lg bg-panel2 hover:bg-panel3 text-[12px] text-ink border border-edge"
           >
             关闭面板
@@ -587,7 +592,10 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
           {/* Close Panel Button */}
           <button
             type="button"
-            onClick={() => setActiveCollaboratorId(null)}
+            onClick={() => {
+              setActiveCollaboratorId(null);
+              setActiveSubprocessId(null);
+            }}
             className="w-8 h-8 rounded-lg hover:bg-panel2 text-inkdim hover:text-ink flex items-center justify-center transition-colors shrink-0 cursor-pointer"
             title="关闭分屏面板"
           >
