@@ -19,6 +19,12 @@ import {
   Sparkles,
   ArrowUp,
   Folder,
+  Layout,
+  Server,
+  FlaskConical,
+  Search,
+  Layers,
+  Zap,
 } from "./Icons";
 
 function formatTokens(n?: number | null): string {
@@ -138,17 +144,17 @@ export function SubagentView({ subagentId }: { subagentId: string }) {
   const getRoleInfo = (role?: string | null) => {
     switch (role) {
       case "frontend":
-        return { label: "前端开发", icon: "🎨", color: "text-blue-400 bg-blue-500/10 border-blue-500/20" };
+        return { label: "前端开发", Icon: Layout, color: "text-blue-400 bg-blue-500/10 border-blue-500/20" };
       case "backend":
-        return { label: "后端开发", icon: "⚙️", color: "text-emerald-400 bg-emerald-500/10 border-emerald-500/20" };
+        return { label: "后端开发", Icon: Server, color: "text-emerald-400 bg-emerald-500/10 border-emerald-500/20" };
       case "testing":
-        return { label: "测试校验", icon: "🧪", color: "text-purple-400 bg-purple-500/10 border-purple-500/20" };
+        return { label: "测试校验", Icon: FlaskConical, color: "text-purple-400 bg-purple-500/10 border-purple-500/20" };
       case "review":
-        return { label: "代码审阅", icon: "🔍", color: "text-amber-400 bg-amber-500/10 border-amber-500/20" };
+        return { label: "代码审阅", Icon: Search, color: "text-amber-400 bg-amber-500/10 border-amber-500/20" };
       case "fullstack":
-        return { label: "全栈开发", icon: "⚡", color: "text-indigo-400 bg-indigo-500/10 border-indigo-500/20" };
+        return { label: "全栈开发", Icon: Layers, color: "text-indigo-400 bg-indigo-500/10 border-indigo-500/20" };
       default:
-        return { label: "子任务", icon: "🤖", color: "text-zinc-400 bg-zinc-500/10 border-zinc-500/20" };
+        return { label: "子任务", Icon: Zap, color: "text-zinc-400 bg-zinc-500/10 border-zinc-500/20" };
     }
   };
 
@@ -232,7 +238,7 @@ export function SubagentView({ subagentId }: { subagentId: string }) {
             className={`h-8 ${isCompact ? "px-2" : "px-2.5"} rounded-lg text-[12px] font-medium border flex items-center gap-1.5 shrink-0 ${roleInfo.color}`}
             title={`角色: ${roleInfo.label}`}
           >
-            <span className="text-[12px]">{roleInfo.icon}</span>
+            <roleInfo.Icon size={12} className="shrink-0" />
             {!isCompact && <span className="whitespace-nowrap">{roleInfo.label}</span>}
           </span>
           <span className="font-medium text-[12.5px] text-ink truncate min-w-0 max-w-[80px] sm:max-w-[130px]" title={subagent.title}>

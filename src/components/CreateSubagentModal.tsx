@@ -1,47 +1,57 @@
 import { useState } from "react";
 import { useStore, currentSession } from "../store";
-import { Layers, X, Loader2, Sparkles } from "./Icons";
+import {
+  Layers,
+  X,
+  Loader2,
+  Sparkles,
+  Layout,
+  Server,
+  FlaskConical,
+  Search,
+  Zap,
+} from "./Icons";
 
 const ROLE_PRESETS = [
   {
     id: "frontend",
     name: "前端开发",
-    icon: "🎨",
+    icon: Layout,
     desc: "专注 UI 界面、组件实现、交互与样式设计",
     defaultPrompt: "负责当前需求的前端模块开发，请遵循现有前端规范与组件风格，确保交互流畅与无报错。",
   },
   {
     id: "backend",
     name: "后端开发",
-    icon: "⚙️",
+    icon: Server,
     desc: "专注服务端逻辑、API 接口、数据处理与性能",
     defaultPrompt: "负责当前需求的后端逻辑或 API 模块开发，确保数据正确性、异常处理健全及接口规范统一。",
   },
   {
     id: "testing",
     name: "测试与校验",
-    icon: "🧪",
+    icon: FlaskConical,
     desc: "专注自动化测试、缺陷验证与质量检查",
     defaultPrompt: "负责编写测试用例并执行验证，全面排查潜在边界情况与回归缺陷，确保代码稳定可靠。",
   },
   {
     id: "review",
     name: "代码审阅与排查",
-    icon: "🔍",
+    icon: Search,
     desc: "专注代码质量审查、Bug 定位与重构优化",
     defaultPrompt: "对目标模块进行深入代码审查或 Bug 排查，提出明确的优化或修复建议并实施验证。",
   },
   {
     id: "fullstack",
     name: "全栈开发",
-    icon: "⚡",
+    icon: Layers,
     desc: "端到端实现全功能模块与接口串联",
     defaultPrompt: "负责端到端完整功能模块开发，贯通前后端交互逻辑并确保最终可用。",
   },
   {
     id: "custom",
     name: "自定义",
-    icon: "🤖",
+    icon: Zap,
     desc: "自由定制目标角色与专属工作任务",
     defaultPrompt: "",
   },
@@ -118,6 +128,7 @@ export function CreateSubagentModal() {
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
               {ROLE_PRESETS.map((preset) => {
                 const isSelected = selectedRole === preset.id;
+                const IconComp = preset.icon;
                 return (
                   <button
                     key={preset.id}
@@ -130,7 +141,7 @@ export function CreateSubagentModal() {
                     }`}
                   >
                     <div className="flex items-center gap-1.5 font-medium text-[13px]">
-                      <span className="text-base">{preset.icon}</span>
+                      <IconComp size={15} className="shrink-0 text-accent/80" />
                       <span>{preset.name}</span>
                     </div>
                     <div className="text-[11px] text-inkdim mt-1 line-clamp-2 leading-tight">

@@ -18,6 +18,13 @@ import {
   Folder,
   Cpu,
   Eye,
+  Play,
+  Layout,
+  Server,
+  FlaskConical,
+  Search,
+  Layers,
+  Zap,
 } from "./Icons";
 
 function formatTokens(n?: number | null): string {
@@ -27,12 +34,12 @@ function formatTokens(n?: number | null): string {
   return n.toLocaleString("zh-CN");
 }
 
-const ROLE_INFO: Record<string, { label: string; icon: string; color: string }> = {
-  frontend: { label: "前端开发", icon: "🎨", color: "text-blue-400 bg-blue-500/10 border-blue-500/20" },
-  backend: { label: "后端开发", icon: "⚙️", color: "text-emerald-400 bg-emerald-500/10 border-emerald-500/20" },
-  testing: { label: "测试校验", icon: "🧪", color: "text-purple-400 bg-purple-500/10 border-purple-500/20" },
-  review: { label: "代码审阅", icon: "🔍", color: "text-amber-400 bg-amber-500/10 border-amber-500/20" },
-  fullstack: { label: "全栈开发", icon: "⚡", color: "text-indigo-400 bg-indigo-500/10 border-indigo-500/20" },
+const ROLE_INFO: Record<string, { label: string; Icon: any; color: string }> = {
+  frontend: { label: "前端开发", Icon: Layout, color: "text-blue-400 bg-blue-500/10 border-blue-500/20" },
+  backend: { label: "后端开发", Icon: Server, color: "text-emerald-400 bg-emerald-500/10 border-emerald-500/20" },
+  testing: { label: "测试校验", Icon: FlaskConical, color: "text-purple-400 bg-purple-500/10 border-purple-500/20" },
+  review: { label: "代码审阅", Icon: Search, color: "text-amber-400 bg-amber-500/10 border-amber-500/20" },
+  fullstack: { label: "全栈开发", Icon: Layers, color: "text-indigo-400 bg-indigo-500/10 border-indigo-500/20" },
 };
 
 export function SubprocessView({ subprocessId }: { subprocessId: string }) {
@@ -224,7 +231,7 @@ export function SubprocessView({ subprocessId }: { subprocessId: string }) {
 
   const roleMeta = ROLE_INFO[sub?.subagentRole || ""] ?? {
     label: "子进程",
-    icon: "⚡",
+    Icon: Zap,
     color: "text-indigo-400 bg-indigo-500/10 border-indigo-500/20",
   };
 
@@ -335,7 +342,7 @@ export function SubprocessView({ subprocessId }: { subprocessId: string }) {
             className={`h-8 ${isCompact ? "px-2" : "px-2.5"} rounded-lg text-[12px] font-medium border flex items-center gap-1.5 shrink-0 ${roleMeta.color}`}
             title={`角色: ${roleMeta.label}`}
           >
-            <span className="text-[12px]">{roleMeta.icon}</span>
+            <roleMeta.Icon size={12} className="shrink-0" />
             {!isCompact && <span className="whitespace-nowrap">{roleMeta.label}</span>}
           </span>
 
@@ -404,11 +411,15 @@ export function SubprocessView({ subprocessId }: { subprocessId: string }) {
           {!isRunning && (
             <button
               onClick={() => void restartSubagent(realSubId)}
-              className="flex items-center gap-1 h-8 px-2.5 rounded-lg text-inkdim hover:text-ink hover:bg-panel2 border border-edge text-[12px] font-medium transition-colors cursor-pointer shrink-0"
-              title="重新启动 / 继续该子进程"
+              className={`flex items-center gap-1 h-8 px-2.5 rounded-lg text-[12px] font-medium transition-colors cursor-pointer shrink-0 ${
+                msgs.length === 0
+                  ? "bg-indigo-500/15 hover:bg-indigo-500/25 text-indigo-400 border border-indigo-500/40 shadow-xs"
+                  : "text-inkdim hover:text-ink hover:bg-panel2 border border-edge"
+              }`}
+              title={msgs.length === 0 ? "手动启用该子进程并开始执行" : "重新启动 / 继续该子进程"}
             >
-              <RefreshCw size={11} />
-              {!isVeryCompact && <span>重试</span>}
+              {msgs.length === 0 ? <Play size={12} fill="currentColor" /> : <RefreshCw size={11} />}
+              {!isVeryCompact && <span>{msgs.length === 0 ? "手动启用" : "重试"}</span>}
             </button>
           )}
 
@@ -446,6 +457,15 @@ export function SubprocessView({ subprocessId }: { subprocessId: string }) {
             <div className="text-[12px] max-w-[280px]">
               正在独立上下文中运行，任务结果与改动将自动汇聚至主进程。
             </div>
+            <button
+              type="button"
+              onClick={() => void restartSubagent(realSubId)}
+              className="mt-4 px-4 py-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 text-white text-[12.5px] font-medium flex items-center gap-1.5 transition-all shadow-sm cursor-pointer"
+              title="手动启用该子进程"
+            >
+              <Play size={13} fill="currentColor" />
+              <span>手动启用子进程</span>
+            </button>
           </div>
         ) : (
           groupedItems.map((item) => {

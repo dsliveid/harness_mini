@@ -14,19 +14,27 @@ import {
   X,
   Clock,
   RefreshCw,
+  Layout,
+  Server,
+  FlaskConical,
+  Search,
+  FileText,
+  Bug,
+  RotateCw,
+  Zap,
 } from "./Icons";
 
 const getSubtaskBadge = (role?: string | null) => {
   const r = (role || "").toLowerCase();
-  if (r.includes("front") || r.includes("ui") || r.includes("前端")) return { label: role || "前端", icon: "🎨" };
-  if (r.includes("back") || r.includes("后端") || r.includes("api")) return { label: role || "后端", icon: "⚙️" };
-  if (r.includes("test") || r.includes("测试")) return { label: role || "测试", icon: "🧪" };
-  if (r.includes("review") || r.includes("审阅") || r.includes("审查")) return { label: role || "审阅", icon: "🔍" };
-  if (r.includes("search") || r.includes("research") || r.includes("调研") || r.includes("探查")) return { label: role || "调研", icon: "🔎" };
-  if (r.includes("doc") || r.includes("文档")) return { label: role || "文档", icon: "📝" };
-  if (r.includes("bug") || r.includes("debug") || r.includes("排查") || r.includes("修复")) return { label: role || "排查", icon: "🐞" };
-  if (r.includes("refactor") || r.includes("重构")) return { label: role || "重构", icon: "♻️" };
-  return { label: role || "子任务", icon: "⚡" };
+  if (r.includes("front") || r.includes("ui") || r.includes("前端")) return { label: role || "前端", Icon: Layout };
+  if (r.includes("back") || r.includes("后端") || r.includes("api")) return { label: role || "后端", Icon: Server };
+  if (r.includes("test") || r.includes("测试")) return { label: role || "测试", Icon: FlaskConical };
+  if (r.includes("review") || r.includes("审阅") || r.includes("审查")) return { label: role || "审阅", Icon: Search };
+  if (r.includes("search") || r.includes("research") || r.includes("调研") || r.includes("探查")) return { label: role || "调研", Icon: Search };
+  if (r.includes("doc") || r.includes("文档")) return { label: role || "文档", Icon: FileText };
+  if (r.includes("bug") || r.includes("debug") || r.includes("排查") || r.includes("修复")) return { label: role || "排查", Icon: Bug };
+  if (r.includes("refactor") || r.includes("重构")) return { label: role || "重构", Icon: RotateCw };
+  return { label: role || "子任务", Icon: Zap };
 };
 
 export function TaskBar() {
@@ -392,7 +400,7 @@ export function TaskBar() {
                   setActiveSubprocessId(sub.id);
                 }
               }}
-              className={`group flex items-center gap-1.5 px-2.5 py-1 rounded-lg border transition-all shrink-0 max-w-[200px] text-left cursor-pointer ${
+              className={`group flex items-center gap-1.5 px-2 py-1 rounded-lg border transition-all shrink-0 max-w-[130px] text-left cursor-pointer ${
                 isActive
                   ? "bg-accent/15 border-accent/60 text-ink shadow-sm ring-1 ring-accent/30"
                   : "bg-panel2/70 hover:bg-panel2 border-edge text-inkdim hover:text-ink"
@@ -409,16 +417,18 @@ export function TaskBar() {
                   : "待推进"
               }`}
             >
-              <span className="text-[12px]">{roleInfo.icon}</span>
-              <span className="truncate font-medium flex-1">{sub.title}</span>
+              <span className="shrink-0 text-accent/80 group-hover:text-accent">
+                <roleInfo.Icon size={12} />
+              </span>
+              <span className="truncate font-medium flex-1 text-[11.5px]">{sub.title}</span>
               {isRunning ? (
-                <Loader2 size={12} className="shrink-0 animate-spin text-accent" />
+                <Loader2 size={11} className="shrink-0 animate-spin text-accent" />
               ) : sub.status === "completed" ? (
-                <CheckCircle2 size={12} className="shrink-0 text-emerald-400" />
+                <CheckCircle2 size={11} className="shrink-0 text-emerald-400" />
               ) : sub.status === "failed" ? (
-                <AlertCircle size={12} className="shrink-0 text-rose-400" />
+                <AlertCircle size={11} className="shrink-0 text-rose-400" />
               ) : sub.status === "cancelled" || sub.status === "interrupted" ? (
-                <AlertCircle size={12} className="shrink-0 text-amber-400" />
+                <AlertCircle size={11} className="shrink-0 text-amber-400" />
               ) : (
                 <span className="w-1.5 h-1.5 rounded-full bg-inkdim/40 shrink-0" />
               )}

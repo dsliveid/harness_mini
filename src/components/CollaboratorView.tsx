@@ -23,6 +23,17 @@ import {
   Eye,
   Pencil,
   MoreHorizontal,
+  Play,
+  Layout,
+  Server,
+  ClipboardList,
+  ListTodo,
+  Palette,
+  FlaskConical,
+  Search,
+  Layers,
+  Zap,
+  Users,
 } from "./Icons";
 
 function formatTokens(n?: number | null): string {
@@ -222,19 +233,27 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
   const getRoleInfo = (role?: string | null) => {
     switch (role) {
       case "frontend":
-        return { label: "前端开发", icon: "🎨", color: "text-blue-400 bg-blue-500/10 border-blue-500/20" };
+        return { label: "前端开发", Icon: Layout, color: "text-blue-400 bg-blue-500/10 border-blue-500/20" };
       case "backend":
-        return { label: "后端开发", icon: "⚙️", color: "text-emerald-400 bg-emerald-500/10 border-emerald-500/20" };
+        return { label: "后端开发", Icon: Server, color: "text-emerald-400 bg-emerald-500/10 border-emerald-500/20" };
+      case "pm":
+        return { label: "产品经理", Icon: ClipboardList, color: "text-cyan-400 bg-cyan-500/10 border-cyan-500/20" };
+      case "pmo":
+        return { label: "项目经理", Icon: ListTodo, color: "text-violet-400 bg-violet-500/10 border-violet-500/20" };
+      case "vision":
+        return { label: "视觉感知", Icon: Eye, color: "text-purple-400 bg-purple-500/10 border-purple-500/20" };
+      case "image_gen":
+        return { label: "图像生成", Icon: Palette, color: "text-pink-400 bg-pink-500/10 border-pink-500/20" };
       case "testing":
-        return { label: "测试校验", icon: "🧪", color: "text-purple-400 bg-purple-500/10 border-purple-500/20" };
+        return { label: "测试校验", Icon: FlaskConical, color: "text-purple-400 bg-purple-500/10 border-purple-500/20" };
       case "review":
-        return { label: "代码审阅", icon: "🔍", color: "text-amber-400 bg-amber-500/10 border-amber-500/20" };
+        return { label: "代码审阅", Icon: Search, color: "text-amber-400 bg-amber-500/10 border-amber-500/20" };
       case "fullstack":
-        return { label: "全栈开发", icon: "⚡", color: "text-indigo-400 bg-indigo-500/10 border-indigo-500/20" };
+        return { label: "全栈开发", Icon: Layers, color: "text-indigo-400 bg-indigo-500/10 border-indigo-500/20" };
       default:
         return {
           label: isSubprocess ? "子任务" : "协作者",
-          icon: isSubprocess ? "⚡" : "🤝",
+          Icon: isSubprocess ? Zap : Users,
           color: isSubprocess ? "text-indigo-400 bg-indigo-500/10 border-indigo-500/20" : "text-zinc-400 bg-zinc-500/10 border-zinc-500/20",
         };
     }
@@ -353,7 +372,7 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
             className={`h-8 ${isCompact ? "px-2" : "px-2.5"} rounded-lg text-[12px] font-medium border flex items-center gap-1.5 shrink-0 ${roleInfo.color}`}
             title={`角色: ${roleInfo.label}`}
           >
-            <span className="text-[12px]">{roleInfo.icon}</span>
+            <roleInfo.Icon size={13} className="shrink-0" />
             {!isCompact && <span className="whitespace-nowrap">{roleInfo.label}</span>}
           </span>
 
@@ -445,16 +464,24 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
             </button>
           )}
 
-          {/* Restart Button */}
+          {/* 手动启用 / 重启 Button */}
           {!isRunning && (
             <button
               type="button"
               onClick={() => void restartSubagent(collaboratorId)}
-              className="flex items-center gap-1 h-8 px-2.5 rounded-lg text-inkdim hover:text-ink hover:bg-panel2 border border-edge text-[12px] font-medium transition-colors cursor-pointer shrink-0"
-              title={isSubprocess ? "重新启动 / 继续该子进程" : "重启 / 继续当前协作者"}
+              className={`flex items-center gap-1 h-8 px-2.5 rounded-lg text-[12px] font-medium transition-colors cursor-pointer shrink-0 ${
+                msgs.length === 0
+                  ? "bg-accent/15 hover:bg-accent/25 text-accent border border-accent/40 shadow-xs"
+                  : "text-inkdim hover:text-ink hover:bg-panel2 border border-edge"
+              }`}
+              title={
+                isSubprocess
+                  ? msgs.length === 0 ? "手动启用该子进程" : "重新启动 / 继续该子进程"
+                  : msgs.length === 0 ? "手动启用该协作者并开始推进任务" : "重启 / 继续当前协作者"
+              }
             >
-              <RefreshCw size={11} />
-              {!isVeryCompact && <span>重启</span>}
+              {msgs.length === 0 ? <Play size={12} fill="currentColor" /> : <RefreshCw size={11} />}
+              {!isVeryCompact && <span>{msgs.length === 0 ? "手动启用" : "重启"}</span>}
             </button>
           )}
 
@@ -625,7 +652,7 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
               )}
               {(collab.imageModelId || collab.image_model_id) && (
                 <span className="px-1.5 py-0.5 rounded bg-purple-500/10 border border-purple-500/30 text-purple-300 font-mono flex items-center gap-1" title="专属生图执行模型">
-                  <span>🎨</span>
+                  <Palette size={10} className="text-purple-300" />
                   <span>{collab.imageModelId || collab.image_model_id}</span>
                 </span>
               )}
@@ -659,6 +686,15 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
                 ? "正在独立上下文中运行，任务结果与产出将自动汇聚至主进程。"
                 : "已加入协作团队。主进程在安排相关任务时将优先委派，您也可以在下方直接向其派发指令。"}
             </div>
+            <button
+              type="button"
+              onClick={() => void restartSubagent(collaboratorId)}
+              className="mt-4 px-4 py-2 rounded-xl bg-accent hover:bg-blue-500 text-white text-[12.5px] font-medium flex items-center gap-1.5 transition-all shadow-sm cursor-pointer"
+              title="手动启用并开始推进任务"
+            >
+              <Play size={13} fill="currentColor" />
+              <span>{isSubprocess ? "手动启用子进程" : "手动启用协作者"}</span>
+            </button>
           </div>
         ) : (
           groupedItems.map((item) => {

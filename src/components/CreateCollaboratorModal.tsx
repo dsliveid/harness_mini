@@ -1,14 +1,32 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { useStore, currentSession } from "../store";
 import { hasModelCapability } from "../types";
-import { Users, X, Loader2, Sparkles, Folder, Check, ChevronDown, ChevronRight, Cpu, Sliders } from "./Icons";
+import {
+  Users,
+  X,
+  Loader2,
+  Sparkles,
+  Check,
+  Cpu,
+  Sliders,
+  Layout,
+  Server,
+  ClipboardList,
+  ListTodo,
+  Eye,
+  Palette,
+  FlaskConical,
+  Search,
+  Layers,
+  MessageSquare,
+} from "./Icons";
 import { ModelCapabilitySelect } from "./ModelCapabilitySelect";
 
 const ROLE_PRESETS = [
   {
     id: "frontend",
     name: "前端开发",
-    icon: "💻",
+    icon: Layout,
     desc: "专注 UI 界面、组件实现、交互与样式设计",
     defaultPrompt: "负责项目的前端模块开发与样式交互优化，遵循项目现有规范，确保界面流畅与体验统一。",
     defaultDispatchRule: "当涉及 UI 界面设计、页面实现、组件重构、Vue/React 模板与 CSS 交互开发时，必须优先委派本协作者。",
@@ -16,7 +34,7 @@ const ROLE_PRESETS = [
   {
     id: "backend",
     name: "后端开发",
-    icon: "⚙️",
+    icon: Server,
     desc: "专注服务端逻辑、API 接口、数据处理与性能",
     defaultPrompt: "负责服务端的业务逻辑与 API 接口开发，确保数据一致性、异常健全与性能稳定。",
     defaultDispatchRule: "当涉及服务端业务逻辑、API 接口、数据库 CRUD、后台架构开发时，必须优先委派本协作者。",
@@ -24,7 +42,7 @@ const ROLE_PRESETS = [
   {
     id: "pm",
     name: "产品经理",
-    icon: "📋",
+    icon: ClipboardList,
     desc: "专注需求拆解、PRD方案制定与业务边界梳理",
     defaultPrompt: "作为产品经理，负责将用户需求拆解细化为清晰的 PRD 需求文档、交互流程和功能边界，为研发团队提供清晰的产品定义与方案。",
     defaultDispatchRule: "当涉及需求分析梳理、PRD 方案编写、功能边界与业务流程设计时，必须优先委派本协作者。",
@@ -32,7 +50,7 @@ const ROLE_PRESETS = [
   {
     id: "pmo",
     name: "项目经理",
-    icon: "📊",
+    icon: ListTodo,
     desc: "专注任务拆解(WBS)、里程碑排期与进度追踪",
     defaultPrompt: "作为项目经理 (PMO)，负责拆解任务清单、统筹各协作者里程碑排期、识别关键风险并推动交付闭环。",
     defaultDispatchRule: "当涉及任务拆解(WBS)、里程碑节点排期、进度与风险追踪时，必须优先委派本协作者。",
@@ -40,7 +58,7 @@ const ROLE_PRESETS = [
   {
     id: "vision",
     name: "图像识别",
-    icon: "👁️",
+    icon: Eye,
     desc: "专注多模态图片识别、设计稿解析与视觉分析",
     defaultPrompt: "作为多模态视觉协作者，负责精准识别分析用户提供的图片、设计稿或运行报错截图，提取关键结构并向主进程汇报成果。",
     defaultDispatchRule: "当用户发送图片、截图、设计稿并要求视觉识别分析时，必须优先委派本协作者。",
@@ -48,7 +66,7 @@ const ROLE_PRESETS = [
   {
     id: "image_gen",
     name: "图像生成",
-    icon: "🎨",
+    icon: Palette,
     desc: "专注图片生成、提示词润色与视觉配图制作",
     defaultPrompt: "作为图像生成协作者，负责根据具体场景构思提示词并调用 generate_image 工具生成图片，产出素材并汇报主进程。",
     defaultDispatchRule: "当用户提出画图、生成图片、插图、海报、Logo、图标、配图制作等视觉生成需求时，必须优先委派本协作者。",
@@ -56,7 +74,7 @@ const ROLE_PRESETS = [
   {
     id: "testing",
     name: "测试校验",
-    icon: "🧪",
+    icon: FlaskConical,
     desc: "专注自动化测试、缺陷验证与质量检查",
     defaultPrompt: "编写单元测试与集成验证用例，全面覆盖关键逻辑边界，防范回归缺陷。",
     defaultDispatchRule: "当需要编写自动化测试用例、单元测试、执行回归测试与缺陷验证时，必须优先委派本协作者。",
@@ -64,7 +82,7 @@ const ROLE_PRESETS = [
   {
     id: "review",
     name: "代码审阅",
-    icon: "🔍",
+    icon: Search,
     desc: "专注代码质量审查、Bug 定位与重构优化",
     defaultPrompt: "深入分析代码设计与潜在隐患，提出针对性重构建议并实施精确修复。",
     defaultDispatchRule: "当需要对代码实现进行质量审查、重构优化与架构防劣化时，必须优先委派本协作者。",
@@ -72,7 +90,7 @@ const ROLE_PRESETS = [
   {
     id: "fullstack",
     name: "全栈开发",
-    icon: "⚡",
+    icon: Layers,
     desc: "端到端实现全功能模块与前后端串联",
     defaultPrompt: "端到端打通前后端业务链路，实现高内聚低耦合的完整功能模块。",
     defaultDispatchRule: "当涉及端到端打通前后端完整功能链路开发时，必须优先委派本协作者。",
@@ -80,7 +98,7 @@ const ROLE_PRESETS = [
   {
     id: "custom",
     name: "自定义",
-    icon: "🤝",
+    icon: Users,
     desc: "自由定制专属职责定位与执行模型",
     defaultPrompt: "",
     defaultDispatchRule: "当用户任务属于本协作者专业领域范围时，必须优先委派本协作者处理。",
@@ -97,25 +115,16 @@ export function CreateCollaboratorModal() {
   const createCollaborator = useStore((s) => s.createCollaborator);
 
   const [selectedRole, setSelectedRole] = useState("frontend");
-  const [title, setTitle] = useState("前端开发协作者");
+  const [title, setTitle] = useState("前端开发");
   const [taskPrompt, setTaskPrompt] = useState(ROLE_PRESETS[0].defaultPrompt);
   const [dispatchRule, setDispatchRule] = useState(ROLE_PRESETS[0].defaultDispatchRule);
-  const [workspacePath, setWorkspacePath] = useState(session?.workspacePath ?? draft?.workspacePath ?? "");
-  const [subpath, setSubpath] = useState("");
   const [autoReport, setAutoReport] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [selectedModelKey, setSelectedModelKey] = useState<string>(""); // format: "providerId::modelId" (chat)
   const [selectedImageModelKey, setSelectedImageModelKey] = useState<string>(""); // format: "providerId::modelId" (image_gen)
   const [selectedVisionModelKey, setSelectedVisionModelKey] = useState<string>(""); // format: "providerId::modelId" (vision)
-  const [showAdvanced, setShowAdvanced] = useState(false);
 
   const providers = settings?.providers ?? [];
-
-  useEffect(() => {
-    if (show) {
-      setWorkspacePath(session?.workspacePath ?? draft?.workspacePath ?? "");
-    }
-  }, [show, session?.workspacePath, draft?.workspacePath]);
 
   if (!show || !currentId) return null;
 
@@ -123,7 +132,7 @@ export function CreateCollaboratorModal() {
     setSelectedRole(roleId);
     const preset = ROLE_PRESETS.find((r) => r.id === roleId);
     if (preset) {
-      setTitle(`${preset.name}协作者`);
+      setTitle(preset.name);
       if (preset.defaultPrompt) {
         setTaskPrompt(preset.defaultPrompt);
       }
@@ -190,8 +199,7 @@ export function CreateCollaboratorModal() {
         title: title.trim() || undefined,
         taskPrompt: taskPrompt.trim(),
         dispatchRule: dispatchRule.trim() || undefined,
-        subpath: subpath.trim() || undefined,
-        workspacePath: workspacePath.trim() || undefined,
+        workspacePath: session?.workspacePath ?? draft?.workspacePath ?? undefined,
         autoReport,
         providerId,
         modelId,
@@ -201,12 +209,10 @@ export function CreateCollaboratorModal() {
         visionModelId,
       });
       handleRoleSelect("frontend");
-      setSubpath("");
       setAutoReport(true);
       setSelectedModelKey("");
       setSelectedImageModelKey("");
       setSelectedVisionModelKey("");
-      setShowAdvanced(false);
     } finally {
       setSubmitting(false);
     }
@@ -262,7 +268,7 @@ export function CreateCollaboratorModal() {
                         : "bg-panel2/40 hover:bg-panel2 border-edge text-inkdim hover:text-ink"
                     }`}
                   >
-                    <span className="text-sm shrink-0">{preset.icon}</span>
+                    <preset.icon size={14} className="shrink-0 text-accent/80" />
                     <span className="text-[12px] truncate">{preset.name}</span>
                   </button>
                 );
@@ -299,8 +305,8 @@ export function CreateCollaboratorModal() {
               <div className="bg-panel2/60 border border-blue-500/20 rounded-lg p-2.5 flex flex-col justify-between gap-1.5">
                 <div>
                   <div className="flex items-center justify-between text-[11.5px] font-medium text-blue-400">
-                    <span className="flex items-center gap-1">
-                      <span>💬</span>
+                    <span className="flex items-center gap-1.5">
+                      <MessageSquare size={13} />
                       <span>对话思考</span>
                     </span>
                     <span className="text-[10px] font-mono text-inkdim">chat</span>
@@ -324,8 +330,8 @@ export function CreateCollaboratorModal() {
               <div className="bg-panel2/60 border border-pink-500/20 rounded-lg p-2.5 flex flex-col justify-between gap-1.5">
                 <div>
                   <div className="flex items-center justify-between text-[11.5px] font-medium text-pink-400">
-                    <span className="flex items-center gap-1">
-                      <span>🎨</span>
+                    <span className="flex items-center gap-1.5">
+                      <Palette size={13} />
                       <span>图像生成</span>
                     </span>
                     <span className="text-[10px] font-mono text-inkdim">image_gen</span>
@@ -348,8 +354,8 @@ export function CreateCollaboratorModal() {
               <div className="bg-panel2/60 border border-purple-500/20 rounded-lg p-2.5 flex flex-col justify-between gap-1.5">
                 <div>
                   <div className="flex items-center justify-between text-[11.5px] font-medium text-purple-400">
-                    <span className="flex items-center gap-1">
-                      <span>👁️</span>
+                    <span className="flex items-center gap-1.5">
+                      <Eye size={13} />
                       <span>视觉感知</span>
                     </span>
                     <span className="text-[10px] font-mono text-inkdim">vision</span>
@@ -427,47 +433,6 @@ export function CreateCollaboratorModal() {
                 <span className="text-inkdim ml-1 text-[11px]">（完成时自动唤醒主进程衔接后续）</span>
               </div>
             </label>
-          </div>
-
-          {/* Collapsible Advanced Section */}
-          <div className="border border-edge/60 rounded-xl overflow-hidden bg-panel2/20">
-            <button
-              type="button"
-              onClick={() => setShowAdvanced(!showAdvanced)}
-              className="w-full px-3 py-2 flex items-center justify-between text-inkdim hover:text-ink text-[11.5px] font-medium transition-colors cursor-pointer"
-            >
-              <span className="flex items-center gap-1.5">
-                <Folder size={12} />
-                <span>高级物理目录配置 (工作区 / 子目录)</span>
-              </span>
-              {showAdvanced ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-            </button>
-            {showAdvanced && (
-              <div className="p-3 pt-0 border-t border-edge/40 space-y-2 text-[11.5px]">
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2">
-                  <div>
-                    <label className="block text-ink mb-1 text-[11px]">工作区根目录</label>
-                    <input
-                      type="text"
-                      value={workspacePath}
-                      onChange={(e) => setWorkspacePath(e.target.value)}
-                      placeholder={session?.workspacePath || draft?.workspacePath || "继承当前项目根目录"}
-                      className="w-full px-2.5 py-1 rounded bg-panel2/60 border border-edge text-ink text-[11px] font-mono focus:outline-none focus:border-accent"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-ink mb-1 text-[11px]">重点关注子目录</label>
-                    <input
-                      type="text"
-                      value={subpath}
-                      onChange={(e) => setSubpath(e.target.value)}
-                      placeholder="例如：src/components 或 docs"
-                      className="w-full px-2.5 py-1 rounded bg-panel2/60 border border-edge text-ink text-[11px] font-mono focus:outline-none focus:border-accent"
-                    />
-                  </div>
-                </div>
-              </div>
-            )}
           </div>
         </div>
 

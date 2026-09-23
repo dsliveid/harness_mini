@@ -12,6 +12,12 @@ import {
   ChevronRight,
   ExternalLink,
   Sparkles,
+  Layout,
+  Server,
+  FlaskConical,
+  Search,
+  Layers,
+  Zap,
 } from "./Icons";
 import type { ToolEvent, Session } from "../types";
 
@@ -22,12 +28,12 @@ function formatTokens(n?: number | null): string {
   return n.toLocaleString("zh-CN");
 }
 
-const ROLE_INFO: Record<string, { label: string; icon: string; color: string; border: string }> = {
-  frontend: { label: "前端开发", icon: "🎨", color: "text-blue-400 bg-blue-500/10", border: "border-blue-500/30" },
-  backend: { label: "后端开发", icon: "⚙️", color: "text-emerald-400 bg-emerald-500/10", border: "border-emerald-500/30" },
-  testing: { label: "测试校验", icon: "🧪", color: "text-purple-400 bg-purple-500/10", border: "border-purple-500/30" },
-  review: { label: "代码审阅", icon: "🔍", color: "text-amber-400 bg-amber-500/10", border: "border-amber-500/30" },
-  fullstack: { label: "全栈开发", icon: "⚡", color: "text-indigo-400 bg-indigo-500/10", border: "border-indigo-500/30" },
+const ROLE_INFO: Record<string, { label: string; Icon: any; color: string; border: string }> = {
+  frontend: { label: "前端开发", Icon: Layout, color: "text-blue-400 bg-blue-500/10", border: "border-blue-500/30" },
+  backend: { label: "后端开发", Icon: Server, color: "text-emerald-400 bg-emerald-500/10", border: "border-emerald-500/30" },
+  testing: { label: "测试校验", Icon: FlaskConical, color: "text-purple-400 bg-purple-500/10", border: "border-purple-500/30" },
+  review: { label: "代码审阅", Icon: Search, color: "text-amber-400 bg-amber-500/10", border: "border-amber-500/30" },
+  fullstack: { label: "全栈开发", Icon: Layers, color: "text-indigo-400 bg-indigo-500/10", border: "border-indigo-500/30" },
 };
 
 export interface SubprocessItemData {
@@ -66,7 +72,7 @@ function SubprocessTaskTab({
 
   const roleMeta = ROLE_INFO[item.role] ?? {
     label: "子进程",
-    icon: "⚡",
+    Icon: Zap,
     color: "text-indigo-400 bg-indigo-500/10",
     border: "border-indigo-500/30",
   };
@@ -121,7 +127,7 @@ function SubprocessTaskTab({
           <span
             className={`px-1.5 py-0.5 rounded text-[10px] font-medium border flex items-center gap-1 shrink-0 ${roleMeta.color} ${roleMeta.border}`}
           >
-            <span>{roleMeta.icon}</span>
+            <roleMeta.Icon size={11} className="shrink-0" />
             <span>{roleMeta.label}</span>
           </span>
 

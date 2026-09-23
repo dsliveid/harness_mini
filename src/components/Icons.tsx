@@ -112,4 +112,11 @@ export {
   TrendingUp,
   Coins,
   Flame,
+  Layout,
+  Server,
+  ClipboardList,
+  ListTodo,
+  FlaskConical,
+  Palette,
+  Bug,
 } from "lucide-react";

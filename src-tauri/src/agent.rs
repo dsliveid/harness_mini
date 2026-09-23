@@ -303,7 +303,13 @@ pub fn restart_subagent(app: &AppHandle, subagent_id: &str) -> Result<(), String
                 m.id.clone()
             }
             _ => {
-                let nm = store::new_message(&db, subagent_id, "user", Some("请继续恢复并执行任务。".into()), false)?;
+                let prompt = s
+                    .subagent_task
+                    .as_deref()
+                    .map(|t| t.trim())
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or("请继续推进并执行任务。");
+                let nm = store::new_message(&db, subagent_id, "user", Some(prompt.into()), false)?;
                 let _ = app.emit("message:final", &nm);
                 nm.id
             }

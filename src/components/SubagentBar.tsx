@@ -1,6 +1,19 @@
-﻿import { useStore, currentSession } from "../store";
+import { useStore, currentSession } from "../store";
 import { DRAFT_ID } from "../types";
-import { Layers, Plus, Square, RefreshCw, Loader2, CheckCircle2, AlertCircle } from "./Icons";
+import {
+  Layers,
+  Plus,
+  Square,
+  RefreshCw,
+  Loader2,
+  CheckCircle2,
+  AlertCircle,
+  Layout,
+  Server,
+  FlaskConical,
+  Search,
+  Zap,
+} from "./Icons";
 
 export function SubagentBar() {
   const currentId = useStore((s) => s.currentId);
@@ -30,17 +43,17 @@ export function SubagentBar() {
   const getRoleBadge = (role?: string | null) => {
     switch (role) {
       case "frontend":
-        return { label: "前端", icon: "🎨" };
+        return { label: "前端", Icon: Layout };
       case "backend":
-        return { label: "后端", icon: "⚙️" };
+        return { label: "后端", Icon: Server };
       case "testing":
-        return { label: "测试", icon: "🧪" };
+        return { label: "测试", Icon: FlaskConical };
       case "review":
-        return { label: "审阅", icon: "🔍" };
+        return { label: "审阅", Icon: Search };
       case "fullstack":
-        return { label: "全栈", icon: "⚡" };
+        return { label: "全栈", Icon: Layers };
       default:
-        return { label: "子任务", icon: "🤖" };
+        return { label: "子任务", Icon: Zap };
     }
   };
 
@@ -66,21 +79,23 @@ export function SubagentBar() {
             <button
               key={sub.id}
               onClick={() => setActiveSubagentId(isActive ? null : sub.id)}
-              className={`group flex items-center gap-1.5 px-2.5 py-1 rounded-lg border transition-all shrink-0 max-w-[200px] text-left ${
+              className={`group flex items-center gap-1.5 px-2 py-1 rounded-lg border transition-all shrink-0 max-w-[130px] text-left ${
                 isActive
                   ? "bg-accent/15 border-accent/60 text-ink shadow-sm ring-1 ring-accent/30"
                   : "bg-panel2/70 hover:bg-panel2 border-edge text-inkdim hover:text-ink"
               }`}
               title={`${sub.title}\n角色: ${roleInfo.label}\n状态: ${isRunning ? "运行中" : sub.status}`}
             >
-              <span className="text-[12px]">{roleInfo.icon}</span>
-              <span className="truncate font-medium flex-1">{sub.title}</span>
+              <span className="shrink-0 text-accent/80 group-hover:text-accent">
+                <roleInfo.Icon size={12} />
+              </span>
+              <span className="truncate font-medium flex-1 text-[11.5px]">{sub.title}</span>
               {isRunning ? (
-                <Loader2 size={12} className="shrink-0 animate-spin text-accent" />
+                <Loader2 size={11} className="shrink-0 animate-spin text-accent" />
               ) : sub.status === "completed" ? (
-                <CheckCircle2 size={12} className="shrink-0 text-emerald-400" />
+                <CheckCircle2 size={11} className="shrink-0 text-emerald-400" />
               ) : sub.status === "failed" ? (
-                <AlertCircle size={12} className="shrink-0 text-rose-400" />
+                <AlertCircle size={11} className="shrink-0 text-rose-400" />
               ) : (
                 <span className="w-1.5 h-1.5 rounded-full bg-inkdim/40 shrink-0" />
               )}

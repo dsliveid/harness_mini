@@ -7,6 +7,7 @@ import {
   resolveActiveVisionModel,
   resolveActiveModel,
 } from "../types";
+import { AlertTriangle } from "./Icons";
 
 export interface ModelCapabilitySelectProps {
   capability: ModelCapability;
@@ -116,7 +117,7 @@ export function ModelCapabilitySelect({
 
       {!isCurrentValid && value && (
         <div className="text-[10.5px] text-rose-400 mt-1 flex items-center gap-1">
-          <span>⚠️</span>
+          <AlertTriangle size={12} className="shrink-0" />
           <span>当前选中的模型不支持【{meta.label}】能力，请更换为可选模型</span>
         </div>
       )}

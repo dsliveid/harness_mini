@@ -2249,10 +2249,11 @@ export const useStore = create<Store>((set, get) => ({
         runStatus: { ...st.runStatus, [subagentId]: "running" },
       }));
       await ipc.restartSubagent(subagentId);
-      get().pushToast("子 Agent 已重启");
+      const isCollab = Object.values(get().collaborators).some((arr) => arr.some((c) => c.id === subagentId));
+      get().pushToast(isCollab ? "协作者已启用" : "子任务已启动");
       void get().syncSessionActiveState(subagentId);
     } catch (e) {
-      get().pushToast(`重启子 Agent 失败: ${e}`);
+      get().pushToast(`启动失败: ${e}`);
     }
   },
 
