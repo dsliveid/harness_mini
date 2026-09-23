@@ -29,6 +29,7 @@ import {
   ZoomIn,
   Link2,
   Sparkles,
+  BookOpen,
 } from "./Icons";
 
 function statusBadge(status: string) {
@@ -79,6 +80,13 @@ function toolCategoryBadge(name: string) {
       </span>
     );
   }
+  if (["record_memory", "read_memory"].includes(name)) {
+    return (
+      <span className="text-[10px] px-1.5 py-[0.5px] rounded bg-teal-500/10 text-teal-300 border border-teal-500/20 shrink-0">
+        长期记忆
+      </span>
+    );
+  }
   return (
     <span className="text-[10px] px-1.5 py-[0.5px] rounded bg-blue-500/10 text-blue-400 border border-blue-500/20 shrink-0">
       内置
@@ -108,6 +116,9 @@ function ToolIcon({ name }: { name: string }) {
     case "read_plan":
     case "list_plans":
       return <CheckSquare size={14} className="text-emerald-400 shrink-0" />;
+    case "record_memory":
+    case "read_memory":
+      return <BookOpen size={14} className="text-teal-400 shrink-0" />;
     case "generate_image":
       return <Image size={14} className="text-pink-400 shrink-0" />;
     case "list_skills":
@@ -161,6 +172,10 @@ function paramTitle(ev: ToolEvent): string {
       return String(p.plan_id ?? "当前活动计划");
     case "list_plans":
       return "项目计划清单";
+    case "record_memory":
+      return `${p.category ? `[${p.category}] ` : ""}${p.title ?? "沉淀记忆"}`;
+    case "read_memory":
+      return p.topic ? `主题: ${p.topic}` : "记忆总览清单";
     case "wait_subprocesses":
     case "wait_subagents":
       return "等待子进程完成汇聚";
@@ -189,6 +204,8 @@ const TOOL_LABELS: Record<string, string> = {
   switch_plan: "切换计划",
   read_plan: "查阅计划",
   list_plans: "计划清单",
+  record_memory: "沉淀记忆",
+  read_memory: "查阅记忆",
   generate_image: "生成图片",
   list_skills: "查询技能库",
   save_skill: "固化项目技能",
@@ -320,6 +337,106 @@ function PlanCardView({
           已将当前活动计划切换为：<span className="font-mono text-emerald-400">[{p.plan_id}]</span>
         </div>
       )}
+    </div>
+  );
+}
+
+function MemoryCardView({
+  ev,
+  onOpenMemory,
+  memoryFilePath,
+}: {
+  ev: ToolEvent;
+  onOpenMemory?: (e: React.MouseEvent) => void;
+  memoryFilePath?: string | null;
+}) {
+  const p = ev.params || {};
+  const isRecord = ev.toolName === "record_memory";
+  const isRead = ev.toolName === "read_memory";
+
+  const categoryName = useMemo(() => {
+    const c = String(p.category || "").toLowerCase();
+    if (c === "profile" || c === "tech_stack") return "技术大盘 profile";
+    if (c === "convention" || c === "notes") return "工程规范 convention";
+    return "主题碎记 digest";
+  }, [p.category]);
+
+  if (ev.status === "failed" || ev.status === "denied" || ev.status === "timeout") {
+    return (
+      <div className="mt-2 text-[12px] bg-red-500/10 border border-red-500/30 rounded-lg p-2.5 text-red-300 space-y-1">
+        <div className="font-medium flex items-center gap-1.5 text-red-400">
+          <ShieldAlert size={14} />
+          <span>记忆操作未完成 ({ev.status})</span>
+        </div>
+        <div className="text-[11.5px] font-mono whitespace-pre-wrap text-red-300/90 max-h-32 overflow-y-auto">
+          {ev.resultText || "执行失败"}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-2 text-[12px] bg-teal-950/25 border border-teal-500/30 rounded-lg p-2.5 space-y-1.5 shadow-xs">
+      <div className="flex items-center gap-2 flex-wrap">
+        <BookOpen size={13} className="text-teal-400 shrink-0" />
+        <span className="font-semibold text-teal-300">
+          {isRecord ? (p.title || "知识资产沉淀") : (p.topic ? `查阅主题: ${p.topic}` : "查阅记忆档案总览")}
+        </span>
+        {isRecord && (
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-teal-500/15 text-teal-200 border border-teal-500/30 font-mono">
+            {categoryName}
+          </span>
+        )}
+      </div>
+
+      {isRecord && p.content && (
+        <div className="text-ink/90 text-[11.5px] max-h-36 overflow-y-auto bg-panel/60 p-2.5 rounded border border-edge/30 font-mono whitespace-pre-wrap select-text leading-relaxed">
+          {String(p.content)}
+        </div>
+      )}
+
+      {isRead && ev.resultText && (
+        <div className="text-ink/90 text-[11.5px] max-h-48 overflow-y-auto bg-panel/60 p-2.5 rounded border border-edge/30 font-mono whitespace-pre-wrap select-text leading-relaxed">
+          {ev.resultText}
+        </div>
+      )}
+
+      {/* 记忆物理文件落盘/读取状态与快捷查看条 */}
+      <div className="mt-2 pt-2 border-t border-teal-500/20 flex items-center justify-between gap-2 flex-wrap text-[11.5px]">
+        <div className="flex items-center gap-1.5 text-inkdim font-mono text-[11px] truncate max-w-[320px]">
+          {memoryFilePath ? (
+            <span title={memoryFilePath} className="truncate text-teal-300 font-mono">
+              📄 {memoryFilePath}
+            </span>
+          ) : ev.status === "running" ? (
+            <span className="text-amber-400 animate-pulse font-sans">⏳ 记忆文件处理中...</span>
+          ) : (
+            <span className="font-sans text-teal-300">📄 记忆档案已落盘</span>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2 ml-auto">
+          {memoryFilePath && (
+            <button
+              type="button"
+              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors text-[11px] cursor-pointer ${
+                ev.status === "running"
+                  ? "bg-panel3 text-inkdim/50 cursor-not-allowed border border-edge/40"
+                  : "bg-teal-500/15 hover:bg-teal-500/25 text-teal-200 border border-teal-500/30"
+              }`}
+              onClick={onOpenMemory}
+              disabled={ev.status === "running"}
+              title="在内置文件查看器中打开该记忆 Markdown 文档（支持直接查看与编辑修改）"
+            >
+              <BookOpen size={12} />
+              <span>{isRecord ? "查看/编辑记忆 (MD)" : "查看记忆 (MD)"}</span>
+            </button>
+          )}
+        </div>
+      </div>
+      <div className="text-[11px] text-inkdim/80 bg-panel/40 px-2 py-1 rounded border border-edge/30">
+        💡 提示：{isRecord ? "记忆已物理落盘至工作区长期认知库（可点击上方按钮查看/修改）。新会话及后续推理将自动秒级召回。" : "已从工作区认知记忆库召回该档案（可点击上方按钮查看全文）。"}
+      </div>
     </div>
   );
 }
@@ -969,8 +1086,101 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
     });
   };
 
+  // 提取长期认知记忆文档（.harness/memory/...）的物理文件路径
+  const resolvedMemoryFilePath = useMemo(() => {
+    if (!["record_memory", "read_memory"].includes(ev.toolName)) {
+      return null;
+    }
+    // 1. 显式参数传递（如 params 中注入 memory_file_path / memoryFilePath / path）
+    if (ev.params?.memory_file_path) return String(ev.params.memory_file_path);
+    if (ev.params?.memoryFilePath) return String(ev.params.memoryFilePath);
+    if (typeof ev.params?.path === "string" && (ev.params.path.includes(".harness/memory/") || ev.params.path.includes(".harness\\memory\\"))) {
+      return ev.params.path.replace(/\\/g, "/");
+    }
+    // 2. 从 resultText 中提取
+    if (ev.resultText) {
+      const normalized = ev.resultText.replace(/\\/g, "/");
+      const match = normalized.match(/(?:\.harness\/memory\/|memory\/)([^`\s\n"'<>。]+\.md)/i);
+      if (match) return `.harness/memory/${match[1]}`;
+    }
+    // 3. 根据工具参数反推路径
+    if (ev.toolName === "record_memory") {
+      const cat = ev.params?.category ? String(ev.params.category).trim() : "";
+      if (cat === "profile" || cat === "tech_stack") {
+        return ".harness/memory/profile.md";
+      }
+      if (cat === "convention" || cat === "notes") {
+        return ".harness/memory/conventions.md";
+      }
+      const title = ev.params?.title ? String(ev.params.title).trim() : "";
+      if (title) {
+        const slug = title
+          .split("")
+          .map((c) => (/[\p{L}\p{N}\-_]/u.test(c) ? c : "-"))
+          .join("")
+          .replace(/-+/g, "-")
+          .replace(/^-|-$/g, "");
+        const finalSlug = slug || "memory-item";
+        return `.harness/memory/digests/${finalSlug}.md`;
+      }
+    } else if (ev.toolName === "read_memory") {
+      const topic = ev.params?.topic ? String(ev.params.topic).trim() : "";
+      if (topic === "profile" || topic === "tech_stack") {
+        return ".harness/memory/profile.md";
+      }
+      if (topic === "conventions" || topic === "convention") {
+        return ".harness/memory/conventions.md";
+      }
+      if (topic) {
+        const slug = topic
+          .split("")
+          .map((c) => (/[\p{L}\p{N}\-_]/u.test(c) ? c : "-"))
+          .join("")
+          .replace(/-+/g, "-")
+          .replace(/^-|-$/g, "");
+        const finalSlug = slug || "memory-item";
+        return `.harness/memory/digests/${finalSlug}.md`;
+      }
+    }
+    return null;
+  }, [ev.toolName, ev.resultText, ev.params]);
+
+  const handleOpenMemoryFile = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (ev.status === "running") {
+      pushToast("记忆处理中，完成后即可打开查看");
+      return;
+    }
+    if (!resolvedMemoryFilePath) {
+      pushToast("未找到对应的记忆文件路径");
+      return;
+    }
+    const cleanRel = resolvedMemoryFilePath.replace(/\\/g, "/");
+    const absPath =
+      /^[a-zA-Z]:\//.test(cleanRel) || cleanRel.startsWith("/")
+        ? cleanRel
+        : currentWorkspace
+          ? `${currentWorkspace.replace(/\\/g, "/").replace(/\/$/, "")}/${cleanRel.replace(/^\//, "")}`
+          : cleanRel;
+    const fileName = cleanRel.split("/").pop() || "记忆档案.md";
+
+    ipc.openFileViewer({
+      id: `file:${absPath}`,
+      type: "file",
+      title: String(ev.params?.title ? `${ev.params.title}.md` : fileName),
+      subtitle: cleanRel,
+      path: absPath,
+      workspacePath: currentWorkspace,
+      sessionId: currentSessionId || undefined,
+    });
+  };
+
   const showOutput = ev.status === "running" && output !== undefined;
-  const showResult = !isImageTool && !!ev.resultText && (ev.status === "success" || ev.status === "failed" || ev.status === "timeout" || ev.status === "denied");
+  const showResult =
+    !isImageTool &&
+    !["record_memory", "read_memory"].includes(ev.toolName) &&
+    !!ev.resultText &&
+    (ev.status === "success" || ev.status === "failed" || ev.status === "timeout" || ev.status === "denied");
 
   return (
     <div
@@ -1093,6 +1303,26 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
               <span>报告工件 (MD)</span>
             </button>
           )}
+          {["record_memory", "read_memory"].includes(ev.toolName) && resolvedMemoryFilePath && (
+            <button
+              type="button"
+              className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded transition-colors ${
+                ev.status === "running"
+                  ? "bg-panel3 text-inkdim/50 cursor-not-allowed border border-edge/40"
+                  : "bg-teal-500/10 hover:bg-teal-500/20 text-teal-300 cursor-pointer border border-teal-500/30"
+              }`}
+              title={
+                ev.status === "running"
+                  ? "记忆处理中，落盘后即可打开查看"
+                  : "在独立窗体中查看记忆文档 (Markdown)"
+              }
+              onClick={handleOpenMemoryFile}
+              disabled={ev.status === "running"}
+            >
+              <BookOpen size={11} />
+              <span>{ev.status === "running" ? "保存中..." : "查看记忆"}</span>
+            </button>
+          )}
           {statusBadge(ev.status)}
           {ev.approvalScope && ev.approvalScope !== "none" && ev.status !== "pending_approval" && (
             <span className="text-[10px] text-inkdim shrink-0">
@@ -1116,6 +1346,15 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
 
       {/* 审批条是交互入口，保持常显 */}
       {ev.status === "pending_approval" && <ApprovalSection ev={ev} />}
+
+      {/* 展开时：若是记忆工具，展示专用记忆卡片 */}
+      {expanded && ["record_memory", "read_memory"].includes(ev.toolName) && (
+        <MemoryCardView
+          ev={ev}
+          onOpenMemory={handleOpenMemoryFile}
+          memoryFilePath={resolvedMemoryFilePath}
+        />
+      )}
 
       {/* 展开时：若是生图工具，展示专用生图成果与提示词卡片 */}
       {expanded && isImageTool && (

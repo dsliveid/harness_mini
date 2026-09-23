@@ -69,6 +69,12 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
     return p.includes("/.harness/plans/") || p.startsWith(".harness/plans/");
   }, [tab.path]);
 
+  // 判定是否是长期记忆 Markdown 文档
+  const isMemoryDoc = useMemo(() => {
+    const p = tab.path.replace(/\\/g, "/");
+    return p.includes("/.harness/memory/") || p.startsWith(".harness/memory/");
+  }, [tab.path]);
+
   const isDirty = useMemo(() => {
     return data !== null && editContent !== data.content;
   }, [data, editContent]);
@@ -544,6 +550,11 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
                     （修改后按 Ctrl+S 保存即可，可在对话框中直接告知 Agent 继续执行）
                   </span>
                 )}
+                {isMemoryDoc && (
+                  <span className="text-teal-400 font-sans ml-1">
+                    （修改后按 Ctrl+S 保存，知识与规范将在后续对话中持续生效）
+                  </span>
+                )}
               </span>
               {isDirty && (
                 <span className="text-amber-400 font-medium">● 存在未保存改动</span>
@@ -553,7 +564,7 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
               className="flex-1 w-full bg-[#121216] border border-edge/80 rounded-lg p-3 text-ink font-mono text-[12.5px] leading-relaxed outline-none focus:border-accent/60 resize-none selection:bg-accent/30 selection:text-white"
               value={editContent}
               onChange={(e) => setEditContent(e.target.value)}
-              placeholder="在此输入或调整方案内容..."
+              placeholder={isMemoryDoc ? "在此调整项目记忆或技术档案内容..." : isPlanDoc ? "在此输入或调整方案内容..." : "在此编辑文件内容..."}
               autoFocus
               spellCheck={false}
               onKeyDown={(e) => {

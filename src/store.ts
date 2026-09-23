@@ -2259,13 +2259,20 @@ export const useStore = create<Store>((set, get) => ({
   async restartAllSubagents(parentSessionId: string) {
     try {
       await ipc.restartAllSubagents(parentSessionId);
-      get().pushToast("已发起所有子 Agent 重启");
-      const list = get().subagents[parentSessionId] ?? [];
-      for (const s of list) {
-        void get().syncSessionActiveState(s.id);
+      get().pushToast("已发起所有子任务重启");
+      const subs = [
+        ...(get().subagents[parentSessionId] ?? []),
+        ...(get().subprocesses[parentSessionId] ?? []),
+      ];
+      const seen = new Set<string>();
+      for (const s of subs) {
+        if (!seen.has(s.id)) {
+          seen.add(s.id);
+          void get().syncSessionActiveState(s.id);
+        }
       }
     } catch (e) {
-      get().pushToast(`批量重启子 Agent 失败: ${e}`);
+      get().pushToast(`批量重启子任务失败: ${e}`);
     }
   },
 

@@ -251,9 +251,16 @@ pub fn resume_long_task(app: &AppHandle, task_id: &str) -> Result<LongTask, Stri
         }
         t.status = "running".to_string();
         t.updated_at = store::now();
-        // 如果当前子任务处于 failed/verifying/interrupted/in_progress，重置为 pending 以便重新执行该子任务
-        if let Some(sub) = t.subtasks.get_mut(t.current_subtask_index) {
-            if sub.status == "failed" || sub.status == "in_progress" || sub.status == "verifying" || sub.status == "interrupted" {
+        // 如果当前子任务处于 failed/verifying/interrupted/in_progress/paused，重置为 pending 以便重新执行该子任务
+        let next_idx = get_next_subtask_index(&t).unwrap_or(t.current_subtask_index);
+        t.current_subtask_index = next_idx;
+        if let Some(sub) = t.subtasks.get_mut(next_idx) {
+            if sub.status == "failed"
+                || sub.status == "in_progress"
+                || sub.status == "verifying"
+                || sub.status == "interrupted"
+                || sub.status == "paused"
+            {
                 sub.status = "pending".to_string();
                 sub.error = None;
             }

@@ -284,6 +284,8 @@ pub fn restart_subagent(app: &AppHandle, subagent_id: &str) -> Result<(), String
     let (parent_id, trigger_id) = {
         let db = state.db.lock().unwrap();
         let s = store::get_session(&db, subagent_id)?.ok_or("子 Agent 不存在")?;
+        // 关键修复：重启子任务时，同步将 SQLite 数据库中的生命周期状态由 cancelled/interrupted/failed 恢复为 running
+        let _ = store::set_session_status(&db, subagent_id, "running");
         let msgs = store::all_messages(&db, subagent_id)?;
         let last_msg = msgs.last();
         let user_msg_id = match last_msg {
@@ -1930,6 +1932,48 @@ async fn handle_tool_call(
             let path_str = sub[..end].trim_end_matches('.');
             if let Some(obj) = ev.params.as_object_mut() {
                 obj.insert("plan_file_path".into(), json!(path_str));
+            }
+        }
+    }
+    if tool_name == "record_memory" && status == "success" {
+        let normalized = text.replace('\\', "/");
+        let detected_path = if let Some(pos) = normalized.find(".harness/memory/") {
+            let sub = &normalized[pos..];
+            let end = sub.find(|c: char| c.is_whitespace() || c == '`' || c == ')' || c == '"' || c == '\'' || c == '。').unwrap_or(sub.len());
+            Some(sub[..end].trim_end_matches('.').to_string())
+        } else {
+            let cat = ev.params.get("category").and_then(|v| v.as_str()).unwrap_or("");
+            let title = ev.params.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            match cat {
+                "profile" | "tech_stack" => Some(".harness/memory/profile.md".to_string()),
+                "convention" | "notes" => Some(".harness/memory/conventions.md".to_string()),
+                _ if !title.is_empty() => {
+                    let slug = crate::memory::sanitize_slug(title);
+                    Some(format!(".harness/memory/digests/{slug}.md"))
+                }
+                _ => None,
+            }
+        };
+        if let Some(p) = detected_path {
+            if let Some(obj) = ev.params.as_object_mut() {
+                obj.insert("memory_file_path".into(), json!(p));
+            }
+        }
+    }
+    if tool_name == "read_memory" && status == "success" {
+        let topic = ev.params.get("topic").and_then(|v| v.as_str()).map(|s| s.trim());
+        let path_str = match topic {
+            Some("profile") | Some("tech_stack") => Some(".harness/memory/profile.md".to_string()),
+            Some("conventions") | Some("convention") => Some(".harness/memory/conventions.md".to_string()),
+            Some(t) if !t.is_empty() => {
+                let slug = crate::memory::sanitize_slug(t);
+                Some(format!(".harness/memory/digests/{slug}.md"))
+            }
+            _ => None,
+        };
+        if let Some(p) = path_str {
+            if let Some(obj) = ev.params.as_object_mut() {
+                obj.insert("memory_file_path".into(), json!(p));
             }
         }
     }

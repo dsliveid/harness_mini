@@ -7,6 +7,7 @@ import {
   GitCompare,
   CheckSquare,
   Image as ImageIcon,
+  BookOpen,
   X,
   Copy,
   FolderOpen,
@@ -29,6 +30,10 @@ function TabIcon({ tab }: { tab: ViewerTabItem }) {
   }
   if (tab.type === "image") {
     return <ImageIcon size={13} className="text-purple-400 shrink-0" />;
+  }
+  const tabPath = "path" in tab ? String(tab.path || "") : "";
+  if (tabPath.includes("/.harness/memory/") || tabPath.includes("\\.harness\\memory\\")) {
+    return <BookOpen size={13} className="text-teal-400 shrink-0" />;
   }
   const ext = tab.title.split(".").pop()?.toLowerCase();
   if (["ts", "tsx", "js", "jsx", "rs", "py", "go", "java", "c", "cpp", "json"].includes(ext || "")) {

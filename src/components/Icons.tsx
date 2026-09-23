@@ -43,6 +43,8 @@ export {
   FileEdit,
   FileCode,
   Files,
+  BookOpen,
+  Bookmark,
   Search,
   GitCompare,
   GitMerge,
