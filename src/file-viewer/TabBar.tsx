@@ -39,6 +39,9 @@ function TabIcon({ tab }: { tab: ViewerTabItem }) {
   if (["ts", "tsx", "js", "jsx", "rs", "py", "go", "java", "c", "cpp", "json"].includes(ext || "")) {
     return <FileCode size={13} className="text-blue-400 shrink-0" />;
   }
+  if (["md", "markdown", "mdown", "mkdn"].includes(ext || "")) {
+    return <FileText size={13} className="text-sky-400 shrink-0" />;
+  }
   return <FileText size={13} className="text-inkdim shrink-0" />;
 }
 

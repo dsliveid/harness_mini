@@ -17,7 +17,9 @@ import {
   CheckSquare,
   ChevronDown,
   ChevronUp,
+  Code,
 } from "../components/Icons";
+import { Markdown } from "../components/Markdown";
 import hljs from "highlight.js";
 
 /** 安全在已有 HTML 中对搜索关键词进行高亮，避开所有 HTML 标签内部的属性和标签名 */
@@ -57,8 +59,29 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
   const [currentMatchIdx, setCurrentMatchIdx] = useState(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
+  // 判定是否是 Markdown 文档
+  const isMarkdown = useMemo(() => {
+    const p = tab.path.toLowerCase();
+    const ext = p.split(".").pop() || "";
+    return (
+      ["md", "markdown", "mdown", "mkdn"].includes(ext) ||
+      data?.language === "markdown" ||
+      data?.language === "md"
+    );
+  }, [tab.path, data?.language]);
+
+  // 视图模式：preview (格式渲染预览) / source (源码行号模式) / edit (编辑模式)
+  const [viewMode, setViewMode] = useState<"preview" | "source" | "edit">(() => {
+    if (tab.highlightLine || tab.highlightRange) return "source";
+    const p = tab.path.toLowerCase();
+    const ext = p.split(".").pop() || "";
+    return ["md", "markdown", "mdown", "mkdn"].includes(ext) ? "preview" : "source";
+  });
+
+  const isEditing = viewMode === "edit";
+  const isRenderedMarkdown = isMarkdown && viewMode === "preview";
+
   // 编辑模式与手动修改状态
-  const [isEditing, setIsEditing] = useState(false);
   const [editContent, setEditContent] = useState("");
   const [isSaving, setIsSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -99,6 +122,13 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
   }, [rawLines, searchQuery]);
 
   const scrollToMatch = (lineNum: number) => {
+    if (isRenderedMarkdown) {
+      const headingElem = document.getElementById(`md-line-${lineNum}`);
+      if (headingElem) {
+        headingElem.scrollIntoView({ behavior: "smooth", block: "center" });
+        return;
+      }
+    }
     const elem = document.getElementById(`code-line-${lineNum}`);
     if (elem) {
       elem.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -228,20 +258,27 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
 
   useEffect(() => {
     setJumpedLine(null);
+    if (tab.highlightLine || tab.highlightRange) {
+      setViewMode("source");
+    } else {
+      const p = tab.path.toLowerCase();
+      const ext = p.split(".").pop() || "";
+      setViewMode(["md", "markdown", "mdown", "mkdn"].includes(ext) ? "preview" : "source");
+    }
     void loadFile();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab.path, tab.reloadNonce]);
+  }, [tab.path, tab.reloadNonce, tab.highlightLine, tab.highlightRange]);
 
   // 窗口重新聚焦自动检测刷新（对标 VS Code / Sublime）
   useEffect(() => {
     const handleFocus = () => {
-      if (!isDirty && !isEditing) {
+      if (!isDirty && viewMode !== "edit") {
         void loadFile(true);
       }
     };
     window.addEventListener("focus", handleFocus);
     return () => window.removeEventListener("focus", handleFocus);
-  }, [isDirty, isEditing, tab.path]);
+  }, [isDirty, viewMode, tab.path]);
 
   // 监听快捷键：Ctrl+S (保存) / Ctrl+F (搜索) / F3 or Shift+F3 (下一个/上一个) / Ctrl+R or F5 (刷新)
   useEffect(() => {
@@ -281,14 +318,15 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
 
   // 跳转到高亮行或行范围首行
   useEffect(() => {
-    if (targetRange && highlightedLineRef.current) {
+    if (targetRange && highlightedLineRef.current && viewMode === "source") {
       highlightedLineRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
     }
-  }, [data, targetRange]);
+  }, [data, targetRange, viewMode]);
 
   const handleCopyContent = () => {
-    if (!data?.content) return;
-    navigator.clipboard.writeText(data.content).then(() => {
+    const textToCopy = isDirty ? editContent : (data?.content || "");
+    if (!textToCopy) return;
+    navigator.clipboard.writeText(textToCopy).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     });
@@ -309,10 +347,25 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
 
   const handleJumpToSymbol = (lineno: number) => {
     setJumpedLine(lineno);
-    const elem = document.getElementById(`code-line-${lineno}`);
-    if (elem) {
-      elem.scrollIntoView({ behavior: "smooth", block: "center" });
+    if (isRenderedMarkdown) {
+      const headingElem = document.getElementById(`md-line-${lineno}`);
+      if (headingElem) {
+        headingElem.scrollIntoView({ behavior: "smooth", block: "start" });
+        headingElem.classList.add("bg-accent/15", "transition-colors", "duration-500", "rounded-md", "px-1");
+        setTimeout(() => {
+          headingElem.classList.remove("bg-accent/15");
+        }, 1500);
+        return;
+      }
+      // 预览中未匹配到对应行号 DOM 时，自动切换到源码模式精准定位
+      setViewMode("source");
     }
+    setTimeout(() => {
+      const elem = document.getElementById(`code-line-${lineno}`);
+      if (elem) {
+        elem.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    }, 50);
   };
 
   // 代码行语法着色与分割
@@ -355,24 +408,73 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
         <div className="flex items-center gap-1.5 shrink-0">
           {/* 编辑 / 预览模式切换 */}
           {!data?.isBinary && (
-            <button
-              type="button"
-              className={`flex items-center gap-1 px-2.5 py-1 rounded-lg transition-colors text-[11.5px] cursor-pointer ${
-                isEditing
-                  ? "bg-amber-500/20 text-amber-300 border border-amber-500/40 font-medium"
-                  : "text-inkdim hover:text-ink hover:bg-panel3"
-              }`}
-              title={isEditing ? "切换回语法高亮预览" : "切换到编辑模式（支持修改方案与代码）"}
-              onClick={() => {
-                if (!isEditing && data) {
-                  setEditContent(data.content);
-                }
-                setIsEditing(!isEditing);
-              }}
-            >
-              {isEditing ? <Eye size={13} /> : <Edit3 size={13} />}
-              <span>{isEditing ? "预览" : "编辑"}</span>
-            </button>
+            isMarkdown ? (
+              <div className="flex items-center bg-panel3/70 p-0.5 rounded-lg border border-edge/60 text-[11.5px]">
+                <button
+                  type="button"
+                  className={`flex items-center gap-1 px-2.5 py-1 rounded-md transition-all cursor-pointer ${
+                    viewMode === "preview"
+                      ? "bg-panel text-accent font-medium shadow-xs"
+                      : "text-inkdim hover:text-ink hover:bg-panel/40"
+                  }`}
+                  title="格式渲染预览（展示排版、图文与富文本效果）"
+                  onClick={() => setViewMode("preview")}
+                >
+                  <Eye size={13} />
+                  <span>格式预览</span>
+                </button>
+                <button
+                  type="button"
+                  className={`flex items-center gap-1 px-2.5 py-1 rounded-md transition-all cursor-pointer ${
+                    viewMode === "source"
+                      ? "bg-panel text-ink font-medium shadow-xs"
+                      : "text-inkdim hover:text-ink hover:bg-panel/40"
+                  }`}
+                  title="源码模式（查看代码行号与语法高亮）"
+                  onClick={() => setViewMode("source")}
+                >
+                  <Code size={13} />
+                  <span>源码</span>
+                </button>
+                <button
+                  type="button"
+                  className={`flex items-center gap-1 px-2.5 py-1 rounded-md transition-all cursor-pointer ${
+                    viewMode === "edit"
+                      ? "bg-amber-500/20 text-amber-300 border border-amber-500/40 font-medium shadow-xs"
+                      : "text-inkdim hover:text-ink hover:bg-panel/40"
+                  }`}
+                  title="编辑模式（支持修改文档内容与快捷保存）"
+                  onClick={() => {
+                    if (viewMode !== "edit" && data && !isDirty) {
+                      setEditContent(data.content);
+                    }
+                    setViewMode("edit");
+                  }}
+                >
+                  <Edit3 size={13} />
+                  <span>编辑</span>
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                className={`flex items-center gap-1 px-2.5 py-1 rounded-lg transition-colors text-[11.5px] cursor-pointer ${
+                  viewMode === "edit"
+                    ? "bg-amber-500/20 text-amber-300 border border-amber-500/40 font-medium"
+                    : "text-inkdim hover:text-ink hover:bg-panel3"
+                }`}
+                title={viewMode === "edit" ? "切换回代码查看" : "切换到编辑模式（支持修改内容）"}
+                onClick={() => {
+                  if (viewMode !== "edit" && data && !isDirty) {
+                    setEditContent(data.content);
+                  }
+                  setViewMode(viewMode === "edit" ? "source" : "edit");
+                }}
+              >
+                {viewMode === "edit" ? <Eye size={13} /> : <Edit3 size={13} />}
+                <span>{viewMode === "edit" ? "代码" : "编辑"}</span>
+              </button>
+            )
           )}
 
           {/* 保存按钮 (Ctrl+S) */}
@@ -381,7 +483,7 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
               type="button"
               className={`flex items-center gap-1 px-2.5 py-1 rounded-lg transition-colors text-[11.5px] cursor-pointer ${
                 isDirty
-                  ? "bg-amber-500 text-black font-semibold shadow-xs"
+                  ? "bg-amber-500 text-black font-semibold shadow-xs hover:bg-amber-400"
                   : "text-inkdim hover:text-ink hover:bg-panel3"
               }`}
               title="保存文件 (快捷键 Ctrl+S)"
@@ -491,6 +593,17 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
               : ""}
           </span>
 
+          {isRenderedMarkdown && matchedLines.length > 0 && (
+            <button
+              type="button"
+              className="text-[11px] text-accent hover:underline cursor-pointer select-none px-1"
+              title="切换到源码模式查看每行高亮定位"
+              onClick={() => setViewMode("source")}
+            >
+              在源码中定位
+            </button>
+          )}
+
           {/* 上一个 / 下一个 导航按钮 */}
           <div className="flex items-center gap-0.5 border border-edge/60 rounded-md bg-panel p-0.5">
             <button
@@ -537,7 +650,7 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
         </div>
       )}
 
-      {/* 主视图（代码区 + 可折叠符号大纲 / 文本编辑器） */}
+      {/* 主视图（代码区 / 格式预览区 + 可折叠符号大纲 / 文本编辑器） */}
       <div className="flex-1 min-h-0 flex flex-row overflow-hidden">
         {isEditing ? (
           <div className="flex-1 flex flex-col min-h-0 bg-[#0c0c0e] p-3">
@@ -545,6 +658,11 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
               <span className="flex items-center gap-1.5">
                 <span className="text-accent font-semibold">EDIT:</span>
                 <span>快捷键 Ctrl+S 实时保存修改</span>
+                {isMarkdown && (
+                  <span className="text-sky-400 font-sans ml-1">
+                    （点击上方“格式预览”可即时预览排版渲染效果）
+                  </span>
+                )}
                 {isPlanDoc && (
                   <span className="text-emerald-400 font-sans ml-1">
                     （修改后按 Ctrl+S 保存即可，可在对话框中直接告知 Agent 继续执行）
@@ -582,8 +700,66 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
               }}
             />
           </div>
+        ) : isRenderedMarkdown ? (
+          /* Markdown 格式渲染预览区域 */
+          <div ref={containerRef} className="flex-1 overflow-y-auto bg-panel px-6 py-8 md:px-12 md:py-10 select-text">
+            <div className="max-w-4xl mx-auto">
+              {loading && (
+                <div className="flex items-center justify-center h-48 text-inkdim text-[13px]">
+                  读取文件中…
+                </div>
+              )}
+
+              {error && (
+                <div className="p-6 flex flex-col items-center justify-center text-red-400 gap-2">
+                  <AlertCircle size={24} />
+                  <div className="text-[13px] font-medium">{error}</div>
+                  <button
+                    className="mt-2 px-3 py-1 bg-panel3 rounded-lg text-ink text-[12px] hover:bg-edge cursor-pointer"
+                    onClick={() => void loadFile()}
+                  >
+                    重新加载
+                  </button>
+                </div>
+              )}
+
+              {data?.isBinary && (
+                <div className="flex flex-col items-center justify-center h-64 text-inkdim gap-3">
+                  <div className="text-[14px]">二进制文件，不支持预览</div>
+                </div>
+              )}
+
+              {isDirty && (
+                <div className="mb-4 px-3.5 py-2 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-[12px] flex items-center justify-between shadow-2xs">
+                  <span className="flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse shrink-0" />
+                    <span>当前为编辑修改后实时渲染预览（存在未保存改动）</span>
+                  </span>
+                  <button
+                    type="button"
+                    className="px-2.5 py-1 bg-amber-500 text-black font-semibold rounded-md text-[11px] hover:bg-amber-400 cursor-pointer transition-colors shadow-2xs"
+                    onClick={handleSave}
+                    disabled={isSaving}
+                  >
+                    {isSaving ? "保存中…" : "保存修改 (Ctrl+S)"}
+                  </button>
+                </div>
+              )}
+
+              {data && !data.isBinary && !data.content && !editContent && (
+                <div className="p-8 text-inkdim text-center">空 Markdown 文件</div>
+              )}
+
+              {data && !data.isBinary && (data.content || editContent) && (
+                <Markdown
+                  content={isDirty ? editContent : (data.content || "")}
+                  workspacePath={tab.workspacePath}
+                />
+              )}
+            </div>
+          </div>
         ) : (
-          /* 代码内容区域 */
+          /* 代码内容区域（源码模式 / 非 Markdown 文件代码查看） */
           <div ref={containerRef} className="flex-1 overflow-auto font-mono text-[12px] leading-[1.6] select-text">
             {loading && (
               <div className="flex items-center justify-center h-48 text-inkdim text-[13px]">
@@ -596,7 +772,7 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
                 <AlertCircle size={24} />
                 <div className="text-[13px] font-medium">{error}</div>
                 <button
-                  className="mt-2 px-3 py-1 bg-panel3 rounded-lg text-ink text-[12px] hover:bg-edge"
+                  className="mt-2 px-3 py-1 bg-panel3 rounded-lg text-ink text-[12px] hover:bg-edge cursor-pointer"
                   onClick={() => void loadFile()}
                 >
                   重新加载

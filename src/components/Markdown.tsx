@@ -147,13 +147,78 @@ export const Markdown = memo(function Markdown({
               </a>
             );
           },
+          h1: ({ node, children, ...props }) => {
+            const line = node?.position?.start?.line;
+            return (
+              <h1 id={line ? `md-line-${line}` : undefined} {...props}>
+                {children}
+              </h1>
+            );
+          },
+          h2: ({ node, children, ...props }) => {
+            const line = node?.position?.start?.line;
+            return (
+              <h2 id={line ? `md-line-${line}` : undefined} {...props}>
+                {children}
+              </h2>
+            );
+          },
+          h3: ({ node, children, ...props }) => {
+            const line = node?.position?.start?.line;
+            return (
+              <h3 id={line ? `md-line-${line}` : undefined} {...props}>
+                {children}
+              </h3>
+            );
+          },
+          h4: ({ node, children, ...props }) => {
+            const line = node?.position?.start?.line;
+            return (
+              <h4 id={line ? `md-line-${line}` : undefined} {...props}>
+                {children}
+              </h4>
+            );
+          },
+          h5: ({ node, children, ...props }) => {
+            const line = node?.position?.start?.line;
+            return (
+              <h5 id={line ? `md-line-${line}` : undefined} {...props}>
+                {children}
+              </h5>
+            );
+          },
+          h6: ({ node, children, ...props }) => {
+            const line = node?.position?.start?.line;
+            return (
+              <h6 id={line ? `md-line-${line}` : undefined} {...props}>
+                {children}
+              </h6>
+            );
+          },
+          table: ({ children, ...props }) => (
+            <div className="overflow-x-auto my-3 max-w-full">
+              <table {...props}>{children}</table>
+            </div>
+          ),
           img: ({ src, alt, ...props }) => {
             const finalSrc = resolveMarkdownImagePath(src || "", effectiveWorkspace);
             return (
               <SafeImage
                 src={finalSrc}
                 alt={alt || "图片"}
-                onClick={() => setLightboxImage({ src: finalSrc, title: alt })}
+                onClick={() => {
+                  if (typeof window !== "undefined" && window.location.search.includes("window=file_viewer")) {
+                    ipc.openFileViewer({
+                      id: `image:${finalSrc}`,
+                      type: "image",
+                      title: alt || finalSrc.split("/").pop() || "图片",
+                      path: finalSrc,
+                      workspacePath: effectiveWorkspace,
+                    });
+                  } else {
+                    setLightboxImage({ src: finalSrc, title: alt });
+                  }
+                }}
                 className="max-h-80 rounded-xl my-2 border border-edge object-contain cursor-zoom-in hover:opacity-95 transition-opacity shadow-sm"
                 loading="lazy"
                 {...props}

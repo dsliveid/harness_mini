@@ -270,6 +270,19 @@ Rust 端实现跨平台多策略唤起：
 2. 尝试 Cursor：`cursor --goto <path>:<line>`；
 3. 回退系统默认绑定（Windows: `explorer`，macOS: `open`，Linux: `xdg-open`）。
 
+### 5. Markdown 文档富文本排版与三模态查看体系（Markdown Tri-Modal Hub）
+针对 Markdown 格式文件（`.md` / `.markdown` / `.harness/memory/*.md` / `docs/*.md` 等），`CodeViewer` 引入专业级三态视图流转模型：
+- **格式预览（Rendered Preview）**：
+  - 默认打开模式（无锚点行号参数时默认激活）；
+  - 基于 `react-markdown` + `remark-gfm` + `rehype-highlight` + `SafeImage` 构建完整富文本渲染树；
+  - 呈现精细化标题字阶（`h1` ~ `h4`）、斑马纹自适应表格、优雅引用块、GFM 任务清单（`- [ ]` / `- [x]`）与代码块高亮；
+  - 各级标题自动注入源码对应行号 `id={`md-line-${line}`}`，与符号大纲抽屉无缝联动；
+  - 支持即时编辑渲染（Live Preview）：若在编辑模式修改内容，切换回预览模式即时呈现最新排版效果，并展示脏状态横幅与快捷保存入口。
+- **源码模式（Source Code）**：
+  - 保留带行号的语法高亮代码表格；若以特定行锚点打开（如 `SPEC.md#L45-L60`），智能优先唤起源码模式并平滑滚动高亮行。
+- **编辑模式（Edit）**：
+  - 暗色代码编辑器，支持 Tab 智能缩进、`Ctrl+S` 即时落盘与脏数据提示。
+
 ---
 
 ## 六、任务方案计划看板中枢（PlanViewer）

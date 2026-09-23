@@ -42,6 +42,7 @@ export {
   FileText,
   FileEdit,
   FileCode,
+  Code,
   Files,
   BookOpen,
   Bookmark,
