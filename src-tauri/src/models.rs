@@ -89,6 +89,9 @@ pub struct SettingsData {
     pub disabled_tools: Vec<String>,
     #[serde(default)]
     pub disabled_sops: Vec<String>,
+    /// 全局默认思考程度（"low" | "medium" | "high" | None / "default" 不传）
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 impl Default for SettingsData {
@@ -111,6 +114,7 @@ impl Default for SettingsData {
             last_workspace_path: None,
             disabled_tools: vec![],
             disabled_sops: vec![],
+            reasoning_effort: None,
         }
     }
 }
@@ -118,34 +122,68 @@ impl Default for SettingsData {
 /// 根据模型名称启发式推断预设上下文上限
 pub fn infer_model_context_limit(model: &str) -> usize {
     let lower = model.to_lowercase();
-    if lower.contains("deepseek") {
-        56_000
-    } else if lower.contains("claude") {
-        180_000
-    } else if lower.contains("gpt-4o") || lower.contains("gpt-4.5") || lower.contains("o1") || lower.contains("o3") {
-        110_000
-    } else if lower.contains("qwen") || lower.contains("千问") {
-        110_000
-    } else if lower.contains("glm") {
-        110_000
-    } else if lower.contains("kimi") || lower.contains("moonshot") {
-        180_000
-    } else if lower.contains("gemini") {
-        200_000
-    } else if lower.contains("8k") {
-        7_000
-    } else if lower.contains("16k") {
-        14_000
-    } else if lower.contains("32k") {
-        28_000
-    } else if lower.contains("64k") {
-        56_000
-    } else if lower.contains("128k") {
-        110_000
+    // 优先检查显式上下文规格标识（避免被厂商名提前拦截，例如 deepseek-64k 或 deepseek-1m）
+    if lower.contains("2m") || lower.contains("2000k") || lower.contains("200w") {
+        1_600_000
+    } else if lower.contains("1m") || lower.contains("1000k") || lower.contains("100w") {
+        800_000
+    } else if lower.contains("500k") {
+        400_000
     } else if lower.contains("200k") {
         180_000
-    } else if lower.contains("1m") {
-        200_000
+    } else if lower.contains("128k") {
+        110_000
+    } else if lower.contains("64k") {
+        56_000
+    } else if lower.contains("32k") {
+        28_000
+    } else if lower.contains("16k") {
+        14_000
+    } else if lower.contains("8k") {
+        7_000
+    // 海外阵营旗舰 1M 窗口
+    } else if lower.contains("gpt-5") || lower.contains("gpt5") {
+        800_000
+    } else if lower.contains("opus-5") || lower.contains("claude-5") || lower.contains("claude-opus-5") {
+        800_000
+    } else if lower.contains("gemini") {
+        // Gemini 系列（如 Gemini 1.5 / 2.0 / 3.8 Flash 等）支持 1M - 2M 窗口
+        800_000
+    } else if lower.contains("deepseek") {
+        // DeepSeek 原生支持 1M 窗口（如 DeepSeek-v4-flash、deepseek-chat 等）
+        800_000
+    } else if lower.contains("qwen-3") || lower.contains("qwen3") {
+        // Qwen3 / Qwen3.8 系列（如 Qwen3.8-flash）原生 1M 窗口
+        800_000
+    } else if lower.contains("glm-5") || lower.contains("glm5") {
+        // GLM-5 / GLM-5.3 系列（如 GLM-5.3-flash）原生 1M 窗口
+        800_000
+    } else if lower.contains("claude") {
+        180_000
+    } else if lower.contains("o1") || lower.contains("o3") {
+        180_000
+    } else if lower.contains("gpt-4o") || lower.contains("gpt-4.5") {
+        110_000
+    } else if lower.contains("qwen") || lower.contains("千问") {
+        if lower.contains("long") {
+            800_000
+        } else {
+            110_000
+        }
+    } else if lower.contains("glm") {
+        if lower.contains("long") {
+            800_000
+        } else {
+            110_000
+        }
+    } else if lower.contains("kimi") || lower.contains("moonshot") {
+        if lower.contains("long") {
+            800_000
+        } else {
+            180_000
+        }
+    } else if lower.contains("llama-3.1") || lower.contains("llama-3.2") || lower.contains("llama-3.3") || lower.contains("mistral-large") || lower.contains("codestral") {
+        110_000
     } else {
         64_000
     }
@@ -420,11 +458,25 @@ mod tests {
         let mut s = SettingsData::default();
         s.context_token_limit = 64_000;
 
-        // 1. 智能推断测试
-        assert_eq!(s.resolve_context_limit(None, "deepseek-chat"), 56_000);
+        // 1. 智能推断测试 - 旗舰 1M 阵营
+        assert_eq!(s.resolve_context_limit(None, "gpt-5.5"), 800_000);
+        assert_eq!(s.resolve_context_limit(None, "claude-opus-5"), 800_000);
+        assert_eq!(s.resolve_context_limit(None, "gemini-3.8-flash"), 800_000);
+        assert_eq!(s.resolve_context_limit(None, "deepseek-v4-flash"), 800_000);
+        assert_eq!(s.resolve_context_limit(None, "qwen3.8-flash"), 800_000);
+        assert_eq!(s.resolve_context_limit(None, "glm-5.3-flash"), 800_000);
+
+        // 智能推断测试 - 经典/显式规格与其他模型
+        assert_eq!(s.resolve_context_limit(None, "deepseek-chat"), 800_000);
+        assert_eq!(s.resolve_context_limit(None, "deepseek-64k"), 56_000);
+        assert_eq!(s.resolve_context_limit(None, "deepseek-128k"), 110_000);
+        assert_eq!(s.resolve_context_limit(None, "deepseek-v3-1m"), 800_000);
+        assert_eq!(s.resolve_context_limit(None, "gemini-1.5-pro"), 800_000);
         assert_eq!(s.resolve_context_limit(None, "claude-3-5-sonnet"), 180_000);
         assert_eq!(s.resolve_context_limit(None, "gpt-4o"), 110_000);
+        assert_eq!(s.resolve_context_limit(None, "o1-preview"), 180_000);
         assert_eq!(s.resolve_context_limit(None, "qwen-max"), 110_000);
+        assert_eq!(s.resolve_context_limit(None, "qwen-long"), 800_000);
         assert_eq!(s.resolve_context_limit(None, "llama-3-8k"), 7_000);
         assert_eq!(s.resolve_context_limit(None, "unknown-model"), 64_000);
 
@@ -539,6 +591,10 @@ pub struct Session {
     pub prompt_tokens: Option<u64>,
     #[serde(default)]
     pub completion_tokens: Option<u64>,
+    #[serde(default)]
+    pub cached_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_hit_rate: Option<f64>,
     /// 父会话 ID（子 Agent 会话非空）
     #[serde(default)]
     pub parent_session_id: Option<String>,
@@ -590,6 +646,9 @@ pub struct Session {
     /// 分支来源消息 ID
     #[serde(default)]
     pub forked_from_message_id: Option<String>,
+    /// 会话专属思考程度（low / medium / high / None 即默认不传）
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// 最近一次 Run 的执行终态（'done' | 'failed' | 'interrupted' | 'cancelled' | 'running'）
     #[serde(default)]
     pub last_run_status: Option<String>,
@@ -624,6 +683,8 @@ impl Default for Session {
             total_tokens: Some(0),
             prompt_tokens: Some(0),
             completion_tokens: Some(0),
+            cached_tokens: Some(0),
+            cache_hit_rate: Some(0.0),
             parent_session_id: None,
             session_type: "main".into(),
             subagent_role: None,
@@ -641,6 +702,7 @@ impl Default for Session {
             vision_model_id: None,
             forked_from_session_id: None,
             forked_from_message_id: None,
+            reasoning_effort: None,
             last_run_status: None,
         }
     }
@@ -862,6 +924,10 @@ pub struct Message {
     pub completion_tokens: Option<u64>,
     #[serde(default)]
     pub total_tokens: Option<u64>,
+    #[serde(default)]
+    pub cached_tokens: Option<u64>,
+    #[serde(default)]
+    pub is_estimated: Option<bool>,
     /// 消息携带的附件列表（图片或文件）
     #[serde(default)]
     pub attachments: Option<Vec<Attachment>>,
@@ -873,6 +939,8 @@ pub struct RunTokenMetrics {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -927,6 +995,95 @@ pub fn estimate_value_tokens(v: &serde_json::Value) -> usize {
                 .map(|(k, val)| estimate_tokens(k) + estimate_value_tokens(val) + 2)
                 .sum::<usize>() + 2
         }
+    }
+}
+
+/// 归一化解析大模型实际返回的 Token 使用量与缓存命中详情
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ParsedTokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_tokens: u64,
+    pub reasoning_tokens: Option<u64>,
+    pub is_estimated: bool,
+}
+
+pub fn parse_llm_usage(
+    raw: Option<&serde_json::Value>,
+    est_in: usize,
+    est_out: usize,
+) -> ParsedTokenUsage {
+    let Some(u) = raw else {
+        return ParsedTokenUsage {
+            prompt_tokens: est_in as u64,
+            completion_tokens: est_out as u64,
+            total_tokens: (est_in + est_out) as u64,
+            cached_tokens: 0,
+            reasoning_tokens: None,
+            is_estimated: true,
+        };
+    };
+
+    // 1. 输入 Prompt 兼容提取 (OpenAI: prompt_tokens, Anthropic: input_tokens, Gemini: promptTokenCount)
+    let p = u
+        .get("prompt_tokens")
+        .or_else(|| u.get("promptTokens"))
+        .or_else(|| u.get("input_tokens"))
+        .or_else(|| u.get("promptTokenCount"))
+        .and_then(|v| v.as_u64());
+
+    // 2. 缓存 Token 提取 (兼容 DeepSeek, OpenAI, Claude 原生与各种中转/代理)
+    let cached = u
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens").or_else(|| d.get("cache_read_input_tokens")))
+        .or_else(|| u.get("prompt_cache_hit_tokens"))
+        .or_else(|| u.get("cache_read_input_tokens"))
+        .or_else(|| u.get("cachedContentTokenCount"))
+        .or_else(|| u.get("cached_tokens"))
+        .or_else(|| u.get("cachedTokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    // 3. 输出 Completion 提取
+    let c = u
+        .get("completion_tokens")
+        .or_else(|| u.get("completionTokens"))
+        .or_else(|| u.get("output_tokens"))
+        .or_else(|| u.get("candidatesTokenCount"))
+        .and_then(|v| v.as_u64());
+
+    // 4. 推理 Token 提取 (DeepSeek R1 / OpenAI o1 / o3)
+    let reasoning = u
+        .get("completion_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .or_else(|| u.get("reasoning_tokens"))
+        .and_then(|v| v.as_u64());
+
+    let is_estimated = p.is_none() && c.is_none();
+    let raw_prompt = p.unwrap_or(est_in as u64);
+    let prompt_tokens = if raw_prompt < cached {
+        // Anthropic 原生格式中 input_tokens 可能不包含 cache_read_input_tokens
+        raw_prompt + cached
+    } else {
+        raw_prompt
+    };
+
+    let completion_tokens = c.unwrap_or(est_out as u64);
+    let total_tokens = u
+        .get("total_tokens")
+        .or_else(|| u.get("totalTokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(prompt_tokens + completion_tokens);
+
+    ParsedTokenUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        cached_tokens: cached.min(prompt_tokens),
+        reasoning_tokens: reasoning,
+        is_estimated,
     }
 }
 
@@ -1069,9 +1226,17 @@ pub struct TokenStatsSummary {
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
     pub total_tokens: u64,
+    #[serde(default)]
+    pub total_cached_tokens: u64,
+    #[serde(default)]
+    pub overall_cache_hit_rate: f64,
     pub today_prompt_tokens: u64,
     pub today_completion_tokens: u64,
     pub today_tokens: u64,
+    #[serde(default)]
+    pub today_cached_tokens: u64,
+    #[serde(default)]
+    pub today_cache_hit_rate: f64,
     pub total_sessions: u64,
     pub total_messages: u64,
 }
@@ -1085,6 +1250,10 @@ pub struct ProjectTokenStats {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default)]
+    pub cache_hit_rate: f64,
     pub session_count: u64,
     pub message_count: u64,
     pub last_used_at: Option<String>,
@@ -1097,6 +1266,10 @@ pub struct DailyTokenStats {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default)]
+    pub cache_hit_rate: f64,
     pub message_count: u64,
 }
 
@@ -1110,6 +1283,10 @@ pub struct SessionTokenStats {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default)]
+    pub cache_hit_rate: f64,
     pub message_count: u64,
     pub last_message_at: Option<String>,
 }

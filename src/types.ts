@@ -64,6 +64,8 @@ export interface ToolInfo {
   isTemp: boolean;
 }
 
+export type ReasoningEffort = "default" | "low" | "medium" | "high";
+
 export interface Settings {
   providers: Provider[];
   activeProviderId?: string | null;
@@ -82,6 +84,7 @@ export interface Settings {
   lastWorkspacePath?: string | null;
   disabledTools?: string[];
   disabledSops?: string[];
+  reasoningEffort?: ReasoningEffort | string | null;
 }
 
 export interface AgentSopInfo {
@@ -199,6 +202,8 @@ export interface Session {
   totalTokens?: number;
   promptTokens?: number;
   completionTokens?: number;
+  cachedTokens?: number;
+  cacheHitRate?: number;
   /** 最近一次 Run 执行终态（done | failed | interrupted | cancelled | running） */
   lastRunStatus?: "done" | "failed" | "interrupted" | "cancelled" | "running" | null;
   /** 父会话 ID（子 Agent 进程非空） */
@@ -244,6 +249,9 @@ export interface Session {
   /** 分支来源消息 ID */
   forkedFromMessageId?: string | null;
   forked_from_message_id?: string | null;
+  /** 思考程度（low / medium / high / default 即默认不传） */
+  reasoningEffort?: ReasoningEffort | string | null;
+  reasoning_effort?: string | null;
 }
 
 export interface SubagentCreateInput {
@@ -296,6 +304,7 @@ export interface SessionModelsUpdateInput {
   imageModelId?: string | null;
   visionProviderId?: string | null;
   visionModelId?: string | null;
+  reasoningEffort?: ReasoningEffort | string | null;
 }
 
 export interface SessionCreateInput {
@@ -309,6 +318,7 @@ export interface SessionCreateInput {
   imageModelId?: string | null;
   visionProviderId?: string | null;
   visionModelId?: string | null;
+  reasoningEffort?: ReasoningEffort | string | null;
 }
 
 /** 临时空间中被拷贝的单个项目条目（主项目 key="main"，关联项目 key="link:<id>"） */
@@ -444,6 +454,8 @@ export interface Message {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
+  cachedTokens?: number;
+  isEstimated?: boolean;
 }
 
 export interface QueuedItem {
@@ -458,6 +470,9 @@ export interface TurnMetrics {
   turnTokens: number;
   turnPromptTokens?: number;
   turnCompletionTokens?: number;
+  turnCachedTokens?: number;
+  turnCacheHitRate?: number;
+  turnIsEstimated?: boolean;
   turnStepCount: number;
   stepIndex?: number;
   turnStartTime: number;
@@ -488,14 +503,23 @@ export function computeTurnMetrics(messages: Message[], running: boolean): Map<s
     let turnTokens = 0;
     let turnPromptTokens = 0;
     let turnCompletionTokens = 0;
+    let turnCachedTokens = 0;
+    let turnIsEstimated = false;
     for (const a of currentTurnAssistants) {
       const tt = a.totalTokens ?? (a.usage?.totalTokens || (a.usage?.inputEst || 0) + (a.usage?.outputEst || 0)) ?? 0;
       const pt = a.promptTokens ?? (a.usage?.promptTokens || a.usage?.inputEst) ?? 0;
       const ct = a.completionTokens ?? (a.usage?.completionTokens || a.usage?.outputEst) ?? 0;
+      const ckt = a.cachedTokens ?? (a.usage?.cachedTokens || a.usage?.promptCacheHitTokens || a.usage?.cacheReadInputTokens) ?? 0;
+      const isEst = a.isEstimated ?? (a.usage?.isEstimated || (a.usage?.inputEst != null && a.usage?.promptTokens == null)) ?? false;
       turnTokens += Number(tt) || 0;
       turnPromptTokens += Number(pt) || 0;
       turnCompletionTokens += Number(ct) || 0;
+      turnCachedTokens += Number(ckt) || 0;
+      if (isEst) turnIsEstimated = true;
     }
+    const turnCacheHitRate = turnPromptTokens > 0
+      ? Math.round((turnCachedTokens / turnPromptTokens) * 1000) / 10
+      : 0;
 
     // 遍历本轮所有 assistant 消息
     for (let i = 0; i < totalSteps; i++) {
@@ -523,6 +547,9 @@ export function computeTurnMetrics(messages: Message[], running: boolean): Map<s
         turnTokens,
         turnPromptTokens,
         turnCompletionTokens,
+        turnCachedTokens,
+        turnCacheHitRate,
+        turnIsEstimated,
         turnStepCount: totalSteps,
         stepIndex: i + 1,
         turnStartTime,
@@ -661,18 +688,43 @@ export interface ModelContextPreset {
 }
 
 export const MODEL_CONTEXT_PRESETS: ModelContextPreset[] = [
+  // ================= 海外阵营 =================
   {
-    id: "deepseek",
-    name: "DeepSeek V3 / R1",
-    category: "主流云端",
-    windowTokens: 64_000,
-    recommendedLimit: 56_000,
-    desc: "窗口 64K · 推荐安全上限 56,000",
+    id: "gpt-5-5",
+    name: "OpenAI GPT-5.5",
+    category: "海外阵营",
+    windowTokens: 1_000_000,
+    recommendedLimit: 800_000,
+    desc: "窗口 1M (100万) · 推荐安全上限 800,000",
+  },
+  {
+    id: "claude-opus-5",
+    name: "Claude Opus 5",
+    category: "海外阵营",
+    windowTokens: 1_000_000,
+    recommendedLimit: 800_000,
+    desc: "窗口 1M (100万) · 推荐安全上限 800,000",
+  },
+  {
+    id: "gemini-3-8-flash",
+    name: "Google Gemini 3.8 Flash",
+    category: "海外阵营",
+    windowTokens: 1_000_000,
+    recommendedLimit: 800_000,
+    desc: "窗口 1M (100万) · 推荐安全上限 800,000",
+  },
+  {
+    id: "openai-o1",
+    name: "OpenAI o1 / o3 / o3-mini",
+    category: "海外阵营",
+    windowTokens: 200_000,
+    recommendedLimit: 180_000,
+    desc: "窗口 200K · 推荐安全上限 180,000",
   },
   {
     id: "claude-3-5",
-    name: "Claude 3.5 Sonnet / Haiku",
-    category: "主流云端",
+    name: "Claude 3.5 / 3.7 Sonnet",
+    category: "海外阵营",
     windowTokens: 200_000,
     recommendedLimit: 180_000,
     desc: "窗口 200K · 推荐安全上限 180,000",
@@ -680,43 +732,79 @@ export const MODEL_CONTEXT_PRESETS: ModelContextPreset[] = [
   {
     id: "gpt-4o",
     name: "GPT-4o / GPT-4o-mini",
-    category: "主流云端",
+    category: "海外阵营",
+    windowTokens: 128_000,
+    recommendedLimit: 110_000,
+    desc: "窗口 128K · 推荐安全上限 110,000",
+  },
+
+  // ================= 国产阵营 =================
+  {
+    id: "deepseek-v4-flash",
+    name: "DeepSeek-v4-flash",
+    category: "国产阵营",
+    windowTokens: 1_000_000,
+    recommendedLimit: 800_000,
+    desc: "窗口 1M (100万) · 推荐安全上限 800,000",
+  },
+  {
+    id: "qwen-3-8-flash",
+    name: "Qwen3.8-flash",
+    category: "国产阵营",
+    windowTokens: 1_000_000,
+    recommendedLimit: 800_000,
+    desc: "窗口 1M (100万) · 推荐安全上限 800,000",
+  },
+  {
+    id: "glm-5-3-flash",
+    name: "GLM-5.3-flash",
+    category: "国产阵营",
+    windowTokens: 1_000_000,
+    recommendedLimit: 800_000,
+    desc: "窗口 1M (100万) · 推荐安全上限 800,000",
+  },
+  {
+    id: "kimi-1m",
+    name: "Kimi / Moonshot (1M)",
+    category: "国产阵营",
+    windowTokens: 1_000_000,
+    recommendedLimit: 800_000,
+    desc: "窗口 1M (100万) · 推荐安全上限 800,000",
+  },
+  {
+    id: "deepseek-128k",
+    name: "DeepSeek V3 / R1 (128K 标准)",
+    category: "国产阵营",
     windowTokens: 128_000,
     recommendedLimit: 110_000,
     desc: "窗口 128K · 推荐安全上限 110,000",
   },
   {
     id: "qwen-2-5",
-    name: "通义千问 Qwen 2.5 / Plus",
-    category: "国内厂商",
+    name: "通义千问 Qwen 2.5 / Plus (128K)",
+    category: "国产阵营",
     windowTokens: 128_000,
     recommendedLimit: 110_000,
     desc: "窗口 128K · 推荐安全上限 110,000",
   },
   {
     id: "glm-4",
-    name: "智谱 GLM-4 / Plus",
-    category: "国内厂商",
+    name: "智谱 GLM-4 / Plus (128K)",
+    category: "国产阵营",
     windowTokens: 128_000,
     recommendedLimit: 110_000,
     desc: "窗口 128K · 推荐安全上限 110,000",
   },
   {
-    id: "kimi-moonshot",
-    name: "Kimi / Moonshot",
-    category: "国内厂商",
-    windowTokens: 200_000,
-    recommendedLimit: 180_000,
-    desc: "窗口 200K · 推荐安全上限 180,000",
+    id: "deepseek-64k",
+    name: "DeepSeek (64K 经典)",
+    category: "国产阵营",
+    windowTokens: 64_000,
+    recommendedLimit: 56_000,
+    desc: "窗口 64K · 推荐安全上限 56,000",
   },
-  {
-    id: "gemini-2",
-    name: "Gemini 1.5 / 2.0",
-    category: "超长上下文",
-    windowTokens: 1_000_000,
-    recommendedLimit: 200_000,
-    desc: "窗口 1M+ · 推荐安全上限 200,000+",
-  },
+
+  // ================= 本地模型 =================
   {
     id: "ollama-32k",
     name: "本地 32K (Ollama / Mistral)",
@@ -726,8 +814,16 @@ export const MODEL_CONTEXT_PRESETS: ModelContextPreset[] = [
     desc: "窗口 32K · 推荐安全上限 28,000",
   },
   {
+    id: "ollama-16k",
+    name: "本地 16K (Ollama)",
+    category: "本地模型",
+    windowTokens: 16_000,
+    recommendedLimit: 14_000,
+    desc: "窗口 16K · 推荐安全上限 14,000",
+  },
+  {
     id: "ollama-8k",
-    name: "本地 8K (Llama 3 8B 默认)",
+    name: "本地 8K (Llama 8B 默认)",
     category: "本地模型",
     windowTokens: 8_192,
     recommendedLimit: 7_000,
@@ -738,20 +834,49 @@ export const MODEL_CONTEXT_PRESETS: ModelContextPreset[] = [
 /** 根据模型名称启发式推断预设上下文上限 */
 export function inferModelContextLimit(model: string): number {
   const lower = model.toLowerCase();
-  if (lower.includes("deepseek")) return 56_000;
-  if (lower.includes("claude")) return 180_000;
-  if (lower.includes("gpt-4o") || lower.includes("gpt-4.5") || lower.includes("o1") || lower.includes("o3")) return 110_000;
-  if (lower.includes("qwen") || lower.includes("千问")) return 110_000;
-  if (lower.includes("glm")) return 110_000;
-  if (lower.includes("kimi") || lower.includes("moonshot")) return 180_000;
-  if (lower.includes("gemini")) return 200_000;
-  if (lower.includes("8k")) return 7_000;
-  if (lower.includes("16k")) return 14_000;
-  if (lower.includes("32k")) return 28_000;
-  if (lower.includes("64k")) return 56_000;
-  if (lower.includes("128k")) return 110_000;
+  // 优先检查显式上下文规格标识（避免被厂商名提前拦截，例如 deepseek-64k 或 deepseek-1m）
+  if (lower.includes("2m") || lower.includes("2000k") || lower.includes("200w")) return 1_600_000;
+  if (lower.includes("1m") || lower.includes("1000k") || lower.includes("100w")) return 800_000;
+  if (lower.includes("500k")) return 400_000;
   if (lower.includes("200k")) return 180_000;
-  if (lower.includes("1m")) return 200_000;
+  if (lower.includes("128k")) return 110_000;
+  if (lower.includes("64k")) return 56_000;
+  if (lower.includes("32k")) return 28_000;
+  if (lower.includes("16k")) return 14_000;
+  if (lower.includes("8k")) return 7_000;
+
+  // 海外阵营旗舰 1M 窗口
+  if (lower.includes("gpt-5") || lower.includes("gpt5")) return 800_000;
+  if (lower.includes("opus-5") || lower.includes("claude-5") || lower.includes("claude-opus-5")) return 800_000;
+  if (lower.includes("gemini")) return 800_000;
+
+  // 国产阵营旗舰 1M 窗口
+  if (lower.includes("deepseek")) return 800_000;
+  if (lower.includes("qwen-3") || lower.includes("qwen3")) return 800_000;
+  if (lower.includes("glm-5") || lower.includes("glm5")) return 800_000;
+
+  // 经典 / 前代主流模型
+  if (lower.includes("claude")) return 180_000;
+  if (lower.includes("o1") || lower.includes("o3")) return 180_000;
+  if (lower.includes("gpt-4o") || lower.includes("gpt-4.5")) return 110_000;
+  if (lower.includes("qwen") || lower.includes("千问")) {
+    return lower.includes("long") ? 800_000 : 110_000;
+  }
+  if (lower.includes("glm")) {
+    return lower.includes("long") ? 800_000 : 110_000;
+  }
+  if (lower.includes("kimi") || lower.includes("moonshot")) {
+    return lower.includes("long") ? 800_000 : 180_000;
+  }
+  if (
+    lower.includes("llama-3.1") ||
+    lower.includes("llama-3.2") ||
+    lower.includes("llama-3.3") ||
+    lower.includes("mistral-large") ||
+    lower.includes("codestral")
+  ) {
+    return 110_000;
+  }
   return 64_000;
 }
 
@@ -1061,9 +1186,13 @@ export interface TokenStatsSummary {
   totalPromptTokens: number;
   totalCompletionTokens: number;
   totalTokens: number;
+  totalCachedTokens?: number;
+  overallCacheHitRate?: number;
   todayPromptTokens: number;
   todayCompletionTokens: number;
   todayTokens: number;
+  todayCachedTokens?: number;
+  todayCacheHitRate?: number;
   totalSessions: number;
   totalMessages: number;
 }
@@ -1075,6 +1204,8 @@ export interface ProjectTokenStats {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  cachedTokens?: number;
+  cacheHitRate?: number;
   sessionCount: number;
   messageCount: number;
   lastUsedAt?: string | null;
@@ -1085,6 +1216,8 @@ export interface DailyTokenStats {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  cachedTokens?: number;
+  cacheHitRate?: number;
   messageCount: number;
 }
 
@@ -1096,6 +1229,8 @@ export interface SessionTokenStats {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  cachedTokens?: number;
+  cacheHitRate?: number;
   messageCount: number;
   lastMessageAt?: string | null;
 }

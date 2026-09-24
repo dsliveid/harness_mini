@@ -6,8 +6,10 @@ import { ModelCapabilitySelect } from "./ModelCapabilitySelect";
 import {
   MODEL_CAPABILITY_METAS,
   Session,
+  formatTokens,
   resolveActiveImageModel,
   resolveActiveVisionModel,
+  resolveModelContextLimit,
 } from "../types";
 
 export function ModelMatrixModal() {
@@ -63,6 +65,15 @@ export function ModelMatrixModal() {
     isConfiguringSession && targetSession
       ? targetSession.modelId || targetSession.model_id || settings.activeModelId || settings.activeModel || "未指定（跟随系统）"
       : settings.activeModelId || settings.activeModel || "未配置";
+
+  const currentChatPid =
+    isConfiguringSession && targetSession
+      ? targetSession.providerId || targetSession.provider_id || settings.activeProviderId || null
+      : settings.activeProviderId || null;
+
+  const chatLimit =
+    targetSession?.contextTokenLimit ??
+    resolveModelContextLimit(settings, currentChatPid, currentChatModelName);
 
   // 弹窗打开时初始化表单值
   useEffect(() => {
@@ -220,7 +231,15 @@ export function ModelMatrixModal() {
                 {currentChatModelName}
               </span>
             </div>
-            <span className="text-[10.5px] text-inkdim/75 shrink-0 ml-2">（在顶栏主菜单直接切换）</span>
+            <div className="flex items-center gap-2 shrink-0 ml-2">
+              <span
+                className="text-[10.5px] font-mono text-inkdim bg-panel3 px-2 py-0.5 rounded border border-edge/60"
+                title={`有效上下文上限: ${chatLimit.toLocaleString()} tokens`}
+              >
+                上下文: {formatTokens(chatLimit)}
+              </span>
+              <span className="text-[10.5px] text-inkdim/75">（顶栏切换）</span>
+            </div>
           </div>
 
           {/* 1. 图像生成槽位 */}

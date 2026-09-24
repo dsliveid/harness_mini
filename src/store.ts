@@ -131,8 +131,11 @@ interface Store {
     /** 草稿专属视觉感知模型配置 */
     visionProviderId?: string | null;
     visionModelId?: string | null;
+    /** 草稿专属思考程度 */
+    reasoningEffort?: string | null;
   } | null;
   setDraftContextTokenLimit: (limit: number | null) => void;
+  setDraftReasoningEffort: (effort: string | null) => void;
   setDraftCapabilityModels: (input: {
     imageProviderId?: string | null;
     imageModelId?: string | null;
@@ -893,6 +896,7 @@ export const useStore = create<Store>((set, get) => ({
         imageModelId: inherit ? prev?.imageModelId ?? null : null,
         visionProviderId: inherit ? prev?.visionProviderId ?? null : null,
         visionModelId: inherit ? prev?.visionModelId ?? null : null,
+        reasoningEffort: (inherit ? prev?.reasoningEffort ?? prev?.reasoning_effort : undefined) ?? st.settings.reasoningEffort ?? null,
       },
       currentId: DRAFT_ID,
       readOnly: false,
@@ -915,13 +919,14 @@ export const useStore = create<Store>((set, get) => ({
           projectId,
           workspacePath: temp.mainTemp,
           temp,
-          // 临时空间对话同样继承上一条对话的访问模式
+          // 临时空间对话同样继承上一条对话的访问模式与思考程度
           accessMode: prev?.accessMode ?? st.settings.globalAccessMode,
           contextTokenLimit: prev?.contextTokenLimit ?? null,
           imageProviderId: prev?.imageProviderId ?? null,
           imageModelId: prev?.imageModelId ?? null,
           visionProviderId: prev?.visionProviderId ?? null,
           visionModelId: prev?.visionModelId ?? null,
+          reasoningEffort: prev?.reasoningEffort ?? prev?.reasoning_effort ?? st.settings.reasoningEffort ?? null,
         },
         currentId: DRAFT_ID,
         readOnly: false,
@@ -953,6 +958,12 @@ export const useStore = create<Store>((set, get) => ({
     const d = get().draft;
     if (!d) return;
     set({ draft: { ...d, contextTokenLimit: limit } });
+  },
+
+  setDraftReasoningEffort(effort) {
+    const d = get().draft;
+    if (!d) return;
+    set({ draft: { ...d, reasoningEffort: effort } });
   },
 
   setDraftCapabilityModels(input) {
@@ -1297,20 +1308,26 @@ export const useStore = create<Store>((set, get) => ({
         let total = 0;
         let prompt = 0;
         let completion = 0;
+        let cached = 0;
         for (const msg of updatedList) {
           const tt = msg.totalTokens ?? (msg.usage?.totalTokens || (msg.usage?.inputEst || 0) + (msg.usage?.outputEst || 0)) ?? 0;
           const pt = msg.promptTokens ?? (msg.usage?.promptTokens || msg.usage?.inputEst) ?? 0;
           const ct = msg.completionTokens ?? (msg.usage?.completionTokens || msg.usage?.outputEst) ?? 0;
+          const ckt = msg.cachedTokens ?? (msg.usage?.cachedTokens || msg.usage?.promptCacheHitTokens || msg.usage?.cacheReadInputTokens) ?? 0;
           total += Number(tt) || 0;
           prompt += Number(pt) || 0;
           completion += Number(ct) || 0;
+          cached += Number(ckt) || 0;
         }
+        const hitRate = prompt > 0 ? Math.round((cached / prompt) * 1000) / 10 : 0;
         nextSessions = st.sessions.slice();
         nextSessions[sIdx] = {
           ...st.sessions[sIdx],
           totalTokens: total,
           promptTokens: prompt,
           completionTokens: completion,
+          cachedTokens: cached,
+          cacheHitRate: hitRate,
         };
       }
 
@@ -1327,14 +1344,18 @@ export const useStore = create<Store>((set, get) => ({
         let subTotal = 0;
         let subPrompt = 0;
         let subCompletion = 0;
+        let subCached = 0;
         for (const msg of updatedList) {
           const tt = msg.totalTokens ?? (msg.usage?.totalTokens || (msg.usage?.inputEst || 0) + (msg.usage?.outputEst || 0)) ?? 0;
           const pt = msg.promptTokens ?? (msg.usage?.promptTokens || msg.usage?.inputEst) ?? 0;
           const ct = msg.completionTokens ?? (msg.usage?.completionTokens || msg.usage?.outputEst) ?? 0;
+          const ckt = msg.cachedTokens ?? (msg.usage?.cachedTokens || msg.usage?.promptCacheHitTokens || msg.usage?.cacheReadInputTokens) ?? 0;
           subTotal += Number(tt) || 0;
           subPrompt += Number(pt) || 0;
           subCompletion += Number(ct) || 0;
+          subCached += Number(ckt) || 0;
         }
+        const subHitRate = subPrompt > 0 ? Math.round((subCached / subPrompt) * 1000) / 10 : 0;
         nextSubagents = {
           ...st.subagents,
           [foundParentId]: (st.subagents[foundParentId] ?? []).map((s) =>
@@ -1344,6 +1365,8 @@ export const useStore = create<Store>((set, get) => ({
                   totalTokens: subTotal,
                   promptTokens: subPrompt,
                   completionTokens: subCompletion,
+                  cachedTokens: subCached,
+                  cacheHitRate: subHitRate,
                 }
               : s
           ),
@@ -1363,14 +1386,18 @@ export const useStore = create<Store>((set, get) => ({
         let subTotal = 0;
         let subPrompt = 0;
         let subCompletion = 0;
+        let subCached = 0;
         for (const msg of updatedList) {
           const tt = msg.totalTokens ?? (msg.usage?.totalTokens || (msg.usage?.inputEst || 0) + (msg.usage?.outputEst || 0)) ?? 0;
           const pt = msg.promptTokens ?? (msg.usage?.promptTokens || msg.usage?.inputEst) ?? 0;
           const ct = msg.completionTokens ?? (msg.usage?.completionTokens || msg.usage?.outputEst) ?? 0;
+          const ckt = msg.cachedTokens ?? (msg.usage?.cachedTokens || msg.usage?.promptCacheHitTokens || msg.usage?.cacheReadInputTokens) ?? 0;
           subTotal += Number(tt) || 0;
           subPrompt += Number(pt) || 0;
           subCompletion += Number(ct) || 0;
+          subCached += Number(ckt) || 0;
         }
+        const subHitRate = subPrompt > 0 ? Math.round((subCached / subPrompt) * 1000) / 10 : 0;
         nextSubprocesses = {
           ...st.subprocesses,
           [foundSubprocParentId]: (st.subprocesses[foundSubprocParentId] ?? []).map((s) =>
@@ -1380,6 +1407,8 @@ export const useStore = create<Store>((set, get) => ({
                   totalTokens: subTotal,
                   promptTokens: subPrompt,
                   completionTokens: subCompletion,
+                  cachedTokens: subCached,
+                  cacheHitRate: subHitRate,
                 }
               : s
           ),

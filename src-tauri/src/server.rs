@@ -360,7 +360,8 @@ pub async fn dispatch_rpc(
             let image_model_id = params.get("imageModelId").and_then(|v| v.as_str()).map(|s| s.to_string());
             let vision_provider_id = params.get("visionProviderId").and_then(|v| v.as_str()).map(|s| s.to_string());
             let vision_model_id = params.get("visionModelId").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let res = commands::send_message(st, app.clone(), session_id, text, workspace_path, project_id, temp, access_mode, context_token_limit, attachments, image_provider_id, image_model_id, vision_provider_id, vision_model_id)?;
+            let reasoning_effort = params.get("reasoningEffort").or_else(|| params.get("reasoning_effort")).and_then(|v| v.as_str()).map(|s| s.to_string());
+            let res = commands::send_message(st, app.clone(), session_id, text, workspace_path, project_id, temp, access_mode, context_token_limit, attachments, image_provider_id, image_model_id, vision_provider_id, vision_model_id, reasoning_effort)?;
             Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
         }
         "list_queued" => {

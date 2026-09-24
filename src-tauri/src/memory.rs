@@ -502,6 +502,7 @@ pub fn trigger_auto_distillation(
             base_url: pc.base_url.clone(),
             api_key: pc.api_key.clone(),
             model: model.to_string(),
+            reasoning_effort: None,
         };
 
         let all_msgs = {

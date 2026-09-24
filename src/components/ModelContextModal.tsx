@@ -41,7 +41,7 @@ export function ModelContextModal({
   const compactionThreshold = Math.round(val * 0.75);
   const isDefaultInferred = val === inferred;
 
-  const categories = ["主流云端", "国内厂商", "超长上下文", "本地模型"] as const;
+  const categories = Array.from(new Set(MODEL_CONTEXT_PRESETS.map((p) => p.category)));
 
   const handleApplyPreset = (limit: number) => {
     if (limit > 0) {
@@ -54,7 +54,7 @@ export function ModelContextModal({
   };
 
   const handleConfirm = () => {
-    const finalVal = Math.max(2000, Math.min(val || inferred, 2_000_000));
+    const finalVal = Math.max(2000, Math.min(val || inferred, 10_000_000));
     onSave(finalVal);
     onClose();
   };
@@ -103,11 +103,45 @@ export function ModelContextModal({
             )}
           </div>
 
+          {/* 快捷规格标签 */}
+          <div className="flex flex-col gap-1.5">
+            <label className="text-[12px] font-medium text-ink flex items-center justify-between">
+              <span>快捷常用规格</span>
+              <span className="text-[11px] text-inkdim font-normal">一键快速填入推荐上限</span>
+            </label>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {[
+                { label: "1M (800k)", val: 800_000, desc: "GPT-5.5 / Opus 5 / Gemini 3.8 / DeepSeek-v4 / Qwen3.8 / GLM-5.3" },
+                { label: "500k (400k)", val: 400_000, desc: "长文本超长上下文" },
+                { label: "200k (180k)", val: 180_000, desc: "Claude 3.5 / o1 / Kimi" },
+                { label: "128k (110k)", val: 110_000, desc: "GPT-4o / Qwen 2.5 / GLM-4" },
+                { label: "64k (56k)", val: 56_000, desc: "经典 64K" },
+                { label: "32k (28k)", val: 28_000, desc: "本地 32K" },
+                { label: "16k (14k)", val: 14_000, desc: "本地 16K" },
+                { label: "8k (7k)", val: 7_000, desc: "本地 8K" },
+              ].map((chip) => (
+                <button
+                  key={chip.val}
+                  type="button"
+                  title={`${chip.desc} · 推荐上限 ${chip.val.toLocaleString()} tokens`}
+                  className={`text-[11px] px-2 py-0.5 rounded-lg border font-mono transition-all cursor-pointer ${
+                    val === chip.val
+                      ? "bg-accent/20 border-accent text-accent font-semibold"
+                      : "bg-panel border-edge hover:border-accent/40 text-inkdim hover:text-ink"
+                  }`}
+                  onClick={() => setVal(chip.val)}
+                >
+                  {chip.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
           {/* 下拉预设选择 */}
           <div className="flex flex-col gap-1.5">
             <label className="text-[12px] font-medium text-ink flex items-center justify-between">
-              <span>选择主流规格预设</span>
-              <span className="text-[11px] text-inkdim font-normal">下拉快速填入推荐值</span>
+              <span>从完整厂商预设列表选择</span>
+              <span className="text-[11px] text-inkdim font-normal">包含代表模型规格</span>
             </label>
             <select
               className={`${inputCls} text-[12px] cursor-pointer`}
@@ -132,7 +166,7 @@ export function ModelContextModal({
           {/* 手动数字微调输入框 */}
           <div className="flex flex-col gap-1.5">
             <label className="text-[12px] font-medium text-ink flex items-center justify-between">
-              <span>手动微调数值（Tokens）</span>
+              <span>手动精确数值（Tokens）</span>
               <span className="text-[11px] font-mono text-accent font-medium">
                 {formatTokens(val || 0)} ({(val || 0).toLocaleString()} tokens)
               </span>
@@ -142,7 +176,7 @@ export function ModelContextModal({
                 className={inputCls}
                 type="number"
                 min={2000}
-                max={2000000}
+                max={10000000}
                 step={1000}
                 value={val || ""}
                 placeholder={String(inferred)}

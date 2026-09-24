@@ -370,6 +370,7 @@ pub fn run() {
             commands::create_collaborator,
             commands::update_collaborator,
             commands::set_session_models,
+            commands::set_session_reasoning_effort,
             commands::set_collaborator_auto_report,
             commands::report_collaborator_increment,
             commands::spawn_subagent,

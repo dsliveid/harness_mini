@@ -443,6 +443,7 @@ pub async fn replan_subtasks(
         base_url: pc.base_url,
         api_key: pc.api_key,
         model,
+        reasoning_effort: None,
     };
 
     let cps = {
@@ -544,6 +545,7 @@ async fn decompose_goal(app: &AppHandle, session_id: &str, goal: &str) -> Vec<Ta
             base_url: pc.base_url,
             api_key: pc.api_key,
             model,
+            reasoning_effort: None,
         };
 
         let sys_prompt = "你是一个专家级 AI 架构师与长任务规划专家。用户将提供一个复杂的开发/编码任务总目标。请你将该目标拆解为 3 至 5 个按逻辑依赖顺序推进、目标明确且可独立执行验收的子任务步骤。\n请为每个适用的子任务推断最恰当的自动化验证命令（verifyCommand，例如 npm test, cargo check, pytest 等）。\n严禁输出任何 Markdown 格式包裹（如不要带 ```json 标记），仅输出纯 JSON 数组。\n格式必须严格符合：\n[{\"title\": \"子任务名称\", \"description\": \"具体任务内容与可验收成果\", \"verifyCommand\": \"可选的自动化验证命令\"}]";

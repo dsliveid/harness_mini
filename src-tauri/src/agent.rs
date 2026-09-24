@@ -638,6 +638,7 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
                 Some(run_tokens.total_tokens),
                 Some(run_tokens.prompt_tokens),
                 Some(run_tokens.completion_tokens),
+                Some(run_tokens.cached_tokens),
             );
             if let Some(ref aid) = last_assistant_id {
                 let _ = store::update_message_turn_duration(&db, aid, run_duration_ms);
@@ -654,6 +655,7 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
                 "status": status,
                 "durationMs": run_duration_ms,
                 "totalTokens": run_tokens.total_tokens,
+                "cachedTokens": run_tokens.cached_tokens,
                 "lastAssistantId": last_assistant_id,
             }),
         );
@@ -874,10 +876,19 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         );
         return (RunOutcome::Failed, None, run_tokens);
     };
+    let effective_reasoning_effort = session
+        .reasoning_effort
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or(settings.reasoning_effort.as_deref())
+        .filter(|s| !s.is_empty() && *s != "default")
+        .map(|s| s.to_string());
+
     let cfg = LlmCfg {
         base_url: pc.base_url.clone(),
         api_key: pc.api_key.clone(),
         model: model.clone(),
+        reasoning_effort: effective_reasoning_effort,
     };
     let effective_ctx_limit = session.context_token_limit.unwrap_or_else(|| {
         settings.resolve_context_limit(Some(&pc.id), &model)
@@ -1344,45 +1355,26 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         }
 
         let step_duration_ms = step_start.elapsed().as_millis() as u64;
-        let (prompt_tokens, completion_tokens, total_tokens) = match &result.usage {
-            Some(u) => {
-                let p = u
-                    .get("prompt_tokens")
-                    .or_else(|| u.get("promptTokens"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(est_in as u64);
-                let c = u
-                    .get("completion_tokens")
-                    .or_else(|| u.get("completionTokens"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or_else(|| {
-                        (estimate_tokens(&result.content) + estimate_tokens(&result.reasoning)) as u64
-                    });
-                let t = u
-                    .get("total_tokens")
-                    .or_else(|| u.get("totalTokens"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(p + c);
-                (p, c, t)
-            }
-            None => {
-                let est_out = estimate_tokens(&result.content) + estimate_tokens(&result.reasoning);
-                (est_in as u64, est_out as u64, (est_in + est_out) as u64)
-            }
-        };
+        let est_out = estimate_tokens(&result.content) + estimate_tokens(&result.reasoning);
+        let parsed_usage = crate::models::parse_llm_usage(result.usage.as_ref(), est_in, est_out);
 
-        run_tokens.prompt_tokens += prompt_tokens;
-        run_tokens.completion_tokens += completion_tokens;
-        run_tokens.total_tokens += total_tokens;
+        run_tokens.prompt_tokens += parsed_usage.prompt_tokens;
+        run_tokens.completion_tokens += parsed_usage.completion_tokens;
+        run_tokens.total_tokens += parsed_usage.total_tokens;
+        run_tokens.cached_tokens += parsed_usage.cached_tokens;
 
         let usage = json!({
-            "promptTokens": prompt_tokens,
-            "completionTokens": completion_tokens,
-            "totalTokens": total_tokens,
+            "promptTokens": parsed_usage.prompt_tokens,
+            "completionTokens": parsed_usage.completion_tokens,
+            "totalTokens": parsed_usage.total_tokens,
+            "cachedTokens": parsed_usage.cached_tokens,
+            "reasoningTokens": parsed_usage.reasoning_tokens,
+            "isEstimated": parsed_usage.is_estimated,
             "inputEst": est_in,
-            "outputEst": estimate_tokens(&result.content),
+            "outputEst": est_out,
             "durationMs": step_duration_ms,
             "model": &cfg.model,
+            "rawUsage": &result.usage,
         });
 
         if result.tool_calls.is_empty() {

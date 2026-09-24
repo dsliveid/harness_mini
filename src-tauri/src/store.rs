@@ -245,6 +245,8 @@ fn init(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "messages", "prompt_tokens", "prompt_tokens INTEGER DEFAULT 0")?;
     ensure_column(conn, "messages", "completion_tokens", "completion_tokens INTEGER DEFAULT 0")?;
     ensure_column(conn, "messages", "total_tokens", "total_tokens INTEGER DEFAULT 0")?;
+    ensure_column(conn, "messages", "cached_tokens", "cached_tokens INTEGER DEFAULT 0")?;
+    ensure_column(conn, "messages", "is_estimated", "is_estimated INTEGER DEFAULT 0")?;
     ensure_column(conn, "messages", "duration_ms", "duration_ms INTEGER DEFAULT 0")?;
     ensure_column(conn, "messages", "turn_duration_ms", "turn_duration_ms INTEGER DEFAULT 0")?;
     ensure_column(conn, "runs", "trigger_message_id", "trigger_message_id TEXT")?;
@@ -252,6 +254,7 @@ fn init(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "runs", "total_tokens", "total_tokens INTEGER DEFAULT 0")?;
     ensure_column(conn, "runs", "prompt_tokens", "prompt_tokens INTEGER DEFAULT 0")?;
     ensure_column(conn, "runs", "completion_tokens", "completion_tokens INTEGER DEFAULT 0")?;
+    ensure_column(conn, "runs", "cached_tokens", "cached_tokens INTEGER DEFAULT 0")?;
     // 子 Agent 会话关联与角色任务字段
     ensure_column(conn, "sessions", "parent_session_id", "parent_session_id TEXT")?;
     ensure_column(conn, "sessions", "session_type", "session_type TEXT NOT NULL DEFAULT 'main'")?;
@@ -270,6 +273,7 @@ fn init(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "sessions", "vision_model_id", "vision_model_id TEXT")?;
     ensure_column(conn, "sessions", "forked_from_session_id", "forked_from_session_id TEXT")?;
     ensure_column(conn, "sessions", "forked_from_message_id", "forked_from_message_id TEXT")?;
+    ensure_column(conn, "sessions", "reasoning_effort", "reasoning_effort TEXT")?;
     ensure_column(conn, "messages", "attachments_json", "attachments_json TEXT")?;
     ensure_column(conn, "tool_events", "subprocess_id", "subprocess_id TEXT")?;
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_trigger_tool ON sessions(trigger_tool_event_id)", []);
@@ -298,23 +302,22 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Re
     Ok(())
 }
 
-/// 兼容回填：解析既有消息中的 usage_json 并填入结构化 token / duration 列
+/// 兼容回填：解析既有消息中的 usage_json 并填入结构化 token / duration / cached 列
 fn backfill_message_tokens(conn: &Connection) -> Result<(), String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, usage_json FROM messages \
-             WHERE (total_tokens IS NULL OR total_tokens = 0) \
-               AND usage_json IS NOT NULL \
+            "SELECT id, usage_json, cached_tokens FROM messages \
+             WHERE usage_json IS NOT NULL \
                AND usage_json != ''",
         )
         .map_err(|e| e.to_string())?;
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+    let rows: Vec<(String, String, Option<i64>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
         .collect();
 
-    for (id, uj) in rows {
+    for (id, uj, existing_cached) in rows {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&uj) {
             let pt = v
                 .get("promptTokens")
@@ -333,15 +336,46 @@ fn backfill_message_tokens(conn: &Connection) -> Result<(), String> {
                 .or_else(|| v.get("total_tokens"))
                 .and_then(|x| x.as_u64())
                 .unwrap_or(pt + ct);
+            let cached = v
+                .get("cachedTokens")
+                .or_else(|| v.get("cached_tokens"))
+                .or_else(|| v.get("prompt_tokens_details").and_then(|d| d.get("cached_tokens")))
+                .or_else(|| v.get("prompt_cache_hit_tokens"))
+                .or_else(|| v.get("cache_read_input_tokens"))
+                .or_else(|| {
+                    v.get("rawUsage").and_then(|u| {
+                        u.get("prompt_tokens_details")
+                            .and_then(|d| d.get("cached_tokens"))
+                            .or_else(|| u.get("prompt_cache_hit_tokens"))
+                            .or_else(|| u.get("cache_read_input_tokens"))
+                    })
+                })
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
             let dur = v
                 .get("durationMs")
                 .or_else(|| v.get("duration_ms"))
                 .and_then(|x| x.as_u64())
                 .unwrap_or(0);
+            let is_est = v
+                .get("isEstimated")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
+
+            if existing_cached.unwrap_or(0) == 0 && cached > 0 {
+                let _ = conn.execute(
+                    "UPDATE messages SET cached_tokens = ?2, is_estimated = ?3 WHERE id = ?1",
+                    params![id, cached as i64, is_est as i64],
+                );
+            }
             if tt > 0 || dur > 0 {
                 let _ = conn.execute(
-                    "UPDATE messages SET prompt_tokens = ?2, completion_tokens = ?3, total_tokens = ?4, duration_ms = ?5 WHERE id = ?1",
-                    params![id, pt, ct, tt, dur],
+                    "UPDATE messages SET prompt_tokens = CASE WHEN prompt_tokens > 0 THEN prompt_tokens ELSE ?2 END, \
+                                        completion_tokens = CASE WHEN completion_tokens > 0 THEN completion_tokens ELSE ?3 END, \
+                                        total_tokens = CASE WHEN total_tokens > 0 THEN total_tokens ELSE ?4 END, \
+                                        duration_ms = CASE WHEN duration_ms > 0 THEN duration_ms ELSE ?5 END \
+                     WHERE id = ?1",
+                    params![id, pt as i64, ct as i64, tt as i64, dur as i64],
                 );
             }
         }
@@ -1186,6 +1220,8 @@ mod tests {
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
+            cached_tokens: None,
+            is_estimated: None,
             attachments: None,
         };
         insert_message(&conn, &m1).unwrap();
@@ -1210,6 +1246,8 @@ mod tests {
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
+            cached_tokens: None,
+            is_estimated: None,
             attachments: None,
         };
         insert_message(&conn, &m2).unwrap();
@@ -1247,6 +1285,8 @@ mod tests {
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
+            cached_tokens: None,
+            is_estimated: None,
             attachments: None,
         };
         insert_message(&conn, &m3).unwrap();
@@ -1270,6 +1310,8 @@ mod tests {
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
+            cached_tokens: None,
+            is_estimated: None,
             attachments: None,
         };
         insert_message(&conn, &m4).unwrap();
@@ -1293,6 +1335,8 @@ mod tests {
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
+            cached_tokens: None,
+            is_estimated: None,
             attachments: None,
         };
         insert_message(&conn, &m5).unwrap();
@@ -1347,6 +1391,7 @@ mod tests {
             Some("doubao-seedream-5.0-lite"),
             Some("openai"),
             Some("gpt-4o"),
+            None,
         )
         .unwrap();
 
@@ -1520,6 +1565,8 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         total_tokens: None,
         prompt_tokens: None,
         completion_tokens: None,
+        cached_tokens: None,
+        cache_hit_rate: None,
         parent_session_id: r.get(15)?,
         session_type: r.get::<_, Option<String>>(16)?.unwrap_or_else(|| "main".into()),
         subagent_role: r.get(17)?,
@@ -1537,6 +1584,7 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         vision_model_id: r.get(29)?,
         forked_from_session_id: r.get(30)?,
         forked_from_message_id: r.get(31)?,
+        reasoning_effort: r.get(32)?,
         last_run_status: None,
     })
 }
@@ -1547,7 +1595,7 @@ const SESSION_COLS: &str =
      parent_session_id, session_type, subagent_role, subagent_task, context_token_limit, \
      last_reported_msg_id, auto_report, trigger_tool_event_id, provider_id, model_id, \
      dispatch_rule, image_provider_id, image_model_id, vision_provider_id, vision_model_id, \
-     forked_from_session_id, forked_from_message_id";
+     forked_from_session_id, forked_from_message_id, reasoning_effort";
 
 fn attach_session_tokens(conn: &Connection, sessions: &mut [Session]) -> Result<(), String> {
     if sessions.is_empty() {
@@ -1558,12 +1606,13 @@ fn attach_session_tokens(conn: &Connection, sessions: &mut [Session]) -> Result<
             "SELECT session_id, \
                     COALESCE(SUM(total_tokens), 0), \
                     COALESCE(SUM(prompt_tokens), 0), \
-                    COALESCE(SUM(completion_tokens), 0) \
+                    COALESCE(SUM(completion_tokens), 0), \
+                    COALESCE(SUM(cached_tokens), 0) \
              FROM messages \
              GROUP BY session_id",
         )
         .map_err(|e| e.to_string())?;
-    let map: std::collections::HashMap<String, (u64, u64, u64)> = stmt
+    let map: std::collections::HashMap<String, (u64, u64, u64, u64)> = stmt
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -1571,6 +1620,7 @@ fn attach_session_tokens(conn: &Connection, sessions: &mut [Session]) -> Result<
                     r.get::<_, i64>(1)? as u64,
                     r.get::<_, i64>(2)? as u64,
                     r.get::<_, i64>(3)? as u64,
+                    r.get::<_, i64>(4)? as u64,
                 ),
             ))
         })
@@ -1579,14 +1629,22 @@ fn attach_session_tokens(conn: &Connection, sessions: &mut [Session]) -> Result<
         .collect();
 
     for s in sessions.iter_mut() {
-        if let Some((tt, pt, ct)) = map.get(&s.id) {
+        if let Some((tt, pt, ct, cached)) = map.get(&s.id) {
             s.total_tokens = Some(*tt);
             s.prompt_tokens = Some(*pt);
             s.completion_tokens = Some(*ct);
+            s.cached_tokens = Some(*cached);
+            s.cache_hit_rate = Some(if *pt > 0 {
+                ((*cached as f64 / *pt as f64) * 1000.0).round() / 10.0
+            } else {
+                0.0
+            });
         } else {
             s.total_tokens = Some(0);
             s.prompt_tokens = Some(0);
             s.completion_tokens = Some(0);
+            s.cached_tokens = Some(0);
+            s.cache_hit_rate = Some(0.0);
         }
     }
     Ok(())
@@ -1629,26 +1687,40 @@ pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>, Strin
     if let Some(ref mut session) = s {
         session.last_run_status = get_last_run_status(conn, id);
 
-        let tokens: Option<(u64, u64, u64)> = conn
+        let tokens: Option<(u64, u64, u64, u64)> = conn
             .query_row(
                 "SELECT COALESCE(SUM(total_tokens), 0), \
                         COALESCE(SUM(prompt_tokens), 0), \
-                        COALESCE(SUM(completion_tokens), 0) \
+                        COALESCE(SUM(completion_tokens), 0), \
+                        COALESCE(SUM(cached_tokens), 0) \
                  FROM messages WHERE session_id = ?1",
                 params![id],
-                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64)),
+                |r| Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, i64>(2)? as u64,
+                    r.get::<_, i64>(3)? as u64,
+                )),
             )
             .optional()
             .map_err(|e| e.to_string())?;
 
-        if let Some((tt, pt, ct)) = tokens {
+        if let Some((tt, pt, ct, cached)) = tokens {
             session.total_tokens = Some(tt);
             session.prompt_tokens = Some(pt);
             session.completion_tokens = Some(ct);
+            session.cached_tokens = Some(cached);
+            session.cache_hit_rate = Some(if pt > 0 {
+                ((cached as f64 / pt as f64) * 1000.0).round() / 10.0
+            } else {
+                0.0
+            });
         } else {
             session.total_tokens = Some(0);
             session.prompt_tokens = Some(0);
             session.completion_tokens = Some(0);
+            session.cached_tokens = Some(0);
+            session.cache_hit_rate = Some(0.0);
         }
     }
     Ok(s)
@@ -1774,6 +1846,7 @@ pub fn create_session(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -1787,6 +1860,7 @@ pub fn create_session_with_models(
     image_model_id: Option<&str>,
     vision_provider_id: Option<&str>,
     vision_model_id: Option<&str>,
+    reasoning_effort: Option<&str>,
 ) -> Result<Session, String> {
     let t = now();
     let s = Session {
@@ -1809,6 +1883,8 @@ pub fn create_session_with_models(
         total_tokens: Some(0),
         prompt_tokens: Some(0),
         completion_tokens: Some(0),
+        cached_tokens: Some(0),
+        cache_hit_rate: Some(0.0),
         parent_session_id: None,
         session_type: "main".into(),
         subagent_role: None,
@@ -1826,6 +1902,7 @@ pub fn create_session_with_models(
         vision_model_id: vision_model_id.map(|s| s.to_string()),
         forked_from_session_id: None,
         forked_from_message_id: None,
+        reasoning_effort: reasoning_effort.map(|s| s.to_string()),
         last_run_status: None,
     };
     conn.execute(
@@ -1834,8 +1911,9 @@ pub fn create_session_with_models(
             last_message_at, created_at, updated_at, 
             parent_session_id, session_type, subagent_role, subagent_task,
             last_reported_msg_id, auto_report,
-            image_provider_id, image_model_id, vision_provider_id, vision_model_id
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,'main',NULL,NULL,NULL,NULL,?10,?11,?12,?13)",
+            image_provider_id, image_model_id, vision_provider_id, vision_model_id,
+            reasoning_effort
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,'main',NULL,NULL,NULL,NULL,?10,?11,?12,?13,?14)",
         params![
             s.id,
             s.title,
@@ -1850,6 +1928,7 @@ pub fn create_session_with_models(
             s.image_model_id,
             s.vision_provider_id,
             s.vision_model_id,
+            s.reasoning_effort,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -1895,6 +1974,8 @@ pub fn create_collaborator_session(
         total_tokens: Some(0),
         prompt_tokens: Some(0),
         completion_tokens: Some(0),
+        cached_tokens: Some(0),
+        cache_hit_rate: Some(0.0),
         parent_session_id: Some(parent_session_id.to_string()),
         session_type: "collaborator".into(),
         subagent_role: Some(role.to_string()),
@@ -1912,6 +1993,7 @@ pub fn create_collaborator_session(
         vision_model_id: vision_model_id.map(|s| s.to_string()),
         forked_from_session_id: None,
         forked_from_message_id: None,
+        reasoning_effort: None,
         last_run_status: None,
     };
     conn.execute(
@@ -2042,6 +2124,21 @@ pub fn update_session_models(
     get_session(conn, session_id)?.ok_or_else(|| "会话不存在".to_string())
 }
 
+pub fn set_session_reasoning_effort(
+    conn: &Connection,
+    session_id: &str,
+    reasoning_effort: Option<&str>,
+) -> Result<Session, String> {
+    let t = now();
+    conn.execute(
+        "UPDATE sessions SET reasoning_effort = ?1, updated_at = ?2 WHERE id = ?3",
+        params![reasoning_effort, t, session_id],
+    )
+    .map_err(|e| e.to_string())?;
+
+    get_session(conn, session_id)?.ok_or_else(|| "会话不存在".to_string())
+}
+
 pub fn create_subprocess_session(
     conn: &Connection,
     parent_session_id: &str,
@@ -2074,6 +2171,8 @@ pub fn create_subprocess_session(
         total_tokens: Some(0),
         prompt_tokens: Some(0),
         completion_tokens: Some(0),
+        cached_tokens: Some(0),
+        cache_hit_rate: Some(0.0),
         parent_session_id: Some(parent_session_id.to_string()),
         session_type: "subprocess".into(),
         subagent_role: Some(role.to_string()),
@@ -2091,6 +2190,7 @@ pub fn create_subprocess_session(
         vision_model_id: None,
         forked_from_session_id: None,
         forked_from_message_id: None,
+        reasoning_effort: None,
         last_run_status: None,
     };
     conn.execute(
@@ -2215,7 +2315,7 @@ pub fn fork_session_at_message(
             context_token_limit, last_reported_msg_id, auto_report,
             trigger_tool_event_id, provider_id, model_id, dispatch_rule,
             image_provider_id, image_model_id, vision_provider_id, vision_model_id,
-            forked_from_session_id, forked_from_message_id
+            forked_from_session_id, forked_from_message_id, reasoning_effort
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, 'active',
             ?6, ?6, ?6, 0,
@@ -2224,7 +2324,7 @@ pub fn fork_session_at_message(
             ?7, NULL, 1,
             NULL, ?8, ?9, NULL,
             ?10, ?11, ?12, ?13,
-            ?14, ?15
+            ?14, ?15, ?16
         )",
         params![
             new_session_id,
@@ -2242,6 +2342,7 @@ pub fn fork_session_at_message(
             source_session.vision_model_id,
             source_session_id,
             target_message_id,
+            source_session.reasoning_effort,
         ],
     )
     .map_err(|e| format!("创建分支会话失败: {}", e))?;
@@ -2250,7 +2351,8 @@ pub fn fork_session_at_message(
         .prepare(
             "SELECT id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id,
                     queued, usage_json, created_at, prompt_tokens, completion_tokens,
-                    total_tokens, duration_ms, turn_duration_ms, attachments_json
+                    total_tokens, duration_ms, turn_duration_ms, attachments_json,
+                    cached_tokens, is_estimated
              FROM messages
              WHERE session_id = ?1 AND seq <= ?2 AND queued = 0
              ORDER BY seq ASC",
@@ -2277,6 +2379,8 @@ pub fn fork_session_at_message(
                 r.get::<_, Option<i64>>(14)?,
                 r.get::<_, Option<i64>>(15)?,
                 r.get::<_, Option<String>>(16)?,
+                r.get::<_, Option<i64>>(17)?,
+                r.get::<_, Option<i64>>(18)?,
             ))
         })
         .map_err(|e| e.to_string())?
@@ -2296,12 +2400,12 @@ pub fn fork_session_at_message(
                 id, session_id, run_id, seq, role, content, reasoning,
                 tool_calls_json, tool_call_id, queued, usage_json, created_at,
                 prompt_tokens, completion_tokens, total_tokens, duration_ms,
-                turn_duration_ms, attachments_json
+                turn_duration_ms, attachments_json, cached_tokens, is_estimated
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7,
                 ?8, ?9, ?10, ?11, ?12,
                 ?13, ?14, ?15, ?16,
-                ?17, ?18
+                ?17, ?18, ?19, ?20
             )",
             params![
                 new_id,
@@ -2322,6 +2426,8 @@ pub fn fork_session_at_message(
                 old.14,
                 old.15,
                 old.16,
+                old.17.unwrap_or(0),
+                old.18.unwrap_or(0),
             ],
         )
         .map_err(|e| format!("复制消息失败: {}", e))?;
@@ -2562,8 +2668,8 @@ pub fn next_seq(conn: &Connection, session_id: &str) -> Result<i64, String> {
 
 pub fn insert_message(conn: &Connection, m: &Message) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO messages(id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+        "INSERT INTO messages(id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, cached_tokens, is_estimated, duration_ms, turn_duration_ms, attachments_json)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
         params![
             m.id,
             m.session_id,
@@ -2580,6 +2686,8 @@ pub fn insert_message(conn: &Connection, m: &Message) -> Result<(), String> {
             m.prompt_tokens.unwrap_or(0) as i64,
             m.completion_tokens.unwrap_or(0) as i64,
             m.total_tokens.unwrap_or(0) as i64,
+            m.cached_tokens.unwrap_or(0) as i64,
+            m.is_estimated.unwrap_or(false) as i64,
             m.duration_ms.unwrap_or(0) as i64,
             m.turn_duration_ms.unwrap_or(0) as i64,
             m.attachments.as_ref().and_then(|v| serde_json::to_string(v).ok()),
@@ -2654,6 +2762,8 @@ pub fn new_message_with_attachments(
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
+        cached_tokens: None,
+        is_estimated: None,
         attachments,
     };
     insert_message(conn, &m)?;
@@ -2677,14 +2787,20 @@ pub fn update_message_content(
     content: &str,
     usage: Option<&serde_json::Value>,
 ) -> Result<(), String> {
-    let (pt, ct, tt, dur) = if let Some(u) = usage {
+    let (pt, ct, tt, cached, dur, is_est) = if let Some(u) = usage {
         let pt = u.get("promptTokens").or_else(|| u.get("prompt_tokens")).or_else(|| u.get("inputEst")).and_then(|v| v.as_u64()).unwrap_or(0);
         let ct = u.get("completionTokens").or_else(|| u.get("completion_tokens")).or_else(|| u.get("outputEst")).and_then(|v| v.as_u64()).unwrap_or(0);
         let tt = u.get("totalTokens").or_else(|| u.get("total_tokens")).and_then(|v| v.as_u64()).unwrap_or(pt + ct);
+        let cached = u.get("cachedTokens").or_else(|| u.get("cached_tokens"))
+            .or_else(|| u.get("prompt_tokens_details").and_then(|d| d.get("cached_tokens")))
+            .or_else(|| u.get("prompt_cache_hit_tokens"))
+            .or_else(|| u.get("cache_read_input_tokens"))
+            .and_then(|v| v.as_u64()).unwrap_or(0);
         let dur = u.get("durationMs").or_else(|| u.get("duration_ms")).and_then(|v| v.as_u64()).unwrap_or(0);
-        (pt, ct, tt, dur)
+        let is_est = u.get("isEstimated").and_then(|v| v.as_bool()).unwrap_or(false);
+        (pt, ct, tt, cached, dur, is_est)
     } else {
-        (0, 0, 0, 0)
+        (0, 0, 0, 0, 0, false)
     };
     conn.execute(
         "UPDATE messages SET
@@ -2693,7 +2809,9 @@ pub fn update_message_content(
             prompt_tokens = CASE WHEN ?4 > 0 THEN ?4 ELSE prompt_tokens END,
             completion_tokens = CASE WHEN ?5 > 0 THEN ?5 ELSE completion_tokens END,
             total_tokens = CASE WHEN ?6 > 0 THEN ?6 ELSE total_tokens END,
-            duration_ms = CASE WHEN ?7 > 0 THEN ?7 ELSE duration_ms END
+            cached_tokens = CASE WHEN ?7 > 0 THEN ?7 ELSE cached_tokens END,
+            duration_ms = CASE WHEN ?8 > 0 THEN ?8 ELSE duration_ms END,
+            is_estimated = CASE WHEN ?9 = 1 THEN 1 ELSE is_estimated END
          WHERE id = ?1",
         params![
             id,
@@ -2702,7 +2820,9 @@ pub fn update_message_content(
             pt as i64,
             ct as i64,
             tt as i64,
+            cached as i64,
             dur as i64,
+            is_est as i64,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -2751,14 +2871,20 @@ pub fn update_message_tool_calls(
     content: &str,
     usage: Option<&serde_json::Value>,
 ) -> Result<(), String> {
-    let (pt, ct, tt, dur) = if let Some(u) = usage {
+    let (pt, ct, tt, cached, dur, is_est) = if let Some(u) = usage {
         let pt = u.get("promptTokens").or_else(|| u.get("prompt_tokens")).or_else(|| u.get("inputEst")).and_then(|v| v.as_u64()).unwrap_or(0);
         let ct = u.get("completionTokens").or_else(|| u.get("completion_tokens")).or_else(|| u.get("outputEst")).and_then(|v| v.as_u64()).unwrap_or(0);
         let tt = u.get("totalTokens").or_else(|| u.get("total_tokens")).and_then(|v| v.as_u64()).unwrap_or(pt + ct);
+        let cached = u.get("cachedTokens").or_else(|| u.get("cached_tokens"))
+            .or_else(|| u.get("prompt_tokens_details").and_then(|d| d.get("cached_tokens")))
+            .or_else(|| u.get("prompt_cache_hit_tokens"))
+            .or_else(|| u.get("cache_read_input_tokens"))
+            .and_then(|v| v.as_u64()).unwrap_or(0);
         let dur = u.get("durationMs").or_else(|| u.get("duration_ms")).and_then(|v| v.as_u64()).unwrap_or(0);
-        (pt, ct, tt, dur)
+        let is_est = u.get("isEstimated").and_then(|v| v.as_bool()).unwrap_or(false);
+        (pt, ct, tt, cached, dur, is_est)
     } else {
-        (0, 0, 0, 0)
+        (0, 0, 0, 0, 0, false)
     };
     conn.execute(
         "UPDATE messages SET
@@ -2768,7 +2894,9 @@ pub fn update_message_tool_calls(
             prompt_tokens = CASE WHEN ?5 > 0 THEN ?5 ELSE prompt_tokens END,
             completion_tokens = CASE WHEN ?6 > 0 THEN ?6 ELSE completion_tokens END,
             total_tokens = CASE WHEN ?7 > 0 THEN ?7 ELSE total_tokens END,
-            duration_ms = CASE WHEN ?8 > 0 THEN ?8 ELSE duration_ms END
+            cached_tokens = CASE WHEN ?8 > 0 THEN ?8 ELSE cached_tokens END,
+            duration_ms = CASE WHEN ?9 > 0 THEN ?9 ELSE duration_ms END,
+            is_estimated = CASE WHEN ?10 = 1 THEN 1 ELSE is_estimated END
          WHERE id = ?1",
         params![
             id,
@@ -2778,7 +2906,9 @@ pub fn update_message_tool_calls(
             pt as i64,
             ct as i64,
             tt as i64,
+            cached as i64,
             dur as i64,
+            is_est as i64,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -2793,7 +2923,7 @@ pub fn get_messages(
 ) -> Result<Vec<Message>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json
+            "SELECT id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens, is_estimated
              FROM messages WHERE session_id = ?1 AND seq < COALESCE(?2, 9223372036854775807)
              ORDER BY seq DESC LIMIT ?3",
         )
@@ -2808,6 +2938,8 @@ pub fn get_messages(
             let dur: Option<i64> = r.get(14)?;
             let turn_dur: Option<i64> = r.get(15)?;
             let att: Option<String> = r.get(16)?;
+            let cached: Option<i64> = r.get(17)?;
+            let is_est: Option<i64> = r.get(18)?;
             Ok(Message {
                 id: r.get(0)?,
                 session_id: session_id.to_string(),
@@ -2827,6 +2959,8 @@ pub fn get_messages(
                 prompt_tokens: pt.map(|v| v as u64),
                 completion_tokens: ct.map(|v| v as u64),
                 total_tokens: tt.map(|v| v as u64),
+                cached_tokens: cached.map(|v| v as u64),
+                is_estimated: is_est.map(|v| v != 0),
                 attachments: att.and_then(|s| serde_json::from_str(&s).ok()),
             })
         })
@@ -2947,7 +3081,7 @@ pub fn list_session_compactions(conn: &Connection, session_id: &str) -> Result<V
 pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, String> {
     let opt = conn
         .query_row(
-            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json
+            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens, is_estimated
              FROM messages WHERE id = ?1",
             params![id],
             |r| {
@@ -2959,6 +3093,8 @@ pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, Strin
                 let dur: Option<i64> = r.get(15)?;
                 let turn_dur: Option<i64> = r.get(16)?;
                 let att: Option<String> = r.get(17)?;
+                let cached: Option<i64> = r.get(18)?;
+                let is_est: Option<i64> = r.get(19)?;
                 Ok(Message {
                     id: r.get(0)?,
                     session_id: r.get(1)?,
@@ -2978,6 +3114,8 @@ pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, Strin
                     prompt_tokens: pt.map(|v| v as u64),
                     completion_tokens: ct.map(|v| v as u64),
                     total_tokens: tt.map(|v| v as u64),
+                    cached_tokens: cached.map(|v| v as u64),
+                    is_estimated: is_est.map(|v| v != 0),
                     attachments: att.and_then(|s| serde_json::from_str(&s).ok()),
                 })
             },
@@ -2992,7 +3130,7 @@ pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, Strin
 pub fn list_queued(conn: &Connection, session_id: &str) -> Result<Vec<Message>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json
+            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens, is_estimated
              FROM messages WHERE session_id = ?1 AND queued = 1 ORDER BY seq ASC",
         )
         .map_err(|e| e.to_string())?;
@@ -3006,6 +3144,8 @@ pub fn list_queued(conn: &Connection, session_id: &str) -> Result<Vec<Message>, 
             let dur: Option<i64> = r.get(15)?;
             let turn_dur: Option<i64> = r.get(16)?;
             let att: Option<String> = r.get(17)?;
+            let cached: Option<i64> = r.get(18)?;
+            let is_est: Option<i64> = r.get(19)?;
             Ok(Message {
                 id: r.get(0)?,
                 session_id: r.get(1)?,
@@ -3025,6 +3165,8 @@ pub fn list_queued(conn: &Connection, session_id: &str) -> Result<Vec<Message>, 
                 prompt_tokens: pt.map(|v| v as u64),
                 completion_tokens: ct.map(|v| v as u64),
                 total_tokens: tt.map(|v| v as u64),
+                cached_tokens: cached.map(|v| v as u64),
+                is_estimated: is_est.map(|v| v != 0),
                 attachments: att.and_then(|s| serde_json::from_str(&s).ok()),
             })
         })
@@ -3160,9 +3302,10 @@ pub fn finish_run(
     total_tokens: Option<u64>,
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
 ) -> Result<(), String> {
     conn.execute(
-        "UPDATE runs SET status = ?2, ended_at = ?3, duration_ms = ?4, total_tokens = ?5, prompt_tokens = ?6, completion_tokens = ?7 WHERE id = ?1",
+        "UPDATE runs SET status = ?2, ended_at = ?3, duration_ms = ?4, total_tokens = ?5, prompt_tokens = ?6, completion_tokens = ?7, cached_tokens = ?8 WHERE id = ?1",
         params![
             id,
             status,
@@ -3171,6 +3314,7 @@ pub fn finish_run(
             total_tokens.map(|v| v as i64),
             prompt_tokens.map(|v| v as i64),
             completion_tokens.map(|v| v as i64),
+            cached_tokens.map(|v| v as i64),
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -3660,32 +3804,34 @@ pub fn get_token_stats(
     };
 
     // 1. 全局概览汇总
-    let (tot_pt, tot_ct, tot_tt, tot_msgs): (i64, i64, i64, i64) = conn
+    let (tot_pt, tot_ct, tot_tt, tot_cached, tot_msgs): (i64, i64, i64, i64, i64) = conn
         .query_row(
             "SELECT 
                 COALESCE(SUM(prompt_tokens), 0),
                 COALESCE(SUM(completion_tokens), 0),
                 COALESCE(SUM(total_tokens), 0),
+                COALESCE(SUM(cached_tokens), 0),
                 COUNT(*)
              FROM messages
              WHERE role = 'assistant'",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
-        .unwrap_or((0, 0, 0, 0));
+        .unwrap_or((0, 0, 0, 0, 0));
 
-    let (today_pt, today_ct, today_tt): (i64, i64, i64) = conn
+    let (today_pt, today_ct, today_tt, today_cached): (i64, i64, i64, i64) = conn
         .query_row(
             "SELECT 
                 COALESCE(SUM(prompt_tokens), 0),
                 COALESCE(SUM(completion_tokens), 0),
-                COALESCE(SUM(total_tokens), 0)
+                COALESCE(SUM(total_tokens), 0),
+                COALESCE(SUM(cached_tokens), 0)
              FROM messages
              WHERE role = 'assistant' AND substr(created_at, 1, 10) = ?1",
             params![today_prefix],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
-        .unwrap_or((0, 0, 0));
+        .unwrap_or((0, 0, 0, 0));
 
     let tot_sessions: i64 = conn
         .query_row(
@@ -3699,9 +3845,21 @@ pub fn get_token_stats(
         total_prompt_tokens: tot_pt as u64,
         total_completion_tokens: tot_ct as u64,
         total_tokens: tot_tt as u64,
+        total_cached_tokens: tot_cached as u64,
+        overall_cache_hit_rate: if tot_pt > 0 {
+            ((tot_cached as f64 / tot_pt as f64) * 1000.0).round() / 10.0
+        } else {
+            0.0
+        },
         today_prompt_tokens: today_pt as u64,
         today_completion_tokens: today_ct as u64,
         today_tokens: today_tt as u64,
+        today_cached_tokens: today_cached as u64,
+        today_cache_hit_rate: if today_pt > 0 {
+            ((today_cached as f64 / today_pt as f64) * 1000.0).round() / 10.0
+        } else {
+            0.0
+        },
         total_sessions: tot_sessions as u64,
         total_messages: tot_msgs as u64,
     };
@@ -3717,6 +3875,7 @@ pub fn get_token_stats(
                 COALESCE(SUM(m.prompt_tokens), 0),
                 COALESCE(SUM(m.completion_tokens), 0),
                 COALESCE(SUM(m.total_tokens), 0),
+                COALESCE(SUM(m.cached_tokens), 0),
                 COUNT(DISTINCT s.id),
                 COUNT(m.id),
                 MAX(m.created_at)
@@ -3733,26 +3892,34 @@ pub fn get_token_stats(
             let pt: i64 = r.get(1)?;
             let ct: i64 = r.get(2)?;
             let tt: i64 = r.get(3)?;
-            let sc: i64 = r.get(4)?;
-            let mc: i64 = r.get(5)?;
-            let last_at: Option<String> = r.get(6)?;
-            Ok((pid, pt as u64, ct as u64, tt as u64, sc as u64, mc as u64, last_at))
+            let cached: i64 = r.get(4)?;
+            let sc: i64 = r.get(5)?;
+            let mc: i64 = r.get(6)?;
+            let last_at: Option<String> = r.get(7)?;
+            Ok((pid, pt as u64, ct as u64, tt as u64, cached as u64, sc as u64, mc as u64, last_at))
         })
         .map_err(|e| e.to_string())?;
 
     let mut mapped_stats: std::collections::HashMap<
         Option<String>,
-        (u64, u64, u64, u64, u64, Option<String>),
+        (u64, u64, u64, u64, u64, u64, Option<String>),
     > = std::collections::HashMap::new();
 
     for row in proj_rows.filter_map(|r| r.ok()) {
-        mapped_stats.insert(row.0, (row.1, row.2, row.3, row.4, row.5, row.6));
+        mapped_stats.insert(row.0, (row.1, row.2, row.3, row.4, row.5, row.6, row.7));
     }
 
     for p in &all_projects {
         let stats = mapped_stats
             .remove(&Some(p.id.clone()))
-            .unwrap_or((0, 0, 0, 0, 0, None));
+            .unwrap_or((0, 0, 0, 0, 0, 0, None));
+        let pt = stats.0;
+        let cached = stats.3;
+        let rate = if pt > 0 {
+            ((cached as f64 / pt as f64) * 1000.0).round() / 10.0
+        } else {
+            0.0
+        };
         by_project.push(ProjectTokenStats {
             project_id: Some(p.id.clone()),
             project_name: p.name.clone(),
@@ -3760,14 +3927,23 @@ pub fn get_token_stats(
             prompt_tokens: stats.0,
             completion_tokens: stats.1,
             total_tokens: stats.2,
-            session_count: stats.3,
-            message_count: stats.4,
-            last_used_at: stats.5.or_else(|| p.last_activity_at.clone()),
+            cached_tokens: cached,
+            cache_hit_rate: rate,
+            session_count: stats.4,
+            message_count: stats.5,
+            last_used_at: stats.6.or_else(|| p.last_activity_at.clone()),
         });
     }
 
     if let Some(stats) = mapped_stats.remove(&None) {
-        if stats.2 > 0 || stats.4 > 0 {
+        if stats.2 > 0 || stats.5 > 0 {
+            let pt = stats.0;
+            let cached = stats.3;
+            let rate = if pt > 0 {
+                ((cached as f64 / pt as f64) * 1000.0).round() / 10.0
+            } else {
+                0.0
+            };
             by_project.push(ProjectTokenStats {
                 project_id: None,
                 project_name: "未归类 / 纯对话".to_string(),
@@ -3775,9 +3951,11 @@ pub fn get_token_stats(
                 prompt_tokens: stats.0,
                 completion_tokens: stats.1,
                 total_tokens: stats.2,
-                session_count: stats.3,
-                message_count: stats.4,
-                last_used_at: stats.5,
+                cached_tokens: cached,
+                cache_hit_rate: rate,
+                session_count: stats.4,
+                message_count: stats.5,
+                last_used_at: stats.6,
             });
         }
     }
@@ -3816,6 +3994,7 @@ pub fn get_token_stats(
             COALESCE(SUM(m.prompt_tokens), 0),
             COALESCE(SUM(m.completion_tokens), 0),
             COALESCE(SUM(m.total_tokens), 0),
+            COALESCE(SUM(m.cached_tokens), 0),
             COUNT(m.id)
          FROM messages m
          JOIN sessions s ON s.id = m.session_id
@@ -3831,12 +4010,20 @@ pub fn get_token_stats(
             let pt: i64 = r.get(1)?;
             let ct: i64 = r.get(2)?;
             let tt: i64 = r.get(3)?;
-            let mc: i64 = r.get(4)?;
+            let cached: i64 = r.get(4)?;
+            let mc: i64 = r.get(5)?;
+            let rate = if pt > 0 {
+                ((cached as f64 / pt as f64) * 1000.0).round() / 10.0
+            } else {
+                0.0
+            };
             Ok(DailyTokenStats {
                 date: day,
                 prompt_tokens: pt as u64,
                 completion_tokens: ct as u64,
                 total_tokens: tt as u64,
+                cached_tokens: cached as u64,
+                cache_hit_rate: rate,
                 message_count: mc as u64,
             })
         })
@@ -3854,6 +4041,7 @@ pub fn get_token_stats(
             COALESCE(SUM(m.prompt_tokens), 0) as pt,
             COALESCE(SUM(m.completion_tokens), 0) as ct,
             COALESCE(SUM(m.total_tokens), 0) as tt,
+            COALESCE(SUM(m.cached_tokens), 0) as cached,
             COUNT(m.id) as mc,
             MAX(m.created_at) as last_msg
          FROM sessions s
@@ -3876,8 +4064,14 @@ pub fn get_token_stats(
             let pt: i64 = r.get(4)?;
             let ct: i64 = r.get(5)?;
             let tt: i64 = r.get(6)?;
-            let mc: i64 = r.get(7)?;
-            let last_at: Option<String> = r.get(8)?;
+            let cached: i64 = r.get(7)?;
+            let mc: i64 = r.get(8)?;
+            let last_at: Option<String> = r.get(9)?;
+            let rate = if pt > 0 {
+                ((cached as f64 / pt as f64) * 1000.0).round() / 10.0
+            } else {
+                0.0
+            };
             Ok(SessionTokenStats {
                 session_id: sid,
                 title,
@@ -3886,6 +4080,8 @@ pub fn get_token_stats(
                 prompt_tokens: pt as u64,
                 completion_tokens: ct as u64,
                 total_tokens: tt as u64,
+                cached_tokens: cached as u64,
+                cache_hit_rate: rate,
                 message_count: mc as u64,
                 last_message_at: last_at,
             })

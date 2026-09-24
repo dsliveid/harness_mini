@@ -5,6 +5,7 @@ pub struct LlmCfg {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub reasoning_effort: Option<String>,
 }
 
 /// 规整 endpoint：容忍用户把完整路径 /chat/completions 填进 Base URL
@@ -59,6 +60,13 @@ pub async fn chat_stream(
     });
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools.to_vec());
+    }
+    // 思考程度处理：仅当明确指定且非 "default" 时才传入 reasoning_effort（支持模型默认不传，防止非推理模型报错 400）
+    if let Some(ref effort) = cfg.reasoning_effort {
+        let trimmed = effort.trim();
+        if !trimmed.is_empty() && trimmed != "default" {
+            body["reasoning_effort"] = json!(trimmed);
+        }
     }
 
     let resp = client()

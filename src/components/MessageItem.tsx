@@ -364,7 +364,16 @@ export function MessageItem({
     const totalTokens = msg.totalTokens ?? (msg.usage?.totalTokens || (msg.usage?.inputEst || 0) + (msg.usage?.outputEst || 0)) ?? 0;
     const promptTokens = msg.promptTokens ?? (msg.usage?.promptTokens || msg.usage?.inputEst) ?? 0;
     const completionTokens = msg.completionTokens ?? (msg.usage?.completionTokens || msg.usage?.outputEst) ?? 0;
+    const cachedTokens = msg.cachedTokens ?? (msg.usage?.cachedTokens || msg.usage?.promptCacheHitTokens || msg.usage?.cacheReadInputTokens) ?? 0;
+    const isEstimated = msg.isEstimated ?? (msg.usage?.isEstimated || (msg.usage?.inputEst != null && msg.usage?.promptTokens == null)) ?? false;
+    const stepCacheHitRate = promptTokens > 0 ? Math.round((cachedTokens / promptTokens) * 1000) / 10 : 0;
+
     const turnTokens = turnMetrics?.turnTokens ?? totalTokens;
+    const turnPromptTokens = turnMetrics?.turnPromptTokens ?? promptTokens;
+    const turnCompletionTokens = turnMetrics?.turnCompletionTokens ?? completionTokens;
+    const turnCachedTokens = turnMetrics?.turnCachedTokens ?? cachedTokens;
+    const turnCacheHitRate = turnMetrics?.turnCacheHitRate ?? (turnPromptTokens > 0 ? Math.round((turnCachedTokens / turnPromptTokens) * 1000) / 10 : 0);
+    const turnIsEstimated = turnMetrics?.turnIsEstimated ?? isEstimated;
 
     const hasTokens = (isTurnEnd ? turnTokens : totalTokens) > 0;
     const hasTurnDuration = isTurnEnd && turnDuration != null && turnDuration > 0;
@@ -477,15 +486,25 @@ export function MessageItem({
                     role="button"
                     tabIndex={0}
                     onClick={() => setShowTokenStatsModal(true)}
-                    className="inline-flex items-center gap-1 text-inkdim/80 hover:text-ink transition-colors font-mono cursor-pointer select-none shrink-0"
-                    title={`本次对话累计消耗: ${(Number(turnTokens) || 0).toLocaleString()} tokens${
-                      (turnMetrics?.turnPromptTokens ?? 0) > 0 || (turnMetrics?.turnCompletionTokens ?? 0) > 0
-                        ? `\n输入: ${(Number(turnMetrics?.turnPromptTokens ?? promptTokens) || 0).toLocaleString()} · 输出: ${(Number(turnMetrics?.turnCompletionTokens ?? completionTokens) || 0).toLocaleString()}`
+                    className="inline-flex items-center gap-1.5 text-inkdim/80 hover:text-ink transition-colors font-mono cursor-pointer select-none shrink-0"
+                    title={`本次对话累计消耗: ${(Number(turnTokens) || 0).toLocaleString()} tokens ${turnIsEstimated ? "(包含部分估算)" : "(模型实际返回)"}${
+                      (turnPromptTokens > 0 || turnCompletionTokens > 0)
+                        ? `\n输入: ${turnPromptTokens.toLocaleString()}${turnCachedTokens > 0 ? ` (缓存命中: ${turnCachedTokens.toLocaleString()} · ${turnCacheHitRate.toFixed(1)}%)` : ""} · 输出: ${turnCompletionTokens.toLocaleString()}`
                         : ""
                     }${stepCount > 1 ? `\n(已汇总本轮全部 ${stepCount} 个步骤)` : ""}\n点击打开 Token 消耗统计看板`}
                   >
                     <Zap size={12} className="text-amber-400/80 shrink-0" />
                     <span>{formatTokens(turnTokens)} tokens</span>
+                    {turnCacheHitRate > 0 && (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20">
+                        ⚡ {turnCacheHitRate.toFixed(1)}% 缓存
+                      </span>
+                    )}
+                    {turnIsEstimated && (
+                      <span className="text-[10px] text-zinc-400 opacity-80" title="该轮次包含基于字符推断的估算用量">
+                        (估算)
+                      </span>
+                    )}
                     {stepCount > 1 && (
                       <span className="text-inkdim text-[10px] opacity-75">累计</span>
                     )}
@@ -497,11 +516,21 @@ export function MessageItem({
                     role="button"
                     tabIndex={0}
                     onClick={() => setShowTokenStatsModal(true)}
-                    className="inline-flex items-center gap-1 text-inkdim/70 hover:text-ink transition-colors font-mono cursor-pointer select-none shrink-0"
-                    title={`本步骤消耗: ${(Number(totalTokens) || 0).toLocaleString()} tokens\n输入: ${(Number(promptTokens) || 0).toLocaleString()} · 输出: ${(Number(completionTokens) || 0).toLocaleString()}\n点击打开 Token 消耗统计看板`}
+                    className="inline-flex items-center gap-1.5 text-inkdim/70 hover:text-ink transition-colors font-mono cursor-pointer select-none shrink-0"
+                    title={`本步骤消耗: ${(Number(totalTokens) || 0).toLocaleString()} tokens ${isEstimated ? "(基于字符估算)" : "(模型实际返回)"}\n输入: ${promptTokens.toLocaleString()}${cachedTokens > 0 ? ` (缓存命中: ${cachedTokens.toLocaleString()} · ${stepCacheHitRate.toFixed(1)}%)` : ""} · 输出: ${completionTokens.toLocaleString()}\n点击打开 Token 消耗统计看板`}
                   >
                     <Zap size={12} className="text-amber-400/60 shrink-0" />
                     <span>{formatTokens(totalTokens)} tokens</span>
+                    {stepCacheHitRate > 0 && (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20">
+                        ⚡ {stepCacheHitRate.toFixed(1)}% 缓存
+                      </span>
+                    )}
+                    {isEstimated && (
+                      <span className="text-[10px] text-zinc-400 opacity-80" title="该步骤模型未返回用量，基于字符推断">
+                        (估算)
+                      </span>
+                    )}
                   </span>
                 )
               )

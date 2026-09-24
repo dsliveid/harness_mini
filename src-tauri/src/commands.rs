@@ -118,6 +118,7 @@ pub async fn test_provider(
         base_url: provider.base_url.clone(),
         api_key: key,
         model,
+        reasoning_effort: None,
     };
     llm::test_connection(&cfg).await
 }
@@ -487,6 +488,7 @@ pub fn create_session(
     image_model_id: Option<String>,
     vision_provider_id: Option<String>,
     vision_model_id: Option<String>,
+    reasoning_effort: Option<String>,
 ) -> Result<Session, String> {
     let access_mode = crate::models::normalize_access_mode(access_mode.as_deref().unwrap_or("confirm"));
     let title = title
@@ -521,6 +523,7 @@ pub fn create_session(
             image_model_id.as_deref(),
             vision_provider_id.as_deref(),
             vision_model_id.as_deref(),
+            reasoning_effort.as_deref(),
         )?;
         if let Some(lim) = context_token_limit {
             let _ = store::set_session_context_limit(&db, &s.id, Some(lim));
@@ -559,6 +562,7 @@ pub fn create_session(
         image_model_id.as_deref(),
         vision_provider_id.as_deref(),
         vision_model_id.as_deref(),
+        reasoning_effort.as_deref(),
     )?;
     if let Some(lim) = context_token_limit {
         let _ = store::set_session_context_limit(&db, &s.id, Some(lim));
@@ -597,6 +601,7 @@ pub fn send_message(
     image_model_id: Option<String>,
     vision_provider_id: Option<String>,
     vision_model_id: Option<String>,
+    reasoning_effort: Option<String>,
 ) -> Result<SendResult, String> {
     let text = text.trim().to_string();
     let has_attachments = attachments.as_ref().map(|a| !a.is_empty()).unwrap_or(false);
@@ -646,6 +651,7 @@ pub fn send_message(
                     image_model_id.as_deref(),
                     vision_provider_id.as_deref(),
                     vision_model_id.as_deref(),
+                    reasoning_effort.as_deref(),
                 )?;
                 if let Some(lim) = context_token_limit {
                     let _ = store::set_session_context_limit(&db, &s.id, Some(lim));
@@ -692,6 +698,7 @@ pub fn send_message(
                     image_model_id.as_deref(),
                     vision_provider_id.as_deref(),
                     vision_model_id.as_deref(),
+                    reasoning_effort.as_deref(),
                 )?;
                 if let Some(lim) = context_token_limit {
                     let _ = store::set_session_context_limit(&db, &s.id, Some(lim));
@@ -1224,6 +1231,32 @@ pub fn set_session_models(
 }
 
 #[tauri::command]
+pub fn set_session_reasoning_effort(
+    app: AppHandle,
+    state: State<'_, crate::AppState>,
+    session_id: String,
+    reasoning_effort: Option<String>,
+) -> Result<Session, String> {
+    let db = state.db.lock().unwrap();
+    let updated = store::set_session_reasoning_effort(
+        &db,
+        &session_id,
+        reasoning_effort.as_deref(),
+    )?;
+    drop(db);
+
+    let _ = app.emit("session:update", &updated);
+    let _ = app.emit("sessions:changed", json!({ "updated": session_id }));
+    if updated.session_type == "collaborator" {
+        let _ = app.emit("collaborator:updated", &updated);
+        if let Some(ref pid) = updated.parent_session_id {
+            let _ = app.emit("collaborators:changed", json!({ "parentId": pid }));
+        }
+    }
+    Ok(updated)
+}
+
+#[tauri::command]
 pub fn set_collaborator_auto_report(
     app: AppHandle,
     state: State<'_, crate::AppState>,
@@ -1306,6 +1339,7 @@ pub fn do_report_collaborator_increment(
         app.clone(),
         Some(parent_id.clone()),
         report_prompt,
+        None,
         None,
         None,
         None,

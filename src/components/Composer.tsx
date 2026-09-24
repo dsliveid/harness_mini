@@ -4,6 +4,7 @@ import { useStore } from "../store";
 import { Attachment, DRAFT_ID } from "../types";
 import { SafeImage } from "./SafeImage";
 import { toAssetUrl, isVisionModel, formatFileSize } from "../utils/image";
+import { ContextUsageGauge } from "./ContextUsageGauge";
 import {
   ArrowUp,
   Square,
@@ -347,6 +348,7 @@ export function Composer() {
             workspacePath: st.draft?.workspacePath || undefined,
             projectId: st.draft?.projectId || undefined,
             title: goalText.slice(0, 24),
+            reasoningEffort: st.draft?.reasoningEffort || undefined,
           });
           st.onSessionUpdate(s);
           await st.selectSession(s.id);
@@ -378,7 +380,8 @@ export function Composer() {
         isDraftLike ? draft?.imageProviderId ?? undefined : undefined,
         isDraftLike ? draft?.imageModelId ?? undefined : undefined,
         isDraftLike ? draft?.visionProviderId ?? undefined : undefined,
-        isDraftLike ? draft?.visionModelId ?? undefined : undefined
+        isDraftLike ? draft?.visionModelId ?? undefined : undefined,
+        isDraftLike ? draft?.reasoningEffort ?? undefined : undefined
       );
       const st2 = useStore.getState();
       if (res.session) st2.onSessionUpdate(res.session);
@@ -750,7 +753,10 @@ export function Composer() {
           </span>
         </div>
 
-        <div className="flex items-center gap-2.5 shrink-0">
+        <div className="flex items-center gap-2 shrink-0">
+          {/* 上下文长度消耗圆圈进度指示器 */}
+          <ContextUsageGauge session={session} />
+
           {session ? (
             <button
               type="button"
@@ -760,7 +766,7 @@ export function Composer() {
                   : "hover:bg-panel2 text-inkdim hover:text-ink border-transparent hover:border-edge/50"
               }`}
               onClick={() => setShowTokenStatsModal(true)}
-              title={`该会话累计消耗: ${(session.totalTokens ?? 0).toLocaleString()} tokens\n输入: ${(session.promptTokens ?? 0).toLocaleString()} · 输出: ${(session.completionTokens ?? 0).toLocaleString()}\n点击打开 Token 消耗统计看板`}
+              title={`该会话累计消耗: ${(session.totalTokens ?? 0).toLocaleString()} tokens\n输入: ${(session.promptTokens ?? 0).toLocaleString()}${(session.cachedTokens ?? 0) > 0 ? ` (缓存命中: ${(session.cachedTokens ?? 0).toLocaleString()} · ${(session.cacheHitRate ?? 0).toFixed(1)}%)` : ""} · 输出: ${(session.completionTokens ?? 0).toLocaleString()}\n点击打开 Token 消耗统计看板`}
             >
               <Coins
                 size={12}
@@ -774,6 +780,11 @@ export function Composer() {
                 {formatTokens(session.totalTokens ?? 0)}
               </span>
               <span className="text-[10px] text-inkdim">tokens</span>
+              {(session.cacheHitRate ?? 0) > 0 && (
+                <span className="px-1 py-0.2 rounded text-[9.5px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20">
+                  ⚡ {(session.cacheHitRate ?? 0).toFixed(1)}%
+                </span>
+              )}
             </button>
           ) : (
             <button

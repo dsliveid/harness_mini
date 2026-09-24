@@ -46,6 +46,7 @@ export const ipc = {
       imageModelId: input.imageModelId ?? null,
       visionProviderId: input.visionProviderId ?? null,
       visionModelId: input.visionModelId ?? null,
+      reasoningEffort: input.reasoningEffort ?? null,
     }),
   forkSessionAtMessage: (sessionId: string, messageId: string, newTitle?: string, includeTarget: boolean = true) =>
     invoke<Session>("fork_session_at_message", {
@@ -98,6 +99,7 @@ export const ipc = {
     imageModelId?: string | null,
     visionProviderId?: string | null,
     visionModelId?: string | null,
+    reasoningEffort?: string | null,
   ) =>
     invoke<{ sessionId: string; messageId: string; queued: boolean; session?: Session | null }>("send_message", {
       sessionId,
@@ -112,7 +114,10 @@ export const ipc = {
       imageModelId: imageModelId ?? null,
       visionProviderId: visionProviderId ?? null,
       visionModelId: visionModelId ?? null,
+      reasoningEffort: reasoningEffort ?? null,
     }),
+  setSessionReasoningEffort: (sessionId: string, reasoningEffort: string | null) =>
+    invoke<Session>("set_session_reasoning_effort", { sessionId, reasoningEffort: reasoningEffort ?? null }),
   listQueued: (sessionId: string) => invoke<Message[]>("list_queued", { sessionId }),
   guideMessage: (sessionId: string, messageId: string) =>
     invoke<void>("guide_message", { sessionId, messageId }),

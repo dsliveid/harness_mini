@@ -950,7 +950,7 @@ export function SettingsModal() {
                         className={inputCls}
                         type="number"
                         min={2000}
-                        max={2000000}
+                        max={10000000}
                         step={1000}
                         value={local.contextTokenLimit}
                         onChange={(e) => setLocal({ ...local, contextTokenLimit: Number(e.target.value) || 64000 })}

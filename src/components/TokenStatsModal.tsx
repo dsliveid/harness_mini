@@ -13,6 +13,7 @@ import {
   Sparkles,
   ChevronRight,
   ExternalLink,
+  Zap,
 } from "./Icons";
 
 function formatTokens(n?: number): string {
@@ -86,7 +87,7 @@ export function TokenStatsModal() {
                 <span>Token 消耗统计</span>
                 {loading && <span className="text-[11px] text-accent font-normal animate-pulse">刷新中…</span>}
               </div>
-              <div className="text-[11px] text-inkdim">按项目与时间全方位统计模型 Token 消耗指标</div>
+              <div className="text-[11px] text-inkdim">按项目与时间全方位统计模型 Token 消耗及缓存命中指标</div>
             </div>
           </div>
 
@@ -108,9 +109,9 @@ export function TokenStatsModal() {
           </div>
         </div>
 
-        {/* 顶部指标 KPI 卡片 (4 个关键汇总) */}
+        {/* 顶部指标 KPI 卡片 (5 个关键汇总) */}
         <div className="p-6 pb-4 border-b border-edge/40 bg-panel/30 shrink-0">
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
             {/* 总消耗 Token */}
             <div className="bg-panel border border-edge/70 rounded-xl p-3.5 shadow-sm">
               <div className="flex items-center justify-between text-inkdim text-[11px] mb-1">
@@ -120,8 +121,22 @@ export function TokenStatsModal() {
               <div className="text-xl font-bold text-ink tracking-tight">
                 {summary ? formatTokens(summary.totalTokens) : "0"}
               </div>
-              <div className="text-[11px] text-inkdim mt-1 truncate">
+              <div className="text-[11px] text-inkdim mt-1 truncate" title={`输入: ${summary?.totalPromptTokens?.toLocaleString() ?? 0} (缓存命中: ${summary?.totalCachedTokens?.toLocaleString() ?? 0}) · 输出: ${summary?.totalCompletionTokens?.toLocaleString() ?? 0}`}>
                 输入 {formatTokens(summary?.totalPromptTokens)} · 输出 {formatTokens(summary?.totalCompletionTokens)}
+              </div>
+            </div>
+
+            {/* 全局缓存命中率 */}
+            <div className="bg-panel border border-edge/70 rounded-xl p-3.5 shadow-sm">
+              <div className="flex items-center justify-between text-inkdim text-[11px] mb-1">
+                <span>全局缓存命中率</span>
+                <Zap size={13} className="text-cyan-400" />
+              </div>
+              <div className="text-xl font-bold text-cyan-400 tracking-tight">
+                {summary?.overallCacheHitRate != null ? `${summary.overallCacheHitRate.toFixed(1)}%` : "0.0%"}
+              </div>
+              <div className="text-[11px] text-inkdim mt-1 truncate" title={`累计命中: ${summary?.totalCachedTokens?.toLocaleString() ?? 0} tokens · 今日命中: ${summary?.todayCachedTokens?.toLocaleString() ?? 0} tokens`}>
+                命中 {formatTokens(summary?.totalCachedTokens)} · 今日 {summary?.todayCacheHitRate != null ? `${summary.todayCacheHitRate.toFixed(1)}%` : "0.0%"}
               </div>
             </div>
 
@@ -134,7 +149,7 @@ export function TokenStatsModal() {
               <div className="text-xl font-bold text-emerald-400 tracking-tight">
                 {summary ? formatTokens(summary.todayTokens) : "0"}
               </div>
-              <div className="text-[11px] text-inkdim mt-1 truncate">
+              <div className="text-[11px] text-inkdim mt-1 truncate" title={`今日输入: ${summary?.todayPromptTokens?.toLocaleString() ?? 0} (缓存命中: ${summary?.todayCachedTokens?.toLocaleString() ?? 0}) · 输出: ${summary?.todayCompletionTokens?.toLocaleString() ?? 0}`}>
                 输入 {formatTokens(summary?.todayPromptTokens)} · 输出 {formatTokens(summary?.todayCompletionTokens)}
               </div>
             </div>
@@ -154,7 +169,7 @@ export function TokenStatsModal() {
             </div>
 
             {/* 累计会话与对话 */}
-            <div className="bg-panel border border-edge/70 rounded-xl p-3.5 shadow-sm">
+            <div className="bg-panel border border-edge/70 rounded-xl p-3.5 shadow-sm col-span-2 sm:col-span-1">
               <div className="flex items-center justify-between text-inkdim text-[11px] mb-1">
                 <span>会话与轮次</span>
                 <MessageSquare size={13} className="text-purple-400" />
@@ -306,7 +321,7 @@ export function TokenStatsModal() {
                       </div>
 
                       {/* 指标矩阵 */}
-                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 border-t border-edge/30 text-[12px]">
+                      <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 pt-1 border-t border-edge/30 text-[12px]">
                         <div>
                           <span className="text-inkdim text-[11px]">总消耗: </span>
                           <span className="font-semibold text-ink font-mono">{item.totalTokens.toLocaleString()}</span>
@@ -316,13 +331,22 @@ export function TokenStatsModal() {
                           <span className="text-inkdim font-mono">{item.promptTokens.toLocaleString()}</span>
                         </div>
                         <div>
+                          <span className="text-inkdim text-[11px]">缓存命中: </span>
+                          <span className="text-cyan-400 font-mono font-medium">
+                            {(item.cachedTokens ?? 0).toLocaleString()}
+                          </span>
+                          <span className="text-[10px] text-cyan-400/80 ml-1">
+                            ({(item.cacheHitRate ?? 0).toFixed(1)}%)
+                          </span>
+                        </div>
+                        <div>
                           <span className="text-inkdim text-[11px]">输出 Token: </span>
                           <span className="text-inkdim font-mono">{item.completionTokens.toLocaleString()}</span>
                         </div>
                         <div className="text-right sm:text-left">
                           <span className="text-inkdim text-[11px]">涉及会话: </span>
                           <span className="text-ink font-medium">{item.sessionCount}</span>
-                          <span className="text-inkdim text-[11px]"> 个 · {item.messageCount} 轮对话</span>
+                          <span className="text-inkdim text-[11px]"> 个 · {item.messageCount} 轮</span>
                         </div>
                       </div>
                     </div>
@@ -349,7 +373,11 @@ export function TokenStatsModal() {
                       <div className="flex items-center gap-4 text-[11px] text-inkdim">
                         <span className="flex items-center gap-1.5">
                           <span className="w-2.5 h-2.5 rounded-sm bg-blue-500 inline-block" />
-                          <span>输入 Token</span>
+                          <span>非缓存输入</span>
+                        </span>
+                        <span className="flex items-center gap-1.5">
+                          <span className="w-2.5 h-2.5 rounded-sm bg-cyan-400 inline-block" />
+                          <span>缓存命中</span>
                         </span>
                         <span className="flex items-center gap-1.5">
                           <span className="w-2.5 h-2.5 rounded-sm bg-emerald-400 inline-block" />
@@ -385,13 +413,21 @@ export function TokenStatsModal() {
 
                           const heightRatio = d.totalTokens / maxDayTokens;
                           const barH = heightRatio * 85;
-                          const promptRatio = d.totalTokens > 0 ? d.promptTokens / d.totalTokens : 0;
-                          const promptH = barH * promptRatio;
-                          const compH = barH - promptH;
+
+                          const cachedTokens = d.cachedTokens ?? 0;
+                          const promptTokens = d.promptTokens;
+                          const uncachedPromptTokens = Math.max(0, promptTokens - cachedTokens);
+                          const compTokens = d.completionTokens;
+                          const total = d.totalTokens || 1;
+
+                          const compH = (compTokens / total) * barH;
+                          const cachedH = (cachedTokens / total) * barH;
+                          const uncachedH = Math.max(0, barH - compH - cachedH);
 
                           const yTotal = 90 - barH;
                           const yComp = yTotal;
-                          const yPrompt = yTotal + compH;
+                          const yCached = yComp + compH;
+                          const yUncached = yCached + cachedH;
 
                           const isHover = hoveredBar === i;
 
@@ -407,16 +443,27 @@ export function TokenStatsModal() {
                                 x={`${x}%`}
                                 y={`${yComp}%`}
                                 width={`${barWidthPct}%`}
-                                height={`${Math.max(compH, 1)}%`}
+                                height={`${Math.max(compH, compTokens > 0 ? 0.8 : 0)}%`}
                                 rx="2"
                                 className={`${isHover ? "fill-emerald-300" : "fill-emerald-400"} transition-colors`}
                               />
-                              {/* 输入 Token 柱 (底部蓝色) */}
+                              {/* 缓存命中 柱 (中间青色) */}
+                              {cachedTokens > 0 && (
+                                <rect
+                                  x={`${x}%`}
+                                  y={`${yCached}%`}
+                                  width={`${barWidthPct}%`}
+                                  height={`${Math.max(cachedH, 0.8)}%`}
+                                  rx="2"
+                                  className={`${isHover ? "fill-cyan-300" : "fill-cyan-400"} transition-colors`}
+                                />
+                              )}
+                              {/* 非缓存输入 柱 (底部蓝色) */}
                               <rect
                                 x={`${x}%`}
-                                y={`${yPrompt}%`}
+                                y={`${yUncached}%`}
                                 width={`${barWidthPct}%`}
-                                height={`${Math.max(promptH, 1)}%`}
+                                height={`${Math.max(uncachedH, uncachedPromptTokens > 0 ? 0.8 : 0)}%`}
                                 rx="2"
                                 className={`${isHover ? "fill-blue-400" : "fill-blue-500"} transition-colors`}
                               />
@@ -436,8 +483,12 @@ export function TokenStatsModal() {
                           <div className="font-semibold text-ink mb-1">{byTime[hoveredBar].date}</div>
                           <div className="text-emerald-400 font-mono">总计: {byTime[hoveredBar].totalTokens.toLocaleString()} tokens</div>
                           <div className="text-inkdim mt-0.5">
-                            输入: {byTime[hoveredBar].promptTokens.toLocaleString()} · 输出: {byTime[hoveredBar].completionTokens.toLocaleString()}
+                            输入: {byTime[hoveredBar].promptTokens.toLocaleString()}
+                            <span className="text-cyan-400 ml-1">
+                              (缓存命中: {(byTime[hoveredBar].cachedTokens ?? 0).toLocaleString()} · {(byTime[hoveredBar].cacheHitRate ?? 0).toFixed(1)}%)
+                            </span>
                           </div>
+                          <div className="text-inkdim mt-0.5">输出: {byTime[hoveredBar].completionTokens.toLocaleString()} tokens</div>
                           <div className="text-inkdim mt-0.5">对话轮次: {byTime[hoveredBar].messageCount} 次</div>
                         </div>
                       )}
@@ -463,6 +514,7 @@ export function TokenStatsModal() {
                             <th className="py-2 px-4 font-medium">日期</th>
                             <th className="py-2 px-4 font-medium">总消耗 (Tokens)</th>
                             <th className="py-2 px-4 font-medium">输入 (Prompt)</th>
+                            <th className="py-2 px-4 font-medium">缓存命中 (Rate)</th>
                             <th className="py-2 px-4 font-medium">输出 (Completion)</th>
                             <th className="py-2 px-4 font-medium">对话轮次</th>
                             <th className="py-2 px-4 font-medium text-right">占比</th>
@@ -476,6 +528,10 @@ export function TokenStatsModal() {
                                 <td className="py-2.5 px-4 font-mono text-ink font-medium">{d.date}</td>
                                 <td className="py-2.5 px-4 font-mono font-semibold text-accent">{d.totalTokens.toLocaleString()}</td>
                                 <td className="py-2.5 px-4 font-mono text-inkdim">{d.promptTokens.toLocaleString()}</td>
+                                <td className="py-2.5 px-4 font-mono">
+                                  <span className="text-cyan-400">{(d.cachedTokens ?? 0).toLocaleString()}</span>
+                                  <span className="text-inkdim text-[10px] ml-1">({(d.cacheHitRate ?? 0).toFixed(1)}%)</span>
+                                </td>
                                 <td className="py-2.5 px-4 font-mono text-inkdim">{d.completionTokens.toLocaleString()}</td>
                                 <td className="py-2.5 px-4 text-inkdim">{d.messageCount} 轮</td>
                                 <td className="py-2.5 px-4 text-right">
@@ -527,10 +583,23 @@ export function TokenStatsModal() {
                             {s.projectName}
                           </span>
                         )}
+                        {(s.cacheHitRate ?? 0) > 0 && (
+                          <span className="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20 truncate">
+                            ⚡ 缓存 {(s.cacheHitRate ?? 0).toFixed(1)}%
+                          </span>
+                        )}
                       </div>
-                      <div className="flex items-center gap-3 text-[11px] text-inkdim mt-0.5">
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-inkdim mt-0.5">
                         <span>输入 {s.promptTokens.toLocaleString()}</span>
                         <span>·</span>
+                        {(s.cachedTokens ?? 0) > 0 && (
+                          <>
+                            <span className="text-cyan-400 font-mono">
+                              缓存命中 {(s.cachedTokens ?? 0).toLocaleString()} ({(s.cacheHitRate ?? 0).toFixed(1)}%)
+                            </span>
+                            <span>·</span>
+                          </>
+                        )}
                         <span>输出 {s.completionTokens.toLocaleString()}</span>
                         <span>·</span>
                         <span>{s.messageCount} 轮对话</span>

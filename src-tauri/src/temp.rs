@@ -1094,6 +1094,7 @@ pub async fn merge_space(
         base_url: pc.base_url.clone(),
         api_key: pc.api_key.clone(),
         model: m.to_string(),
+        reasoning_effort: None,
     });
 
     let summary = apply_merge(&manifest, llm_cfg.as_ref()).await;
@@ -1400,6 +1401,7 @@ pub async fn merge_from_agent(
         base_url: pc.base_url.clone(),
         api_key: pc.api_key.clone(),
         model: m.to_string(),
+        reasoning_effort: None,
     });
 
     let summary = apply_merge(&manifest, llm_cfg.as_ref()).await;

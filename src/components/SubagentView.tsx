@@ -4,6 +4,7 @@ import { computeTurnMetrics } from "../types";
 import { ipc } from "../ipc";
 import { MessageItem } from "./MessageItem";
 import { ExecutionProcessBlock, groupTimelineItems } from "./ExecutionProcessBlock";
+import { ContextUsageGauge } from "./ContextUsageGauge";
 import { askConfirm } from "./PromptModal";
 import {
   X,
@@ -85,16 +86,19 @@ export function SubagentView({ subagentId }: { subagentId: string }) {
     let total = 0;
     let prompt = 0;
     let completion = 0;
+    let cached = 0;
 
     for (const msg of msgs) {
       const tt = msg.totalTokens ?? (msg.usage?.totalTokens || (msg.usage?.inputEst || 0) + (msg.usage?.outputEst || 0)) ?? 0;
       const pt = msg.promptTokens ?? (msg.usage?.promptTokens || msg.usage?.inputEst) ?? 0;
       const ct = msg.completionTokens ?? (msg.usage?.completionTokens || msg.usage?.outputEst) ?? 0;
+      const ckt = msg.cachedTokens ?? (msg.usage?.cachedTokens || msg.usage?.promptCacheHitTokens || msg.usage?.cacheReadInputTokens) ?? 0;
 
       if (tt > 0 || pt > 0 || ct > 0) {
         total += Number(tt) || 0;
         prompt += Number(pt) || 0;
         completion += Number(ct) || 0;
+        cached += Number(ckt) || 0;
       } else if (msg.role === "assistant" && isRunning && msg.id === msgs[msgs.length - 1]?.id) {
         // 正在流式生成中的最后一条消息：动态估算流式增量 Token，带来实时的计数反馈
         const streamedChars = (msg.content?.length || 0) + (msg.reasoning?.length || 0);
@@ -109,13 +113,17 @@ export function SubagentView({ subagentId }: { subagentId: string }) {
     const finalTotal = Math.max(total, Number(subagent?.totalTokens) || 0);
     const finalPrompt = Math.max(prompt, Number(subagent?.promptTokens) || 0);
     const finalCompletion = Math.max(completion, Number(subagent?.completionTokens) || 0);
+    const finalCached = Math.max(cached, Number(subagent?.cachedTokens) || 0);
+    const cacheHitRate = finalPrompt > 0 ? Math.round((finalCached / finalPrompt) * 1000) / 10 : 0;
 
     return {
       totalTokens: finalTotal,
       promptTokens: finalPrompt,
       completionTokens: finalCompletion,
+      cachedTokens: finalCached,
+      cacheHitRate,
     };
-  }, [msgs, isRunning, subagent?.totalTokens, subagent?.promptTokens, subagent?.completionTokens]);
+  }, [msgs, isRunning, subagent?.totalTokens, subagent?.promptTokens, subagent?.completionTokens, subagent?.cachedTokens]);
 
   const resize = () => {
     const ta = taRef.current;
@@ -433,7 +441,10 @@ export function SubagentView({ subagentId }: { subagentId: string }) {
             </span>
           </div>
 
-          <div className="flex items-center gap-2.5 shrink-0">
+          <div className="flex items-center gap-2 shrink-0">
+            {/* 上下文长度消耗圆圈进度指示器 */}
+            <ContextUsageGauge session={subagent} />
+
             <button
               type="button"
               className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-[11px] transition-all font-mono border cursor-pointer ${
@@ -444,7 +455,7 @@ export function SubagentView({ subagentId }: { subagentId: string }) {
               onClick={() => setShowTokenStatsModal(true)}
               title={
                 tokenStats.totalTokens > 0
-                  ? `该子 Agent 累计消耗: ${tokenStats.totalTokens.toLocaleString()} tokens\n输入: ${tokenStats.promptTokens.toLocaleString()} · 输出: ${tokenStats.completionTokens.toLocaleString()}\n点击打开 Token 消耗统计看板`
+                  ? `该子 Agent 累计消耗: ${tokenStats.totalTokens.toLocaleString()} tokens\n输入: ${tokenStats.promptTokens.toLocaleString()}${tokenStats.cachedTokens > 0 ? ` (缓存命中: ${tokenStats.cachedTokens.toLocaleString()} · ${tokenStats.cacheHitRate.toFixed(1)}%)` : ""} · 输出: ${tokenStats.completionTokens.toLocaleString()}\n点击打开 Token 消耗统计看板`
                   : "子 Agent 独立会话消耗 · 点击打开 Token 统计看板"
               }
             >
@@ -460,6 +471,11 @@ export function SubagentView({ subagentId }: { subagentId: string }) {
                 {formatTokens(tokenStats.totalTokens)}
               </span>
               <span className="text-[10px] text-inkdim">tokens</span>
+              {tokenStats.cacheHitRate > 0 && (
+                <span className="px-1 py-0.2 rounded text-[9.5px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20">
+                  ⚡ {tokenStats.cacheHitRate.toFixed(1)}%
+                </span>
+              )}
             </button>
 
             <span className="hidden sm:inline-block opacity-65">

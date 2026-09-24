@@ -2,7 +2,7 @@ import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ipc } from "../ipc";
 import { currentSession, useStore } from "../store";
-import { DRAFT_ID, formatTokens, modelKey, parseModelKey, resolveActiveModel, resolveModelContextLimit, samePath, type Project } from "../types";
+import { DRAFT_ID, formatTokens, modelKey, parseModelKey, resolveActiveModel, resolveModelContextLimit, samePath, type Project, type ReasoningEffort } from "../types";
 import { askConfirm } from "./PromptModal";
 import { ModelContextModal } from "./ModelContextModal";
 
@@ -22,6 +22,7 @@ import {
   Cpu,
   Sliders,
   GitBranch,
+  Brain,
 } from "./Icons";
 
 type OpenMenu = "ws" | "mode" | "model" | null;
@@ -45,6 +46,7 @@ export function TopBar() {
   const pushToast = useStore((s) => s.pushToast);
   const setDraftAccessMode = useStore((s) => s.setDraftAccessMode);
   const setDraftContextTokenLimit = useStore((s) => s.setDraftContextTokenLimit);
+  const setDraftReasoningEffort = useStore((s) => s.setDraftReasoningEffort);
   const openModelMatrixModal = useStore((s) => s.openModelMatrixModal);
 
   const [openMenu, setOpenMenu] = useState<OpenMenu>(null);
@@ -66,6 +68,11 @@ export function TopBar() {
   const modelDefaultLimit = active ? resolveModelContextLimit(settings, active.provider.id, active.model) : (settings.contextTokenLimit || 64_000);
   const effectiveLimit = sessionLimitOverride ?? modelDefaultLimit;
   const activeLimit = effectiveLimit;
+
+  // 思考程度三级解析：会话专属设置 -> 草稿设置 -> 全局偏好 -> 默认（不传参）
+  const currentEffort: ReasoningEffort = session
+    ? ((session.reasoningEffort || session.reasoning_effort || settings.reasoningEffort || "default") as ReasoningEffort)
+    : ((draft?.reasoningEffort || settings.reasoningEffort || "default") as ReasoningEffort);
 
   // 访问模式为会话级：已保存对话取自身取值，未保存草稿取草稿上的取值（新建时已从
   // “上一条对话”继承）。不再有“跟随全局”状态，全局值仅作为新建对话的默认值。
@@ -183,6 +190,24 @@ export function TopBar() {
     } else if (currentId === DRAFT_ID) {
       setDraftContextTokenLimit(newLimit);
     }
+  };
+
+  const handleSelectReasoningEffort = async (effort: ReasoningEffort) => {
+    const val = effort === "default" ? null : effort;
+    if (session) {
+      try {
+        await ipc.setSessionReasoningEffort(session.id, val);
+      } catch (err) {
+        pushToast(`更新思考程度失败: ${String(err)}`);
+      }
+    } else if (currentId === DRAFT_ID) {
+      setDraftReasoningEffort(val);
+    }
+    const nextSettings = { ...settings, reasoningEffort: val };
+    setSettingsLocal(nextSettings);
+    try {
+      await ipc.setSettings(nextSettings);
+    } catch {}
   };
 
   const handleParentJump = () => {
@@ -404,10 +429,10 @@ export function TopBar() {
           )}
         </div>
 
-        {/* 模型切换器（统一 h-8 高度，下拉收窄至 230px） */}
+        {/* 模型切换器（统一 h-8 高度，下拉适配 245px） */}
         <div className="relative shrink-0">
           <button
-            className={`flex items-center gap-1.5 h-8 bg-panel2/60 hover:bg-panel2 border border-edge/60 hover:border-accent/40 rounded-lg px-2.5 text-[12px] text-ink shrink-0 transition-all cursor-pointer max-w-[120px] sm:max-w-[160px] ${
+            className={`flex items-center gap-1.5 h-8 bg-panel2/60 hover:bg-panel2 border border-edge/60 hover:border-accent/40 rounded-lg px-2.5 text-[12px] text-ink shrink-0 transition-all cursor-pointer max-w-[130px] sm:max-w-[170px] ${
               openMenu === "model" ? "border-accent/50 bg-panel2 ring-1 ring-accent/20" : ""
             }`}
             onClick={() => setOpenMenu(openMenu === "model" ? null : "model")}
@@ -415,12 +440,20 @@ export function TopBar() {
               active
                 ? `${active.provider.name} / ${active.model}\n有效上下文上限: ${effectiveLimit.toLocaleString()} tokens (~${formatTokens(effectiveLimit)})${
                     isSessionOverridden ? " (★ 仅当前对话生效)" : " (跟随模型默认)"
-                  }`
+                  }\n有效思考程度: ${currentEffort === "default" ? "厂商默认 (不传)" : currentEffort.toUpperCase()}`
                 : "未配置模型"
             }
           >
             <Sparkles size={13} className="text-accent shrink-0" />
             <span className="truncate min-w-0 flex-1 text-left">{active?.model ?? "选择模型"}</span>
+            {currentEffort !== "default" && (
+              <span
+                className="px-1 py-0.2 rounded text-[9.5px] bg-purple-500/15 text-purple-400 font-medium border border-purple-500/30 shrink-0"
+                title={`当前思考程度: ${currentEffort.toUpperCase()}`}
+              >
+                {currentEffort === "low" ? "低" : currentEffort === "medium" ? "中" : "高"}
+              </span>
+            )}
             {isSessionOverridden && (
               <span
                 className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0"
@@ -433,7 +466,7 @@ export function TopBar() {
           {openMenu === "model" && (
             <>
               <div className="fixed inset-0 z-40" onMouseDown={() => setOpenMenu(null)} />
-              <div className="absolute right-0 top-10 z-50 w-[230px] bg-panel2 border border-edge/80 rounded-xl shadow-2xl p-1.5 max-h-[65vh] overflow-y-auto animate-in fade-in zoom-in-95 duration-100">
+              <div className="absolute right-0 top-10 z-50 w-[245px] bg-panel2 border border-edge/80 rounded-xl shadow-2xl p-1.5 max-h-[65vh] overflow-y-auto animate-in fade-in zoom-in-95 duration-100">
                 <div className="p-0.5 mb-1 border-b border-edge/50 flex items-center gap-1">
                   <button
                     className="flex-1 flex items-center justify-between px-2 py-1 rounded-md bg-accent/10 hover:bg-accent/20 border border-accent/25 text-accent text-[11px] font-medium transition-colors cursor-pointer"
@@ -451,7 +484,7 @@ export function TopBar() {
                   </button>
                   {active && (
                     <button
-                      className={`px-1.5 py-1 rounded-md border text-[10.5px] font-mono transition-colors cursor-pointer shrink-0 ${
+                      className={`px-1.5 py-1 rounded-md border text-[10.5px] font-mono transition-colors cursor-pointer shrink-0 flex items-center gap-1 ${
                         isSessionOverridden
                           ? "text-amber-400 bg-amber-500/15 border-amber-500/35 hover:bg-amber-500/25 font-semibold"
                           : "text-inkdim hover:text-ink bg-panel3 hover:bg-panel border-edge"
@@ -464,9 +497,50 @@ export function TopBar() {
                         setOpenSessionContextModal(true);
                       }}
                     >
-                      <span>{formatTokens(effectiveLimit)}</span>
+                      <Sliders size={10} className="opacity-70" />
+                      <span>上下文: {formatTokens(effectiveLimit)}</span>
                     </button>
                   )}
+                </div>
+
+                {/* 思考程度选择栏 */}
+                <div className="px-1 py-1 mb-1 border-b border-edge/50">
+                  <div className="flex items-center justify-between text-[10px] text-inkdim mb-1">
+                    <span className="flex items-center gap-1 font-medium">
+                      <Brain size={11} className="text-purple-400" />
+                      <span>思考程度</span>
+                    </span>
+                    <span className="text-[9px] text-inkdim/70">
+                      {currentEffort === "default" ? "厂商默认 (不传)" : currentEffort.toUpperCase()}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-4 gap-1 p-0.5 bg-panel3/70 rounded-md border border-edge/40">
+                    {(
+                      [
+                        { key: "default", label: "默认", tip: "使用模型厂商默认设置（不传 reasoning_effort，避免非思考模型报错）" },
+                        { key: "low", label: "低", tip: "轻度思考（low）：快速响应，轻微推理" },
+                        { key: "medium", label: "中", tip: "中度思考（medium）：平衡速度与深度" },
+                        { key: "high", label: "高", tip: "深度思考（high）：最强推理与充分思考" },
+                      ] as const
+                    ).map((item) => {
+                      const activeEffort = currentEffort === item.key;
+                      return (
+                        <button
+                          key={item.key}
+                          type="button"
+                          onClick={() => void handleSelectReasoningEffort(item.key)}
+                          title={item.tip}
+                          className={`px-1 py-0.5 text-[10.5px] rounded transition-all text-center cursor-pointer ${
+                            activeEffort
+                              ? "bg-purple-500/20 text-purple-300 font-semibold border border-purple-500/40 shadow-xs"
+                              : "text-inkdim hover:text-ink hover:bg-panel2/80 border border-transparent"
+                          }`}
+                        >
+                          {item.label}
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
                 <div className="px-2 py-0.5 text-[10.5px] font-medium text-inkdim flex items-center justify-between">
                   <span>选择对话模型</span>

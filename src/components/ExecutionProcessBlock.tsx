@@ -262,6 +262,26 @@ export function ExecutionProcessBlock({
     }, 0);
   }, [turnMetrics?.turnTokens, steps]);
 
+  const { promptTokens, completionTokens, cachedTokens, isEstimated } = useMemo(() => {
+    let p = 0;
+    let c = 0;
+    let ck = 0;
+    let est = false;
+    for (const s of steps) {
+      const pt = s.promptTokens ?? (s.usage?.promptTokens || s.usage?.inputEst) ?? 0;
+      const ct = s.completionTokens ?? (s.usage?.completionTokens || s.usage?.outputEst) ?? 0;
+      const ckt = s.cachedTokens ?? (s.usage?.cachedTokens || s.usage?.promptCacheHitTokens || s.usage?.cacheReadInputTokens) ?? 0;
+      const isEst = s.isEstimated ?? (s.usage?.isEstimated || (s.usage?.inputEst != null && s.usage?.promptTokens == null)) ?? false;
+      p += Number(pt) || 0;
+      c += Number(ct) || 0;
+      ck += Number(ckt) || 0;
+      if (isEst) est = true;
+    }
+    return { promptTokens: p, completionTokens: c, cachedTokens: ck, isEstimated: est };
+  }, [steps]);
+
+  const cacheHitRate = promptTokens > 0 ? Math.round((cachedTokens / promptTokens) * 1000) / 10 : 0;
+
   const durationStr =
     durationMs != null ? `${(durationMs / 1000).toFixed(1)}s` : null;
   const tokensStr = tokens > 0 ? `${tokens.toLocaleString()} tokens` : null;
@@ -315,9 +335,17 @@ export function ExecutionProcessBlock({
             </span>
           )}
           {tokensStr && (
-            <span className="hidden md:inline-flex items-center gap-1 font-mono">
+            <span
+              className="hidden md:inline-flex items-center gap-1 font-mono"
+              title={`执行过程总消耗: ${tokens.toLocaleString()} tokens ${isEstimated ? "(基于字符估算)" : "(模型实际返回)"}\n输入: ${promptTokens.toLocaleString()}${cachedTokens > 0 ? ` (缓存命中: ${cachedTokens.toLocaleString()} · ${cacheHitRate.toFixed(1)}%)` : ""} · 输出: ${completionTokens.toLocaleString()}`}
+            >
               <Coins size={11} className="text-inkdim/60" />
-              {tokensStr}
+              <span>{tokensStr}</span>
+              {cacheHitRate > 0 && (
+                <span className="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20">
+                  ⚡ {cacheHitRate.toFixed(1)}% 缓存
+                </span>
+              )}
             </span>
           )}
           <span className="text-accent group-hover:underline ml-1 font-medium text-[12px]">

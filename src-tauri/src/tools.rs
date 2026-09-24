@@ -2940,6 +2940,7 @@ async fn generate_image_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
         base_url: provider.base_url.clone(),
         api_key: provider.api_key.clone(),
         model: model_name.clone(),
+        reasoning_effort: None,
     };
 
     let img_bytes = crate::llm::generate_image_api(&cfg, prompt, size).await?;

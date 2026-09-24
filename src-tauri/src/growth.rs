@@ -51,6 +51,7 @@ pub fn trigger_reflection_on_denial(
             base_url: pc.base_url.clone(),
             api_key: pc.api_key.clone(),
             model: model.to_string(),
+            reasoning_effort: None,
         };
 
         let _ = app.emit(
@@ -177,6 +178,7 @@ pub fn trigger_manual_reflection(
             base_url: pc.base_url.clone(),
             api_key: pc.api_key.clone(),
             model: model.to_string(),
+            reasoning_effort: None,
         };
 
         let _ = app.emit(
