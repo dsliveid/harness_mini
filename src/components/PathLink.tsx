@@ -168,7 +168,7 @@ export const PathLink: React.FC<PathLinkProps> = ({
       ipc
         .openDir(finalAbsPath, effectiveWorkspace)
         .then(() => {
-          pushToast(`📂 已打开目录: ${parsed.fileName || parsed.cleanPath}`);
+          pushToast(`已打开目录: ${parsed.fileName || parsed.cleanPath}`, "info");
         })
         .catch((err) => {
           pushToast(`打开目录失败: ${err}`, "error");

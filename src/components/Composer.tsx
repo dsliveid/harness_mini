@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ipc } from "../ipc";
 import { useStore } from "../store";
 import { Attachment, DRAFT_ID } from "../types";
@@ -18,6 +18,7 @@ import {
   Settings as SettingsIcon,
   Pencil,
   Target,
+  Zap,
 } from "./Icons";
 
 function formatTokens(n?: number | null): string {
@@ -51,6 +52,8 @@ export function Composer() {
   const [visionWarningOpen, setVisionWarningOpen] = useState(false);
   const [slashIndex, setSlashIndex] = useState(0);
   const [isGoalTagActive, setIsGoalTagActive] = useState(false);
+  const [cursorPos, setCursorPos] = useState<number | null>(null);
+  const [dismissedQuery, setDismissedQuery] = useState<string | null>(null);
 
   const SLASH_COMMANDS = [
     {
@@ -131,17 +134,49 @@ export function Composer() {
   const canSend = !readOnly && !tempBlocked && !uploading && (!editingMessage || !running);
   const hasContent = !!text.trim() || hasAttachments;
 
-  const isGoalCommand = isGoalTagActive || text.trim().startsWith("/goal") || text.trim().startsWith("/task");
+  const isGoalCommand =
+    isGoalTagActive || /(?:^|[^\w\/:])\/(goal|task)($|\s+)/i.test(text.trim());
+
+  const slashCtx = useMemo(() => {
+    if (isGoalTagActive) return null;
+    const pos = cursorPos ?? (taRef.current ? taRef.current.selectionStart : text.length);
+    const safePos = Math.max(0, Math.min(pos, text.length));
+    const before = text.slice(0, safePos);
+    const m = before.match(/(?:^|[^\w\/:])\/([a-zA-Z0-9_-]*)$/);
+    if (!m) return null;
+    const queryBefore = m[1];
+    const slashStartIndex = before.length - queryBefore.length - 1;
+    const after = text.slice(safePos);
+    const afterMatch = after.match(/^[a-zA-Z0-9_-]*/);
+    const queryAfter = afterMatch ? afterMatch[0] : "";
+    const fullQuery = (queryBefore + queryAfter).toLowerCase();
+    const slashEndIndex = safePos + queryAfter.length;
+    return {
+      startIndex: slashStartIndex,
+      endIndex: slashEndIndex,
+      query: fullQuery,
+    };
+  }, [isGoalTagActive, text, cursorPos]);
+
+  const filteredCommands = useMemo(() => {
+    if (!slashCtx) return [];
+    return SLASH_COMMANDS.filter((c) =>
+      c.cmd.toLowerCase().startsWith(`/${slashCtx.query}`)
+    );
+  }, [slashCtx]);
+
+  useEffect(() => {
+    if (dismissedQuery !== null && slashCtx?.query !== dismissedQuery) {
+      setDismissedQuery(null);
+    }
+    setSlashIndex(0);
+  }, [slashCtx?.query]);
 
   const showSlashMenu =
     !isGoalTagActive &&
-    text.startsWith("/") &&
-    !text.includes(" ") &&
-    SLASH_COMMANDS.some((c) => c.cmd.toLowerCase().startsWith(text.toLowerCase()));
-
-  const filteredCommands = SLASH_COMMANDS.filter((c) =>
-    c.cmd.toLowerCase().startsWith(text.toLowerCase())
-  );
+    !!slashCtx &&
+    (dismissedQuery === null || slashCtx.query !== dismissedQuery) &&
+    filteredCommands.length > 0;
 
   const placeholder = editingMessage
     ? "正在编辑最后一条消息，Enter 重新发送，Esc 取消编辑…"
@@ -317,12 +352,17 @@ export function Composer() {
 
     const trimmed = t.trim();
 
-    // 检查是否触发长任务标签模式或者带 /goal /task 前缀的指令
-    const isGoalSlash = isGoalTagActive || /^\/(goal|task)($|\s+)/i.test(trimmed);
+    // 检查是否触发长任务标签模式或者带 /goal /task 的指令（原生融入当前会话）
+    const goalRegex = /(?:^|[^\w\/:])\/(goal|task)($|\s+)/i;
+    const isGoalSlash = isGoalTagActive || goalRegex.test(trimmed);
+    let messageToSend = t;
     if (isGoalSlash) {
       const goalText = isGoalTagActive
         ? trimmed
-        : trimmed.replace(/^\/(goal|task)\s*/i, "").trim();
+        : trimmed.replace(goalRegex, (match) => {
+            const prefix = match.replace(/\/(goal|task)($|\s+)/i, "");
+            return prefix ? prefix.trimEnd() + " " : "";
+          }).trim();
 
       if (!goalText) {
         setIsGoalTagActive(true);
@@ -336,29 +376,9 @@ export function Composer() {
         return;
       }
 
-      setSessionDraft(targetId, "");
-      setPendingAttachments([]);
       setIsGoalTagActive(false);
-      requestAnimationFrame(resize);
-      try {
-        const st = useStore.getState();
-        let sid = currentId && currentId !== DRAFT_ID ? currentId : null;
-        if (!sid) {
-          const s = await ipc.createSession({
-            workspacePath: st.draft?.workspacePath || undefined,
-            projectId: st.draft?.projectId || undefined,
-            title: goalText.slice(0, 24),
-            reasoningEffort: st.draft?.reasoningEffort || undefined,
-          });
-          st.onSessionUpdate(s);
-          await st.selectSession(s.id);
-          sid = s.id;
-        }
-        await st.startLongTask(sid, goalText);
-      } catch (e: any) {
-        pushToast(String(e));
-      }
-      return;
+      // 原生融合当前会话，大模型基于内置方案工具直接流式推进
+      messageToSend = `【长任务目标模式】${goalText}\n\n请分析并拆解该长任务目标，制定明确的阶段方案（优先调用 create_plan / todo 规划），并立即按步骤推进落实。`;
     }
 
     setSessionDraft(targetId, "");
@@ -370,7 +390,7 @@ export function Composer() {
       const draft = st.draft;
       const res = await ipc.sendMessage(
         isDraftLike ? null : currentId,
-        t,
+        messageToSend,
         isDraftLike ? draft?.workspacePath ?? undefined : undefined,
         isDraftLike ? draft?.projectId ?? st.currentProjectId ?? undefined : undefined,
         isDraftLike ? draft?.temp ?? undefined : undefined,
@@ -399,23 +419,44 @@ export function Composer() {
   };
 
   const applySlashCommand = (cmd: string) => {
+    let remaining = "";
+    if (slashCtx) {
+      const beforeSlash = text.slice(0, slashCtx.startIndex);
+      const afterCommand = text.slice(slashCtx.endIndex);
+      remaining = (beforeSlash.trimEnd() + " " + afterCommand.trimStart()).trim();
+    } else {
+      const goalRegex = /(?:^|[^\w\/:])\/(goal|task)($|\s+)/i;
+      remaining = text.replace(goalRegex, (match) => {
+        const prefix = match.replace(/\/(goal|task)($|\s+)/i, "");
+        return prefix ? prefix.trimEnd() + " " : "";
+      }).trim();
+    }
+
     if (cmd === "/goal" || cmd === "/task") {
       setIsGoalTagActive(true);
-      setSessionDraft(activeId, "");
+      setSessionDraft(activeId, remaining);
       requestAnimationFrame(() => {
         if (taRef.current) {
           taRef.current.focus();
+          const len = remaining.length;
+          taRef.current.setSelectionRange(len, len);
+          setCursorPos(len);
           resize();
         }
       });
       return;
     }
-    setSessionDraft(activeId, `${cmd} `);
+
+    const newText = slashCtx
+      ? text.slice(0, slashCtx.startIndex) + `${cmd} ` + text.slice(slashCtx.endIndex)
+      : `${cmd} `;
+    setSessionDraft(activeId, newText);
     requestAnimationFrame(() => {
       if (taRef.current) {
         taRef.current.focus();
-        const pos = cmd.length + 1;
+        const pos = slashCtx ? slashCtx.startIndex + cmd.length + 1 : newText.length;
         taRef.current.setSelectionRange(pos, pos);
+        setCursorPos(pos);
         resize();
       }
     });
@@ -435,7 +476,13 @@ export function Composer() {
       }
       if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !e.altKey)) {
         e.preventDefault();
-        applySlashCommand(filteredCommands[slashIndex]?.cmd || "/goal");
+        const safeIdx = Math.min(slashIndex, filteredCommands.length - 1);
+        applySlashCommand(filteredCommands[safeIdx]?.cmd || "/goal");
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setDismissedQuery(slashCtx?.query ?? "");
         return;
       }
     }
@@ -489,8 +536,8 @@ export function Composer() {
         <div className="mb-2 px-3 py-1.5 rounded-xl bg-accent/10 border border-accent/30 flex items-center justify-between text-xs animate-in fade-in slide-in-from-bottom-1 duration-150 shadow-xs">
           <div className="flex items-center gap-2 text-accent font-medium">
             <Pencil size={13} className="shrink-0 animate-pulse" />
-            <span>正在编辑最后一条消息</span>
-            <span className="text-[11px] text-inkdim hidden sm:inline">（其后的消息将被作废并重新运行）</span>
+            <span>正在编辑提问（撤回本轮对话中）</span>
+            <span className="text-[11px] text-inkdim hidden sm:inline">（重新发送将自动回退本轮产生的所有代码改动；如需恢复可点击气泡上的「↻ 重新应用本轮对话」）</span>
           </div>
           <button
             type="button"
@@ -586,6 +633,10 @@ export function Composer() {
                 return (
                   <div
                     key={item.cmd}
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      applySlashCommand(item.cmd);
+                    }}
                     onClick={() => applySlashCommand(item.cmd)}
                     onMouseEnter={() => setSlashIndex(idx)}
                     className={`px-2.5 py-1.5 rounded-lg flex items-center justify-between gap-3 text-[12px] cursor-pointer transition-colors ${
@@ -651,13 +702,31 @@ export function Composer() {
             placeholder={placeholder}
             disabled={!canSend}
             onPaste={handlePaste}
+            onClick={(e) => setCursorPos(e.currentTarget.selectionStart)}
+            onKeyUp={(e) => setCursorPos(e.currentTarget.selectionStart)}
+            onSelect={(e) => setCursorPos(e.currentTarget.selectionStart)}
             onChange={(e) => {
               const val = e.target.value;
+              const pos = e.target.selectionStart;
+              setCursorPos(pos);
+
               // 用户键入或粘贴 /goal 或 /task 加空格时，自动转为长任务标签
-              if (!isGoalTagActive && /^\/(goal|task)\s+/i.test(val)) {
-                const remaining = val.replace(/^\/(goal|task)\s+/i, "");
+              const goalWithSpaceRegex = /(?:^|[^\w\/:])\/(goal|task)\s+/i;
+              if (!isGoalTagActive && goalWithSpaceRegex.test(val)) {
+                const remaining = val.replace(goalWithSpaceRegex, (match) => {
+                  const prefix = match.replace(/\/(goal|task)\s+/i, "");
+                  return prefix ? prefix.trimEnd() + " " : "";
+                }).trim();
                 setIsGoalTagActive(true);
                 setSessionDraft(activeId, remaining);
+                requestAnimationFrame(() => {
+                  if (taRef.current) {
+                    const len = remaining.length;
+                    taRef.current.setSelectionRange(len, len);
+                    setCursorPos(len);
+                    resize();
+                  }
+                });
                 return;
               }
               setSessionDraft(activeId, val);
@@ -781,8 +850,9 @@ export function Composer() {
               </span>
               <span className="text-[10px] text-inkdim">tokens</span>
               {(session.cacheHitRate ?? 0) > 0 && (
-                <span className="px-1 py-0.2 rounded text-[9.5px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20">
-                  ⚡ {(session.cacheHitRate ?? 0).toFixed(1)}%
+                <span className="px-1 py-0.2 rounded text-[9.5px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20 inline-flex items-center gap-0.5">
+                  <Zap size={9} className="shrink-0" />
+                  <span>{(session.cacheHitRate ?? 0).toFixed(1)}%</span>
                 </span>
               )}
             </button>

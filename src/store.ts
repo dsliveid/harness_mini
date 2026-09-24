@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "./ipc";
-import { DRAFT_ID, samePath, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem } from "./types";
+import { DRAFT_ID, samePath, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem, type FocusFloatingTarget } from "./types";
 
 
 export interface EditingMessageTarget {
@@ -207,6 +207,9 @@ interface Store {
   view: "list" | "project";
   lightboxImage: { src: string; alt?: string; title?: string } | null;
   setLightboxImage: (img: { src: string; alt?: string; title?: string } | null) => void;
+  /** 外部（如对话卡片）请求聚焦右侧浮窗的特定任务或方案标识 */
+  focusFloatingTaskId: string | FocusFloatingTarget | null;
+  setFocusFloatingTaskId: (target: string | FocusFloatingTarget | null) => void;
 
   bootstrap: () => Promise<void>;
   /** 拉取全局运行中的会话，恢复各会话的“运行中”状态显示（启动/界面刷新后调用） */
@@ -277,6 +280,7 @@ interface Store {
   onMessageDelta: (p: any) => void;
   onMessageReasoningDelta: (p: any) => void;
   onMessageFinal: (m: Message) => void;
+  onMessageUpdate: (m: Message) => void;
   onToolUpdate: (p: any) => void;
   onToolOutput: (p: any) => void;
   onApprovalRequest: (r: ApprovalReq) => void;
@@ -319,6 +323,8 @@ interface Store {
   /** 当前正在编辑重发的消息目标 */
   editingMessage: EditingMessageTarget | null;
   setEditingMessage: (target: EditingMessageTarget | null) => void;
+  turnRevertAndEdit: (messageId: string, force?: boolean) => Promise<void>;
+  turnReapply: (messageId: string, force?: boolean) => Promise<void>;
   /** 能力模型分配矩阵弹窗 */
   showModelMatrixModal: boolean;
   modelMatrixSessionId: string | null;
@@ -475,6 +481,7 @@ export const useStore = create<Store>((set, get) => ({
     activeModel: null,
     globalAccessMode: "confirm",
     maxSteps: 30,
+    taskSubtaskMaxSteps: 30,
     commandTimeoutSecs: 120,
     contextTokenLimit: 64000,
     lastWorkspacePath: null,
@@ -535,6 +542,8 @@ export const useStore = create<Store>((set, get) => ({
   view: "project",
   lightboxImage: null,
   setLightboxImage: (img) => set({ lightboxImage: img }),
+  focusFloatingTaskId: null,
+  setFocusFloatingTaskId: (target) => set({ focusFloatingTaskId: target }),
 
   activeTasks: {},
   taskCheckpoints: {},
@@ -902,6 +911,8 @@ export const useStore = create<Store>((set, get) => ({
       readOnly: false,
       editingMessage: null,
       messages: { ...get().messages, [DRAFT_ID]: [] },
+      sessionTodos: { ...get().sessionTodos, [DRAFT_ID]: [] },
+      focusFloatingTaskId: null,
       activeCollaboratorId: null,
       activeSubprocessId: null,
       activeSubagentId: null,
@@ -932,6 +943,8 @@ export const useStore = create<Store>((set, get) => ({
         readOnly: false,
         editingMessage: null,
         messages: { ...get().messages, [DRAFT_ID]: [] },
+        sessionTodos: { ...get().sessionTodos, [DRAFT_ID]: [] },
+        focusFloatingTaskId: null,
         activeCollaboratorId: null,
         activeSubprocessId: null,
         activeSubagentId: null,
@@ -990,6 +1003,7 @@ export const useStore = create<Store>((set, get) => ({
         currentId: id,
         readOnly,
         editingMessage: null,
+        focusFloatingTaskId: null,
         messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], msgs) },
         hasMore: { ...st.hasMore, [id]: msgs.length >= 200 },
         lastRunOutcome: initialOutcome ? { ...st.lastRunOutcome, [id]: initialOutcome } : st.lastRunOutcome,
@@ -1006,8 +1020,12 @@ export const useStore = create<Store>((set, get) => ({
       ipc.getSessionTodos(id).then((val) => {
         if (val && Array.isArray(val.todos)) {
           set((st) => ({ sessionTodos: { ...st.sessionTodos, [id]: val.todos } }));
+        } else {
+          set((st) => ({ sessionTodos: { ...st.sessionTodos, [id]: [] } }));
         }
-      }).catch(() => {});
+      }).catch(() => {
+        set((st) => ({ sessionTodos: { ...st.sessionTodos, [id]: [] } }));
+      });
       // 拉取会话历史压缩记录
       void get().refreshSessionCompactions(id);
       // 拉取该会话待审阅的成长提案
@@ -1056,7 +1074,7 @@ export const useStore = create<Store>((set, get) => ({
       const newSession = await ipc.forkSessionAtMessage(sessionId, messageId, customTitle, includeTarget);
       await get().refreshSessions();
       await get().selectSession(newSession.id);
-      get().pushToast(`🌿 已创建分支「${newSession.title}」`, "success");
+      get().pushToast(`已创建分支「${newSession.title}」`, "success");
       return newSession;
     } catch (e) {
       get().pushToast(`创建分支失败: ${e}`, "error");
@@ -1070,7 +1088,7 @@ export const useStore = create<Store>((set, get) => ({
       await get().refreshSessions();
       await get().selectSession(newSession.id);
       get().setSessionDraft(newSession.id, message.content ?? "");
-      get().pushToast(`🌿 已创建分支，提问内容已预填入输入框`, "success");
+      get().pushToast(`已创建分支，提问内容已预填入输入框`, "success");
       return newSession;
     } catch (e) {
       get().pushToast(`创建分支失败: ${e}`, "error");
@@ -1293,6 +1311,10 @@ export const useStore = create<Store>((set, get) => ({
 
   onRunRetry(p) {
     get().pushToast(`网络波动，正在进行第 ${p.attempt}/${p.maxRetries} 次自动重试...`, "warning");
+  },
+
+  onMessageUpdate(m) {
+    get().onMessageFinal(m);
   },
 
   onMessageFinal(m) {
@@ -1898,9 +1920,9 @@ export const useStore = create<Store>((set, get) => ({
       },
     }));
     if (p.status === "passed") {
-      get().pushToast(`🛡️ 交付前 SOP 自检通过 (${p.command})`);
+      get().pushToast(`交付前 SOP 自检通过 (${p.command})`, "success");
     } else if (p.status === "failed") {
-      get().pushToast(`🛡️ 交付前 SOP 自检未通过 (${p.command})，Agent 正在自愈修复...`);
+      get().pushToast(`交付前 SOP 自检未通过 (${p.command})，Agent 正在自愈修复...`, "warning");
     }
   },
 
@@ -1933,11 +1955,11 @@ export const useStore = create<Store>((set, get) => ({
       },
     }));
     if (status === "retrying") {
-      get().pushToast(`🔄 工具 ${p.toolName} 执行受阻，Agent 正在自省排查并重试 (${attempt}/${maxRetries})...`);
+      get().pushToast(`工具 ${p.toolName} 执行受阻，Agent 正在自省排查并重试 (${attempt}/${maxRetries})...`, "warning");
     } else if (status === "success") {
-      get().pushToast(`✅ 工具 ${p.toolName} 自纠成功，已恢复执行`);
+      get().pushToast(`工具 ${p.toolName} 自纠成功，已恢复执行`, "success");
     } else if (status === "failed") {
-      get().pushToast(`❌ 工具 ${p.toolName} 自纠未果（已达重试上限）`);
+      get().pushToast(`工具 ${p.toolName} 自纠未果（已达重试上限）`, "error");
     }
   },
 
@@ -2016,6 +2038,94 @@ export const useStore = create<Store>((set, get) => ({
 
   setEditingMessage(target: EditingMessageTarget | null) {
     set({ editingMessage: target });
+  },
+
+  async turnRevertAndEdit(messageId: string, force?: boolean) {
+    const st = get();
+    try {
+      const res = await ipc.revertMessageTurn(messageId, force);
+      if (!res.success && res.hasConflict && !force) {
+        const proceed = window.confirm(`${res.message}\n\n是否强制覆盖撤回本轮对话与所有代码修改？`);
+        if (proceed) {
+          return await get().turnRevertAndEdit(messageId, true);
+        }
+        return;
+      }
+      if (!res.success) {
+        st.pushToast(res.message || "撤回失败", "error");
+        return;
+      }
+
+      const activeSessionId = st.currentId;
+      if (activeSessionId) {
+        const msgs = st.messages[activeSessionId] ?? [];
+        const targetIdx = msgs.findIndex((m) => m.id === messageId);
+        let userMsg: Message | undefined;
+
+        if (targetIdx >= 0) {
+          const targetMsg = msgs[targetIdx];
+          if (targetMsg.role === "user") {
+            userMsg = targetMsg;
+          } else {
+            if (targetMsg.runId) {
+              userMsg = msgs.find((m) => m.runId === targetMsg.runId && m.role === "user");
+            }
+            if (!userMsg) {
+              for (let i = targetIdx; i >= 0; i--) {
+                if (msgs[i].role === "user") {
+                  userMsg = msgs[i];
+                  break;
+                }
+              }
+            }
+          }
+        }
+
+        if (userMsg) {
+          st.setEditingMessage({
+            messageId: userMsg.id,
+            sessionId: activeSessionId,
+            text: userMsg.content || "",
+            attachments: userMsg.attachments || [],
+          });
+        }
+
+        await st.reloadMessages(activeSessionId);
+      }
+      st.pushToast("已撤回本轮对话并带入编辑框");
+    } catch (err: any) {
+      st.pushToast(String(err) || "撤回失败", "error");
+    }
+  },
+
+  async turnReapply(messageId: string, force?: boolean) {
+    const st = get();
+    try {
+      const res = await ipc.reapplyMessageTurn(messageId, force);
+      if (!res.success && res.hasConflict && !force) {
+        const proceed = window.confirm(`${res.message}\n\n是否强制覆盖重新应用本轮修改？`);
+        if (proceed) {
+          return await get().turnReapply(messageId, true);
+        }
+        return;
+      }
+      if (!res.success) {
+        st.pushToast(res.message || "重新应用失败", "error");
+        return;
+      }
+
+      if (st.editingMessage) {
+        st.setEditingMessage(null);
+      }
+
+      const activeSessionId = st.currentId;
+      if (activeSessionId) {
+        await st.reloadMessages(activeSessionId);
+      }
+      st.pushToast("已重新应用本轮对话");
+    } catch (err: any) {
+      st.pushToast(String(err) || "重新应用失败", "error");
+    }
   },
 
   openModelMatrixModal(sessionId) {

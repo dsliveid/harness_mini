@@ -6,7 +6,8 @@ import { Markdown } from "./Markdown";
 import { ToolCard } from "./ToolCard";
 import { SubprocessBranchTree } from "./SubprocessBranchTree";
 import { SafeImage } from "./SafeImage";
-import { Brain, ChevronRight, Pencil, Copy, Check, Clock, Zap, File, GitBranch, GitFork } from "./Icons";
+import { TurnDiffModal } from "./TurnDiffModal";
+import { Brain, ChevronRight, Pencil, Copy, Check, Clock, Zap, File, GitBranch, GitFork, RotateCcw, RotateCw, GitCompare } from "./Icons";
 import { toAssetUrl, formatFileSize } from "../utils/image";
 
 function formatDuration(ms?: number | null): string {
@@ -258,7 +259,7 @@ export function MessageItem({
                 className={`w-7 h-7 rounded-lg hover:bg-panel3 flex items-center justify-center text-inkdim hover:text-ink shrink-0 transition-opacity ${
                   isBeingEdited ? "opacity-100 text-accent bg-accent/10" : "opacity-0 group-hover:opacity-100"
                 }`}
-                title="编辑并重新发送（其后的消息将被作废）"
+                title="编辑并重新发送（将自动回退本次提问产生的所有代码修改，后续回复将被作废并重新运行）"
                 onClick={() => {
                   if (isBeingEdited) {
                     setEditingMessage(null);
@@ -279,8 +280,14 @@ export function MessageItem({
           <div
             className={`bg-panel2 border rounded-2xl px-4 py-2.5 shadow-sm text-ink max-w-full transition-all ${
               isBeingEdited ? "border-accent ring-2 ring-accent/30 shadow-md" : "border-edge"
-            }`}
+            } ${msg.revertedAt ? "opacity-60" : ""}`}
           >
+            {msg.revertedAt && (
+              <div className="flex items-center gap-1.5 text-[11px] text-amber-400 bg-amber-500/10 border border-amber-500/20 px-2 py-0.5 rounded-lg w-fit mb-1.5 select-none">
+                <RotateCcw size={12} />
+                <span>已撤回该轮对话</span>
+              </div>
+            )}
             {isBeingEdited && (
               <div className="flex items-center gap-1.5 text-[11.5px] font-medium text-accent mb-2 pb-1.5 border-b border-accent/20 select-none">
                 <Pencil size={12} className="animate-pulse shrink-0" />
@@ -382,8 +389,56 @@ export function MessageItem({
 
     const toolGroups = useMemo(() => groupToolEvents(events), [events]);
 
+    const [showDiffModal, setShowDiffModal] = useState(false);
+    const [revertingTurn, setRevertingTurn] = useState(false);
+
+    const effectiveToolEvents = msg.turnToolEvents ?? msg.toolEvents ?? [];
+    const modifiedFilesCount = useMemo(() => {
+      const filePaths = new Set<string>();
+      for (const ev of effectiveToolEvents) {
+        if (
+          (ev.toolName === "write_file" || ev.toolName === "edit_file") &&
+          (ev.status === "success" || msg.revertedAt)
+        ) {
+          const p = ev.params?.path ? String(ev.params.path) : "";
+          if (p) filePaths.add(p);
+        }
+      }
+      return filePaths.size;
+    }, [effectiveToolEvents, msg.revertedAt]);
+
+    const handleRevertTurn = async () => {
+      if (revertingTurn) return;
+      setRevertingTurn(true);
+      try {
+        await useStore.getState().turnRevertAndEdit(msg.id, false);
+      } finally {
+        setRevertingTurn(false);
+      }
+    };
+
+    const handleReapplyTurn = async () => {
+      if (revertingTurn) return;
+      setRevertingTurn(true);
+      try {
+        await useStore.getState().turnReapply(msg.id, false);
+      } finally {
+        setRevertingTurn(false);
+      }
+    };
+
     return (
-      <div className="flex flex-col gap-2">
+      <div
+        id={`msg-${msg.id}`}
+        data-message-id={msg.id}
+        className={`flex flex-col gap-2 transition-opacity ${msg.revertedAt ? "opacity-60" : ""}`}
+      >
+        {msg.revertedAt && (
+          <div className="flex items-center gap-1.5 text-[11px] text-amber-400 bg-amber-500/10 border border-amber-500/20 px-2.5 py-1 rounded-lg w-fit select-none">
+            <RotateCcw size={12} />
+            <span>已撤回本轮修改 (Soft Undo - 模型已自动忽略此轮上下文)</span>
+          </div>
+        )}
         {hasReasoning && <ReasoningBlock text={msg.reasoning!} streaming={!!streaming} />}
         {hasContent && (
           <div
@@ -443,6 +498,47 @@ export function MessageItem({
               </button>
             )}
 
+            {/* 影子快照与时光机：查看 Diff 与 撤回/重新应用本轮对话 */}
+            {(modifiedFilesCount > 0 || isTurnEnd) && !streaming && !isRunningTurn && (
+              <>
+                {modifiedFilesCount > 0 && (
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-panel2 hover:text-ink text-amber-400/90 shrink-0 transition-colors"
+                    onClick={() => setShowDiffModal(true)}
+                    title="查看本轮修改产生的文件变更统一 Diff"
+                  >
+                    <GitCompare size={12} />
+                    <span>{msg.revertedAt ? "查看曾修改的 Diff" : `本轮改动 (${modifiedFilesCount}个文件)`}</span>
+                  </button>
+                )}
+
+                {!msg.revertedAt ? (
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-panel2 hover:text-rose-400 text-inkdim shrink-0 transition-colors disabled:opacity-50"
+                    onClick={handleRevertTurn}
+                    disabled={revertingTurn}
+                    title="撤回本轮对话（包括提问与所有助手回复置灰，提问内容带入输入框，代码物理还原）"
+                  >
+                    <RotateCcw size={12} className={revertingTurn ? "animate-spin" : ""} />
+                    <span>{revertingTurn ? "撤回中..." : "撤回本轮对话"}</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-panel2 hover:text-emerald-400 text-emerald-400/90 shrink-0 transition-colors disabled:opacity-50"
+                    onClick={handleReapplyTurn}
+                    disabled={revertingTurn}
+                    title="重新应用本轮对话（代码重新写回，大模型重新认知该轮完整对话）"
+                  >
+                    <RotateCw size={12} className={revertingTurn ? "animate-spin" : ""} />
+                    <span>{revertingTurn ? "应用中..." : "重新应用本轮对话"}</span>
+                  </button>
+                )}
+              </>
+            )}
+
             {/* 耗时显示：区分整轮执行总耗时与单步耗时，正在执行中持续跳动 */}
             {isRunningTurn ? (
               <span
@@ -496,8 +592,9 @@ export function MessageItem({
                     <Zap size={12} className="text-amber-400/80 shrink-0" />
                     <span>{formatTokens(turnTokens)} tokens</span>
                     {turnCacheHitRate > 0 && (
-                      <span className="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20">
-                        ⚡ {turnCacheHitRate.toFixed(1)}% 缓存
+                      <span className="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20 inline-flex items-center gap-1">
+                        <Zap size={10} className="shrink-0" />
+                        <span>{turnCacheHitRate.toFixed(1)}% 缓存</span>
                       </span>
                     )}
                     {turnIsEstimated && (
@@ -522,8 +619,9 @@ export function MessageItem({
                     <Zap size={12} className="text-amber-400/60 shrink-0" />
                     <span>{formatTokens(totalTokens)} tokens</span>
                     {stepCacheHitRate > 0 && (
-                      <span className="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20">
-                        ⚡ {stepCacheHitRate.toFixed(1)}% 缓存
+                      <span className="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20 inline-flex items-center gap-1">
+                        <Zap size={10} className="shrink-0" />
+                        <span>{stepCacheHitRate.toFixed(1)}% 缓存</span>
                       </span>
                     )}
                     {isEstimated && (
@@ -536,6 +634,16 @@ export function MessageItem({
               )
             )}
           </div>
+        )}
+
+        {showDiffModal && (
+          <TurnDiffModal
+            messageId={msg.id}
+            isReverted={!!msg.revertedAt}
+            onClose={() => setShowDiffModal(false)}
+            onReverted={() => setShowDiffModal(false)}
+            onReapplied={() => setShowDiffModal(false)}
+          />
         )}
       </div>
     );

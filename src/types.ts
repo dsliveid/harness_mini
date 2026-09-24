@@ -1,3 +1,6 @@
+import type { LucideIcon } from "lucide-react";
+import { MessageSquare, Palette, Eye } from "lucide-react";
+
 export interface Provider {
   id: string;
   name: string; // 厂商名称
@@ -57,6 +60,38 @@ export interface ActivePlanDetail {
   steps: PlanStep[];
 }
 
+export type TaskType = "plan" | "todo";
+export type TaskStatus = "pending" | "in_progress" | "completed" | "suspended" | "done" | string;
+
+export interface TimelineTaskItem {
+  index: number;
+  content: string;
+  status: "pending" | "in_progress" | "done" | string;
+}
+
+export interface FocusFloatingTarget {
+  eventId?: string;
+  planId?: string;
+  filename?: string;
+  title?: string;
+}
+
+export interface TimelineTask {
+  id: string;
+  type: TaskType;
+  title: string;
+  version?: number;
+  filename?: string;
+  status: TaskStatus;
+  items: TimelineTaskItem[];
+  body?: string;
+  messageId?: string;
+  toolEventId?: string;
+  toolEventIds?: string[];
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 export interface ToolInfo {
   name: string;
   description: string;
@@ -73,6 +108,7 @@ export interface Settings {
   activeModel?: string | null; // 兼容后端 activeModel 字段
   globalAccessMode: "confirm" | "full_access";
   maxSteps: number;
+  taskSubtaskMaxSteps?: number;
   commandTimeoutSecs: number;
   contextTokenLimit: number;
   modelContextLimits?: Record<string, number>;
@@ -431,6 +467,7 @@ export interface ToolEvent {
   approvalScope?: string | null;
   createdAt: string;
   subprocessId?: string | null;
+  revertedAt?: string | null;
 }
 
 export interface Message {
@@ -456,6 +493,34 @@ export interface Message {
   totalTokens?: number;
   cachedTokens?: number;
   isEstimated?: boolean;
+  revertedAt?: string | null;
+  turnToolEvents?: ToolEvent[];
+}
+
+export interface SnapshotFileDiff {
+  filePath: string;
+  isNewFile: boolean;
+  added: number;
+  removed: number;
+  diffText: string;
+  beforeContent?: string | null;
+  afterContent: string;
+}
+
+export interface RevertResult {
+  success: boolean;
+  revertedFiles: string[];
+  hasConflict: boolean;
+  conflictedFiles: string[];
+  message: string;
+}
+
+export interface ReapplyResult {
+  success: boolean;
+  reappliedFiles: string[];
+  hasConflict: boolean;
+  conflictedFiles: string[];
+  message: string;
 }
 
 export interface QueuedItem {
@@ -984,7 +1049,8 @@ export type ModelCapability = "chat" | "image_gen" | "vision";
 export interface ModelCapabilityMeta {
   id: ModelCapability;
   label: string;
-  icon: string;
+  icon?: string;
+  Icon: LucideIcon;
   description: string;
   badgeClass: string;
 }
@@ -993,21 +1059,21 @@ export const MODEL_CAPABILITY_METAS: Record<ModelCapability, ModelCapabilityMeta
   chat: {
     id: "chat",
     label: "对话思考",
-    icon: "💬",
+    Icon: MessageSquare,
     description: "驱动日常对话、任务规划、代码编写与执行逻辑推演",
     badgeClass: "bg-blue-500/15 text-blue-400 border-blue-500/30",
   },
   image_gen: {
     id: "image_gen",
     label: "图像生成",
-    icon: "🎨",
+    Icon: Palette,
     description: "驱动生图工具 (generate_image)，支持海报/图标/概念图生成",
     badgeClass: "bg-pink-500/15 text-pink-400 border-pink-500/30",
   },
   vision: {
     id: "vision",
     label: "视觉感知",
-    icon: "👁️",
+    Icon: Eye,
     description: "驱动图片多模态理解与视觉识别，支持分析用户截图与设计稿",
     badgeClass: "bg-purple-500/15 text-purple-400 border-purple-500/30",
   },

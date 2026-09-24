@@ -30,9 +30,15 @@ import {
   Link2,
   Sparkles,
   BookOpen,
+  RotateCcw,
+  RotateCw,
+  Lightbulb,
 } from "./Icons";
 
-function statusBadge(status: string) {
+function statusBadge(status: string, revertedAt?: string | null) {
+  if (revertedAt) {
+    return <span className="text-[11px] px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/30 font-medium">已撤回</span>;
+  }
   switch (status) {
     case "pending_approval":
       return <span className="text-[11px] px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/30 font-medium">待审批</span>;
@@ -293,13 +299,20 @@ function PlanCardView({
           <div className="mt-2 pt-2 border-t border-edge/40 flex items-center justify-between gap-2 flex-wrap text-[11.5px]">
             <div className="flex items-center gap-1.5 text-inkdim font-mono text-[11px] truncate max-w-[260px]">
               {planFilePath ? (
-                <span title={planFilePath} className="truncate text-emerald-400/90 font-mono">
-                  📄 {planFilePath}
+                <span title={planFilePath} className="truncate text-emerald-400/90 font-mono inline-flex items-center gap-1">
+                  <FileText size={12} className="shrink-0" />
+                  <span className="truncate">{planFilePath}</span>
                 </span>
               ) : ev.status === "running" ? (
-                <span className="text-amber-400/90 animate-pulse font-sans">⏳ 方案文档生成中...</span>
+                <span className="text-amber-400/90 animate-pulse font-sans inline-flex items-center gap-1">
+                  <Loader2 size={12} className="animate-spin shrink-0" />
+                  <span>方案文档生成中...</span>
+                </span>
               ) : (
-                <span className="font-sans text-emerald-400/90">📄 方案已物理落盘</span>
+                <span className="font-sans text-emerald-400/90 inline-flex items-center gap-1">
+                  <FileText size={12} className="shrink-0" />
+                  <span>方案已物理落盘</span>
+                </span>
               )}
             </div>
 
@@ -320,8 +333,9 @@ function PlanCardView({
               </button>
             </div>
           </div>
-          <div className="text-[11px] text-inkdim/80 bg-panel/40 px-2 py-1 rounded border border-edge/30">
-            💡 提示：方案已物理落盘（可点击上方按钮查看/修改）。您可直接在下方对话框中告知 Agent 确认开始执行或提出调整建议。
+          <div className="text-[11px] text-inkdim/80 bg-panel/40 px-2 py-1 rounded border border-edge/30 flex items-center gap-1.5">
+            <Lightbulb size={12} className="text-amber-400 shrink-0" />
+            <span>提示：方案已物理落盘（可点击上方按钮查看/修改）。您可直接在下方对话框中告知 Agent 确认开始执行或提出调整建议。</span>
           </div>
         </>
       )}
@@ -419,13 +433,20 @@ function MemoryCardView({
       <div className="mt-2 pt-2 border-t border-teal-500/20 flex items-center justify-between gap-2 flex-wrap text-[11.5px]">
         <div className="flex items-center gap-1.5 text-inkdim font-mono text-[11px] truncate max-w-[320px]">
           {memoryFilePath ? (
-            <span title={memoryFilePath} className="truncate text-teal-300 font-mono">
-              📄 {memoryFilePath}
+            <span title={memoryFilePath} className="truncate text-teal-300 font-mono inline-flex items-center gap-1">
+              <FileText size={12} className="shrink-0" />
+              <span className="truncate">{memoryFilePath}</span>
             </span>
           ) : ev.status === "running" ? (
-            <span className="text-amber-400 animate-pulse font-sans">⏳ 记忆文件处理中...</span>
+            <span className="text-amber-400 animate-pulse font-sans inline-flex items-center gap-1">
+              <Loader2 size={12} className="animate-spin shrink-0" />
+              <span>记忆文件处理中...</span>
+            </span>
           ) : (
-            <span className="font-sans text-teal-300">📄 记忆档案已落盘</span>
+            <span className="font-sans text-teal-300 inline-flex items-center gap-1">
+              <FileText size={12} className="shrink-0" />
+              <span>记忆档案已落盘</span>
+            </span>
           )}
         </div>
 
@@ -448,8 +469,9 @@ function MemoryCardView({
           )}
         </div>
       </div>
-      <div className="text-[11px] text-inkdim/80 bg-panel/40 px-2 py-1 rounded border border-edge/30">
-        💡 提示：{isRecord ? "记忆已物理落盘至工作区长期认知库（可点击上方按钮查看/修改）。新会话及后续推理将自动秒级召回。" : "已从工作区认知记忆库召回该档案（可点击上方按钮查看全文）。"}
+      <div className="text-[11px] text-inkdim/80 bg-panel/40 px-2 py-1 rounded border border-edge/30 flex items-center gap-1.5">
+        <Lightbulb size={12} className="text-amber-400 shrink-0" />
+        <span>提示：{isRecord ? "记忆已物理落盘至工作区长期认知库（可点击上方按钮查看/修改）。新会话及后续推理将自动秒级召回。" : "已从工作区认知记忆库召回该档案（可点击上方按钮查看全文）。"}</span>
       </div>
     </div>
   );
@@ -954,6 +976,67 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
     }
   };
 
+  const [revertingItem, setRevertingItem] = useState(false);
+  const handleRevertSingle = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (revertingItem) return;
+    setRevertingItem(true);
+    try {
+      const res = await ipc.revertToolEvent(ev.id, false);
+      if (!res.success && res.hasConflict) {
+        const proceed = window.confirm(`${res.message}\n\n是否强制覆盖撤回该文件的修改？`);
+        if (proceed) {
+          const forceRes = await ipc.revertToolEvent(ev.id, true);
+          if (forceRes.success) {
+            pushToast("该文件修改已强制撤回");
+          } else {
+            pushToast(forceRes.message || "撤回失败", "error");
+          }
+        }
+      } else if (res.success) {
+        pushToast("该文件修改已成功撤回");
+      } else {
+        pushToast(res.message || "撤回失败", "error");
+      }
+      const curId = useStore.getState().currentId;
+      if (curId) await useStore.getState().reloadMessages(curId);
+    } catch (err: any) {
+      pushToast(String(err) || "单项撤回失败", "error");
+    } finally {
+      setRevertingItem(false);
+    }
+  };
+
+  const handleReapplySingle = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (revertingItem) return;
+    setRevertingItem(true);
+    try {
+      const res = await ipc.reapplyToolEvent(ev.id, false);
+      if (!res.success && res.hasConflict) {
+        const proceed = window.confirm(`${res.message}\n\n是否强制覆盖重新应用该文件的修改？`);
+        if (proceed) {
+          const forceRes = await ipc.reapplyToolEvent(ev.id, true);
+          if (forceRes.success) {
+            pushToast("该文件修改已强制重新应用");
+          } else {
+            pushToast(forceRes.message || "重新应用失败", "error");
+          }
+        }
+      } else if (res.success) {
+        pushToast("已成功重新应用该文件修改");
+      } else {
+        pushToast(res.message || "重新应用失败", "error");
+      }
+      const curId = useStore.getState().currentId;
+      if (curId) await useStore.getState().reloadMessages(curId);
+    } catch (err: any) {
+      pushToast(String(err) || "单项重新应用失败", "error");
+    } finally {
+      setRevertingItem(false);
+    }
+  };
+
   const currentWorkspace = useStore(
     (s) =>
       s.sessions.find((x) => x.id === s.currentId)?.workspacePath ||
@@ -1070,6 +1153,36 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
       path: absPath,
       workspacePath: currentWorkspace,
       sessionId: currentSessionId || undefined,
+    });
+  };
+
+  const handleFocusFloating = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (ev.toolName === "todo") {
+      useStore.getState().setFocusFloatingTaskId({
+        eventId: ev.id,
+      });
+      return;
+    }
+
+    const filename = resolvedPlanFilePath ? resolvedPlanFilePath.replace(/\\/g, "/").split("/").pop() : undefined;
+    let planId = ev.params?.plan_id ? String(ev.params.plan_id) : undefined;
+    let title = ev.params?.title ? String(ev.params.title) : undefined;
+
+    if (!planId && ev.resultText) {
+      const idMatch = ev.resultText.match(/(?:活动计划ID|计划ID|plan_id)[:：\s`]+([a-zA-Z0-9_\-]+)/i);
+      if (idMatch) planId = idMatch[1];
+    }
+    if (!title && ev.resultText) {
+      const titleMatch = ev.resultText.match(/【([^】]+)】/);
+      if (titleMatch) title = titleMatch[1];
+    }
+
+    useStore.getState().setFocusFloatingTaskId({
+      eventId: ev.id,
+      planId,
+      filename,
+      title,
     });
   };
 
@@ -1206,9 +1319,11 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
 
   return (
     <div
-      className={`border rounded-xl bg-panel2/80 hover:bg-panel2 px-3 py-2.5 transition-colors shadow-sm ${
+      id={`tool-${ev.id}`}
+      data-tool-event-id={ev.id}
+      className={`border rounded-xl bg-panel2/80 hover:bg-panel2 px-3 py-2.5 transition-all shadow-sm ${
         ev.status === "pending_approval" ? "border-amber-500/50 ring-1 ring-amber-500/20" : "border-edge/80"
-      }`}
+      } ${ev.revertedAt ? "opacity-60" : ""}`}
     >
       <div
         role="button"
@@ -1284,15 +1399,42 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
             </button>
           )}
           {(ev.toolName === "write_file" || ev.toolName === "edit_file") && filePath && (
-            <button
-              type="button"
-              className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 transition-colors"
-              title="在独立窗体中查看文件变更对比 (Diff)"
-              onClick={handleOpenDiffViewer}
-            >
-              <GitCompare size={11} />
-              <span>对比 Diff</span>
-            </button>
+            <>
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 transition-colors"
+                title="在独立窗体中查看文件变更对比 (Diff)"
+                onClick={handleOpenDiffViewer}
+              >
+                <GitCompare size={11} />
+                <span>对比 Diff</span>
+              </button>
+              {ev.status === "success" && (
+                !ev.revertedAt ? (
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 transition-colors disabled:opacity-50"
+                    title="仅撤回本卡片对该文件的修改（影子快照还原）"
+                    disabled={revertingItem}
+                    onClick={handleRevertSingle}
+                  >
+                    <RotateCcw size={11} className={revertingItem ? "animate-spin" : ""} />
+                    <span>{revertingItem ? "撤回中…" : "撤回此项"}</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 transition-colors disabled:opacity-50"
+                    title="重新应用本卡片对该文件的修改"
+                    disabled={revertingItem}
+                    onClick={handleReapplySingle}
+                  >
+                    <RotateCw size={11} className={revertingItem ? "animate-spin" : ""} />
+                    <span>{revertingItem ? "应用中…" : "重新应用"}</span>
+                  </button>
+                )
+              )}
+            </>
           )}
           {["create_plan", "update_plan", "switch_plan", "read_plan"].includes(ev.toolName) && (
             <button
@@ -1312,6 +1454,17 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
             >
               <CheckSquare size={11} />
               <span>{ev.status === "running" ? "方案生成中..." : "方案文档 (MD)"}</span>
+            </button>
+          )}
+          {(ev.toolName === "todo" || ["create_plan", "update_plan", "switch_plan"].includes(ev.toolName)) && (
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-purple-500/10 hover:bg-purple-500/20 text-purple-300 transition-colors cursor-pointer border border-purple-500/30"
+              title="在右侧浮窗中锁定查看并跟踪该任务"
+              onClick={handleFocusFloating}
+            >
+              <CheckSquare size={11} />
+              <span>浮窗查看</span>
             </button>
           )}
           {["wait_subprocesses", "wait_subagents", "wait_collaborators"].includes(ev.toolName) && resolvedSubtaskReportPath && (
@@ -1345,7 +1498,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
               <span>{ev.status === "running" ? "保存中..." : "查看记忆"}</span>
             </button>
           )}
-          {statusBadge(ev.status)}
+          {statusBadge(ev.status, ev.revertedAt)}
           {ev.approvalScope && ev.approvalScope !== "none" && ev.status !== "pending_approval" && (
             <span className="text-[10px] text-inkdim shrink-0">
               ({ev.approvalScope === "mode" ? "完全访问" : ev.approvalScope === "once" ? "一次放行" : ev.approvalScope === "harness_whitelist" ? "系统白名单" : "会话规则"})

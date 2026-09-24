@@ -8,7 +8,7 @@ import { ExecutionProcessBlock, groupTimelineItems } from "./ExecutionProcessBlo
 import { ToolRetryBanner } from "./ToolRetryBanner";
 import { CompactionBanner, CompactedHistoryCard } from "./CompactionBanner";
 import { TruncationNoticeList } from "./TruncationNoticeCard";
-import { Bot, Plus, Sprout, ShieldCheck, AlertTriangle, Loader2, Play, RotateCcw } from "./Icons";
+import { Bot, Plus, Sprout, ShieldCheck, AlertTriangle, Loader2, Play, RotateCcw, Zap } from "./Icons";
 
 const EMPTY_PROPOSALS: any[] = [];
 const EMPTY_COMPACTIONS: any[] = [];
@@ -187,7 +187,7 @@ export function ChatView() {
           ) : session ? (
             <div className="text-inkdim text-[13px] leading-relaxed">
               <div className="font-semibold text-ink text-[14px] mb-1.5 flex items-center justify-center gap-1.5">
-                <span>⚡</span>
+                <Zap size={15} className="text-amber-400 shrink-0" />
                 <span>主进程与统筹协调者已就绪</span>
               </div>
               <div>当前会话作为主架构师与统筹核心，您可以在此输入指令让主进程统领全局，也可以在上方协作者栏与专属专家协同工作。</div>

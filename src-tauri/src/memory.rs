@@ -594,7 +594,11 @@ pub fn trigger_auto_distillation(
         });
 
         let truncated_reply = if assistant_reply.len() > 3000 {
-            format!("{}...\n(后续内容省略)", &assistant_reply[..3000])
+            let mut end = 3000;
+            while end > 0 && !assistant_reply.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}...\n(后续内容省略)", &assistant_reply[..end])
         } else {
             assistant_reply
         };

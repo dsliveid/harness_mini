@@ -1423,9 +1423,9 @@ pub fn kill_command(
     Ok(())
 }
 
-/// 编辑并重新发送最后一条用户消息
+/// 编辑并重新发送最后一条用户消息（自动回退本次提问产生的所有代码修改）
 #[tauri::command]
-pub fn edit_and_resend(
+pub async fn edit_and_resend(
     state: State<'_, crate::AppState>,
     app: AppHandle,
     session_id: String,
@@ -1441,7 +1441,9 @@ pub fn edit_and_resend(
     if text.is_empty() && !has_attachments {
         return Err("消息内容与附件不能同时为空".into());
     }
-    {
+
+    // 1. 检查权限并收集待回退的代码快照（在删除消息与快照元数据前执行）
+    let (ws, data_dir, snaps_to_revert) = {
         let db = state.db.lock().unwrap();
         let m = store::get_message(&db, &message_id)?
             .filter(|m| m.session_id == session_id && m.role == "user" && !m.queued)
@@ -1454,6 +1456,27 @@ pub fn edit_and_resend(
                 }
             }
         }
+        let session = store::get_session(&db, &session_id)?
+            .ok_or_else(|| format!("会话未找到: {session_id}"))?;
+        let dir = {
+            let lock = state.data_dir.lock().unwrap();
+            lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
+        };
+        let snaps = store::list_snapshots_after_seq(&db, &session_id, m.seq)?;
+        (PathBuf::from(session.workspace_path), dir, snaps)
+    };
+
+    // 2. 自动无损还原该提问及后续所产生的所有代码修改（确定性回退到提问前状态）
+    if !snaps_to_revert.is_empty() {
+        let _ = crate::snapshot_revert::revert_snapshots(&ws, &data_dir, &snaps_to_revert, true).await;
+    }
+
+    // 3. 更新用户消息正文并安全作废后续消息与历史记录
+    {
+        let db = state.db.lock().unwrap();
+        let m = store::get_message(&db, &message_id)?
+            .filter(|m| m.session_id == session_id && m.role == "user" && !m.queued)
+            .ok_or("仅支持编辑会话内的用户消息")?;
         store::update_message_content_and_attachments(&db, &message_id, &text, attachments.as_deref())?;
         store::delete_messages_after(&db, &session_id, m.seq)?;
         store::touch_session(&db, &session_id)?;
@@ -1575,21 +1598,23 @@ pub fn get_session_todos(state: State<'_, crate::AppState>, session_id: String) 
         }
     }
 
-    // 若当前会话关联了工作区中的活动计划，以计划文件中的步骤作为权威真理源优先同步
+    // 若当前会话关联了工作区中的活动计划，以计划文件中的步骤作为权威真理源优先同步（仅限进行中计划）
     if let Ok(Some(sess)) = crate::store::get_session(&db, &session_id) {
         if !sess.workspace_path.is_empty() {
             let ws = std::path::Path::new(&sess.workspace_path);
-            if let Some((_, _meta, body)) = crate::plan::find_plan_file(ws, &session_id, None, Some(&db)) {
-                let steps = crate::plan::parse_steps_from_markdown(&body);
-                if !steps.is_empty() {
-                    let todos_val: Vec<Value> = steps.iter().map(|s| {
-                        serde_json::json!({
-                            "content": s.content,
-                            "status": s.status
-                        })
-                    }).collect();
-                    val = serde_json::json!({ "todos": todos_val });
-                    let _ = store::set_kv(&db, &session_id, "todos", &val.to_string());
+            if let Some((_, meta, body)) = crate::plan::find_plan_file(ws, &session_id, None, Some(&db)) {
+                if meta.status == "in_progress" {
+                    let steps = crate::plan::parse_steps_from_markdown(&body);
+                    if !steps.is_empty() {
+                        let todos_val: Vec<Value> = steps.iter().map(|s| {
+                            serde_json::json!({
+                                "content": s.content,
+                                "status": s.status
+                            })
+                        }).collect();
+                        val = serde_json::json!({ "todos": todos_val });
+                        let _ = store::set_kv(&db, &session_id, "todos", &val.to_string());
+                    }
                 }
             }
         }
@@ -2372,6 +2397,35 @@ pub fn get_active_plan(
             "steps": steps,
         })))
     } else {
+        // 容错兜底：若当前会话无进行中活动计划，回退查找该会话名下最近更新过的计划（如 completed 或 suspended），防止浮窗断崖式清空
+        let pdir = crate::plan::plans_dir(ws);
+        if pdir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&pdir) {
+                let mut session_plans = Vec::new();
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            let (meta, body) = crate::plan::parse_frontmatter(&content);
+                            if meta.session_id == session_id {
+                                session_plans.push((path, meta, body));
+                            }
+                        }
+                    }
+                }
+                session_plans.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
+                if let Some((path, meta, body)) = session_plans.into_iter().next() {
+                    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                    let steps = crate::plan::parse_steps_from_markdown(&body);
+                    return Ok(Some(serde_json::json!({
+                        "meta": meta,
+                        "filename": filename,
+                        "body": body,
+                        "steps": steps,
+                    })));
+                }
+            }
+        }
         Ok(None)
     }
 }
@@ -2389,6 +2443,21 @@ pub fn list_workspace_plans(
     let db = state.db.lock().unwrap();
     let ws = std::path::Path::new(&workspace_path);
     crate::plan::list_plans(ws, session_id.as_deref(), include_archived.unwrap_or(false), Some(&db))
+}
+
+#[tauri::command]
+pub fn switch_plan(
+    state: State<'_, crate::AppState>,
+    workspace_path: String,
+    session_id: String,
+    plan_id: String,
+) -> Result<String, String> {
+    if workspace_path.is_empty() {
+        return Err("工作区路径不能为空".into());
+    }
+    let db = state.db.lock().unwrap();
+    let ws = std::path::Path::new(&workspace_path);
+    crate::plan::switch_plan(ws, &session_id, &plan_id, Some(&db))
 }
 
 // ---------- 文件与变更查看器 (File Viewer) commands ----------
@@ -3181,6 +3250,190 @@ pub fn update_task_subtasks(
     subtasks: Vec<TaskSubItem>,
 ) -> Result<LongTask, String> {
     crate::task::update_task_subtasks(&app, &task_id, subtasks)
+}
+
+// ---------- 影子快照与时光机（多轮撤回/重做/Diff审查） ----------
+
+#[tauri::command]
+pub async fn revert_message_turn(
+    state: State<'_, crate::AppState>,
+    message_id: String,
+    force: Option<bool>,
+) -> Result<RevertResult, String> {
+    let (ws, data_dir, snapshots, session_id) = {
+        let db = state.db.lock().unwrap();
+        let msg = store::get_message(&db, &message_id)?
+            .ok_or_else(|| format!("消息未找到: {message_id}"))?;
+        let session = store::get_session(&db, &msg.session_id)?
+            .ok_or_else(|| format!("会话未找到: {}", msg.session_id))?;
+        let dir = {
+            let lock = state.data_dir.lock().unwrap();
+            lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
+        };
+        let snaps = store::list_snapshots_for_turn(&db, &message_id)?;
+        (PathBuf::from(session.workspace_path), dir, snaps, msg.session_id)
+    };
+
+    let force = force.unwrap_or(false);
+    let res = crate::snapshot_revert::revert_snapshots(&ws, &data_dir, &snapshots, force).await?;
+
+    if res.success {
+        let db = state.db.lock().unwrap();
+        let now = store::now();
+        let affected_ids = store::mark_snapshots_reverted_for_turn(&db, &message_id, Some(&now))?;
+        for mid in affected_ids {
+            if let Ok(Some(msg)) = store::get_message(&db, &mid) {
+                state.emit("message:update", &msg);
+            }
+        }
+        state.emit("messages:changed", &serde_json::json!({ "sessionId": session_id }));
+    }
+
+    Ok(res)
+}
+
+#[tauri::command]
+pub async fn reapply_message_turn(
+    state: State<'_, crate::AppState>,
+    message_id: String,
+    force: Option<bool>,
+) -> Result<ReapplyResult, String> {
+    let (ws, data_dir, snapshots, session_id) = {
+        let db = state.db.lock().unwrap();
+        let msg = store::get_message(&db, &message_id)?
+            .ok_or_else(|| format!("消息未找到: {message_id}"))?;
+        let session = store::get_session(&db, &msg.session_id)?
+            .ok_or_else(|| format!("会话未找到: {}", msg.session_id))?;
+        let dir = {
+            let lock = state.data_dir.lock().unwrap();
+            lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
+        };
+        let snaps = store::list_snapshots_for_turn(&db, &message_id)?;
+        (PathBuf::from(session.workspace_path), dir, snaps, msg.session_id)
+    };
+
+    let force = force.unwrap_or(false);
+    let res = crate::snapshot_revert::reapply_snapshots(&ws, &data_dir, &snapshots, force).await?;
+
+    if res.success {
+        let db = state.db.lock().unwrap();
+        let affected_ids = store::mark_snapshots_reverted_for_turn(&db, &message_id, None)?;
+        for mid in affected_ids {
+            if let Ok(Some(msg)) = store::get_message(&db, &mid) {
+                state.emit("message:update", &msg);
+            }
+        }
+        state.emit("messages:changed", &serde_json::json!({ "sessionId": session_id }));
+    }
+
+    Ok(res)
+}
+
+#[tauri::command]
+pub async fn revert_tool_event(
+    state: State<'_, crate::AppState>,
+    tool_event_id: String,
+    force: Option<bool>,
+) -> Result<RevertResult, String> {
+    let (ws, data_dir, snapshots, message_id, session_id) = {
+        let db = state.db.lock().unwrap();
+        let snaps = store::list_snapshots_for_event(&db, &tool_event_id)?;
+        if snaps.is_empty() {
+            return Ok(RevertResult {
+                success: true,
+                reverted_files: vec![],
+                has_conflict: false,
+                conflicted_files: vec![],
+                message: "该工具调用无文件修改快照".into(),
+            });
+        }
+        let session_id = snaps[0].session_id.clone();
+        let message_id = snaps[0].message_id.clone();
+        let session = store::get_session(&db, &session_id)?
+            .ok_or_else(|| format!("会话未找到: {session_id}"))?;
+        let dir = {
+            let lock = state.data_dir.lock().unwrap();
+            lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
+        };
+        (PathBuf::from(session.workspace_path), dir, snaps, message_id, session_id)
+    };
+
+    let force = force.unwrap_or(false);
+    let res = crate::snapshot_revert::revert_snapshots(&ws, &data_dir, &snapshots, force).await?;
+
+    if res.success && !snapshots.is_empty() {
+        let db = state.db.lock().unwrap();
+        let now = store::now();
+        store::mark_snapshot_reverted_for_event(&db, &tool_event_id, Some(&now))?;
+        if let Ok(Some(msg)) = store::get_message(&db, &message_id) {
+            state.emit("message:update", &msg);
+        }
+        state.emit("messages:changed", &serde_json::json!({ "sessionId": session_id }));
+    }
+
+    Ok(res)
+}
+
+#[tauri::command]
+pub async fn reapply_tool_event(
+    state: State<'_, crate::AppState>,
+    tool_event_id: String,
+    force: Option<bool>,
+) -> Result<ReapplyResult, String> {
+    let (ws, data_dir, snapshots, message_id, session_id) = {
+        let db = state.db.lock().unwrap();
+        let snaps = store::list_snapshots_for_event(&db, &tool_event_id)?;
+        if snaps.is_empty() {
+            return Ok(ReapplyResult {
+                success: true,
+                reapplied_files: vec![],
+                has_conflict: false,
+                conflicted_files: vec![],
+                message: "该工具调用无文件修改快照".into(),
+            });
+        }
+        let session_id = snaps[0].session_id.clone();
+        let message_id = snaps[0].message_id.clone();
+        let session = store::get_session(&db, &session_id)?
+            .ok_or_else(|| format!("会话未找到: {session_id}"))?;
+        let dir = {
+            let lock = state.data_dir.lock().unwrap();
+            lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
+        };
+        (PathBuf::from(session.workspace_path), dir, snaps, message_id, session_id)
+    };
+
+    let force = force.unwrap_or(false);
+    let res = crate::snapshot_revert::reapply_snapshots(&ws, &data_dir, &snapshots, force).await?;
+
+    if res.success && !snapshots.is_empty() {
+        let db = state.db.lock().unwrap();
+        store::mark_snapshot_reverted_for_event(&db, &tool_event_id, None)?;
+        if let Ok(Some(msg)) = store::get_message(&db, &message_id) {
+            state.emit("message:update", &msg);
+        }
+        state.emit("messages:changed", &serde_json::json!({ "sessionId": session_id }));
+    }
+
+    Ok(res)
+}
+
+#[tauri::command]
+pub async fn get_turn_diff(
+    state: State<'_, crate::AppState>,
+    message_id: String,
+) -> Result<Vec<SnapshotFileDiff>, String> {
+    let (data_dir, snapshots) = {
+        let db = state.db.lock().unwrap();
+        let dir = {
+            let lock = state.data_dir.lock().unwrap();
+            lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
+        };
+        let snaps = store::list_snapshots_for_turn(&db, &message_id)?;
+        (dir, snaps)
+    };
+
+    crate::snapshot_revert::get_snapshots_diff_details(&data_dir, &snapshots).await
 }
 
 #[cfg(test)]

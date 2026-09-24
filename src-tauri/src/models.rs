@@ -30,7 +30,10 @@ pub fn normalize_access_mode(mode: &str) -> String {
     }
 }
 fn default_max_steps() -> u32 {
-    50
+    30
+}
+fn default_task_subtask_max_steps() -> u32 {
+    30
 }
 fn default_cmd_timeout() -> u64 {
     120
@@ -64,6 +67,9 @@ pub struct SettingsData {
     pub global_access_mode: String,
     #[serde(default = "default_max_steps")]
     pub max_steps: u32,
+    /// 长任务单子任务轮次预算硬上限（默认 30 轮）
+    #[serde(default = "default_task_subtask_max_steps")]
+    pub task_subtask_max_steps: u32,
     #[serde(default = "default_cmd_timeout")]
     pub command_timeout_secs: u64,
     #[serde(default = "default_ctx_tokens")]
@@ -103,6 +109,7 @@ impl Default for SettingsData {
             active_model: None,
             global_access_mode: default_access_mode(),
             max_steps: default_max_steps(),
+            task_subtask_max_steps: default_task_subtask_max_steps(),
             command_timeout_secs: default_cmd_timeout(),
             context_token_limit: default_ctx_tokens(),
             model_context_limits: std::collections::HashMap::new(),
@@ -874,6 +881,9 @@ pub struct ToolEvent {
     /// 该工具调用派生创建的子进程/子 Agent 真实会话 ID
     #[serde(default)]
     pub subprocess_id: Option<String>,
+    /// 工具快照软撤回时间（若该工具事件产生的快照已被撤回则非空）
+    #[serde(default)]
+    pub reverted_at: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -931,7 +941,61 @@ pub struct Message {
     /// 消息携带的附件列表（图片或文件）
     #[serde(default)]
     pub attachments: Option<Vec<Attachment>>,
+    /// 软撤回时间戳（若非空表示本消息已被软撤回，排除在上下文组装之外）
+    #[serde(default)]
+    pub reverted_at: Option<String>,
 }
+
+/// 代码文件影子快照条目（与 tool_event_id / message_id 关联）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolFileSnapshot {
+    pub id: String,
+    pub session_id: String,
+    pub message_id: String,
+    pub tool_event_id: String,
+    pub file_path: String,
+    pub before_hash: Option<String>,
+    pub after_hash: String,
+    #[serde(default)]
+    pub is_new_file: bool,
+    #[serde(default)]
+    pub reverted_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RevertResult {
+    pub success: bool,
+    pub reverted_files: Vec<String>,
+    pub has_conflict: bool,
+    pub conflicted_files: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ReapplyResult {
+    pub success: bool,
+    pub reapplied_files: Vec<String>,
+    pub has_conflict: bool,
+    pub conflicted_files: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotFileDiff {
+    pub file_path: String,
+    pub is_new_file: bool,
+    pub added: usize,
+    pub removed: usize,
+    pub diff_text: String,
+    pub before_content: Option<String>,
+    pub after_content: String,
+}
+
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 #[serde(rename_all = "camelCase")]

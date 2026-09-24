@@ -239,6 +239,14 @@ fn contains_negative_code_intent(s: &str) -> bool {
 
 ---
 
+### 5. 长任务模式动态升阶与意图门禁保障 (Long Task Autonomous Flow)
+
+长任务（通过 `/goal`、`/task` 或后台长任务激活）的宗旨是自主闭环推进。为避免长任务被频繁人工确认门禁打断，系统在运行时动态计算 `effective_plan_mode`：
+1. **自动升阶为 Always Proceed**：长任务执行流中，无论宿主项目配置为 `standard` 还是 `always_plan`，均自动以 `always_proceed` 驱动，允许 Agent 在落盘方案后连贯修改代码、执行测试并推进 Checklist；
+2. **否定意图守卫绝对优先**：若用户在长任务指令中明确说明了“先不改动代码 / 仅出方案 / 先评估”，`contains_negative_code_intent` 依然精准生效，模式守卫立即拦截任何写盘操作，严密保护用户意图。
+
+---
+
 ## 五、前端界面与交互规范
 
 ### 1. 项目设置弹窗「规划与执行」面板

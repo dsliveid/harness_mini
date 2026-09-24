@@ -584,8 +584,9 @@ export function TokenStatsModal() {
                           </span>
                         )}
                         {(s.cacheHitRate ?? 0) > 0 && (
-                          <span className="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20 truncate">
-                            ⚡ 缓存 {(s.cacheHitRate ?? 0).toFixed(1)}%
+                          <span className="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20 truncate inline-flex items-center gap-1">
+                            <Zap size={10} className="shrink-0" />
+                            <span>缓存 {(s.cacheHitRate ?? 0).toFixed(1)}%</span>
                           </span>
                         )}
                       </div>

@@ -824,7 +824,7 @@ pub fn read_plan(
     Ok(format_with_frontmatter(&meta, &body))
 }
 
-/// 列出工作区内所有任务计划清单
+/// 列出工作区内任务计划清单（支持按会话及关联父子会话严格隔离）
 pub fn list_plans(
     workspace: &Path,
     session_id: Option<&str>,
@@ -836,7 +836,38 @@ pub fn list_plans(
         return Ok(Vec::new());
     }
 
-    let active_id = session_id.and_then(|sid| get_active_plan_id(conn, sid));
+    let target_session_id = session_id.map(|s| s.trim()).filter(|s| !s.is_empty());
+    if let Some(sid) = target_session_id {
+        if sid == "draft" || sid == "DRAFT_ID" {
+            return Ok(Vec::new());
+        }
+    }
+
+    let related_sessions: Option<std::collections::HashSet<String>> = if let Some(sid) = target_session_id {
+        let mut set = std::collections::HashSet::new();
+        set.insert(sid.to_string());
+        if let Some(db) = conn {
+            // 1. 若当前会话是子任务或协作者，允许查看父会话关联的方案
+            if let Ok(Some(sess)) = crate::store::get_session(db, sid) {
+                if let Some(ref pid) = sess.parent_session_id {
+                    set.insert(pid.clone());
+                }
+            }
+            // 2. 若当前会话是父会话，允许查看派生给子任务/协作者的方案
+            if let Ok(mut stmt) = db.prepare("SELECT id FROM sessions WHERE parent_session_id = ?1") {
+                if let Ok(rows) = stmt.query_map(rusqlite::params![sid], |r| r.get::<_, String>(0)) {
+                    for cid in rows.flatten() {
+                        set.insert(cid);
+                    }
+                }
+            }
+        }
+        Some(set)
+    } else {
+        None
+    };
+
+    let active_id = target_session_id.and_then(|sid| get_active_plan_id(conn, sid));
     let mut dirs = vec![pdir.clone()];
     if include_archived {
         let adir = archive_dir(workspace);
@@ -853,6 +884,14 @@ pub fn list_plans(
                 if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
                     if let Ok(content) = fs::read_to_string(&path) {
                         let (meta, body) = parse_frontmatter(&content);
+
+                        // 会话边界隔离：若指定了会话，过滤非本会话及非关联会话的方案
+                        if let Some(ref allowed) = related_sessions {
+                            if !allowed.contains(&meta.session_id) {
+                                continue;
+                            }
+                        }
+
                         let steps = parse_steps_from_markdown(&body);
                         let completed_count =
                             steps.iter().filter(|s| s.status == "done").count();
@@ -1140,6 +1179,19 @@ mod tests {
         // 4. 会话 B 加载 Prompt 计划上下文：也必须返回 None
         let ctx_b = load_active_plan_context(ws, sid_b, None);
         assert!(ctx_b.is_none());
+
+        // 5. 会话 A 列出计划：能看到专属计划
+        let list_a = list_plans(ws, Some(sid_a), false, None).unwrap();
+        assert_eq!(list_a.len(), 1);
+        assert_eq!(list_a[0].title, "会话A专属计划");
+
+        // 6. 会话 B 列出计划：必须严格隔离返回空，绝不可泄露会话 A 的方案与看板
+        let list_b = list_plans(ws, Some(sid_b), false, None).unwrap();
+        assert_eq!(list_b.len(), 0, "会话 B 绝不可看到会话 A 的方案");
+
+        // 7. 新建草稿会话（draft）：必须直接返回空
+        let list_draft = list_plans(ws, Some("draft"), false, None).unwrap();
+        assert_eq!(list_draft.len(), 0, "draft 会话不可看到历史方案");
     }
 
     #[test]

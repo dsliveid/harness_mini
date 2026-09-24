@@ -8,6 +8,7 @@ import {
   Clock,
   Coins,
   Brain,
+  Zap,
 } from "./Icons";
 
 export type GroupedTimelineItem =
@@ -107,6 +108,12 @@ export function groupTimelineItems(
           turnMetrics: metrics,
           isRunning: false,
         });
+        if (singleMsg.content && singleMsg.content.trim().length > 0) {
+          result.push({
+            type: "message",
+            msg: { ...singleMsg, reasoning: null, turnToolEvents: singleMsg.toolEvents },
+          });
+        }
       } else if (hasReasoning && singleMsg.content && singleMsg.content.trim().length > 0) {
         // 单步同时具备思考过程与回复正文：思考过程收归抽屉并默认折叠，外部仅留干净的正文交付
         const metrics = turnMetricsMap.get(singleMsg.id);
@@ -134,6 +141,9 @@ export function groupTimelineItems(
     const lastHasTools = hasAnyTools(lastMsg);
     const lastHasReasoning = hasAnyReasoning(lastMsg);
 
+    const allTurnToolEvents = currentAssistantSteps.flatMap((m) => m.toolEvents || []);
+    const turnRevertedAt = currentAssistantSteps.find((m) => m.revertedAt)?.revertedAt || lastMsg.revertedAt;
+
     if (!lastHasTools) {
       // 最后一条是无工具的交付答复：前序所有步骤（以及最后一条的思考过程，若有）收拢入执行过程，正文作为外部交付成果
       const processSteps = currentAssistantSteps.slice(0, currentAssistantSteps.length - 1);
@@ -160,7 +170,12 @@ export function groupTimelineItems(
 
       result.push({
         type: "message",
-        msg: { ...lastMsg, reasoning: null },
+        msg: {
+          ...lastMsg,
+          reasoning: null,
+          turnToolEvents: allTurnToolEvents,
+          revertedAt: turnRevertedAt,
+        },
       });
     } else {
       // 整轮所有步骤均包含工具调用（如中断在工具执行）
@@ -175,6 +190,18 @@ export function groupTimelineItems(
         turnMetrics: metrics,
         isRunning: false,
       });
+
+      if (lastMsg.content && lastMsg.content.trim().length > 0) {
+        result.push({
+          type: "message",
+          msg: {
+            ...lastMsg,
+            reasoning: null,
+            turnToolEvents: allTurnToolEvents,
+            revertedAt: turnRevertedAt,
+          },
+        });
+      }
     }
 
     currentAssistantSteps = [];
@@ -282,6 +309,22 @@ export function ExecutionProcessBlock({
 
   const cacheHitRate = promptTokens > 0 ? Math.round((cachedTokens / promptTokens) * 1000) / 10 : 0;
 
+  const turnModifiedFilesCount = useMemo(() => {
+    const paths = new Set<string>();
+    for (const s of steps) {
+      for (const ev of s.toolEvents ?? []) {
+        if (
+          (ev.toolName === "write_file" || ev.toolName === "edit_file") &&
+          (ev.status === "success" || s.revertedAt)
+        ) {
+          const p = ev.params?.path ? String(ev.params.path) : "";
+          if (p) paths.add(p);
+        }
+      }
+    }
+    return paths.size;
+  }, [steps]);
+
   const durationStr =
     durationMs != null ? `${(durationMs / 1000).toFixed(1)}s` : null;
   const tokensStr = tokens > 0 ? `${tokens.toLocaleString()} tokens` : null;
@@ -320,6 +363,11 @@ export function ExecutionProcessBlock({
               {toolCount} 次工具调用
             </span>
           )}
+          {turnModifiedFilesCount > 0 && (
+            <span className="text-[11px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 border border-amber-500/30 shrink-0 font-medium">
+              改动 {turnModifiedFilesCount} 个文件
+            </span>
+          )}
           {isRunning && (
             <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-400 border border-blue-500/30 animate-pulse shrink-0 font-medium">
               运行中
@@ -342,8 +390,9 @@ export function ExecutionProcessBlock({
               <Coins size={11} className="text-inkdim/60" />
               <span>{tokensStr}</span>
               {cacheHitRate > 0 && (
-                <span className="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20">
-                  ⚡ {cacheHitRate.toFixed(1)}% 缓存
+                <span className="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20 inline-flex items-center gap-1">
+                  <Zap size={10} className="shrink-0" />
+                  <span>{cacheHitRate.toFixed(1)}% 缓存</span>
                 </span>
               )}
             </span>

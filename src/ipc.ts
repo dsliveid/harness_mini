@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, DataStatus, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult } from "./types";
+import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, DataStatus, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult } from "./types";
 
 export const ipc = {
   getSettings: () => invoke<Settings>("get_settings"),
@@ -304,6 +304,8 @@ export const ipc = {
       stepIndex,
       status,
     }),
+  switchPlan: (workspacePath: string, sessionId: string, planId: string) =>
+    invoke<string>("switch_plan", { workspacePath, sessionId, planId }),
 
   // 文件与变更查看器 (File Viewer)
   openFileViewer: (payload?: ViewerTabItem) =>
@@ -349,9 +351,21 @@ export const ipc = {
     invoke<LongTask>("rollback_to_checkpoint", { checkpointId }),
   updateTaskSubtasks: (taskId: string, subtasks: TaskSubItem[]) =>
     invoke<LongTask>("update_task_subtasks", { taskId, subtasks }),
+
+  // 影子快照与时光机（多轮撤回/重做/Diff审查）
+  revertMessageTurn: (messageId: string, force?: boolean) =>
+    invoke<RevertResult>("revert_message_turn", { messageId, force: force ?? null }),
+  reapplyMessageTurn: (messageId: string, force?: boolean) =>
+    invoke<ReapplyResult>("reapply_message_turn", { messageId, force: force ?? null }),
+  revertToolEvent: (toolEventId: string, force?: boolean) =>
+    invoke<RevertResult>("revert_tool_event", { toolEventId, force: force ?? null }),
+  reapplyToolEvent: (toolEventId: string, force?: boolean) =>
+    invoke<ReapplyResult>("reapply_tool_event", { toolEventId, force: force ?? null }),
+  getTurnDiff: (messageId: string) =>
+    invoke<SnapshotFileDiff[]>("get_turn_diff", { messageId }),
 };
 
-export type { ActivePlanDetail, PlanSummary, Message, Session, SessionActiveState, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport, CollaboratorCreateInput, CollaboratorUpdateInput, SessionCreateInput, SessionModelsUpdateInput, FileTextContent, ViewerTabItem, FileOutlineItem, DiffHunk, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult };
+export type { ActivePlanDetail, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Message, Session, SessionActiveState, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport, CollaboratorCreateInput, CollaboratorUpdateInput, SessionCreateInput, SessionModelsUpdateInput, FileTextContent, ViewerTabItem, FileOutlineItem, DiffHunk, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult };
 
 
 

@@ -439,7 +439,7 @@ export function TopBar() {
             title={
               active
                 ? `${active.provider.name} / ${active.model}\n有效上下文上限: ${effectiveLimit.toLocaleString()} tokens (~${formatTokens(effectiveLimit)})${
-                    isSessionOverridden ? " (★ 仅当前对话生效)" : " (跟随模型默认)"
+                    isSessionOverridden ? " (仅当前对话生效)" : " (跟随模型默认)"
                   }\n有效思考程度: ${currentEffort === "default" ? "厂商默认 (不传)" : currentEffort.toUpperCase()}`
                 : "未配置模型"
             }
@@ -490,7 +490,7 @@ export function TopBar() {
                           : "text-inkdim hover:text-ink bg-panel3 hover:bg-panel border-edge"
                       }`}
                       title={`本次有效上限: ${effectiveLimit.toLocaleString()} tokens (~${formatTokens(effectiveLimit)})${
-                        isSessionOverridden ? "\n（★ 本次对话专属自定义）" : "\n（跟随模型默认配置）"
+                        isSessionOverridden ? "\n（本次对话专属自定义）" : "\n（跟随模型默认配置）"
                       }\n点击调整本次对话专属上限`}
                       onClick={() => {
                         setOpenMenu(null);

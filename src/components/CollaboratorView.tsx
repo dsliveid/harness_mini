@@ -808,8 +808,9 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
                 </span>
                 <span className="text-[10px] text-inkdim">tokens</span>
                 {tokenStats.cacheHitRate > 0 && (
-                  <span className="px-1 py-0.2 rounded text-[9.5px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20">
-                    ⚡ {tokenStats.cacheHitRate.toFixed(1)}%
+                  <span className="px-1 py-0.2 rounded text-[9.5px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20 inline-flex items-center gap-0.5">
+                    <Zap size={9} className="shrink-0" />
+                    <span>{tokenStats.cacheHitRate.toFixed(1)}%</span>
                   </span>
                 )}
               </button>
@@ -867,8 +868,9 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
                 </span>
                 <span className="text-[10px] text-inkdim">tokens</span>
                 {tokenStats.cacheHitRate > 0 && (
-                  <span className="px-1 py-0.2 rounded text-[9.5px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20">
-                    ⚡ {tokenStats.cacheHitRate.toFixed(1)}%
+                  <span className="px-1 py-0.2 rounded text-[9.5px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20 inline-flex items-center gap-0.5">
+                    <Zap size={9} className="shrink-0" />
+                    <span>{tokenStats.cacheHitRate.toFixed(1)}%</span>
                   </span>
                 )}
               </button>

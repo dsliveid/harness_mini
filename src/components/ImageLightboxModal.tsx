@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { useStore } from "../store";
 import { SafeImage } from "./SafeImage";
-import { X, ZoomIn, ZoomOut, RotateCcw, Copy, Check } from "./Icons";
+import { X, ZoomIn, ZoomOut, RotateCcw, Copy, Check, Palette } from "./Icons";
 
 export function ImageLightboxModal() {
   const lightboxImage = useStore((s) => s.lightboxImage);
@@ -118,8 +118,9 @@ export function ImageLightboxModal() {
           className="absolute bottom-4 left-1/2 -translate-x-1/2 z-50 max-w-[85vw] bg-panel/90 border border-edge rounded-xl px-3.5 py-1.5 shadow-xl backdrop-blur-md text-[13px] text-ink flex items-center gap-2 select-text"
           onClick={(e) => e.stopPropagation()}
         >
-          <span className="truncate max-w-[70vw] font-mono" title={lightboxImage.title || lightboxImage.alt}>
-            🎨 {lightboxImage.title || lightboxImage.alt}
+          <span className="truncate max-w-[70vw] font-mono inline-flex items-center gap-1.5" title={lightboxImage.title || lightboxImage.alt}>
+            <Palette size={14} className="text-pink-400 shrink-0" />
+            <span className="truncate">{lightboxImage.title || lightboxImage.alt}</span>
           </span>
           <button
             type="button"

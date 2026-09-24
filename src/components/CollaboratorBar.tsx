@@ -291,7 +291,7 @@ export function CollaboratorBar() {
                   ? "bg-emerald-500/10 border-emerald-500/35 text-emerald-400 shadow-xs animate-in fade-in duration-200"
                   : "bg-panel2/70 hover:bg-panel2 border-edge text-inkdim hover:text-ink"
               }`}
-              title={`[⚡ 派生子任务]\n名称: ${sub.title}\n角色: ${roleInfo.label}\n状态: ${
+              title={`[派生子任务]\n名称: ${sub.title}\n角色: ${roleInfo.label}\n状态: ${
                 isRunning
                   ? "运行中"
                   : sub.status === "completed"

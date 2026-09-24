@@ -46,6 +46,8 @@ pub struct ToolCtx {
     pub host: Option<HostCtx>,
     /// 当前正在执行的工具事件 ID（用于控制台进程注册与手动关闭）
     pub event_id: Option<String>,
+    /// 当前正在执行的助手消息 ID（用于影子快照归属）
+    pub message_id: Option<String>,
 }
 
 /// 把变更类型字符渲染为可读标记（工具输出用）
@@ -1401,7 +1403,8 @@ async fn write_file(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let old = tokio::fs::read(&path).await.ok();
     let existed = old.is_some();
     let old_str = old
-        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .as_ref()
+        .map(|b| String::from_utf8_lossy(b).to_string())
         .unwrap_or_default();
     let is_crlf = old_str.contains("\r\n");
     let content_to_write = if is_crlf && !content.contains("\r\n") {
@@ -1412,12 +1415,69 @@ async fn write_file(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     tokio::fs::write(&path, &content_to_write)
         .await
         .map_err(|e| format!("写入失败: {e}"))?;
+    record_file_snapshot(ctx, rel, old.as_deref(), content_to_write.as_bytes()).await;
     let d = diffutil::diff_lines(&old_str, &content_to_write, 24 * 1024);
     let action = if existed { "已覆盖写入" } else { "已创建" };
     Ok(truncate_result(&format!(
         "{action} {rel}（+{} −{}）\n```diff\n{}```",
         d.added, d.removed, d.text
     )))
+}
+
+async fn record_file_snapshot(
+    ctx: &ToolCtx,
+    rel_path: &str,
+    old_bytes: Option<&[u8]>,
+    new_bytes: &[u8],
+) {
+    let (Some(host), Some(event_id), Some(message_id)) = (&ctx.host, &ctx.event_id, &ctx.message_id) else {
+        return;
+    };
+    let state = host.app.state::<crate::AppState>();
+    let data_dir = {
+        let lock = state.data_dir.lock().unwrap();
+        lock.clone()
+    };
+    let Some(data_dir) = data_dir else {
+        return;
+    };
+
+    let before_hash = match old_bytes {
+        Some(b) => match crate::snapshot_fs::save_blob_async(&data_dir, b).await {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("[Snapshot] 保存旧文件快照失败: {e}");
+                None
+            }
+        },
+        None => None,
+    };
+
+    let after_hash = match crate::snapshot_fs::save_blob_async(&data_dir, new_bytes).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[Snapshot] 保存新文件快照失败: {e}");
+            return;
+        }
+    };
+
+    let snap = crate::models::ToolFileSnapshot {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: host.session_id.clone(),
+        message_id: message_id.clone(),
+        tool_event_id: event_id.clone(),
+        file_path: rel_path.replace('\\', "/"),
+        before_hash,
+        after_hash,
+        is_new_file: old_bytes.is_none(),
+        reverted_at: None,
+        created_at: crate::store::now(),
+    };
+
+    let db = state.db.lock().unwrap();
+    if let Err(e) = crate::store::insert_tool_file_snapshot(&db, &snap) {
+        eprintln!("[Snapshot] 插入快照元数据失败: {e}");
+    }
 }
 
 async fn edit_file(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
@@ -1472,6 +1532,7 @@ async fn edit_file(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     tokio::fs::write(&path, &final_content)
         .await
         .map_err(|e| format!("写入失败: {e}"))?;
+    record_file_snapshot(ctx, rel, Some(&bytes), final_content.as_bytes()).await;
     let d = diffutil::diff_lines(&raw_text, &final_content, 24 * 1024);
     Ok(truncate_result(&format!(
         "已修改 {rel}（+{} −{}）\n```diff\n{}```",
@@ -3068,6 +3129,7 @@ const handleClick = async () => {
             temp: None,
             host: None,
             event_id: None,
+            message_id: None,
         };
 
         // 工作区内已存在目录
@@ -3116,6 +3178,7 @@ const handleClick = async () => {
             temp: None,
             host: None,
             event_id: None,
+            message_id: None,
         };
 
         let resolved_normal = resolve(&ctx, "src/main.rs");
@@ -3180,6 +3243,7 @@ const handleClick = async () => {
             temp: None,
             host: None,
             event_id: None,
+            message_id: None,
         };
 
         // LLM 发送 LF 换行的 old_string 与 new_string

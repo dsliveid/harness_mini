@@ -2,6 +2,7 @@ import React, { Component, type ReactNode } from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import { FileViewerApp } from "./file-viewer/FileViewerApp";
+import { AlertTriangle } from "./components/Icons";
 import "highlight.js/styles/github-dark.css";
 import "./index.css";
 
@@ -30,7 +31,7 @@ class ErrorBoundary extends Component<{ children: ReactNode }, ErrorBoundaryStat
         <div className="h-full w-full bg-[#0d1117] text-[#e6edf3] p-6 flex flex-col items-center justify-center font-sans">
           <div className="max-w-[600px] w-full bg-[#161b22] border border-[#30363d] rounded-2xl p-6 shadow-2xl">
             <div className="flex items-center gap-3 text-red-400 mb-3">
-              <span className="text-xl">⚠️</span>
+              <AlertTriangle size={22} className="shrink-0 text-red-400" />
               <h2 className="text-base font-semibold">界面渲染异常已拦截</h2>
             </div>
             <p className="text-[13px] text-[#8b949e] mb-4 leading-relaxed">

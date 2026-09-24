@@ -3,7 +3,7 @@ import { ipc } from "../ipc";
 import { useStore } from "../store";
 import { ModalClose } from "./ModalActions";
 import { askConfirm } from "./PromptModal";
-import { KeyRound, Shield, Trash2, Sliders, RotateCcw } from "./Icons";
+import { KeyRound, Shield, Trash2, Sliders, RotateCcw, Sparkles } from "./Icons";
 import { formatTokens, resolveModelContextLimit, MODEL_CONTEXT_PRESETS } from "../types";
 
 type Tab = "mode" | "rules" | "context";
@@ -309,7 +309,10 @@ export function SessionSettingsModal() {
                   <div className="text-inkdim">
                     当前状态：
                     {isCustomSession ? (
-                      <span className="text-amber-400 font-medium">★ 本对话专属自定义数值</span>
+                      <span className="text-amber-400 font-medium inline-flex items-center gap-1">
+                        <Sparkles size={11} className="shrink-0" />
+                        <span>本对话专属自定义数值</span>
+                      </span>
                     ) : (
                       <span className="text-emerald-400">跟随模型默认设定</span>
                     )}

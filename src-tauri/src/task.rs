@@ -5,7 +5,6 @@ use crate::store;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
@@ -46,41 +45,9 @@ fn remove_control(task_id: &str) {
     }
 }
 
-fn git_cmd() -> Command {
-    let mut cmd = Command::new("git");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
-    cmd
-}
-
-/// 执行真实物理 Git 快照提交
-fn create_git_snapshot(workspace: &Path, task_id: &str, step_num: usize) -> Option<String> {
-    if !workspace.join(".git").exists() {
-        return None;
-    }
-    // 1. git add -A
-    let _ = git_cmd().current_dir(workspace).args(["add", "-A"]).output();
-    // 2. git commit -m "..." --allow-empty
-    let msg = format!("checkpoint: task_{task_id}_step_{step_num}");
-    let _ = git_cmd()
-        .current_dir(workspace)
-        .args(["commit", "-m", &msg, "--allow-empty"])
-        .output();
-    // 3. git rev-parse HEAD
-    let out = git_cmd()
-        .current_dir(workspace)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()?;
-    if out.status.success() {
-        let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !sha.is_empty() {
-            return Some(sha);
-        }
-    }
+/// 零 Git 污染改造：彻底废除在用户主工作区执行 git commit 脏提交。
+/// 代码快照与时光机回滚全量移交 CAS 影子快照引擎接管。
+fn create_git_snapshot(_workspace: &Path, _task_id: &str, _step_num: usize) -> Option<String> {
     None
 }
 
@@ -115,6 +82,18 @@ async fn execute_verify_command(workspace: &Path, command_str: &str) -> (bool, S
     }
 }
 
+/// 安全按字节上限截断字符串，确保落在 UTF-8 字符边界上
+fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// 组装工作记忆块（Working Memory Block），包含历史检查点总结
 fn build_working_memory_block(checkpoints: &[TaskCheckpoint], goal: &str) -> String {
     if checkpoints.is_empty() {
@@ -122,14 +101,15 @@ fn build_working_memory_block(checkpoints: &[TaskCheckpoint], goal: &str) -> Str
     }
     let mut text = format!("【总目标锚点】: {}\n\n【已完成历史阶段检查点与沉淀事实 (Working Memory)】:\n", goal);
     for cp in checkpoints {
+        let summary_preview = if cp.summary.len() > 300 {
+            format!("{}…", safe_truncate(&cp.summary, 300))
+        } else {
+            cp.summary.clone()
+        };
         text.push_str(&format!(
             "- 阶段 #{}: 结论摘要 -> {}\n",
             cp.step_number,
-            if cp.summary.len() > 300 {
-                format!("{}…", &cp.summary[..300])
-            } else {
-                cp.summary.clone()
-            }
+            summary_preview
         ));
     }
     text.push_str("\n⚠️ 请基于上述已完成的成果继续推进，严禁无故推翻或重复已完成的修改！");
@@ -167,12 +147,15 @@ pub fn start_long_task(
         }
     }
 
-    let (workspace_path, task_id) = {
+    let (workspace_path, task_id, subtask_max_steps) = {
         let db = state.db.lock().unwrap();
+        let master = state.master_key.lock().unwrap();
         let s = store::get_session(&db, &session_id)?
             .ok_or_else(|| "会话不存在".to_string())?;
         let tid = format!("task-{}", uuid::Uuid::new_v4().simple());
-        (s.workspace_path, tid)
+        let settings = store::get_settings_with_secrets(&db, &master).unwrap_or_default();
+        let limit = settings.task_subtask_max_steps.max(1) as usize;
+        (s.workspace_path, tid, limit)
     };
 
     let now = store::now();
@@ -187,7 +170,7 @@ pub fn start_long_task(
         max_budget_tokens,
         total_tokens_used: 0,
         current_step: 0,
-        max_steps: 50,
+        max_steps: subtask_max_steps,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -361,13 +344,8 @@ pub fn rollback_to_checkpoint(app: &AppHandle, checkpoint_id: &str) -> Result<Lo
     // 1. 暂停当前可能在运行的任务
     let _ = pause_long_task(app, &task.id);
 
-    // 2. 如果包含 Git 物理提交且存在 .git，执行 hard reset
-    if let Some(ref sha) = cp.git_commit_hash {
-        let ws = Path::new(&task.workspace_path);
-        if ws.join(".git").exists() {
-            let _ = git_cmd().current_dir(ws).args(["reset", "--hard", sha]).output();
-        }
-    }
+    // 2. 零 Git 污染改造：废除 git reset --hard，防止冲刷用户工作区未暂存代码
+    // 原生代码时光机全量通过统一的 CAS 影子快照回滚。
 
     // 3. 将任务回退到该检查点步数
     task.current_subtask_index = cp.step_number.saturating_sub(1);
@@ -700,11 +678,11 @@ async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiver<b
         let subtask = task.subtasks[cur_idx].clone();
 
         // 提取历史检查点并生成工作记忆（Working Memory）
-        let working_memory = {
+        let cps = {
             let db = state.db.lock().unwrap();
-            let cps = store::list_task_checkpoints(&db, &task.id).unwrap_or_default();
-            build_working_memory_block(&cps, &task.goal)
+            store::list_task_checkpoints(&db, &task.id).unwrap_or_default()
         };
+        let working_memory = build_working_memory_block(&cps, &task.goal);
 
         let mut verify_instruction = String::new();
         if let Some(ref vc) = subtask.verify_command {
@@ -712,12 +690,13 @@ async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiver<b
         }
 
         let prompt = format!(
-            "【长任务自主推进阶段 {}/{}】: {}\n\n{}\n\n目标详情: {}\n\n【自主执行指令】:\n1. 请独立调用相关工具完成本阶段任务；\n2. 产出具体改动或验证结论，严禁停留在空泛设想；\n3. 完成后在最终答复中明确总结本次子任务所完成的具体成果。{}",
+            "【长任务自主推进阶段 {}/{}】: {}\n\n{}\n\n目标详情: {}\n\n【自主执行指令】:\n1. 请独立调用相关工具完成本阶段任务（本阶段单子任务轮次预算硬上限为 {} 步）；\n2. 产出具体改动或验证结论，严禁停留在空泛设想；\n3. 完成后在最终答复中明确总结本次子任务所完成的具体成果。{}",
             task.current_step,
             task.subtasks.len(),
             subtask.title,
             working_memory,
             subtask.description.as_deref().unwrap_or(""),
+            task.max_steps,
             verify_instruction
         );
 
@@ -817,7 +796,7 @@ async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiver<b
                 let fix_prompt = format!(
                     "【🚨 自动化质量门禁校验未通过】\n验证命令 `{}` 执行失败，报错如下：\n```\n{}\n```\n请立即根据上述报错信息自主调用工具排查并修复代码缺陷，确保验证命令通过！",
                     v_cmd,
-                    if verify_res_output.len() > 1500 { format!("{}…[截断]", &verify_res_output[..1500]) } else { verify_res_output.clone() }
+                    if verify_res_output.len() > 1500 { format!("{}…[截断]", safe_truncate(&verify_res_output, 1500)) } else { verify_res_output.clone() }
                 );
                 let fix_msg = {
                     let db = state.db.lock().unwrap();
@@ -922,3 +901,49 @@ async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiver<b
     let _ = app.emit("task:notification", json!({ "title": "长任务达成", "body": format!("目标【{}】已顺利完成！", task.goal) }));
     remove_control(&task.id);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_safe_truncate_ascii() {
+        let s = "Hello, world!";
+        assert_eq!(safe_truncate(s, 5), "Hello");
+        assert_eq!(safe_truncate(s, 50), "Hello, world!");
+    }
+
+    #[test]
+    fn test_safe_truncate_multibyte_chinese() {
+        // "你好世界" - each char is 3 bytes (total 12 bytes)
+        let s = "你好世界";
+        assert_eq!(safe_truncate(s, 3), "你");
+        // byte 4 falls inside '好' (bytes 3..6). safe_truncate should back off to byte 3 ("你")
+        assert_eq!(safe_truncate(s, 4), "你");
+        assert_eq!(safe_truncate(s, 5), "你");
+        assert_eq!(safe_truncate(s, 6), "你好");
+    }
+
+    #[test]
+    fn test_build_working_memory_block_with_multibyte_boundary() {
+        // Construct a checkpoint whose summary has a Chinese char split at byte 300
+        let mut summary = "a".repeat(299);
+        summary.push_str("中文测试"); // '中' starts at byte 299, ends at byte 302
+        let cp = TaskCheckpoint {
+            id: "cp-test".to_string(),
+            task_id: "task-test".to_string(),
+            step_number: 1,
+            subtask_id: None,
+            status: "completed".to_string(),
+            summary,
+            working_memory: String::new(),
+            git_commit_hash: None,
+            created_at: "2026-09-24".to_string(),
+        };
+        // This should not panic!
+        let result = build_working_memory_block(&[cp], "test goal");
+        assert!(result.contains("【总目标锚点】: test goal"));
+        assert!(result.contains("- 阶段 #1: 结论摘要 -> "));
+    }
+}
+

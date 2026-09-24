@@ -246,7 +246,7 @@ export function ModelMatrixModal() {
           <div className="p-3.5 rounded-xl border border-pink-500/20 bg-pink-500/5 space-y-2">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <span className="text-[15px]">{MODEL_CAPABILITY_METAS.image_gen.icon}</span>
+                <MODEL_CAPABILITY_METAS.image_gen.Icon size={16} className="text-pink-400 shrink-0" />
                 <span className="text-[12.5px] font-medium text-ink">
                   {MODEL_CAPABILITY_METAS.image_gen.label}
                 </span>
@@ -276,7 +276,7 @@ export function ModelMatrixModal() {
           <div className="p-3.5 rounded-xl border border-purple-500/20 bg-purple-500/5 space-y-2">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <span className="text-[15px]">{MODEL_CAPABILITY_METAS.vision.icon}</span>
+                <MODEL_CAPABILITY_METAS.vision.Icon size={16} className="text-purple-400 shrink-0" />
                 <span className="text-[12.5px] font-medium text-ink">
                   {MODEL_CAPABILITY_METAS.vision.label}
                 </span>

@@ -8,12 +8,6 @@ import { ModalActions, ModalClose } from "./ModalActions";
 import { ModelContextModal } from "./ModelContextModal";
 import { ModelCapabilitySelect } from "./ModelCapabilitySelect";
 
-const MODEL_CAP_OPTIONS = [
-  { id: "chat", label: "对话", icon: "💬" },
-  { id: "image_gen", label: "生图", icon: "🎨" },
-  { id: "vision", label: "视觉", icon: "👁️" },
-] as const;
-
 import {
   Cpu,
   Wrench,
@@ -30,7 +24,16 @@ import {
   Sparkles,
   BarChart2,
   Sliders,
+  MessageSquare,
+  Palette,
+  Sprout,
 } from "./Icons";
+
+const MODEL_CAP_OPTIONS = [
+  { id: "chat", label: "对话", Icon: MessageSquare },
+  { id: "image_gen", label: "生图", Icon: Palette },
+  { id: "vision", label: "视觉", Icon: Eye },
+] as const;
 
 type Tab = "models" | "tools" | "sop" | "datadir";
 
@@ -690,7 +693,7 @@ export function SettingsModal() {
                                                   }));
                                                 }}
                                                 title={active ? `点击取消【${cap.label}】能力` : `点击赋予【${cap.label}】能力`}
-                                                className={`text-[10px] px-1.5 py-0.5 rounded transition-all cursor-pointer flex items-center gap-0.5 border ${
+                                                className={`text-[10px] px-1.5 py-0.5 rounded transition-all cursor-pointer flex items-center gap-1 border ${
                                                   active
                                                     ? cap.id === "chat"
                                                       ? "bg-blue-500/15 text-blue-400 border-blue-500/30 font-medium"
@@ -700,7 +703,7 @@ export function SettingsModal() {
                                                     : "bg-panel3/40 text-inkdim/40 border-edge/50 hover:text-inkdim hover:border-edge"
                                                 }`}
                                               >
-                                                <span>{cap.icon}</span>
+                                                <cap.Icon size={11} className="shrink-0" />
                                                 <span>{cap.label}</span>
                                               </button>
                                             );
@@ -899,7 +902,7 @@ export function SettingsModal() {
                     <div className="text-[11px] text-inkdim flex items-center gap-1.5 leading-relaxed bg-panel3/40 rounded-lg px-2.5 py-1.5 border border-edge/40">
                       <Sparkles size={13} className="text-accent shrink-0" />
                       <span>
-                        建议：将纯生图模型（如 <code className="font-mono text-accent">doubao-seedream-5.0-lite</code>）标记为 <span className="text-purple-400 font-medium">🎨 生图</span> 能力，并在「图像生成协作者」中单独绑定。这样对话思考与生图物理隔离，杜绝 400 Bad Request。
+                        建议：将纯生图模型（如 <code className="font-mono text-accent">doubao-seedream-5.0-lite</code>）标记为 <span className="text-purple-400 font-medium inline-flex items-center gap-1"><Palette size={11} className="shrink-0" />生图</span> 能力，并在「图像生成协作者」中单独绑定。这样对话思考与生图物理隔离，杜绝 400 Bad Request。
                       </span>
                     </div>
                   </div>
@@ -908,7 +911,7 @@ export function SettingsModal() {
                 {/* 运行参数 */}
                 <section>
                   <div className="font-medium mb-2">运行参数</div>
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
                     <label className="flex flex-col gap-1">
                       <span className="text-inkdim">默认访问模式</span>
                       <select
@@ -921,7 +924,7 @@ export function SettingsModal() {
                       </select>
                     </label>
                     <label className="flex flex-col gap-1">
-                      <span className="text-inkdim">最大步数</span>
+                      <span className="text-inkdim" title="常规对话单次运行的最大工具调用步数">最大步数</span>
                       <input
                         className={inputCls}
                         type="number"
@@ -929,6 +932,21 @@ export function SettingsModal() {
                         max={100}
                         value={local.maxSteps}
                         onChange={(e) => setLocal({ ...local, maxSteps: Number(e.target.value) || 30 })}
+                        title="常规对话单次运行的最大工具调用步数"
+                      />
+                    </label>
+                    <label className="flex flex-col gap-1">
+                      <span className="text-inkdim" title="长任务中推进单个子任务时的执行与自愈轮次预算硬上限，默认30轮，防止死循环">
+                        单子任务轮次预算
+                      </span>
+                      <input
+                        className={inputCls}
+                        type="number"
+                        min={1}
+                        max={100}
+                        value={local.taskSubtaskMaxSteps ?? 30}
+                        onChange={(e) => setLocal({ ...local, taskSubtaskMaxSteps: Number(e.target.value) || 30 })}
+                        title="长任务中推进单个子任务时的执行与自愈轮次预算硬上限，默认30轮，防止死循环"
                       />
                     </label>
                     <label className="flex flex-col gap-1">
@@ -1003,7 +1021,7 @@ export function SettingsModal() {
                       <div className="text-inkdim leading-relaxed">
                         <span className="text-blue-400 font-medium">1. 系统内置工具</span>：平台底座原生提供的文件读写、代码搜索与命令行执行能力；<br />
                         <span className="text-purple-400 font-medium">2. 自演化引擎工具</span>：Agent 发现多步任务规律并将其固化为复用技能的内置元工具；<br />
-                        <span className="text-emerald-400 font-medium">3. 项目自成长技能</span>：Agent 或用户自动沉淀的项目定制技能脚本，存储于项目的 <code className="bg-panel2 px-1 rounded text-accent font-mono">.harness/skills/</code> 目录。可在顶栏 <b className="text-ink">「🌱 成长中心」</b> 的「⚡ 技能工具库」中查看与管理。
+                        <span className="text-emerald-400 font-medium">3. 项目自成长技能</span>：Agent 或用户自动沉淀的项目定制技能脚本，存储于项目的 <code className="bg-panel2 px-1 rounded text-accent font-mono">.harness/skills/</code> 目录。可在顶栏 <b className="text-ink inline-flex items-center gap-1"><Sprout size={13} className="text-emerald-400 shrink-0" />成长中心</b> 的「<span className="inline-flex items-center gap-0.5"><Zap size={12} className="text-amber-400 shrink-0" />技能工具库</span>」中查看与管理。
                       </div>
                     </div>
                   </div>

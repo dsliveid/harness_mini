@@ -7,7 +7,7 @@ import {
   resolveActiveVisionModel,
   resolveActiveModel,
 } from "../types";
-import { AlertTriangle } from "./Icons";
+import { AlertTriangle, Settings as SettingsIcon } from "./Icons";
 
 export interface ModelCapabilitySelectProps {
   capability: ModelCapability;
@@ -35,7 +35,7 @@ export function ModelCapabilitySelect({
   const meta = MODEL_CAPABILITY_METAS[capability] || {
     id: capability,
     label: capability,
-    icon: "⚙️",
+    Icon: SettingsIcon,
   };
 
   // 计算全局生效模型名作为跟随全局的标签

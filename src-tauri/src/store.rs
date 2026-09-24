@@ -198,6 +198,22 @@ fn init(conn: &Connection) -> Result<(), String> {
           created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_task_checkpoints_task ON task_checkpoints(task_id, step_number);
+
+        CREATE TABLE IF NOT EXISTS tool_file_snapshots (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+          tool_event_id TEXT NOT NULL REFERENCES tool_events(id) ON DELETE CASCADE,
+          file_path TEXT NOT NULL,
+          before_hash TEXT,
+          after_hash TEXT NOT NULL,
+          is_new_file INTEGER NOT NULL DEFAULT 0,
+          reverted_at TEXT,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_snapshots_event ON tool_file_snapshots(tool_event_id);
+        CREATE INDEX IF NOT EXISTS idx_snapshots_message ON tool_file_snapshots(message_id);
+        CREATE INDEX IF NOT EXISTS idx_snapshots_session ON tool_file_snapshots(session_id, created_at);
         "#,
     )
     .map_err(|e| e.to_string())?;
@@ -276,6 +292,8 @@ fn init(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "sessions", "reasoning_effort", "reasoning_effort TEXT")?;
     ensure_column(conn, "messages", "attachments_json", "attachments_json TEXT")?;
     ensure_column(conn, "tool_events", "subprocess_id", "subprocess_id TEXT")?;
+    ensure_column(conn, "messages", "reverted_at", "reverted_at TEXT")?;
+    ensure_column(conn, "tool_file_snapshots", "reverted_at", "reverted_at TEXT")?;
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_trigger_tool ON sessions(trigger_tool_event_id)", []);
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_forked_from ON sessions(forked_from_session_id)", []);
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_tool_events_subprocess ON tool_events(subprocess_id)", []);
@@ -775,6 +793,7 @@ mod tests {
             approval_scope: None,
             created_at: now(),
             subprocess_id: None,
+            reverted_at: None,
         };
         insert_tool_event(&conn, &ev).unwrap();
 
@@ -805,6 +824,7 @@ mod tests {
             approval_scope: None,
             created_at: now(),
             subprocess_id: None,
+            reverted_at: None,
         };
         insert_tool_event(&conn, &ev2).unwrap();
         cleanup_orphaned_running_states(&conn).unwrap();
@@ -1223,6 +1243,7 @@ mod tests {
             cached_tokens: None,
             is_estimated: None,
             attachments: None,
+            reverted_at: None,
         };
         insert_message(&conn, &m1).unwrap();
 
@@ -1249,6 +1270,7 @@ mod tests {
             cached_tokens: None,
             is_estimated: None,
             attachments: None,
+            reverted_at: None,
         };
         insert_message(&conn, &m2).unwrap();
 
@@ -1263,6 +1285,7 @@ mod tests {
             approval_scope: None,
             created_at: "2026-01-01T00:00:02Z".into(),
             subprocess_id: None,
+            reverted_at: None,
         };
         insert_tool_event(&conn, &ev1).unwrap();
 
@@ -1288,6 +1311,7 @@ mod tests {
             cached_tokens: None,
             is_estimated: None,
             attachments: None,
+            reverted_at: None,
         };
         insert_message(&conn, &m3).unwrap();
 
@@ -1313,6 +1337,7 @@ mod tests {
             cached_tokens: None,
             is_estimated: None,
             attachments: None,
+            reverted_at: None,
         };
         insert_message(&conn, &m4).unwrap();
 
@@ -1338,6 +1363,7 @@ mod tests {
             cached_tokens: None,
             is_estimated: None,
             attachments: None,
+            reverted_at: None,
         };
         insert_message(&conn, &m5).unwrap();
 
@@ -1406,6 +1432,179 @@ mod tests {
         assert_eq!(loaded.image_model_id.as_deref(), Some("doubao-seedream-5.0-lite"));
         assert_eq!(loaded.vision_provider_id.as_deref(), Some("openai"));
         assert_eq!(loaded.vision_model_id.as_deref(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn test_tool_file_snapshots_crud() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        let s = create_session(&conn, "D:\\workspace", None, "快照测试会话", "confirm").unwrap();
+        let m = new_message(&conn, &s.id, "assistant", Some("修改代码".into()), false).unwrap();
+        let ev = ToolEvent {
+            id: "ev-snap-1".into(),
+            message_id: m.id.clone(),
+            tool_name: "edit_file".into(),
+            tool_call_id: Some("call-1".into()),
+            params: serde_json::json!({"path": "src/main.rs"}),
+            result_text: Some("ok".into()),
+            status: "success".into(),
+            approval_scope: Some("none".into()),
+            created_at: now(),
+            subprocess_id: None,
+            reverted_at: None,
+        };
+        insert_tool_event(&conn, &ev).unwrap();
+
+        let snap = ToolFileSnapshot {
+            id: "snap-1".into(),
+            session_id: s.id.clone(),
+            message_id: m.id.clone(),
+            tool_event_id: ev.id.clone(),
+            file_path: "src/main.rs".into(),
+            before_hash: Some("hash_before_123".into()),
+            after_hash: "hash_after_456".into(),
+            is_new_file: false,
+            reverted_at: None,
+            created_at: now(),
+        };
+
+        insert_tool_file_snapshot(&conn, &snap).unwrap();
+
+        let msg_snaps = list_snapshots_for_message(&conn, &m.id).unwrap();
+        assert_eq!(msg_snaps.len(), 1);
+        assert_eq!(msg_snaps[0].file_path, "src/main.rs");
+        assert_eq!(msg_snaps[0].before_hash.as_deref(), Some("hash_before_123"));
+        assert_eq!(msg_snaps[0].after_hash, "hash_after_456");
+        assert_eq!(msg_snaps[0].reverted_at, None);
+
+        let ev_snaps = list_snapshots_for_event(&conn, &ev.id).unwrap();
+        assert_eq!(ev_snaps.len(), 1);
+
+        let sess_snaps = list_snapshots_for_session(&conn, &s.id).unwrap();
+        assert_eq!(sess_snaps.len(), 1);
+
+        // 标记已撤回
+        mark_snapshots_reverted_for_message(&conn, &m.id, Some("2026-09-24T16:00:00Z")).unwrap();
+        let updated_snaps = list_snapshots_for_message(&conn, &m.id).unwrap();
+        assert_eq!(updated_snaps[0].reverted_at.as_deref(), Some("2026-09-24T16:00:00Z"));
+
+        let updated_msg = get_message(&conn, &m.id).unwrap().unwrap();
+        assert_eq!(updated_msg.reverted_at.as_deref(), Some("2026-09-24T16:00:00Z"));
+
+        // 恢复重做 (revert_at 置为 None)
+        mark_snapshots_reverted_for_message(&conn, &m.id, None).unwrap();
+        let redone_snaps = list_snapshots_for_message(&conn, &m.id).unwrap();
+        assert_eq!(redone_snaps[0].reverted_at, None);
+        let redone_msg = get_message(&conn, &m.id).unwrap().unwrap();
+        assert_eq!(redone_msg.reverted_at, None);
+    }
+
+    #[test]
+    fn test_turn_snapshots_and_edit_resend_revert_flow() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        let s = create_session(&conn, "D:\\workspace", None, "test", "confirm").unwrap();
+        let u = new_message(&conn, &s.id, "user", Some("请帮我修改代码".into()), false).unwrap();
+
+        // 模拟多步 assistant 轮次，共享同一 run_id
+        let a1 = new_message(&conn, &s.id, "assistant", Some("正在修改 step 1".into()), false).unwrap();
+        set_message_run_id(&conn, &a1.id, "run-turn-100").unwrap();
+
+        let a2 = new_message(&conn, &s.id, "assistant", Some("正在修改 step 2".into()), false).unwrap();
+        set_message_run_id(&conn, &a2.id, "run-turn-100").unwrap();
+
+        let a3 = new_message(&conn, &s.id, "assistant", Some("修改已完成交付".into()), false).unwrap();
+        set_message_run_id(&conn, &a3.id, "run-turn-100").unwrap();
+
+        let ev1 = ToolEvent {
+            id: "ev-1".into(),
+            message_id: a1.id.clone(),
+            tool_name: "edit_file".into(),
+            tool_call_id: Some("call-1".into()),
+            params: serde_json::json!({"path": "src/a.rs"}),
+            result_text: Some("ok".into()),
+            status: "success".into(),
+            approval_scope: Some("none".into()),
+            created_at: now(),
+            subprocess_id: None,
+            reverted_at: None,
+        };
+        let ev2 = ToolEvent {
+            id: "ev-2".into(),
+            message_id: a2.id.clone(),
+            tool_name: "edit_file".into(),
+            tool_call_id: Some("call-2".into()),
+            params: serde_json::json!({"path": "src/b.rs"}),
+            result_text: Some("ok".into()),
+            status: "success".into(),
+            approval_scope: Some("none".into()),
+            created_at: now(),
+            subprocess_id: None,
+            reverted_at: None,
+        };
+        insert_tool_event(&conn, &ev1).unwrap();
+        insert_tool_event(&conn, &ev2).unwrap();
+
+        // 为 a1 与 a2 插入修改快照（a3 仅交付纯文本，无快照）
+        let snap1 = ToolFileSnapshot {
+            id: "snap-1".into(),
+            session_id: s.id.clone(),
+            message_id: a1.id.clone(),
+            tool_event_id: "ev-1".into(),
+            file_path: "src/a.rs".into(),
+            before_hash: Some("bh1".into()),
+            after_hash: "ah1".into(),
+            is_new_file: false,
+            reverted_at: None,
+            created_at: "2026-09-24T18:00:00Z".into(),
+        };
+        let snap2 = ToolFileSnapshot {
+            id: "snap-2".into(),
+            session_id: s.id.clone(),
+            message_id: a2.id.clone(),
+            tool_event_id: "ev-2".into(),
+            file_path: "src/b.rs".into(),
+            before_hash: Some("bh2".into()),
+            after_hash: "ah2".into(),
+            is_new_file: false,
+            reverted_at: None,
+            created_at: "2026-09-24T18:01:00Z".into(),
+        };
+        insert_tool_file_snapshot(&conn, &snap1).unwrap();
+        insert_tool_file_snapshot(&conn, &snap2).unwrap();
+
+        // 1. 测试从纯文本交付消息 a3 查询整轮快照：应聚合 a1 与 a2 的全部 2 个快照
+        let turn_snaps_from_a3 = list_snapshots_for_turn(&conn, &a3.id).unwrap();
+        assert_eq!(turn_snaps_from_a3.len(), 2);
+        assert_eq!(turn_snaps_from_a3[0].file_path, "src/a.rs");
+        assert_eq!(turn_snaps_from_a3[1].file_path, "src/b.rs");
+
+        // 2. 测试从 a1 查询整轮快照：同样聚合全轮快照
+        let turn_snaps_from_a1 = list_snapshots_for_turn(&conn, &a1.id).unwrap();
+        assert_eq!(turn_snaps_from_a1.len(), 2);
+
+        // 3. 测试整轮软撤回与重做广播
+        let affected = mark_snapshots_reverted_for_turn(&conn, &a3.id, Some("2026-09-24T18:02:00Z")).unwrap();
+        assert!(affected.contains(&a1.id));
+        assert!(affected.contains(&a2.id));
+        assert!(affected.contains(&a3.id));
+        assert!(affected.contains(&u.id));
+
+        let updated_a3 = get_message(&conn, &a3.id).unwrap().unwrap();
+        assert_eq!(updated_a3.reverted_at.as_deref(), Some("2026-09-24T18:02:00Z"));
+        let updated_u = get_message(&conn, &u.id).unwrap().unwrap();
+        assert_eq!(updated_u.reverted_at.as_deref(), Some("2026-09-24T18:02:00Z"));
+
+        // 4. 测试重新编辑提问时的后序快照获取（按 LIFO 逆序返回）
+        mark_snapshots_reverted_for_turn(&conn, &a3.id, None).unwrap();
+        let redone_u = get_message(&conn, &u.id).unwrap().unwrap();
+        assert_eq!(redone_u.reverted_at, None);
+        let snaps_after_u_active = list_snapshots_after_seq(&conn, &s.id, u.seq).unwrap();
+        assert_eq!(snaps_after_u_active.len(), 2);
+        assert_eq!(snaps_after_u_active[0].file_path, "src/b.rs"); // 后生成的排在前面 (LIFO)
+        assert_eq!(snaps_after_u_active[1].file_path, "src/a.rs");
     }
 }
 
@@ -2668,8 +2867,8 @@ pub fn next_seq(conn: &Connection, session_id: &str) -> Result<i64, String> {
 
 pub fn insert_message(conn: &Connection, m: &Message) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO messages(id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, cached_tokens, is_estimated, duration_ms, turn_duration_ms, attachments_json)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+        "INSERT INTO messages(id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, cached_tokens, is_estimated, duration_ms, turn_duration_ms, attachments_json, reverted_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
         params![
             m.id,
             m.session_id,
@@ -2691,6 +2890,7 @@ pub fn insert_message(conn: &Connection, m: &Message) -> Result<(), String> {
             m.duration_ms.unwrap_or(0) as i64,
             m.turn_duration_ms.unwrap_or(0) as i64,
             m.attachments.as_ref().and_then(|v| serde_json::to_string(v).ok()),
+            m.reverted_at,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -2765,6 +2965,7 @@ pub fn new_message_with_attachments(
         cached_tokens: None,
         is_estimated: None,
         attachments,
+        reverted_at: None,
     };
     insert_message(conn, &m)?;
     Ok(m)
@@ -2923,7 +3124,7 @@ pub fn get_messages(
 ) -> Result<Vec<Message>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens, is_estimated
+            "SELECT id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens, is_estimated, reverted_at
              FROM messages WHERE session_id = ?1 AND seq < COALESCE(?2, 9223372036854775807)
              ORDER BY seq DESC LIMIT ?3",
         )
@@ -2940,6 +3141,7 @@ pub fn get_messages(
             let att: Option<String> = r.get(16)?;
             let cached: Option<i64> = r.get(17)?;
             let is_est: Option<i64> = r.get(18)?;
+            let rev_at: Option<String> = r.get(19)?;
             Ok(Message {
                 id: r.get(0)?,
                 session_id: session_id.to_string(),
@@ -2962,6 +3164,7 @@ pub fn get_messages(
                 cached_tokens: cached.map(|v| v as u64),
                 is_estimated: is_est.map(|v| v != 0),
                 attachments: att.and_then(|s| serde_json::from_str(&s).ok()),
+                reverted_at: rev_at,
             })
         })
         .map_err(|e| e.to_string())?
@@ -2986,8 +3189,9 @@ fn tool_events_for(
     let _ = message_ids;
     let mut stmt = conn
         .prepare(
-            "SELECT id, message_id, tool_name, tool_call_id, params_json, result_text, status, approval_scope, created_at, subprocess_id
-             FROM tool_events WHERE message_id = ?1 ORDER BY rowid ASC",
+            "SELECT te.id, te.message_id, te.tool_name, te.tool_call_id, te.params_json, te.result_text, te.status, te.approval_scope, te.created_at, te.subprocess_id,
+                    (SELECT reverted_at FROM tool_file_snapshots WHERE tool_event_id = te.id ORDER BY rowid DESC LIMIT 1)
+             FROM tool_events te WHERE te.message_id = ?1 ORDER BY te.rowid ASC",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -3004,6 +3208,7 @@ fn tool_events_for(
                 approval_scope: r.get(7)?,
                 created_at: r.get(8)?,
                 subprocess_id: r.get(9)?,
+                reverted_at: r.get(10)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -3081,7 +3286,7 @@ pub fn list_session_compactions(conn: &Connection, session_id: &str) -> Result<V
 pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, String> {
     let opt = conn
         .query_row(
-            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens, is_estimated
+            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens, is_estimated, reverted_at
              FROM messages WHERE id = ?1",
             params![id],
             |r| {
@@ -3095,6 +3300,7 @@ pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, Strin
                 let att: Option<String> = r.get(17)?;
                 let cached: Option<i64> = r.get(18)?;
                 let is_est: Option<i64> = r.get(19)?;
+                let rev_at: Option<String> = r.get(20)?;
                 Ok(Message {
                     id: r.get(0)?,
                     session_id: r.get(1)?,
@@ -3117,6 +3323,7 @@ pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, Strin
                     cached_tokens: cached.map(|v| v as u64),
                     is_estimated: is_est.map(|v| v != 0),
                     attachments: att.and_then(|s| serde_json::from_str(&s).ok()),
+                    reverted_at: rev_at,
                 })
             },
         )
@@ -3130,7 +3337,7 @@ pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, Strin
 pub fn list_queued(conn: &Connection, session_id: &str) -> Result<Vec<Message>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens, is_estimated
+            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens, is_estimated, reverted_at
              FROM messages WHERE session_id = ?1 AND queued = 1 ORDER BY seq ASC",
         )
         .map_err(|e| e.to_string())?;
@@ -3146,6 +3353,7 @@ pub fn list_queued(conn: &Connection, session_id: &str) -> Result<Vec<Message>, 
             let att: Option<String> = r.get(17)?;
             let cached: Option<i64> = r.get(18)?;
             let is_est: Option<i64> = r.get(19)?;
+            let rev_at: Option<String> = r.get(20)?;
             Ok(Message {
                 id: r.get(0)?,
                 session_id: r.get(1)?,
@@ -3168,6 +3376,7 @@ pub fn list_queued(conn: &Connection, session_id: &str) -> Result<Vec<Message>, 
                 cached_tokens: cached.map(|v| v as u64),
                 is_estimated: is_est.map(|v| v != 0),
                 attachments: att.and_then(|s| serde_json::from_str(&s).ok()),
+                reverted_at: rev_at,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -3366,6 +3575,7 @@ pub fn fail_open_tool_events(conn: &Connection, session_id: &str) -> Result<Vec<
                 approval_scope: r.get(7)?,
                 created_at: r.get(8)?,
                 subprocess_id: r.get(9)?,
+                reverted_at: None,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -3407,7 +3617,8 @@ pub fn cleanup_orphaned_running_states(conn: &Connection) -> Result<(), String> 
 pub fn get_tool_event_with_session(conn: &Connection, event_id: &str) -> Result<Option<(ToolEvent, String)>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT te.id, te.message_id, te.tool_name, te.tool_call_id, te.params_json, te.result_text, te.status, te.approval_scope, te.created_at, m.session_id, te.subprocess_id
+            "SELECT te.id, te.message_id, te.tool_name, te.tool_call_id, te.params_json, te.result_text, te.status, te.approval_scope, te.created_at, m.session_id, te.subprocess_id,
+                    (SELECT reverted_at FROM tool_file_snapshots WHERE tool_event_id = te.id ORDER BY rowid DESC LIMIT 1)
              FROM tool_events te
              JOIN messages m ON te.message_id = m.id
              WHERE te.id = ?1",
@@ -3427,6 +3638,7 @@ pub fn get_tool_event_with_session(conn: &Connection, event_id: &str) -> Result<
                 approval_scope: r.get(7)?,
                 created_at: r.get(8)?,
                 subprocess_id: r.get(10)?,
+                reverted_at: r.get(11)?,
             };
             let session_id: String = r.get(9)?;
             Ok((ev, session_id))
@@ -4370,3 +4582,412 @@ pub fn startup_reconcile(conn: &Connection) -> Result<(), String> {
 
     Ok(())
 }
+
+// ---------- Tool File Snapshots (影子快照元数据) ----------
+
+pub fn insert_tool_file_snapshot(conn: &Connection, snap: &ToolFileSnapshot) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO tool_file_snapshots (
+            id, session_id, message_id, tool_event_id, file_path, before_hash, after_hash, is_new_file, reverted_at, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            snap.id,
+            snap.session_id,
+            snap.message_id,
+            snap.tool_event_id,
+            snap.file_path,
+            snap.before_hash,
+            snap.after_hash,
+            snap.is_new_file as i64,
+            snap.reverted_at,
+            snap.created_at,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    // 50 轮滑动窗口自动淘汰
+    let _ = prune_session_snapshots_sliding_window(conn, &snap.session_id, 50);
+
+    Ok(())
+}
+
+pub fn list_snapshots_for_message(conn: &Connection, message_id: &str) -> Result<Vec<ToolFileSnapshot>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, message_id, tool_event_id, file_path, before_hash, after_hash, is_new_file, reverted_at, created_at
+             FROM tool_file_snapshots WHERE message_id = ?1 ORDER BY created_at ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![message_id], |r| {
+            Ok(ToolFileSnapshot {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                message_id: r.get(2)?,
+                tool_event_id: r.get(3)?,
+                file_path: r.get(4)?,
+                before_hash: r.get(5)?,
+                after_hash: r.get(6)?,
+                is_new_file: r.get::<_, i64>(7)? != 0,
+                reverted_at: r.get(8)?,
+                created_at: r.get(9)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+/// 获取整轮对话（同一个 run_id 或指定 message_id）关联的所有快照
+pub fn list_snapshots_for_turn(conn: &Connection, message_id: &str) -> Result<Vec<ToolFileSnapshot>, String> {
+    let run_id: Option<String> = conn
+        .query_row(
+            "SELECT run_id FROM messages WHERE id = ?1",
+            params![message_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None)
+        .flatten();
+
+    if let Some(rid) = run_id {
+        if !rid.is_empty() {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT s.id, s.session_id, s.message_id, s.tool_event_id, s.file_path, s.before_hash, s.after_hash, s.is_new_file, s.reverted_at, s.created_at
+                     FROM tool_file_snapshots s
+                     JOIN messages m ON s.message_id = m.id
+                     WHERE m.run_id = ?1 ORDER BY s.created_at ASC",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![rid], |r| {
+                    Ok(ToolFileSnapshot {
+                        id: r.get(0)?,
+                        session_id: r.get(1)?,
+                        message_id: r.get(2)?,
+                        tool_event_id: r.get(3)?,
+                        file_path: r.get(4)?,
+                        before_hash: r.get(5)?,
+                        after_hash: r.get(6)?,
+                        is_new_file: r.get::<_, i64>(7)? != 0,
+                        reverted_at: r.get(8)?,
+                        created_at: r.get(9)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?;
+            let snaps = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+            if !snaps.is_empty() {
+                return Ok(snaps);
+            }
+        }
+    }
+
+    list_snapshots_for_message(conn, message_id)
+}
+
+/// 查询某个 seq 之后的所有有效快照（用于重新编辑时回退此后的全部修改，按 LIFO 逆序排列）
+pub fn list_snapshots_after_seq(
+    conn: &Connection,
+    session_id: &str,
+    seq: i64,
+) -> Result<Vec<ToolFileSnapshot>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.id, s.session_id, s.message_id, s.tool_event_id, s.file_path, s.before_hash, s.after_hash, s.is_new_file, s.reverted_at, s.created_at
+             FROM tool_file_snapshots s
+             JOIN messages m ON s.message_id = m.id
+             WHERE m.session_id = ?1 AND m.seq > ?2 AND s.reverted_at IS NULL
+             ORDER BY s.created_at DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id, seq], |r| {
+            Ok(ToolFileSnapshot {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                message_id: r.get(2)?,
+                tool_event_id: r.get(3)?,
+                file_path: r.get(4)?,
+                before_hash: r.get(5)?,
+                after_hash: r.get(6)?,
+                is_new_file: r.get::<_, i64>(7)? != 0,
+                reverted_at: r.get(8)?,
+                created_at: r.get(9)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+pub fn list_snapshots_for_event(conn: &Connection, tool_event_id: &str) -> Result<Vec<ToolFileSnapshot>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, message_id, tool_event_id, file_path, before_hash, after_hash, is_new_file, reverted_at, created_at
+             FROM tool_file_snapshots WHERE tool_event_id = ?1 ORDER BY created_at ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![tool_event_id], |r| {
+            Ok(ToolFileSnapshot {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                message_id: r.get(2)?,
+                tool_event_id: r.get(3)?,
+                file_path: r.get(4)?,
+                before_hash: r.get(5)?,
+                after_hash: r.get(6)?,
+                is_new_file: r.get::<_, i64>(7)? != 0,
+                reverted_at: r.get(8)?,
+                created_at: r.get(9)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+pub fn list_snapshots_for_session(conn: &Connection, session_id: &str) -> Result<Vec<ToolFileSnapshot>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, message_id, tool_event_id, file_path, before_hash, after_hash, is_new_file, reverted_at, created_at
+             FROM tool_file_snapshots WHERE session_id = ?1 ORDER BY created_at ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id], |r| {
+            Ok(ToolFileSnapshot {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                message_id: r.get(2)?,
+                tool_event_id: r.get(3)?,
+                file_path: r.get(4)?,
+                before_hash: r.get(5)?,
+                after_hash: r.get(6)?,
+                is_new_file: r.get::<_, i64>(7)? != 0,
+                reverted_at: r.get(8)?,
+                created_at: r.get(9)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+pub fn mark_snapshots_reverted_for_message(conn: &Connection, message_id: &str, reverted_at: Option<&str>) -> Result<(), String> {
+    conn.execute(
+        "UPDATE tool_file_snapshots SET reverted_at = ?2 WHERE message_id = ?1",
+        params![message_id, reverted_at],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE messages SET reverted_at = ?2 WHERE id = ?1",
+        params![message_id, reverted_at],
+    )
+    .map_err(|e| e.to_string())?;
+    let _ = conn.execute(
+        "UPDATE messages SET reverted_at = ?2 WHERE tool_call_id IN (SELECT tool_call_id FROM tool_events WHERE message_id = ?1 AND tool_call_id IS NOT NULL)",
+        params![message_id, reverted_at],
+    );
+    Ok(())
+}
+
+/// 标记整轮对话（包括同一 run_id 下的所有消息及触发该 run 的用户提问消息）及其快照为已撤回/激活态，并返回受影响的所有 message_id
+pub fn mark_snapshots_reverted_for_turn(
+    conn: &Connection,
+    message_id: &str,
+    reverted_at: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut run_id: Option<String> = conn
+        .query_row(
+            "SELECT run_id FROM messages WHERE id = ?1",
+            params![message_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None)
+        .flatten();
+
+    if run_id.is_none() {
+        run_id = conn
+            .query_row(
+                "SELECT id FROM runs WHERE trigger_message_id = ?1 ORDER BY rowid DESC LIMIT 1",
+                params![message_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap_or(None);
+    }
+
+    let target_msg_ids: Vec<String> = if let Some(ref rid) = run_id {
+        if !rid.is_empty() {
+            let mut ids = Vec::new();
+            let mut stmt = conn
+                .prepare("SELECT id FROM messages WHERE run_id = ?1")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt.query_map(params![rid], |r| r.get(0)).map_err(|e| e.to_string())?;
+            for r in rows {
+                if let Ok(id) = r {
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+            }
+
+            // 查找 runs 表中的 trigger_message_id (用户提问)
+            let trigger_id: Option<String> = conn
+                .query_row(
+                    "SELECT trigger_message_id FROM runs WHERE id = ?1",
+                    params![rid],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap_or(None)
+                .flatten();
+            if let Some(tid) = trigger_id {
+                if !ids.contains(&tid) {
+                    ids.push(tid);
+                }
+            }
+
+            // 兜底检查：若仍未包含 user 角色消息，向前寻找到该轮次最近的 user 消息
+            let has_user = {
+                let mut found = false;
+                for mid in &ids {
+                    let role: Option<String> = conn
+                        .query_row("SELECT role FROM messages WHERE id = ?1", params![mid], |r| r.get(0))
+                        .optional()
+                        .unwrap_or(None);
+                    if role.as_deref() == Some("user") {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            };
+            if !has_user {
+                let min_seq_res: Option<(i64, String)> = conn
+                    .query_row(
+                        "SELECT MIN(seq), session_id FROM messages WHERE run_id = ?1 GROUP BY session_id",
+                        params![rid],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()
+                    .unwrap_or(None);
+                if let Some((mseq, sid)) = min_seq_res {
+                    let prev_user: Option<String> = conn
+                        .query_row(
+                            "SELECT id FROM messages WHERE session_id = ?1 AND role = 'user' AND seq <= ?2 ORDER BY seq DESC LIMIT 1",
+                            params![sid, mseq],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .unwrap_or(None);
+                    if let Some(puid) = prev_user {
+                        if !ids.contains(&puid) {
+                            ids.push(puid);
+                        }
+                    }
+                }
+            }
+
+            if ids.is_empty() {
+                vec![message_id.to_string()]
+            } else {
+                ids
+            }
+        } else {
+            vec![message_id.to_string()]
+        }
+    } else {
+        vec![message_id.to_string()]
+    };
+
+    for mid in &target_msg_ids {
+        let _ = mark_snapshots_reverted_for_message(conn, mid, reverted_at);
+    }
+
+    Ok(target_msg_ids)
+}
+
+pub fn mark_snapshot_reverted_for_event(conn: &Connection, tool_event_id: &str, reverted_at: Option<&str>) -> Result<(), String> {
+    conn.execute(
+        "UPDATE tool_file_snapshots SET reverted_at = ?2 WHERE tool_event_id = ?1",
+        params![tool_event_id, reverted_at],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 按照人机交互轮次（Turn，以 message_id 为原子单元）维护 50 轮滑动窗口。
+/// 当会话中快照所属的不同轮次数超过 max_turns 时，原子淘汰最老的多余轮次快照元数据。
+pub fn prune_session_snapshots_sliding_window(
+    conn: &Connection,
+    session_id: &str,
+    max_turns: usize,
+) -> Result<usize, String> {
+    if max_turns == 0 {
+        return Ok(0);
+    }
+
+    // 1. 查询当前会话中所有包含快照的 message_id，按最早创建时间升序排列
+    let mut stmt = conn
+        .prepare(
+            "SELECT message_id, MIN(created_at) as first_seen
+             FROM tool_file_snapshots
+             WHERE session_id = ?1
+             GROUP BY message_id
+             ORDER BY first_seen ASC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let turn_ids: Vec<String> = stmt
+        .query_map(params![session_id], |r| r.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    if turn_ids.len() <= max_turns {
+        return Ok(0);
+    }
+
+    let excess_count = turn_ids.len() - max_turns;
+    let evicted_turns = &turn_ids[..excess_count];
+
+    let mut deleted_count = 0usize;
+    for mid in evicted_turns {
+        let n = conn
+            .execute(
+                "DELETE FROM tool_file_snapshots WHERE session_id = ?1 AND message_id = ?2",
+                params![session_id, mid],
+            )
+            .map_err(|e| e.to_string())?;
+        deleted_count += n;
+    }
+
+    Ok(deleted_count)
+}
+
+/// 收集数据库中所有有效引用的 CAS 哈希集合（用于后台 GC 对比）
+pub fn collect_active_snapshot_hashes(conn: &Connection) -> Result<std::collections::HashSet<String>, String> {
+    let mut hashes = std::collections::HashSet::new();
+    let mut stmt = conn
+        .prepare(
+            "SELECT before_hash FROM tool_file_snapshots WHERE before_hash IS NOT NULL
+             UNION
+             SELECT after_hash FROM tool_file_snapshots",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+
+    for h in rows {
+        if let Ok(hash) = h {
+            if !hash.is_empty() {
+                hashes.insert(hash);
+            }
+        }
+    }
+
+    Ok(hashes)
+}
+

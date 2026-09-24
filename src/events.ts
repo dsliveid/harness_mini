@@ -17,6 +17,7 @@ export function useAppEvents() {
       listen<any>("message:reset", (e) => s.onMessageReset(e.payload)),
       listen<any>("run:retry", (e) => s.onRunRetry(e.payload)),
       listen<Message>("message:final", (e) => s.onMessageFinal(e.payload as Message)),
+      listen<Message>("message:update", (e) => s.onMessageUpdate(e.payload as Message)),
       listen<any>("tool:update", (e) => s.onToolUpdate(e.payload)),
       listen<any>("tool:output", (e) => s.onToolOutput(e.payload)),
       listen<any>("approval:request", (e) => s.onApprovalRequest(e.payload)),
@@ -96,7 +97,7 @@ export function useAppEvents() {
       listen<any>("subagent:update", (e) => s.onSubagentUpdate(e.payload)),
       listen<any>("task:update", (e) => s.onTaskUpdate(e.payload)),
       listen<any>("task:checkpoint", (e) => s.onTaskCheckpoint(e.payload)),
-      listen<any>("task:finished", () => s.pushToast("🎉 长任务已圆满完成！", "success")),
+      listen<any>("task:finished", () => s.pushToast("长任务已圆满完成！", "success")),
       listen<any>("run:error", (ev) => s.pushToast(ev.payload?.message || "运行遇到异常", "error")),
       listen<any>("error", (ev) => s.onError(ev.payload)),
     ];

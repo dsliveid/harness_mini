@@ -35,6 +35,7 @@ thiserror = "2"
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors"] }
 tokio-stream = "0.1"
+sha2 = "0.10"
 
 [profile.release]
 strip = true

@@ -17,7 +17,6 @@ import { TempActions } from "./components/TempActions";
 import { Toasts } from "./components/Toasts";
 import { TokenStatsModal } from "./components/TokenStatsModal";
 import { TopBar } from "./components/TopBar";
-import { TaskBar } from "./components/TaskBar";
 import { TaskDetailModal } from "./components/TaskDetailModal";
 import { CollaboratorBar } from "./components/CollaboratorBar";
 import { CollaboratorView } from "./components/CollaboratorView";
@@ -82,7 +81,6 @@ export default function App() {
           className="flex-1 flex flex-col relative overflow-hidden"
         >
           <TopBar />
-          <TaskBar />
           <CollaboratorBar />
           <ChatView />
           <PendingQueue />

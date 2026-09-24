@@ -400,8 +400,39 @@ pub async fn dispatch_rpc(
             let message_id = params.get("messageId").and_then(|v| v.as_str()).ok_or("缺少 messageId")?.to_string();
             let new_text = params.get("newText").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let attachments: Option<Vec<crate::models::Attachment>> = params.get("attachments").and_then(|v| serde_json::from_value(v.clone()).ok());
-            commands::edit_and_resend(st, app.clone(), session_id, message_id, new_text, attachments)?;
+            commands::edit_and_resend(st, app.clone(), session_id, message_id, new_text, attachments).await?;
             Ok(Value::Null)
+        }
+
+        // ---- 影子快照与时光机 ----
+        "revert_message_turn" => {
+            let message_id = params.get("messageId").and_then(|v| v.as_str()).ok_or("缺少 messageId")?.to_string();
+            let force = params.get("force").and_then(|v| v.as_bool());
+            let res = commands::revert_message_turn(st, message_id, force).await?;
+            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+        }
+        "reapply_message_turn" => {
+            let message_id = params.get("messageId").and_then(|v| v.as_str()).ok_or("缺少 messageId")?.to_string();
+            let force = params.get("force").and_then(|v| v.as_bool());
+            let res = commands::reapply_message_turn(st, message_id, force).await?;
+            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+        }
+        "revert_tool_event" => {
+            let tool_event_id = params.get("toolEventId").and_then(|v| v.as_str()).ok_or("缺少 toolEventId")?.to_string();
+            let force = params.get("force").and_then(|v| v.as_bool());
+            let res = commands::revert_tool_event(st, tool_event_id, force).await?;
+            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+        }
+        "reapply_tool_event" => {
+            let tool_event_id = params.get("toolEventId").and_then(|v| v.as_str()).ok_or("缺少 toolEventId")?.to_string();
+            let force = params.get("force").and_then(|v| v.as_bool());
+            let res = commands::reapply_tool_event(st, tool_event_id, force).await?;
+            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+        }
+        "get_turn_diff" => {
+            let message_id = params.get("messageId").and_then(|v| v.as_str()).ok_or("缺少 messageId")?.to_string();
+            let res = commands::get_turn_diff(st, message_id).await?;
+            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
         }
 
         // ---- 审批与交互 ----

@@ -925,6 +925,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
             session_id: session_id.to_string(),
         }),
         event_id: None,
+        message_id: None,
     };
     let is_subagent = session.session_type == "subagent" || session.parent_session_id.is_some();
 
@@ -977,7 +978,18 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
             })
         })
         .collect();
-    let max_steps = settings.max_steps.max(1) as usize;
+    let (max_steps, is_long_task) = {
+        let db = state.db.lock().unwrap();
+        if let Ok(Some(task)) = store::get_active_long_task(&db, session_id) {
+            if task.status == "running" || task.status == "planning" {
+                (task.max_steps.max(1), true)
+            } else {
+                (settings.max_steps.max(1) as usize, false)
+            }
+        } else {
+            (settings.max_steps.max(1) as usize, false)
+        }
+    };
 
     // 确保工作区记忆目录存在，并执行轻量记忆衰减清理
     if !session.workspace_path.is_empty() {
@@ -1008,15 +1020,44 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
             "standard".into()
         };
 
-        let neg_intent = if let Ok(msgs) = store::all_messages(&db, session_id) {
-            msgs.iter()
-                .filter(|m| m.role == "user")
-                .last()
-                .and_then(|m| m.content.as_deref())
-                .map(contains_negative_code_intent)
+        let msgs = store::all_messages(&db, session_id).unwrap_or_default();
+        let last_user_content = msgs
+            .iter()
+            .filter(|m| m.role == "user")
+            .last()
+            .and_then(|m| m.content.as_deref());
+
+        let neg_intent = last_user_content.map(contains_negative_code_intent).unwrap_or(false);
+
+        // 识别长任务触发：包含显式指令前缀、/goal 或 /task
+        let directly_triggered_goal = last_user_content
+            .map(|c| c.contains("【长任务目标模式】") || c.starts_with("/goal") || c.starts_with("/task"))
+            .unwrap_or(false);
+
+        // 或者当前会话曾触发过长任务且仍有处于进行中 (in_progress) 的方案正在推进
+        let ongoing_goal_plan = if !session.workspace_path.is_empty() {
+            let ws = std::path::Path::new(&session.workspace_path);
+            crate::plan::find_plan_file(ws, session_id, None, Some(&db))
+                .map(|(_, meta, _)| meta.status == "in_progress")
                 .unwrap_or(false)
+                && msgs.iter().any(|m| {
+                    m.content
+                        .as_deref()
+                        .map(|c| c.contains("【长任务目标模式】") || c.starts_with("/goal") || c.starts_with("/task"))
+                        .unwrap_or(false)
+                })
         } else {
             false
+        };
+
+        let is_goal_task = is_long_task || directly_triggered_goal || ongoing_goal_plan;
+
+        // 长任务自动走 always_proceed 流程（由模型先规划后自主连贯实施）；
+        // 只有当用户在当前指令中明确要求“先不改动代码/仅出方案/先评估”时，由运行时守卫拦截阻断代码修改
+        let effective_plan_mode = if is_goal_task {
+            "always_proceed".to_string()
+        } else {
+            plan_mode
         };
 
         let db_sec = if session.is_temp {
@@ -1136,7 +1177,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         } else {
             Some(parts.join("\n\n"))
         };
-        (sec, plan_mode, neg_intent)
+        (sec, effective_plan_mode, neg_intent)
     };
     let sys = system_prompt(
         &session,
@@ -1187,8 +1228,13 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         // 临界步数倒计时收敛提醒：当步数接近上限时注入高优先级系统收敛提示，防止达到 maxSteps 硬性强杀导致无输出
         let remaining_steps = max_steps.saturating_sub(_step);
         if remaining_steps <= 3 && max_steps > 3 {
+            let limit_label = if is_long_task {
+                format!("单子任务轮次预算硬上限（{max_steps} 轮）")
+            } else {
+                format!("最大步数上限（{max_steps}）")
+            };
             let warn_content = format!(
-                "【⚠️ 临界步数紧急预警：当前仅剩最后 {remaining_steps} 步，即将达到最大步数上限（{max_steps}）！严禁继续调用任何探索、排查或读取类工具！必须立即根据目前已掌握的所有信息，按规定结构化格式输出最终总结与交付回复！】"
+                "【⚠️ 临界步数紧急预警：当前仅剩最后 {remaining_steps} 步，即将达到{limit_label}！严禁继续调用任何探索、排查或读取类工具！必须立即根据目前已掌握的所有信息，按规定结构化格式输出最终总结与交付回复！】"
             );
             messages.push(json!({
                 "role": "user",
@@ -1581,6 +1627,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
                     approval_scope: Some("guard_blocked".into()),
                     created_at: now,
                     subprocess_id: None,
+                    reverted_at: None,
                 };
                 {
                     let db = state.db.lock().unwrap();
@@ -1710,13 +1757,19 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         // 回到下一轮循环
     }
 
+    let err_msg = if is_long_task {
+        format!("单子任务已达到最大轮次预算上限（{max_steps} 轮），为防止死循环已安全中止。可在设置中调整「单子任务轮次预算」。")
+    } else {
+        format!("已达到最大步数（{max_steps}），任务中止。可在设置中调整「最大步数」。")
+    };
     emit_error(
         app,
         session_id,
         "max_steps",
-        format!("已达到最大步数（{max_steps}），任务中止。可在设置中调整 maxSteps。"),
+        err_msg,
     );
-    (RunOutcome::Done, last_assistant_id, run_tokens)
+    let outcome = if is_long_task { RunOutcome::Failed } else { RunOutcome::Done };
+    (outcome, last_assistant_id, run_tokens)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1744,6 +1797,7 @@ async fn handle_tool_call(
         approval_scope: Some("none".into()),
         created_at: now,
         subprocess_id: None,
+        reverted_at: None,
     };
 
     let spec = specs.iter().find(|s| s.name == tool_name);
@@ -1948,6 +2002,7 @@ async fn handle_tool_call(
     let started = Instant::now();
     let mut call_ctx = ctx.clone();
     call_ctx.event_id = Some(ev.id.clone());
+    call_ctx.message_id = Some(assistant_msg_id.to_string());
     let exec = tools::execute(tool_name, args, &call_ctx, &on_partial).await;
     let elapsed = started.elapsed().as_millis() as u64;
 
@@ -2104,6 +2159,19 @@ pub fn auto_finish_session_todos(state: &crate::AppState, app: &AppHandle, sessi
                         new_lines.push(line.to_string());
                     }
                 }
+                let has_uncompleted = new_lines.iter().any(|l| {
+                    let t = l.trim();
+                    t.starts_with("- [ ]") || t.starts_with("- [/]")
+                });
+                let has_steps = new_lines.iter().any(|l| l.trim().starts_with("- [x]"));
+
+                if !has_uncompleted && has_steps && meta.status == "in_progress" {
+                    meta.status = "completed".to_string();
+                    meta.updated_at = chrono::Utc::now().to_rfc3339();
+                    let _ = crate::plan::set_active_plan_id(Some(&db), session_id, None);
+                    body_changed = true;
+                }
+
                 if body_changed {
                     meta.updated_at = chrono::Utc::now().to_rfc3339();
                     let new_body = new_lines.join("\n");
@@ -2443,6 +2511,9 @@ fn build_context(
     // tool_call_id -> 结果文本
     let mut tool_results: HashMap<String, String> = HashMap::new();
     for m in &msgs {
+        if m.reverted_at.is_some() {
+            continue;
+        }
         if m.role == "tool" {
             if let Some(id) = &m.tool_call_id {
                 tool_results.insert(id.clone(), m.content.clone().unwrap_or_default());
@@ -2474,10 +2545,10 @@ fn build_context(
         out.push(json!({"role": "assistant", "content": ack}));
     }
 
-    // 处理未被压缩的消息
+    // 处理未被压缩的消息（严格过滤已被软撤回的消息）
     for m in &msgs {
-        if m.queued || m.seq <= max_compacted_seq {
-            continue; // 待执行列表中的消息以及已被压缩历史不作为原始消息进入上下文
+        if m.queued || m.seq <= max_compacted_seq || m.reverted_at.is_some() {
+            continue; // 待执行列表、已压缩历史及已软撤回的消息不作为原始消息进入上下文
         }
         match m.role.as_str() {
             "user" => {
@@ -3573,6 +3644,40 @@ mod tests {
     }
 
     #[test]
+    fn test_long_task_always_proceed_flow_and_negative_intent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        store::init_schema(&conn).unwrap();
+        let proj = store::create_project(&conn, "TestProj", Some("D:\\ws")).unwrap();
+        store::set_project_plan_mode(&conn, &proj.id, "always_plan").unwrap();
+
+        let s = store::create_session(&conn, "D:\\ws", Some(&proj.id), "test", "confirm").unwrap();
+
+        // 1. 常规长任务消息（无否定代码意图）
+        let _m1 = store::new_message(&conn, &s.id, "user", Some("【长任务目标模式】实现用户认证模块\n\n请分析并拆解".into()), false).unwrap();
+        let msgs = store::all_messages(&conn, &s.id).unwrap();
+        let last_user = msgs.iter().filter(|m| m.role == "user").last().and_then(|m| m.content.as_deref());
+        let neg = last_user.map(contains_negative_code_intent).unwrap_or(false);
+        let is_goal = last_user.map(|c| c.contains("【长任务目标模式】") || c.starts_with("/goal")).unwrap_or(false);
+        assert!(!neg);
+        assert!(is_goal);
+
+        let effective_mode = if is_goal { "always_proceed" } else { "always_plan" };
+        assert_eq!(effective_mode, "always_proceed");
+
+        // 2. 带否定意图的长任务消息
+        let _m2 = store::new_message(&conn, &s.id, "user", Some("【长任务目标模式】梳理工程重构，先不要改代码，仅出方案评估".into()), false).unwrap();
+        let msgs2 = store::all_messages(&conn, &s.id).unwrap();
+        let last_user2 = msgs2.iter().filter(|m| m.role == "user").last().and_then(|m| m.content.as_deref());
+        let neg2 = last_user2.map(contains_negative_code_intent).unwrap_or(false);
+        let is_goal2 = last_user2.map(|c| c.contains("【长任务目标模式】") || c.starts_with("/goal")).unwrap_or(false);
+        assert!(neg2);
+        assert!(is_goal2);
+
+        let effective_mode2 = if is_goal2 { "always_proceed" } else { "always_plan" };
+        assert_eq!(effective_mode2, "always_proceed");
+    }
+
+    #[test]
     fn build_project_section_resolves_linked_constraints() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         store::init_schema(&conn).unwrap();
@@ -3621,5 +3726,44 @@ mod tests {
 
         let p_cmd = build_tool_reflexion_prompt("run_command", "exit code 1", 2, 2);
         assert!(p_cmd.contains("stderr"));
+    }
+
+    #[test]
+    fn test_build_context_filters_reverted_messages() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        store::init_schema(&conn).unwrap();
+        let s = store::create_session(&conn, "D:\\test", None, "test", "confirm").unwrap();
+
+        // 1. 发送第 1 轮消息（有效）
+        let _u1 = store::new_message(&conn, &s.id, "user", Some("请实现功能A".into()), false).unwrap();
+        let _a1 = store::new_message(&conn, &s.id, "assistant", Some("已实现功能A".into()), false).unwrap();
+
+        // 2. 发送第 2 轮消息（随后被软撤回）
+        let _u2 = store::new_message(&conn, &s.id, "user", Some("请实现功能B".into()), false).unwrap();
+        let a2 = store::new_message(&conn, &s.id, "assistant", Some("已实现功能B".into()), false).unwrap();
+
+        // 3. 用户发送后续提问（使得 a2 成为对话历史，避免被末尾 assistant 协议防御剪除）
+        let _u3 = store::new_message(&conn, &s.id, "user", Some("请检查代码".into()), false).unwrap();
+
+        // 验证撤回前均在上下文中
+        let (ctx1, _, _) = build_context(&conn, &s.id, "sys", 64000);
+        let ctx1 = ctx1.unwrap();
+        assert!(ctx1.iter().any(|m| m["content"].as_str() == Some("已实现功能B")));
+
+        // 软撤回第 2 轮消息
+        let now_str = store::now();
+        store::mark_snapshots_reverted_for_message(&conn, &a2.id, Some(&now_str)).unwrap();
+
+        // 验证撤回后第 2 轮 assistant 消息被精确排除，大模型看不见该历史
+        let (ctx2, _, _) = build_context(&conn, &s.id, "sys", 64000);
+        let ctx2 = ctx2.unwrap();
+        assert!(ctx2.iter().any(|m| m["content"].as_str() == Some("已实现功能A")));
+        assert!(!ctx2.iter().any(|m| m["content"].as_str() == Some("已实现功能B")));
+
+        // 重新应用（重做）
+        store::mark_snapshots_reverted_for_message(&conn, &a2.id, None).unwrap();
+        let (ctx3, _, _) = build_context(&conn, &s.id, "sys", 64000);
+        let ctx3 = ctx3.unwrap();
+        assert!(ctx3.iter().any(|m| m["content"].as_str() == Some("已实现功能B")));
     }
 }

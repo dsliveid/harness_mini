@@ -13,6 +13,9 @@ pub mod server;
 pub mod single_instance;
 mod skills;
 pub mod snapshot;
+pub mod snapshot_fs;
+pub mod snapshot_gc;
+pub mod snapshot_revert;
 mod sop;
 mod store;
 pub mod task;
@@ -293,6 +296,21 @@ pub fn run() {
                 }
             });
 
+            // 后台惰性 CAS 垃圾回收（启动 10 秒后执行一次，清理超过 24 小时未引用的孤儿 Blob）
+            let gc_data_dir = data_dir.clone();
+            let app_handle_for_gc = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                if let Some(data_dir) = gc_data_dir {
+                    let active_hashes = {
+                        let state = app_handle_for_gc.state::<AppState>();
+                        let conn = state.db.lock().unwrap();
+                        store::collect_active_snapshot_hashes(&conn).unwrap_or_default()
+                    };
+                    let _ = snapshot_gc::gc_orphan_blobs(&data_dir, &active_hashes, std::time::Duration::from_secs(24 * 3600)).await;
+                }
+            });
+
             // 系统托盘：左键点击显示主窗口，右键弹出菜单（显示主窗口 / 退出）
             let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -416,6 +434,7 @@ pub fn run() {
             commands::read_file_base64,
             commands::get_active_plan,
             commands::list_workspace_plans,
+            commands::switch_plan,
             commands::open_file_viewer,
             commands::get_file_viewer_init_tab,
             commands::read_text_file,
@@ -434,6 +453,11 @@ pub fn run() {
             commands::list_task_checkpoints,
             commands::rollback_to_checkpoint,
             commands::update_task_subtasks,
+            commands::revert_message_turn,
+            commands::reapply_message_turn,
+            commands::revert_tool_event,
+            commands::reapply_tool_event,
+            commands::get_turn_diff,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
