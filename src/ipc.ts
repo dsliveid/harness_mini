@@ -353,6 +353,10 @@ export const ipc = {
     invoke<LongTask>("update_task_subtasks", { taskId, subtasks }),
 
   // 影子快照与时光机（多轮撤回/重做/Diff审查）
+  revertToMessage: (messageId: string, force?: boolean) =>
+    invoke<RevertResult>("revert_to_message", { messageId, force: force ?? null }),
+  reapplyFromMessage: (messageId: string, force?: boolean) =>
+    invoke<ReapplyResult>("reapply_from_message", { messageId, force: force ?? null }),
   revertMessageTurn: (messageId: string, force?: boolean) =>
     invoke<RevertResult>("revert_message_turn", { messageId, force: force ?? null }),
   reapplyMessageTurn: (messageId: string, force?: boolean) =>
@@ -361,6 +365,10 @@ export const ipc = {
     invoke<RevertResult>("revert_tool_event", { toolEventId, force: force ?? null }),
   reapplyToolEvent: (toolEventId: string, force?: boolean) =>
     invoke<ReapplyResult>("reapply_tool_event", { toolEventId, force: force ?? null }),
+  revertTurnFile: (messageId: string, filePath: string, force?: boolean) =>
+    invoke<RevertResult>("revert_turn_file", { messageId, filePath, force: force ?? null }),
+  reapplyTurnFile: (messageId: string, filePath: string, force?: boolean) =>
+    invoke<ReapplyResult>("reapply_turn_file", { messageId, filePath, force: force ?? null }),
   getTurnDiff: (messageId: string) =>
     invoke<SnapshotFileDiff[]>("get_turn_diff", { messageId }),
 };

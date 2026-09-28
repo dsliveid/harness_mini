@@ -328,9 +328,10 @@ export function ExecutionProcessBlock({
   const durationStr =
     durationMs != null ? `${(durationMs / 1000).toFixed(1)}s` : null;
   const tokensStr = tokens > 0 ? `${tokens.toLocaleString()} tokens` : null;
+  const isReverted = useMemo(() => steps.length > 0 && steps.some((s) => !!s.revertedAt), [steps]);
 
   return (
-    <div className="rounded-2xl border border-edge/70 bg-panel2/40 hover:border-edge transition-all shadow-sm overflow-hidden select-none my-1">
+    <div className={`rounded-2xl border border-edge/70 bg-panel2/40 hover:border-edge transition-all shadow-sm overflow-hidden select-none my-1 ${isReverted ? "opacity-60 grayscale-[30%]" : ""}`}>
       {/* 折叠栏头部 */}
       <button
         type="button"
@@ -358,6 +359,11 @@ export function ExecutionProcessBlock({
               ? `思考过程 (${stepCount} 个步骤)`
               : `执行过程 (${stepCount} 个步骤)`}
           </span>
+          {isReverted && (
+            <span className="text-[11px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 border border-amber-500/30 shrink-0 font-medium">
+              已撤回
+            </span>
+          )}
           {toolCount > 0 && (
             <span className="text-[11px] px-1.5 py-0.5 rounded bg-panel3 text-inkdim border border-edge/40 shrink-0">
               {toolCount} 次工具调用

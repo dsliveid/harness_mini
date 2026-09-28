@@ -3047,7 +3047,8 @@ pub fn update_message_content_and_attachments(
     conn.execute(
         "UPDATE messages SET
             content = ?2,
-            attachments_json = ?3
+            attachments_json = ?3,
+            reverted_at = NULL
          WHERE id = ?1",
         params![id, content, att_json],
     )
@@ -3220,6 +3221,12 @@ pub fn all_messages(conn: &Connection, session_id: &str) -> Result<Vec<Message>,
 }
 
 pub fn delete_messages_after(conn: &Connection, session_id: &str, seq: i64) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM tool_file_snapshots WHERE session_id = ?1 AND message_id IN
+           (SELECT id FROM messages WHERE session_id = ?1 AND seq > ?2)",
+        params![session_id, seq],
+    )
+    .map_err(|e| e.to_string())?;
     conn.execute(
         "DELETE FROM tool_events WHERE message_id IN
            (SELECT id FROM messages WHERE session_id = ?1 AND seq > ?2)",
@@ -4719,6 +4726,40 @@ pub fn list_snapshots_after_seq(
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
+/// 查询某个 seq 之后的所有已被撤回的快照（用于时光机“重新应用”时重做代码修改，按 FIFO 顺序排列）
+pub fn list_reverted_snapshots_after_seq(
+    conn: &Connection,
+    session_id: &str,
+    seq: i64,
+) -> Result<Vec<ToolFileSnapshot>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.id, s.session_id, s.message_id, s.tool_event_id, s.file_path, s.before_hash, s.after_hash, s.is_new_file, s.reverted_at, s.created_at
+             FROM tool_file_snapshots s
+             JOIN messages m ON s.message_id = m.id
+             WHERE m.session_id = ?1 AND m.seq > ?2 AND s.reverted_at IS NOT NULL
+             ORDER BY s.created_at ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id, seq], |r| {
+            Ok(ToolFileSnapshot {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                message_id: r.get(2)?,
+                tool_event_id: r.get(3)?,
+                file_path: r.get(4)?,
+                before_hash: r.get(5)?,
+                after_hash: r.get(6)?,
+                is_new_file: r.get::<_, i64>(7)? != 0,
+                reverted_at: r.get(8)?,
+                created_at: r.get(9)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
 pub fn list_snapshots_for_event(conn: &Connection, tool_event_id: &str) -> Result<Vec<ToolFileSnapshot>, String> {
     let mut stmt = conn
         .prepare(
@@ -4745,6 +4786,7 @@ pub fn list_snapshots_for_event(conn: &Connection, tool_event_id: &str) -> Resul
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
+#[allow(dead_code)]
 pub fn list_snapshots_for_session(conn: &Connection, session_id: &str) -> Result<Vec<ToolFileSnapshot>, String> {
     let mut stmt = conn
         .prepare(
@@ -4916,6 +4958,84 @@ pub fn mark_snapshot_reverted_for_event(conn: &Connection, tool_event_id: &str, 
     Ok(())
 }
 
+pub fn mark_snapshots_reverted_by_ids(
+    conn: &Connection,
+    ids: &[String],
+    reverted_at: Option<&str>,
+) -> Result<(), String> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    for chunk in ids.chunks(50) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "UPDATE tool_file_snapshots SET reverted_at = ?1 WHERE id IN ({})",
+            placeholders
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        params.push(&reverted_at);
+        for id in chunk {
+            params.push(id);
+        }
+        conn.execute(&sql, rusqlite::params_from_iter(params))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 批量标记会话中某 seq（含）之后的所有消息及其快照为已撤回/未撤回，并返回受影响的所有 message_id
+pub fn mark_messages_and_snapshots_reverted_after_seq(
+    conn: &Connection,
+    session_id: &str,
+    seq: i64,
+    reverted_at: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM messages WHERE session_id = ?1 AND seq >= ?2")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id, seq], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    let affected_ids: Vec<String> = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "UPDATE messages SET reverted_at = ?3 WHERE session_id = ?1 AND seq >= ?2",
+        params![session_id, seq, reverted_at],
+    )
+    .map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "UPDATE tool_file_snapshots SET reverted_at = ?3
+         WHERE session_id = ?1 AND message_id IN (SELECT id FROM messages WHERE session_id = ?1 AND seq >= ?2)",
+        params![session_id, seq, reverted_at],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(affected_ids)
+}
+
+/// 清理会话末尾处于已撤回置灰状态的残留消息（若用户直接发送全新消息时触发）
+pub fn delete_reverted_tail_messages(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<(), String> {
+    let min_seq: Option<i64> = conn
+        .query_row(
+            "SELECT MIN(seq) FROM messages WHERE session_id = ?1 AND reverted_at IS NOT NULL",
+            params![session_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+
+    if let Some(seq) = min_seq {
+        delete_messages_after(conn, session_id, seq - 1)?;
+    }
+    Ok(())
+}
+
 /// 按照人机交互轮次（Turn，以 message_id 为原子单元）维护 50 轮滑动窗口。
 /// 当会话中快照所属的不同轮次数超过 max_turns 时，原子淘汰最老的多余轮次快照元数据。
 pub fn prune_session_snapshots_sliding_window(
@@ -4989,5 +5109,45 @@ pub fn collect_active_snapshot_hashes(conn: &Connection) -> Result<std::collecti
     }
 
     Ok(hashes)
+}
+
+/// 在撤回或重做消息后，将 session_kv 中的 "todos" 同步回溯到会话中最近一个未被撤回的 todo 工具事件
+pub fn sync_session_todos_after_revert(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let raw_params: Option<String> = conn
+        .query_row(
+            "SELECT te.params_json
+             FROM tool_events te
+             JOIN messages m ON te.message_id = m.id
+             WHERE m.session_id = ?1
+               AND m.reverted_at IS NULL
+               AND te.tool_name = 'todo'
+               AND te.status = 'success'
+             ORDER BY m.seq DESC, te.created_at DESC
+             LIMIT 1",
+            params![session_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .flatten();
+
+    if let Some(ref params_str) = raw_params {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(params_str) {
+            if let Some(todos_arr) = val.get("todos") {
+                let _ = set_kv(conn, session_id, "todos", params_str);
+                return Ok(Some(todos_arr.clone()));
+            }
+        }
+    }
+
+    // 若当前会话中已经没有任何未撤回的有效 todo 事件，清理 session_kv 中的 todos
+    let _ = conn.execute(
+        "DELETE FROM session_kv WHERE session_id = ?1 AND key = 'todos'",
+        params![session_id],
+    );
+    Ok(Some(serde_json::json!([])))
 }
 

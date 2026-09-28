@@ -148,9 +148,12 @@ export function MessageItem({
   const isBeingEdited = useStore((s) => s.editingMessage?.messageId === msg.id);
   const forkSession = useStore((s) => s.forkSession);
   const forkAndEditUserMessage = useStore((s) => s.forkAndEditUserMessage);
+  const revertToMessage = useStore((s) => s.revertToMessage);
+  const reapplyFromMessage = useStore((s) => s.reapplyFromMessage);
   const [copied, setCopied] = useState(false);
   const [forking, setForking] = useState(false);
   const [showUserForkMenu, setShowUserForkMenu] = useState(false);
+  const [revertingToHere, setRevertingToHere] = useState(false);
   const [streamDuration, setStreamDuration] = useState<number>(0);
   const [liveTurnDuration, setLiveTurnDuration] = useState<number>(0);
 
@@ -254,27 +257,43 @@ export function MessageItem({
                 )}
               </div>
             )}
-            {isLastUser && !running && !readOnly && !editBlocked && (
-              <button
-                className={`w-7 h-7 rounded-lg hover:bg-panel3 flex items-center justify-center text-inkdim hover:text-ink shrink-0 transition-opacity ${
-                  isBeingEdited ? "opacity-100 text-accent bg-accent/10" : "opacity-0 group-hover:opacity-100"
-                }`}
-                title="编辑并重新发送（将自动回退本次提问产生的所有代码修改，后续回复将被作废并重新运行）"
-                onClick={() => {
-                  if (isBeingEdited) {
-                    setEditingMessage(null);
-                  } else {
-                    setEditingMessage({
-                      messageId: msg.id,
-                      sessionId: msg.sessionId,
-                      text: msg.content ?? "",
-                      attachments: msg.attachments ? [...msg.attachments] : [],
-                    });
-                  }
-                }}
-              >
-                <Pencil size={13} />
-              </button>
+            {/* 撤回对话到此处 / 重新应用按钮 */}
+            {!running && !readOnly && !editBlocked && (
+              !msg.revertedAt ? (
+                <button
+                  className={`w-7 h-7 rounded-lg hover:bg-panel3 flex items-center justify-center text-inkdim hover:text-amber-400 shrink-0 transition-opacity ${
+                    revertingToHere ? "opacity-100 text-amber-400" : "opacity-0 group-hover:opacity-100"
+                  }`}
+                  title="撤回对话到此处（从该对话开始，后面所有对话和执行过程都置灰，还原后续所有会话的文件改动到这条信息之前，并将内容填充到输入框）"
+                  disabled={revertingToHere}
+                  onClick={async () => {
+                    setRevertingToHere(true);
+                    try {
+                      await revertToMessage(msg.id, false);
+                    } finally {
+                      setRevertingToHere(false);
+                    }
+                  }}
+                >
+                  <RotateCcw size={13} className={revertingToHere ? "animate-spin" : ""} />
+                </button>
+              ) : (
+                <button
+                  className="w-7 h-7 rounded-lg hover:bg-panel3 flex items-center justify-center text-emerald-400 shrink-0 transition-opacity opacity-100 bg-emerald-500/10 hover:bg-emerald-500/20"
+                  title="重新应用（所有消息和文件还原为最新）"
+                  disabled={revertingToHere}
+                  onClick={async () => {
+                    setRevertingToHere(true);
+                    try {
+                      await reapplyFromMessage(msg.id, false);
+                    } finally {
+                      setRevertingToHere(false);
+                    }
+                  }}
+                >
+                  <RotateCw size={13} className={revertingToHere ? "animate-spin" : ""} />
+                </button>
+              )
             )}
           </div>
           <div
@@ -285,7 +304,7 @@ export function MessageItem({
             {msg.revertedAt && (
               <div className="flex items-center gap-1.5 text-[11px] text-amber-400 bg-amber-500/10 border border-amber-500/20 px-2 py-0.5 rounded-lg w-fit mb-1.5 select-none">
                 <RotateCcw size={12} />
-                <span>已撤回该轮对话</span>
+                <span>已撤回至此处（发送新消息将覆盖此后历史，或点击左侧重新应用恢复）</span>
               </div>
             )}
             {isBeingEdited && (
@@ -390,7 +409,6 @@ export function MessageItem({
     const toolGroups = useMemo(() => groupToolEvents(events), [events]);
 
     const [showDiffModal, setShowDiffModal] = useState(false);
-    const [revertingTurn, setRevertingTurn] = useState(false);
 
     const effectiveToolEvents = msg.turnToolEvents ?? msg.toolEvents ?? [];
     const modifiedFilesCount = useMemo(() => {
@@ -406,26 +424,6 @@ export function MessageItem({
       }
       return filePaths.size;
     }, [effectiveToolEvents, msg.revertedAt]);
-
-    const handleRevertTurn = async () => {
-      if (revertingTurn) return;
-      setRevertingTurn(true);
-      try {
-        await useStore.getState().turnRevertAndEdit(msg.id, false);
-      } finally {
-        setRevertingTurn(false);
-      }
-    };
-
-    const handleReapplyTurn = async () => {
-      if (revertingTurn) return;
-      setRevertingTurn(true);
-      try {
-        await useStore.getState().turnReapply(msg.id, false);
-      } finally {
-        setRevertingTurn(false);
-      }
-    };
 
     return (
       <div
@@ -498,45 +496,17 @@ export function MessageItem({
               </button>
             )}
 
-            {/* 影子快照与时光机：查看 Diff 与 撤回/重新应用本轮对话 */}
-            {(modifiedFilesCount > 0 || isTurnEnd) && !streaming && !isRunningTurn && (
-              <>
-                {modifiedFilesCount > 0 && (
-                  <button
-                    type="button"
-                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-panel2 hover:text-ink text-amber-400/90 shrink-0 transition-colors"
-                    onClick={() => setShowDiffModal(true)}
-                    title="查看本轮修改产生的文件变更统一 Diff"
-                  >
-                    <GitCompare size={12} />
-                    <span>{msg.revertedAt ? "查看曾修改的 Diff" : `本轮改动 (${modifiedFilesCount}个文件)`}</span>
-                  </button>
-                )}
-
-                {!msg.revertedAt ? (
-                  <button
-                    type="button"
-                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-panel2 hover:text-rose-400 text-inkdim shrink-0 transition-colors disabled:opacity-50"
-                    onClick={handleRevertTurn}
-                    disabled={revertingTurn}
-                    title="撤回本轮对话（包括提问与所有助手回复置灰，提问内容带入输入框，代码物理还原）"
-                  >
-                    <RotateCcw size={12} className={revertingTurn ? "animate-spin" : ""} />
-                    <span>{revertingTurn ? "撤回中..." : "撤回本轮对话"}</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-panel2 hover:text-emerald-400 text-emerald-400/90 shrink-0 transition-colors disabled:opacity-50"
-                    onClick={handleReapplyTurn}
-                    disabled={revertingTurn}
-                    title="重新应用本轮对话（代码重新写回，大模型重新认知该轮完整对话）"
-                  >
-                    <RotateCw size={12} className={revertingTurn ? "animate-spin" : ""} />
-                    <span>{revertingTurn ? "应用中..." : "重新应用本轮对话"}</span>
-                  </button>
-                )}
-              </>
+            {/* 影子快照与时光机：查看本轮 Diff */}
+            {modifiedFilesCount > 0 && !streaming && !isRunningTurn && (
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-panel2 hover:text-ink text-amber-400/90 shrink-0 transition-colors"
+                onClick={() => setShowDiffModal(true)}
+                title="查看本轮修改产生的文件变更统一 Diff"
+              >
+                <GitCompare size={12} />
+                <span>{msg.revertedAt ? "查看曾修改的 Diff" : `本轮改动 (${modifiedFilesCount}个文件)`}</span>
+              </button>
             )}
 
             {/* 耗时显示：区分整轮执行总耗时与单步耗时，正在执行中持续跳动 */}

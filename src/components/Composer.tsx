@@ -536,16 +536,16 @@ export function Composer() {
         <div className="mb-2 px-3 py-1.5 rounded-xl bg-accent/10 border border-accent/30 flex items-center justify-between text-xs animate-in fade-in slide-in-from-bottom-1 duration-150 shadow-xs">
           <div className="flex items-center gap-2 text-accent font-medium">
             <Pencil size={13} className="shrink-0 animate-pulse" />
-            <span>正在编辑提问（撤回本轮对话中）</span>
-            <span className="text-[11px] text-inkdim hidden sm:inline">（重新发送将自动回退本轮产生的所有代码改动；如需恢复可点击气泡上的「↻ 重新应用本轮对话」）</span>
+            <span>已撤回对话到此处（修改并重新发送将覆盖后续旧历史）</span>
+            <span className="text-[11px] text-inkdim hidden sm:inline">（如需恢复全部最新历史，可点击上方气泡前的「重新应用」）</span>
           </div>
           <button
             type="button"
             onClick={cancelEdit}
             className="px-2 py-0.5 rounded-lg hover:bg-accent/20 text-inkdim hover:text-ink flex items-center gap-1.5 transition-colors cursor-pointer text-[11.5px]"
-            title="取消编辑 (Esc)"
+            title="退出编辑模式 (Esc)"
           >
-            <span>取消编辑</span>
+            <span>退出编辑</span>
             <kbd className="text-[10px] font-mono bg-panel2/80 px-1 py-0.5 rounded border border-edge">Esc</kbd>
           </button>
         </div>

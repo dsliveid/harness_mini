@@ -405,6 +405,18 @@ pub async fn dispatch_rpc(
         }
 
         // ---- 影子快照与时光机 ----
+        "revert_to_message" => {
+            let message_id = params.get("messageId").and_then(|v| v.as_str()).ok_or("缺少 messageId")?.to_string();
+            let force = params.get("force").and_then(|v| v.as_bool());
+            let res = commands::revert_to_message(st, app.clone(), message_id, force).await?;
+            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+        }
+        "reapply_from_message" => {
+            let message_id = params.get("messageId").and_then(|v| v.as_str()).ok_or("缺少 messageId")?.to_string();
+            let force = params.get("force").and_then(|v| v.as_bool());
+            let res = commands::reapply_from_message(st, app.clone(), message_id, force).await?;
+            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+        }
         "revert_message_turn" => {
             let message_id = params.get("messageId").and_then(|v| v.as_str()).ok_or("缺少 messageId")?.to_string();
             let force = params.get("force").and_then(|v| v.as_bool());
@@ -427,6 +439,20 @@ pub async fn dispatch_rpc(
             let tool_event_id = params.get("toolEventId").and_then(|v| v.as_str()).ok_or("缺少 toolEventId")?.to_string();
             let force = params.get("force").and_then(|v| v.as_bool());
             let res = commands::reapply_tool_event(st, tool_event_id, force).await?;
+            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+        }
+        "revert_turn_file" => {
+            let message_id = params.get("messageId").and_then(|v| v.as_str()).ok_or("缺少 messageId")?.to_string();
+            let file_path = params.get("filePath").and_then(|v| v.as_str()).ok_or("缺少 filePath")?.to_string();
+            let force = params.get("force").and_then(|v| v.as_bool());
+            let res = commands::revert_turn_file(st, message_id, file_path, force).await?;
+            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+        }
+        "reapply_turn_file" => {
+            let message_id = params.get("messageId").and_then(|v| v.as_str()).ok_or("缺少 messageId")?.to_string();
+            let file_path = params.get("filePath").and_then(|v| v.as_str()).ok_or("缺少 filePath")?.to_string();
+            let force = params.get("force").and_then(|v| v.as_bool());
+            let res = commands::reapply_turn_file(st, message_id, file_path, force).await?;
             Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
         }
         "get_turn_diff" => {

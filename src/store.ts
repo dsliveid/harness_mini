@@ -325,6 +325,8 @@ interface Store {
   setEditingMessage: (target: EditingMessageTarget | null) => void;
   turnRevertAndEdit: (messageId: string, force?: boolean) => Promise<void>;
   turnReapply: (messageId: string, force?: boolean) => Promise<void>;
+  revertToMessage: (messageId: string, force?: boolean) => Promise<void>;
+  reapplyFromMessage: (messageId: string, force?: boolean) => Promise<void>;
   /** 能力模型分配矩阵弹窗 */
   showModelMatrixModal: boolean;
   modelMatrixSessionId: string | null;
@@ -2123,6 +2125,87 @@ export const useStore = create<Store>((set, get) => ({
         await st.reloadMessages(activeSessionId);
       }
       st.pushToast("已重新应用本轮对话");
+    } catch (err: any) {
+      st.pushToast(String(err) || "重新应用失败", "error");
+    }
+  },
+
+  async revertToMessage(messageId: string, force?: boolean) {
+    const st = get();
+    try {
+      const res = await ipc.revertToMessage(messageId, force);
+      if (!res.success && res.hasConflict && !force) {
+        const proceed = window.confirm(`${res.message}\n\n是否强制覆盖撤回对话与所有后续代码修改？`);
+        if (proceed) {
+          return await get().revertToMessage(messageId, true);
+        }
+        return;
+      }
+      if (!res.success) {
+        st.pushToast(res.message || "撤回失败", "error");
+        return;
+      }
+
+      const activeSessionId = st.currentId;
+      if (activeSessionId) {
+        const msgs = st.messages[activeSessionId] ?? [];
+        const targetMsg = msgs.find((m) => m.id === messageId);
+        let userMsg: Message | undefined;
+
+        if (targetMsg?.role === "user") {
+          userMsg = targetMsg;
+        } else {
+          const targetIdx = msgs.findIndex((m) => m.id === messageId);
+          for (let i = targetIdx; i >= 0; i--) {
+            if (msgs[i].role === "user") {
+              userMsg = msgs[i];
+              break;
+            }
+          }
+        }
+
+        if (userMsg) {
+          st.setEditingMessage({
+            messageId: userMsg.id,
+            sessionId: activeSessionId,
+            text: userMsg.content || "",
+            attachments: userMsg.attachments || [],
+          });
+        }
+
+        await st.reloadMessages(activeSessionId);
+      }
+      st.pushToast("已撤回对话到此处并带入输入框");
+    } catch (err: any) {
+      st.pushToast(String(err) || "撤回失败", "error");
+    }
+  },
+
+  async reapplyFromMessage(messageId: string, force?: boolean) {
+    const st = get();
+    try {
+      const res = await ipc.reapplyFromMessage(messageId, force);
+      if (!res.success && res.hasConflict && !force) {
+        const proceed = window.confirm(`${res.message}\n\n是否强制覆盖重新应用后续修改？`);
+        if (proceed) {
+          return await get().reapplyFromMessage(messageId, true);
+        }
+        return;
+      }
+      if (!res.success) {
+        st.pushToast(res.message || "重新应用失败", "error");
+        return;
+      }
+
+      if (st.editingMessage) {
+        st.setEditingMessage(null);
+      }
+
+      const activeSessionId = st.currentId;
+      if (activeSessionId) {
+        await st.reloadMessages(activeSessionId);
+      }
+      st.pushToast("已重新应用对话至最新状态");
     } catch (err: any) {
       st.pushToast(String(err) || "重新应用失败", "error");
     }

@@ -505,6 +505,11 @@ export interface SnapshotFileDiff {
   diffText: string;
   beforeContent?: string | null;
   afterContent: string;
+  toolEventId?: string;
+  snapshotId?: string;
+  revertedAt?: string | null;
+  modifyCount?: number;
+  toolEventIds?: string[];
 }
 
 export interface RevertResult {

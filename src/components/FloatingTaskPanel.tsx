@@ -10,6 +10,7 @@ import {
   type TodoItem,
   type ToolEvent,
   type FocusFloatingTarget,
+  type Message,
   DRAFT_ID,
 } from "../types";
 import { Markdown } from "./Markdown";
@@ -304,27 +305,108 @@ export function FloatingTaskPanel() {
     }
   }, [lastPlanEventKey, fetchPlans]);
 
-  // 2. 从消息流中提取所有独立的 todo 任务清单（按轮次/消息聚合）
+  // 2. 从消息流中提取独立的 todo 任务清单（按真实对话轮次 Turn 折叠聚合）
   const todoTasks = useMemo(() => {
     const list: TimelineTask[] = [];
     if (!currentId || currentId === DRAFT_ID) return list;
 
-    let turnCount = 0;
-    for (let i = 0; i < msgs.length; i++) {
-      const m = msgs[i];
-      if (m.role !== "assistant" || !m.toolEvents) continue;
+    // 严格过滤已被软撤回的消息以及 tool/queued 消息
+    const validMsgs = msgs.filter((m) => !m.revertedAt && !m.queued && m.role !== "tool");
+    if (validMsgs.length === 0) {
+      if (rawTodos.length > 0) {
+        const items: TimelineTaskItem[] = rawTodos.map((t, idx) => ({
+          index: idx + 1,
+          content: t.content,
+          status: isRunning ? t.status : t.status === "in_progress" ? "done" : t.status,
+        }));
+        list.push({
+          id: "raw-session-todos",
+          type: "todo",
+          title: "当前任务清单",
+          status: isRunning ? "in_progress" : "completed",
+          items,
+        });
+      }
+      return list;
+    }
 
-      const todoEvs = m.toolEvents.filter((ev) => ev.toolName === "todo" && Array.isArray(ev.params?.todos));
-      if (todoEvs.length === 0) continue;
-      const lastTodoEv = todoEvs[todoEvs.length - 1];
-      const rawItems = lastTodoEv.params?.todos ?? [];
-      if (!Array.isArray(rawItems) || rawItems.length === 0) continue;
+    // 按对话轮次（以 user 消息作为轮次分界）聚合
+    interface TurnGroup {
+      userMsg?: Message;
+      assistants: Message[];
+      isLatestTurn: boolean;
+    }
+    const turns: TurnGroup[] = [];
+    let currentTurn: TurnGroup = { assistants: [], isLatestTurn: false };
 
-      turnCount += 1;
-      const isLatestMsg = i === msgs.length - 1;
-      const isTaskRunning = isRunning && isLatestMsg;
+    for (let i = 0; i < validMsgs.length; i++) {
+      const m = validMsgs[i];
+      if (m.role === "user") {
+        if (currentTurn.userMsg || currentTurn.assistants.length > 0) {
+          turns.push(currentTurn);
+        }
+        currentTurn = { userMsg: m, assistants: [], isLatestTurn: false };
+      } else if (m.role === "assistant") {
+        currentTurn.assistants.push(m);
+      }
+    }
+    if (currentTurn.userMsg || currentTurn.assistants.length > 0) {
+      turns.push(currentTurn);
+    }
+    if (turns.length > 0) {
+      turns[turns.length - 1].isLatestTurn = true;
+    }
 
-      const items: TimelineTaskItem[] = rawItems.map((t: any, idx: number) => ({
+    // 收集每一轮对话中最后的有效 todo 快照（折叠同轮次内的初始化、进展和收尾调用）
+    interface ParsedTurnTodo {
+      turnIndex: number;
+      lastTodoEv: any;
+      lastTodoMsg: Message;
+      matchedEventIds: string[];
+      isLatestTurn: boolean;
+      rawItems: any[];
+    }
+    const parsedTurns: ParsedTurnTodo[] = [];
+
+    for (let turnIdx = 0; turnIdx < turns.length; turnIdx++) {
+      const turn = turns[turnIdx];
+      let turnLastTodoEv: any = null;
+      let turnLastTodoMsg: Message | null = null;
+      const turnEventIds: string[] = [];
+
+      for (const a of turn.assistants) {
+        if (!a.toolEvents) continue;
+        const todoEvs = a.toolEvents.filter(
+          (ev: ToolEvent) => ev.toolName === "todo" && Array.isArray(ev.params?.todos) && ev.params.todos.length > 0
+        );
+        for (const ev of todoEvs) {
+          turnEventIds.push(ev.id);
+          turnLastTodoEv = ev;
+          turnLastTodoMsg = a;
+        }
+      }
+
+      if (turnLastTodoEv && turnLastTodoMsg) {
+        const rawItems = turnLastTodoEv.params?.todos ?? [];
+        if (Array.isArray(rawItems) && rawItems.length > 0) {
+          parsedTurns.push({
+            turnIndex: turnIdx,
+            lastTodoEv: turnLastTodoEv,
+            lastTodoMsg: turnLastTodoMsg,
+            matchedEventIds: turnEventIds,
+            isLatestTurn: turn.isLatestTurn,
+            rawItems,
+          });
+        }
+      }
+    }
+
+    const totalValidTurns = parsedTurns.length;
+    for (let i = 0; i < totalValidTurns; i++) {
+      const pt = parsedTurns[i];
+      const isTaskRunning = isRunning && pt.isLatestTurn;
+
+      const items: TimelineTaskItem[] = pt.rawItems.map((t: any, idx: number) => ({
         index: idx + 1,
         content: String(t.content || ""),
         status: isTaskRunning
@@ -336,16 +418,18 @@ export function FloatingTaskPanel() {
 
       const allDone = items.every((t) => t.status === "done");
       const status: TaskStatus = isTaskRunning ? "in_progress" : allDone ? "completed" : "pending";
+      const title = totalValidTurns > 1 ? `第 ${i + 1} 轮任务清单` : "当前任务清单";
 
       list.push({
-        id: `todo-${lastTodoEv.id}`,
+        id: `todo-${pt.lastTodoEv.id}`,
         type: "todo",
-        title: `第 ${turnCount} 轮任务清单`,
+        title,
         status,
         items,
-        messageId: m.id,
-        toolEventId: lastTodoEv.id,
-        createdAt: m.createdAt || "",
+        messageId: pt.lastTodoMsg.id,
+        toolEventId: pt.lastTodoEv.id,
+        toolEventIds: pt.matchedEventIds,
+        createdAt: pt.lastTodoMsg.createdAt || "",
       });
     }
 
@@ -394,7 +478,7 @@ export function FloatingTaskPanel() {
       const matchedEventIds: string[] = [];
 
       for (const m of msgs) {
-        if (!m.toolEvents) continue;
+        if (!m.toolEvents || m.revertedAt) continue;
         for (const ev of m.toolEvents) {
           if (["create_plan", "update_plan", "switch_plan", "read_plan"].includes(ev.toolName)) {
             const evTitle = typeof ev.params?.title === "string" ? ev.params.title.trim().toLowerCase() : "";
@@ -419,7 +503,7 @@ export function FloatingTaskPanel() {
       // 兜底容错：若当前只有 1 个方案且未通过精确条件匹配，将对话中唯一的方案类事件关联上
       if (matchedEventIds.length === 0 && plans.length === 1) {
         for (const m of msgs) {
-          if (!m.toolEvents) continue;
+          if (!m.toolEvents || m.revertedAt) continue;
           for (const ev of m.toolEvents) {
             if (["create_plan", "update_plan", "switch_plan"].includes(ev.toolName)) {
               if (!foundMsgId) foundMsgId = m.id;

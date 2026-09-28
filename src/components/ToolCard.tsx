@@ -30,8 +30,6 @@ import {
   Link2,
   Sparkles,
   BookOpen,
-  RotateCcw,
-  RotateCw,
   Lightbulb,
 } from "./Icons";
 
@@ -976,66 +974,6 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
     }
   };
 
-  const [revertingItem, setRevertingItem] = useState(false);
-  const handleRevertSingle = async (e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (revertingItem) return;
-    setRevertingItem(true);
-    try {
-      const res = await ipc.revertToolEvent(ev.id, false);
-      if (!res.success && res.hasConflict) {
-        const proceed = window.confirm(`${res.message}\n\n是否强制覆盖撤回该文件的修改？`);
-        if (proceed) {
-          const forceRes = await ipc.revertToolEvent(ev.id, true);
-          if (forceRes.success) {
-            pushToast("该文件修改已强制撤回");
-          } else {
-            pushToast(forceRes.message || "撤回失败", "error");
-          }
-        }
-      } else if (res.success) {
-        pushToast("该文件修改已成功撤回");
-      } else {
-        pushToast(res.message || "撤回失败", "error");
-      }
-      const curId = useStore.getState().currentId;
-      if (curId) await useStore.getState().reloadMessages(curId);
-    } catch (err: any) {
-      pushToast(String(err) || "单项撤回失败", "error");
-    } finally {
-      setRevertingItem(false);
-    }
-  };
-
-  const handleReapplySingle = async (e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (revertingItem) return;
-    setRevertingItem(true);
-    try {
-      const res = await ipc.reapplyToolEvent(ev.id, false);
-      if (!res.success && res.hasConflict) {
-        const proceed = window.confirm(`${res.message}\n\n是否强制覆盖重新应用该文件的修改？`);
-        if (proceed) {
-          const forceRes = await ipc.reapplyToolEvent(ev.id, true);
-          if (forceRes.success) {
-            pushToast("该文件修改已强制重新应用");
-          } else {
-            pushToast(forceRes.message || "重新应用失败", "error");
-          }
-        }
-      } else if (res.success) {
-        pushToast("已成功重新应用该文件修改");
-      } else {
-        pushToast(res.message || "重新应用失败", "error");
-      }
-      const curId = useStore.getState().currentId;
-      if (curId) await useStore.getState().reloadMessages(curId);
-    } catch (err: any) {
-      pushToast(String(err) || "单项重新应用失败", "error");
-    } finally {
-      setRevertingItem(false);
-    }
-  };
 
   const currentWorkspace = useStore(
     (s) =>
@@ -1399,42 +1337,15 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
             </button>
           )}
           {(ev.toolName === "write_file" || ev.toolName === "edit_file") && filePath && (
-            <>
-              <button
-                type="button"
-                className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 transition-colors"
-                title="在独立窗体中查看文件变更对比 (Diff)"
-                onClick={handleOpenDiffViewer}
-              >
-                <GitCompare size={11} />
-                <span>对比 Diff</span>
-              </button>
-              {ev.status === "success" && (
-                !ev.revertedAt ? (
-                  <button
-                    type="button"
-                    className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 transition-colors disabled:opacity-50"
-                    title="仅撤回本卡片对该文件的修改（影子快照还原）"
-                    disabled={revertingItem}
-                    onClick={handleRevertSingle}
-                  >
-                    <RotateCcw size={11} className={revertingItem ? "animate-spin" : ""} />
-                    <span>{revertingItem ? "撤回中…" : "撤回此项"}</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 transition-colors disabled:opacity-50"
-                    title="重新应用本卡片对该文件的修改"
-                    disabled={revertingItem}
-                    onClick={handleReapplySingle}
-                  >
-                    <RotateCw size={11} className={revertingItem ? "animate-spin" : ""} />
-                    <span>{revertingItem ? "应用中…" : "重新应用"}</span>
-                  </button>
-                )
-              )}
-            </>
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 transition-colors cursor-pointer"
+              title="在独立窗体中查看文件变更对比 (Diff)"
+              onClick={handleOpenDiffViewer}
+            >
+              <GitCompare size={11} />
+              <span>对比 Diff</span>
+            </button>
           )}
           {["create_plan", "update_plan", "switch_plan", "read_plan"].includes(ev.toolName) && (
             <button

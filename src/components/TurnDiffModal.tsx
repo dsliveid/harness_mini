@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { ipc } from "../ipc";
 import { useStore } from "../store";
 import type { SnapshotFileDiff } from "../types";
-import { X, Copy, Check, ExternalLink, GitCompare } from "./Icons";
+import { X, Copy, Check, ExternalLink, GitCompare, RotateCcw, RotateCw } from "./Icons";
 
 interface TurnDiffModalProps {
   messageId: string;
@@ -58,7 +58,8 @@ export function TurnDiffModal({
     };
   }, [messageId]);
 
-  const selectedDiff = diffs[selectedIdx] || null;
+  const safeIdx = Math.min(selectedIdx, Math.max(0, diffs.length - 1));
+  const selectedDiff = diffs[safeIdx] || null;
 
   const handleCopyDiff = () => {
     if (!selectedDiff) return;
@@ -82,6 +83,101 @@ export function TurnDiffModal({
         ? `${currentWorkspace.replace(/\\/g, "/")}/${cleanRel.replace(/^\.\//, "")}`
         : cleanRel;
     ipc.openInExternalEditor(absPath);
+  };
+
+  const [revertingPath, setRevertingPath] = useState<string | null>(null);
+
+  const reloadDiffs = async () => {
+    try {
+      const res = await ipc.getTurnDiff(messageId);
+      setDiffs(res);
+    } catch (err) {
+      console.error("重新加载 Diff 失败:", err);
+    }
+  };
+
+  const handleOpenDiffViewer = (diff: SnapshotFileDiff) => {
+    if (!diff?.filePath) return;
+    const cleanRel = diff.filePath.replace(/\\/g, "/");
+    const fileName = cleanRel.split("/").pop() || "文件";
+    const absPath =
+      /^[a-zA-Z]:\//.test(cleanRel) || cleanRel.startsWith("/")
+        ? cleanRel
+        : currentWorkspace
+        ? `${currentWorkspace.replace(/\\/g, "/")}/${cleanRel.replace(/^\.\//, "")}`
+        : cleanRel;
+
+    ipc.openFileViewer({
+      id: `diff:${absPath}`,
+      type: "diff",
+      title: `Diff: ${fileName}`,
+      subtitle: cleanRel,
+      path: absPath,
+      diffSource: "git",
+      oldContent: diff.beforeContent || "",
+      newContent: diff.afterContent,
+      workspacePath: currentWorkspace,
+    });
+  };
+
+  const handleRevertFile = async (diff: SnapshotFileDiff) => {
+    if (!diff.filePath || revertingPath) return;
+    setRevertingPath(diff.filePath);
+    try {
+      const res = await ipc.revertTurnFile(messageId, diff.filePath, false);
+      if (!res.success && res.hasConflict) {
+        const proceed = window.confirm(`${res.message}\n\n是否强制覆盖撤回该文件的全部修改？`);
+        if (proceed) {
+          const forceRes = await ipc.revertTurnFile(messageId, diff.filePath, true);
+          if (forceRes.success) {
+            pushToast("该文件修改已强制撤回");
+          } else {
+            pushToast(forceRes.message || "撤回失败", "error");
+          }
+        }
+      } else if (res.success) {
+        pushToast("该文件修改已成功撤回");
+      } else {
+        pushToast(res.message || "撤回失败", "error");
+      }
+      const curId = useStore.getState().currentId;
+      if (curId) await useStore.getState().reloadMessages(curId);
+      await reloadDiffs();
+    } catch (err: any) {
+      pushToast(String(err) || "撤回文件修改失败", "error");
+    } finally {
+      setRevertingPath(null);
+    }
+  };
+
+  const handleReapplyFile = async (diff: SnapshotFileDiff) => {
+    if (!diff.filePath || revertingPath) return;
+    setRevertingPath(diff.filePath);
+    try {
+      const res = await ipc.reapplyTurnFile(messageId, diff.filePath, false);
+      if (!res.success && res.hasConflict) {
+        const proceed = window.confirm(`${res.message}\n\n是否强制覆盖重新应用该文件的修改？`);
+        if (proceed) {
+          const forceRes = await ipc.reapplyTurnFile(messageId, diff.filePath, true);
+          if (forceRes.success) {
+            pushToast("该文件修改已强制重新应用");
+          } else {
+            pushToast(forceRes.message || "重新应用失败", "error");
+          }
+        }
+      } else if (res.success) {
+        pushToast("已成功重新应用该文件修改");
+      } else {
+        pushToast(res.message || "重新应用失败", "error");
+      }
+      const curId = useStore.getState().currentId;
+      if (curId) await useStore.getState().reloadMessages(curId);
+      await reloadDiffs();
+    } catch (err: any) {
+      pushToast(String(err) || "重新应用文件修改失败", "error");
+    } finally {
+      setRevertingPath(null);
+    }
   };
 
   const modalContent = (
@@ -149,23 +245,35 @@ export function TurnDiffModal({
                 </div>
                 <div className="flex-1 overflow-y-auto p-1.5 flex flex-col gap-0.5">
                   {diffs.map((d, idx) => {
-                    const isSel = idx === selectedIdx;
+                    const isSel = idx === safeIdx;
                     const fileName = d.filePath.split(/[/\\]/).pop() || d.filePath;
                     return (
                       <div
                         key={d.filePath}
                         onClick={() => setSelectedIdx(idx)}
                         className={`flex items-center justify-between px-2.5 py-1.5 rounded-lg cursor-pointer text-xs font-mono transition-colors ${
+                          d.revertedAt ? "opacity-60 " : ""
+                        }${
                           isSel
                             ? "bg-accent/15 text-accent font-medium border border-accent/25"
                             : "hover:bg-panel2/60 text-ink/90 border border-transparent"
                         }`}
                       >
-                        <span className="truncate mr-2" title={d.filePath}>
-                          {fileName}
-                        </span>
+                        <div className="flex items-center gap-1.5 truncate mr-2 min-w-0" title={d.filePath}>
+                          <span className="truncate">{fileName}</span>
+                          {d.modifyCount && d.modifyCount > 1 ? (
+                            <span
+                              className="text-[10px] text-inkdim bg-panel3 px-1 py-0.2 rounded border border-edge/60 shrink-0 font-sans"
+                              title={`本轮对话对该文件进行了 ${d.modifyCount} 次修改`}
+                            >
+                              {d.modifyCount}次修改
+                            </span>
+                          ) : null}
+                        </div>
                         <div className="flex items-center gap-1 text-[10px] shrink-0 font-mono">
-                          {d.isNewFile ? (
+                          {d.revertedAt ? (
+                            <span className="text-amber-400 bg-amber-500/15 border border-amber-500/30 px-1 rounded">已撤回</span>
+                          ) : d.isNewFile ? (
                             <span className="text-emerald-400 bg-emerald-500/10 px-1 rounded">新建</span>
                           ) : (
                             <>
@@ -189,8 +297,45 @@ export function TurnDiffModal({
                         <span>{selectedDiff.filePath}</span>
                         <span className="text-emerald-400 text-[11px]">+{selectedDiff.added}</span>
                         <span className="text-rose-400 text-[11px]">-{selectedDiff.removed}</span>
+                        {selectedDiff.revertedAt && (
+                          <span className="text-[11px] px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/30 font-sans">
+                            已撤回
+                          </span>
+                        )}
                       </div>
                       <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 text-xs transition-colors cursor-pointer"
+                          onClick={() => handleOpenDiffViewer(selectedDiff)}
+                          title="在独立窗体中查看文件变更对比 (Diff)"
+                        >
+                          <GitCompare size={12} />
+                          <span>对比 Diff</span>
+                        </button>
+                        {!selectedDiff.revertedAt ? (
+                          <button
+                            type="button"
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 text-xs transition-colors cursor-pointer disabled:opacity-50"
+                            title="撤回本轮对话对该文件的全部修改（还原至初始状态）"
+                            disabled={revertingPath === selectedDiff.filePath}
+                            onClick={() => handleRevertFile(selectedDiff)}
+                          >
+                            <RotateCcw size={12} className={revertingPath === selectedDiff.filePath ? "animate-spin" : ""} />
+                            <span>{revertingPath === selectedDiff.filePath ? "撤回中…" : "撤回该文件"}</span>
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 text-xs transition-colors cursor-pointer disabled:opacity-50"
+                            title="重新应用本轮对话对该文件的修改"
+                            disabled={revertingPath === selectedDiff.filePath}
+                            onClick={() => handleReapplyFile(selectedDiff)}
+                          >
+                            <RotateCw size={12} className={revertingPath === selectedDiff.filePath ? "animate-spin" : ""} />
+                            <span>{revertingPath === selectedDiff.filePath ? "应用中…" : "重新应用"}</span>
+                          </button>
+                        )}
                         <button
                           type="button"
                           className="inline-flex items-center gap-1 px-2 py-1 rounded hover:bg-panel3 text-inkdim hover:text-ink text-xs transition-colors cursor-pointer"
@@ -211,6 +356,13 @@ export function TurnDiffModal({
                         </button>
                       </div>
                     </div>
+
+                    {selectedDiff.revertedAt && (
+                      <div className="bg-amber-500/10 border-b border-amber-500/20 px-4 py-1.5 flex items-center gap-2 text-[11.5px] text-amber-300 select-none shrink-0">
+                        <RotateCcw size={12} className="shrink-0 text-amber-400" />
+                        <span>该文件在本次会话中的修改已被撤回（代码已还原）。点击“重新应用”可再次生效。</span>
+                      </div>
+                    )}
 
                     <div className="flex-1 overflow-auto p-4 font-mono text-xs leading-relaxed select-text">
                       <pre className="whitespace-pre-wrap break-all text-ink/90">

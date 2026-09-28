@@ -177,13 +177,16 @@ pub async fn revert_snapshots(
         });
     }
 
-    // 1. 冲突检测阶段：若未指定 force，任何一个文件冲突都安全拦截，不产生部分回滚
+    // 1. 冲突检测阶段：若未指定 force，对每个不同文件仅检测其最新快照（当前磁盘应当对应的版本）
     if !force {
         let mut conflicted = Vec::new();
-        for s in snapshots {
-            if let Ok(Some(cf)) = check_revert_conflict(workspace, s).await {
-                if !conflicted.contains(&cf) {
-                    conflicted.push(cf);
+        let mut checked_files = std::collections::HashSet::new();
+        for s in snapshots.iter().rev() {
+            if checked_files.insert(&s.file_path) {
+                if let Ok(Some(cf)) = check_revert_conflict(workspace, s).await {
+                    if !conflicted.contains(&cf) {
+                        conflicted.push(cf);
+                    }
                 }
             }
         }
@@ -235,13 +238,16 @@ pub async fn reapply_snapshots(
         });
     }
 
-    // 1. 冲突检测
+    // 1. 冲突检测：对每个不同文件仅检测其最老快照（重做起始状态）是否与磁盘匹配
     if !force {
         let mut conflicted = Vec::new();
+        let mut checked_files = std::collections::HashSet::new();
         for s in snapshots {
-            if let Ok(Some(cf)) = check_reapply_conflict(workspace, s).await {
-                if !conflicted.contains(&cf) {
-                    conflicted.push(cf);
+            if checked_files.insert(&s.file_path) {
+                if let Ok(Some(cf)) = check_reapply_conflict(workspace, s).await {
+                    if !conflicted.contains(&cf) {
+                        conflicted.push(cf);
+                    }
                 }
             }
         }
@@ -276,34 +282,66 @@ pub async fn reapply_snapshots(
     })
 }
 
-/// 解析快照列表并生成对比 diff 详情
+/// 解析快照列表并生成对比 diff 详情（同一轮对话中同一文件的多次修改自动聚合为一条全量 Diff）
 pub async fn get_snapshots_diff_details(
     data_dir: &Path,
     snapshots: &[ToolFileSnapshot],
 ) -> Result<Vec<SnapshotFileDiff>, String> {
-    let mut diffs = Vec::new();
+    let mut file_order: Vec<String> = Vec::new();
+    let mut file_map: std::collections::HashMap<String, Vec<&ToolFileSnapshot>> = std::collections::HashMap::new();
+
     for s in snapshots {
-        let before_text = if let Some(ref bh) = s.before_hash {
+        if !file_map.contains_key(&s.file_path) {
+            file_order.push(s.file_path.clone());
+        }
+        file_map.entry(s.file_path.clone()).or_default().push(s);
+    }
+
+    let mut diffs = Vec::new();
+    for file_path in file_order {
+        let snaps = match file_map.get(&file_path) {
+            Some(list) if !list.is_empty() => list,
+            _ => continue,
+        };
+
+        let first = snaps[0];
+        let last = snaps[snaps.len() - 1];
+
+        let before_text = if first.is_new_file {
+            None
+        } else if let Some(ref bh) = first.before_hash {
             let bytes = read_blob_async(data_dir, bh).await.unwrap_or_default();
             Some(String::from_utf8_lossy(&bytes).to_string())
         } else {
             None
         };
 
-        let after_bytes = read_blob_async(data_dir, &s.after_hash).await.unwrap_or_default();
+        let after_bytes = read_blob_async(data_dir, &last.after_hash).await.unwrap_or_default();
         let after_text = String::from_utf8_lossy(&after_bytes).to_string();
 
         let old_str = before_text.as_deref().unwrap_or("");
         let d = diffutil::diff_lines(old_str, &after_text, 64 * 1024);
 
+        let is_all_reverted = snaps.iter().all(|s| s.reverted_at.is_some());
+        let reverted_at = if is_all_reverted {
+            last.reverted_at.clone()
+        } else {
+            None
+        };
+
         diffs.push(SnapshotFileDiff {
-            file_path: s.file_path.clone(),
-            is_new_file: s.is_new_file,
+            file_path: file_path.clone(),
+            is_new_file: first.is_new_file,
             added: d.added,
             removed: d.removed,
             diff_text: d.text,
             before_content: before_text,
             after_content: after_text,
+            tool_event_id: Some(last.tool_event_id.clone()),
+            snapshot_id: Some(last.id.clone()),
+            reverted_at,
+            modify_count: snaps.len(),
+            tool_event_ids: snaps.iter().map(|s| s.tool_event_id.clone()).collect(),
         });
     }
     Ok(diffs)
@@ -570,6 +608,291 @@ mod tests {
         let force_res = revert_message_turn(&ws, &data, &conn, &m.id, true).await.unwrap();
         assert!(force_res.success);
         assert!(!target_file.exists());
+
+        let _ = std::fs::remove_dir_all(ws.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_multi_turn_revert_and_reapply() {
+        let (ws, data) = temp_test_env("multi_turn");
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        let s = create_session(&conn, &ws.to_string_lossy(), None, "test", "confirm").unwrap();
+
+        // 轮次 1：用户提问 u1 -> 助手回复 a1 新建 a.txt (version 1)
+        let u1 = new_message(&conn, &s.id, "user", Some("create a.txt".into()), false).unwrap();
+        let a1 = new_message(&conn, &s.id, "assistant", Some("created a.txt".into()), false).unwrap();
+        let file_a = ws.join("a.txt");
+        let a_v1 = b"a content v1";
+        std::fs::write(&file_a, a_v1).unwrap();
+        let ev1 = ToolEvent {
+            id: "ev-1".into(),
+            message_id: a1.id.clone(),
+            tool_name: "write_file".into(),
+            tool_call_id: None,
+            params: serde_json::json!({}),
+            result_text: None,
+            status: "success".into(),
+            approval_scope: None,
+            created_at: now(),
+            subprocess_id: None,
+            reverted_at: None,
+        };
+        insert_tool_event(&conn, &ev1).unwrap();
+
+        let snap1 = ToolFileSnapshot {
+            id: "snap-1".into(),
+            session_id: s.id.clone(),
+            message_id: a1.id.clone(),
+            tool_event_id: "ev-1".into(),
+            file_path: "a.txt".into(),
+            before_hash: None,
+            after_hash: save_blob(&data, a_v1).unwrap(),
+            is_new_file: true,
+            reverted_at: None,
+            created_at: "2026-09-28T10:00:00Z".into(),
+        };
+        insert_tool_file_snapshot(&conn, &snap1).unwrap();
+
+        // 轮次 2：用户提问 u2 -> 助手回复 a2 修改 a.txt (version 2) 并新建 b.txt
+        let u2 = new_message(&conn, &s.id, "user", Some("update a and create b".into()), false).unwrap();
+        let a2 = new_message(&conn, &s.id, "assistant", Some("done".into()), false).unwrap();
+        let a_v2 = b"a content v2 modified";
+        std::fs::write(&file_a, a_v2).unwrap();
+
+        let ev2a = ToolEvent {
+            id: "ev-2a".into(),
+            message_id: a2.id.clone(),
+            tool_name: "edit_file".into(),
+            tool_call_id: None,
+            params: serde_json::json!({}),
+            result_text: None,
+            status: "success".into(),
+            approval_scope: None,
+            created_at: now(),
+            subprocess_id: None,
+            reverted_at: None,
+        };
+        insert_tool_event(&conn, &ev2a).unwrap();
+
+        let snap2_a = ToolFileSnapshot {
+            id: "snap-2a".into(),
+            session_id: s.id.clone(),
+            message_id: a2.id.clone(),
+            tool_event_id: "ev-2a".into(),
+            file_path: "a.txt".into(),
+            before_hash: Some(save_blob(&data, a_v1).unwrap()),
+            after_hash: save_blob(&data, a_v2).unwrap(),
+            is_new_file: false,
+            reverted_at: None,
+            created_at: "2026-09-28T10:01:00Z".into(),
+        };
+        insert_tool_file_snapshot(&conn, &snap2_a).unwrap();
+
+        let file_b = ws.join("b.txt");
+        let b_v1 = b"b content";
+        std::fs::write(&file_b, b_v1).unwrap();
+
+        let ev2b = ToolEvent {
+            id: "ev-2b".into(),
+            message_id: a2.id.clone(),
+            tool_name: "write_file".into(),
+            tool_call_id: None,
+            params: serde_json::json!({}),
+            result_text: None,
+            status: "success".into(),
+            approval_scope: None,
+            created_at: now(),
+            subprocess_id: None,
+            reverted_at: None,
+        };
+        insert_tool_event(&conn, &ev2b).unwrap();
+
+        let snap2_b = ToolFileSnapshot {
+            id: "snap-2b".into(),
+            session_id: s.id.clone(),
+            message_id: a2.id.clone(),
+            tool_event_id: "ev-2b".into(),
+            file_path: "b.txt".into(),
+            before_hash: None,
+            after_hash: save_blob(&data, b_v1).unwrap(),
+            is_new_file: true,
+            reverted_at: None,
+            created_at: "2026-09-28T10:01:05Z".into(),
+        };
+        insert_tool_file_snapshot(&conn, &snap2_b).unwrap();
+
+        // 1. 测试撤回对话到 u2
+        let snaps_to_revert = list_snapshots_after_seq(&conn, &s.id, u2.seq).unwrap();
+        assert_eq!(snaps_to_revert.len(), 2);
+        let rev_res = revert_snapshots(&ws, &data, &snaps_to_revert, false).await.unwrap();
+        assert!(rev_res.success);
+
+        let now_str = "2026-09-28T10:02:00Z";
+        let affected = mark_messages_and_snapshots_reverted_after_seq(&conn, &s.id, u2.seq, Some(now_str)).unwrap();
+        assert_eq!(affected.len(), 2); // u2 and a2
+
+        // 验证文件回退状态：a.txt 还原为 v1，b.txt 被安全删除
+        assert_eq!(std::fs::read(&file_a).unwrap(), a_v1);
+        assert!(!file_b.exists());
+
+        // 验证数据库状态
+        let loaded_u1 = get_message(&conn, &u1.id).unwrap().unwrap();
+        let loaded_u2 = get_message(&conn, &u2.id).unwrap().unwrap();
+        let loaded_a2 = get_message(&conn, &a2.id).unwrap().unwrap();
+        assert!(loaded_u1.reverted_at.is_none());
+        assert_eq!(loaded_u2.reverted_at.as_deref(), Some(now_str));
+        assert_eq!(loaded_a2.reverted_at.as_deref(), Some(now_str));
+
+        // 2. 测试重新应用（后悔药）
+        let snaps_to_reapply = list_reverted_snapshots_after_seq(&conn, &s.id, u2.seq).unwrap();
+        assert_eq!(snaps_to_reapply.len(), 2);
+        let reap_res = reapply_snapshots(&ws, &data, &snaps_to_reapply, false).await.unwrap();
+        assert!(reap_res.success);
+
+        mark_messages_and_snapshots_reverted_after_seq(&conn, &s.id, u2.seq, None).unwrap();
+
+        // 验证文件与消息重做恢复
+        assert_eq!(std::fs::read(&file_a).unwrap(), a_v2);
+        assert_eq!(std::fs::read(&file_b).unwrap(), b_v1);
+
+        let reloaded_u2 = get_message(&conn, &u2.id).unwrap().unwrap();
+        let reloaded_a2 = get_message(&conn, &a2.id).unwrap().unwrap();
+        assert!(reloaded_u2.reverted_at.is_none());
+        assert!(reloaded_a2.reverted_at.is_none());
+
+        // 3. 测试再次撤回后发送新消息（覆盖截断旧分支）
+        let snaps_to_revert2 = list_snapshots_after_seq(&conn, &s.id, u2.seq).unwrap();
+        revert_snapshots(&ws, &data, &snaps_to_revert2, false).await.unwrap();
+        mark_messages_and_snapshots_reverted_after_seq(&conn, &s.id, u2.seq, Some(now_str)).unwrap();
+
+        // 用户编辑 u2 内容并发送（清除原后续消息）
+        update_message_content_and_attachments(&conn, &u2.id, "u2 rewritten", None).unwrap();
+        delete_messages_after(&conn, &s.id, u2.seq).unwrap();
+
+        let final_u2 = get_message(&conn, &u2.id).unwrap().unwrap();
+        let final_a2 = get_message(&conn, &a2.id).unwrap();
+        assert_eq!(final_u2.content.as_deref(), Some("u2 rewritten"));
+        assert!(final_u2.reverted_at.is_none()); // 必须被自动重置为非撤回状态
+        assert!(final_a2.is_none()); // a2 已被物理删除
+
+        let _ = std::fs::remove_dir_all(ws.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_turn_diff_aggregation_and_single_file_revert() {
+        let (ws, data) = temp_test_env("agg");
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        let target_file = ws.join("sample.txt");
+        let v0_content = b"line 1\nline 2";
+        std::fs::write(&target_file, v0_content).unwrap();
+
+        let v1_content = b"line 1\nline 2 modified\nline 3";
+        let v2_content = b"line 1\nline 2 modified\nline 3\nline 4 added";
+
+        let h0 = save_blob(&data, v0_content).unwrap();
+        let h1 = save_blob(&data, v1_content).unwrap();
+        let h2 = save_blob(&data, v2_content).unwrap();
+
+        let s = create_session(&conn, &ws.to_string_lossy(), None, "test", "confirm").unwrap();
+        let m = new_message(&conn, &s.id, "assistant", Some("test turn".into()), false).unwrap();
+
+        let ev1 = ToolEvent {
+            id: "ev-step-1".into(),
+            message_id: m.id.clone(),
+            tool_name: "edit_file".into(),
+            tool_call_id: None,
+            params: serde_json::json!({"path": "sample.txt"}),
+            result_text: None,
+            status: "success".into(),
+            approval_scope: None,
+            created_at: now(),
+            subprocess_id: None,
+            reverted_at: None,
+        };
+        insert_tool_event(&conn, &ev1).unwrap();
+
+        let snap1 = ToolFileSnapshot {
+            id: "snap-1".into(),
+            session_id: s.id.clone(),
+            message_id: m.id.clone(),
+            tool_event_id: ev1.id.clone(),
+            file_path: "sample.txt".into(),
+            before_hash: Some(h0.clone()),
+            after_hash: h1.clone(),
+            is_new_file: false,
+            reverted_at: None,
+            created_at: "2026-09-28T10:00:00Z".into(),
+        };
+        insert_tool_file_snapshot(&conn, &snap1).unwrap();
+
+        let ev2 = ToolEvent {
+            id: "ev-step-2".into(),
+            message_id: m.id.clone(),
+            tool_name: "edit_file".into(),
+            tool_call_id: None,
+            params: serde_json::json!({"path": "sample.txt"}),
+            result_text: None,
+            status: "success".into(),
+            approval_scope: None,
+            created_at: now(),
+            subprocess_id: None,
+            reverted_at: None,
+        };
+        insert_tool_event(&conn, &ev2).unwrap();
+
+        let snap2 = ToolFileSnapshot {
+            id: "snap-2".into(),
+            session_id: s.id.clone(),
+            message_id: m.id.clone(),
+            tool_event_id: ev2.id.clone(),
+            file_path: "sample.txt".into(),
+            before_hash: Some(h1.clone()),
+            after_hash: h2.clone(),
+            is_new_file: false,
+            reverted_at: None,
+            created_at: "2026-09-28T10:01:00Z".into(),
+        };
+        insert_tool_file_snapshot(&conn, &snap2).unwrap();
+
+        // Write disk to v2 (current final state)
+        std::fs::write(&target_file, v2_content).unwrap();
+
+        // 1. 验证聚合：同一轮改动弹窗中，只应看到 1 条记录，而不是 2 条
+        let diffs = get_turn_diff_details(&data, &conn, &m.id).await.unwrap();
+        assert_eq!(diffs.len(), 1);
+        let d = &diffs[0];
+        assert_eq!(d.file_path, "sample.txt");
+        assert_eq!(d.modify_count, 2);
+        assert_eq!(d.tool_event_ids, vec!["ev-step-1", "ev-step-2"]);
+        assert_eq!(d.before_content.as_deref(), Some("line 1\nline 2"));
+        assert_eq!(d.after_content, "line 1\nline 2 modified\nline 3\nline 4 added");
+
+        // 2. 撤回该文件
+        let snaps_for_file = vec![snap1.clone(), snap2.clone()];
+        let rev_res = revert_snapshots(&ws, &data, &snaps_for_file, false).await.unwrap();
+        assert!(rev_res.success);
+        assert_eq!(std::fs::read(&target_file).unwrap(), v0_content);
+
+        // 标记已撤回
+        mark_snapshots_reverted_by_ids(&conn, &["snap-1".into(), "snap-2".into()], Some("2026-09-28T10:05:00Z")).unwrap();
+
+        // 再次获取 Diff，应显示为已撤回状态
+        let diffs_rev = get_turn_diff_details(&data, &conn, &m.id).await.unwrap();
+        assert_eq!(diffs_rev.len(), 1);
+        assert!(diffs_rev[0].reverted_at.is_some());
+
+        // 3. 重新应用
+        let reap_res = reapply_snapshots(&ws, &data, &snaps_for_file, false).await.unwrap();
+        assert!(reap_res.success);
+        assert_eq!(std::fs::read(&target_file).unwrap(), v2_content);
+
+        mark_snapshots_reverted_by_ids(&conn, &["snap-1".into(), "snap-2".into()], None).unwrap();
+        let diffs_reap = get_turn_diff_details(&data, &conn, &m.id).await.unwrap();
+        assert!(diffs_reap[0].reverted_at.is_none());
 
         let _ = std::fs::remove_dir_all(ws.parent().unwrap());
     }

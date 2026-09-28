@@ -994,6 +994,20 @@ pub struct SnapshotFileDiff {
     pub diff_text: String,
     pub before_content: Option<String>,
     pub after_content: String,
+    #[serde(default)]
+    pub tool_event_id: Option<String>,
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
+    #[serde(default)]
+    pub reverted_at: Option<String>,
+    #[serde(default = "default_one")]
+    pub modify_count: usize,
+    #[serde(default)]
+    pub tool_event_ids: Vec<String>,
+}
+
+fn default_one() -> usize {
+    1
 }
 
 

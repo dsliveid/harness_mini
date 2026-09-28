@@ -453,10 +453,14 @@ pub fn run() {
             commands::list_task_checkpoints,
             commands::rollback_to_checkpoint,
             commands::update_task_subtasks,
+            commands::revert_to_message,
+            commands::reapply_from_message,
             commands::revert_message_turn,
             commands::reapply_message_turn,
             commands::revert_tool_event,
             commands::reapply_tool_event,
+            commands::revert_turn_file,
+            commands::reapply_turn_file,
             commands::get_turn_diff,
         ])
         .run(tauri::generate_context!())
