@@ -150,6 +150,17 @@ export function ChatView() {
     stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
   };
 
+  // 当切换到一个已有消息历史但本地尚未缓存完毕的会话时，展示轻量 loading，消除空会话卡片闪烁
+  const isInitialLoading = Boolean(currentId && currentId !== DRAFT_ID && msgs.length === 0 && session?.lastMessageAt);
+  if (isInitialLoading) {
+    return (
+      <div className="flex-1 flex items-center justify-center select-none text-inkdim text-[13px] gap-2 animate-in fade-in duration-100">
+        <Loader2 size={16} className="animate-spin text-accent" />
+        <span>加载对话记录…</span>
+      </div>
+    );
+  }
+
   if (!currentId || msgs.length === 0) {
     const noProvider = providers.every((p) => !(p.models ?? []).length);
     const noWorkspace = currentId === DRAFT_ID ? !draft?.workspacePath : !session?.workspacePath;
@@ -218,7 +229,7 @@ export function ChatView() {
 
   return (
     <div className="flex-1 min-h-0 relative z-0 flex flex-col">
-      <FloatingTaskPanel key={currentId} />
+      <FloatingTaskPanel />
       <ToolRetryBanner />
       <CompactionBanner />
       <TruncationNoticeList />

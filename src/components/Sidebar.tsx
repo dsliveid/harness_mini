@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, memo, useCallback } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ipc } from "../ipc";
 import { currentSession, useStore } from "../store";
@@ -38,6 +38,8 @@ function formatTokens(n?: number): string {
   if (n >= 10_000) return `${(n / 1_000).toFixed(1)}k`;
   return n.toLocaleString("zh-CN");
 }
+
+const EMPTY_MENU: any[] = [];
 
 function ItemMenu({
   items,
@@ -87,6 +89,77 @@ function Chevron({ collapsed }: { collapsed?: boolean }) {
     />
   );
 }
+
+interface SessionRowProps {
+  s: Session;
+  indent: boolean;
+  isSelected: boolean;
+  isRunning: boolean;
+  isMenuOpen: boolean;
+  onSelect: (id: string) => void;
+  onToggleMenu: (id: string) => void;
+  onCloseMenu: () => void;
+  menuItems: { label: string; danger?: boolean; onClick: () => void }[];
+}
+
+const SessionRow = memo(function SessionRow({
+  s,
+  indent,
+  isSelected,
+  isRunning,
+  isMenuOpen,
+  onSelect,
+  onToggleMenu,
+  onCloseMenu,
+  menuItems,
+}: SessionRowProps) {
+  return (
+    <div
+      className={`group relative flex items-center gap-1.5 rounded-lg px-2 py-1.5 cursor-pointer mr-2 transition-colors ${
+        isSelected ? "bg-panel3 text-ink font-medium" : "hover:bg-panel2 text-ink/90"
+      } ${indent ? "ml-4" : ""}`}
+      onClick={() => onSelect(s.id)}
+    >
+      {isRunning && (
+        <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse shrink-0 shadow-[0_0_8px_rgba(74,222,128,0.6)]" title="Agent 运行中" />
+      )}
+      <div className="flex-1 min-w-0">
+        <div className="truncate text-[13px]" title={s.title}>
+          {s.title}
+        </div>
+        <div className={`flex items-center gap-1.5 text-[11px] ${isRunning ? "text-green-400" : "text-inkdim"}`}>
+          <span className="truncate">{isRunning ? "运行中…" : timeLabel(s.lastMessageAt ?? s.createdAt)}</span>
+          {s.totalTokens != null && s.totalTokens > 0 && (
+            <span
+              className="shrink-0 font-mono text-[10px] text-inkdim/75"
+              title={`会话累计消耗: ${(Number(s.totalTokens) || 0).toLocaleString()} tokens`}
+            >
+              · {formatTokens(s.totalTokens)} tokens
+            </span>
+          )}
+          {s.isTemp && (
+            <span className="shrink-0 inline-flex items-center gap-0.5 px-1.5 py-[1px] rounded text-[10px] leading-none bg-amber-500/15 text-amber-400 border border-amber-500/30">
+              <Wind size={9} />
+              <span>临时</span>
+            </span>
+          )}
+        </div>
+      </div>
+      <button
+        className={`opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-inkdim hover:text-ink transition-opacity ${
+          isMenuOpen ? "opacity-100" : ""
+        }`}
+        onClick={(e) => {
+          e.stopPropagation();
+          onToggleMenu(s.id);
+        }}
+      >
+        <MoreHorizontal size={14} />
+      </button>
+      {isMenuOpen && <ItemMenu items={menuItems} onClose={onCloseMenu} />}
+    </div>
+  );
+});
 
 export function Sidebar() {
   const sessions = useStore((s) => s.sessions);
@@ -174,55 +247,12 @@ export function Sidebar() {
       } },
   ];
 
-  const SessionRow = ({ s, indent }: { s: Session; indent: boolean }) => {
-    const isRunning = runStatus[s.id] === "running";
-    return (
-      <div
-        className={`group relative flex items-center gap-1.5 rounded-lg px-2 py-1.5 cursor-pointer mr-2 transition-colors ${
-          currentId === s.id ? "bg-panel3 text-ink font-medium" : "hover:bg-panel2 text-ink/90"
-        } ${indent ? "ml-4" : ""}`}
-        onClick={() => selectSession(s.id)}
-      >
-        {isRunning && (
-          <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse shrink-0 shadow-[0_0_8px_rgba(74,222,128,0.6)]" title="Agent 运行中" />
-        )}
-        <div className="flex-1 min-w-0">
-          <div className="truncate text-[13px]" title={s.title}>
-            {s.title}
-          </div>
-          <div className={`flex items-center gap-1.5 text-[11px] ${isRunning ? "text-green-400" : "text-inkdim"}`}>
-            <span className="truncate">{isRunning ? "运行中…" : timeLabel(s.lastMessageAt ?? s.createdAt)}</span>
-            {s.totalTokens != null && s.totalTokens > 0 && (
-              <span
-                className="shrink-0 font-mono text-[10px] text-inkdim/75"
-                title={`会话累计消耗: ${(Number(s.totalTokens) || 0).toLocaleString()} tokens`}
-              >
-                · {formatTokens(s.totalTokens)} tokens
-              </span>
-            )}
-            {s.isTemp && (
-              <span className="shrink-0 inline-flex items-center gap-0.5 px-1.5 py-[1px] rounded text-[10px] leading-none bg-amber-500/15 text-amber-400 border border-amber-500/30">
-                <Wind size={9} />
-                <span>临时</span>
-              </span>
-            )}
-          </div>
-        </div>
-        <button
-          className={`opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-inkdim hover:text-ink transition-opacity ${
-            menuFor === s.id ? "opacity-100" : ""
-          }`}
-          onClick={(e) => {
-            e.stopPropagation();
-            setMenuFor(menuFor === s.id ? null : s.id);
-          }}
-        >
-          <MoreHorizontal size={14} />
-        </button>
-        {menuFor === s.id && <ItemMenu items={sessionMenu(s)} onClose={() => setMenuFor(null)} />}
-      </div>
-    );
-  };
+  const handleToggleMenu = useCallback((id: string) => {
+    setMenuFor((cur) => (cur === id ? null : id));
+  }, []);
+  const handleCloseMenu = useCallback(() => {
+    setMenuFor(null);
+  }, []);
 
   return (
     <div className="w-[260px] shrink-0 h-full border-r border-edge bg-panel flex flex-col select-none">
@@ -267,7 +297,18 @@ export function Sidebar() {
         {view === "list" && (
           <>
             {sorted.map((s) => (
-              <SessionRow key={s.id} s={s} indent={false} />
+              <SessionRow
+                key={s.id}
+                s={s}
+                indent={false}
+                isSelected={currentId === s.id}
+                isRunning={runStatus[s.id] === "running"}
+                isMenuOpen={menuFor === s.id}
+                onSelect={selectSession}
+                onToggleMenu={handleToggleMenu}
+                onCloseMenu={handleCloseMenu}
+                menuItems={menuFor === s.id ? sessionMenu(s) : EMPTY_MENU}
+              />
             ))}
             {sorted.length === 0 && <div className="text-inkdim text-[13px] px-2 py-4">暂无会话</div>}
           </>
@@ -377,7 +418,20 @@ export function Sidebar() {
                           {menuFor === p.id && <ItemMenu items={projectMenu(p.id, p.pinned, p.path)} onClose={() => setMenuFor(null)} />}
                         </div>
                         {!isCollapsed &&
-                          displayChildren.map((s) => <SessionRow key={s.id} s={s} indent={true} />)}
+                          displayChildren.map((s) => (
+                            <SessionRow
+                              key={s.id}
+                              s={s}
+                              indent={true}
+                              isSelected={currentId === s.id}
+                              isRunning={runStatus[s.id] === "running"}
+                              isMenuOpen={menuFor === s.id}
+                              onSelect={selectSession}
+                              onToggleMenu={handleToggleMenu}
+                              onCloseMenu={handleCloseMenu}
+                              menuItems={menuFor === s.id ? sessionMenu(s) : EMPTY_MENU}
+                            />
+                          ))}
                         {!isCollapsed && hasMore && (
                           !isMoreExpanded ? (
                             <div
@@ -445,7 +499,20 @@ export function Sidebar() {
                   </button>
                 </div>
                 {!groupCollapsed.chats &&
-                  ungrouped.map((s) => <SessionRow key={s.id} s={s} indent={false} />)}
+                  ungrouped.map((s) => (
+                    <SessionRow
+                      key={s.id}
+                      s={s}
+                      indent={false}
+                      isSelected={currentId === s.id}
+                      isRunning={runStatus[s.id] === "running"}
+                      isMenuOpen={menuFor === s.id}
+                      onSelect={selectSession}
+                      onToggleMenu={handleToggleMenu}
+                      onCloseMenu={handleCloseMenu}
+                      menuItems={menuFor === s.id ? sessionMenu(s) : EMPTY_MENU}
+                    />
+                  ))}
               </div>
             )}
           </>

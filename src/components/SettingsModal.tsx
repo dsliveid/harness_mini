@@ -27,6 +27,7 @@ import {
   MessageSquare,
   Palette,
   Sprout,
+  Globe,
 } from "./Icons";
 
 const MODEL_CAP_OPTIONS = [
@@ -35,16 +36,18 @@ const MODEL_CAP_OPTIONS = [
   { id: "vision", label: "视觉", Icon: Eye },
 ] as const;
 
-type Tab = "models" | "tools" | "sop" | "datadir";
+type Tab = "models" | "tools" | "network" | "sop" | "datadir";
 
 const TOOL_TITLES: Record<string, string> = {
   read_file: "读取文件",
   list_dir: "列出目录",
+  file_outline: "提取大纲",
   glob: "查找文件",
   grep: "搜索内容",
   write_file: "写入文件",
   edit_file: "编辑文件",
   run_command: "执行命令",
+  fetch_web_page: "网页抓取",
   todo: "任务清单",
   list_skills: "查询技能库",
   save_skill: "固化项目技能",
@@ -108,6 +111,8 @@ export function SettingsModal() {
     modelName: string;
     currentLimit: number;
   } | null>(null);
+  const [proxyTesting, setProxyTesting] = useState(false);
+  const [proxyTestResult, setProxyTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
 
   useEffect(() => {
     if (show) {
@@ -119,6 +124,8 @@ export function SettingsModal() {
       setNewModel({});
       setExpandedIds({});
       setEditingContextModel(null);
+      setProxyTesting(false);
+      setProxyTestResult(null);
       // 打开时从后端拉取最新设置与工具列表，避免草稿基于启动时的旧缓存回写
       ipc
         .getSettings()
@@ -507,6 +514,12 @@ export function SettingsModal() {
               <span className="flex items-center gap-2">
                 <Wrench size={15} />
                 <span>Agent 工具</span>
+              </span>
+            </button>
+            <button className={menuCls(tab === "network")} onClick={() => setTab("network")}>
+              <span className="flex items-center gap-2">
+                <Globe size={15} />
+                <span>网络代理</span>
               </span>
             </button>
             <button className={menuCls(tab === "sop")} onClick={() => setTab("sop")}>
@@ -1086,6 +1099,119 @@ export function SettingsModal() {
                       )}
                     </>
                   )}
+                </section>
+              </div>
+            )}
+
+            {tab === "network" && (
+              <div className="flex flex-col gap-5">
+                <section>
+                  <div className="flex items-start justify-between gap-4 mb-4">
+                    <div className="flex-1 min-w-0">
+                      <div className="font-medium text-[14px]">网络代理设置</div>
+                      <div className="text-[12px] text-inkdim mt-0.5 leading-relaxed max-w-[560px]">
+                        统一配置客户端网络正向代理。开启后，网页抓取工具、终端命令环境与厂商模型请求将统一经由此代理访问，解决境外网站与模型 API 受阻的问题。
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col gap-4">
+                    {/* 开启代理总开关 */}
+                    <div className="border border-edge rounded-xl p-4 bg-panel flex items-start justify-between gap-4">
+                      <div>
+                        <div className="font-medium text-[13px] text-ink flex items-center gap-2">
+                          <Globe size={16} className={local.proxyEnabled ? "text-accent" : "text-inkdim"} />
+                          <span>启用网络代理</span>
+                        </div>
+                        <div className="text-[12px] text-inkdim mt-1 leading-relaxed">
+                          开启后，网页读取工具、网络请求与厂商模型均统一走下方代理；停用时统一直连。
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={local.proxyEnabled ?? false}
+                        title={local.proxyEnabled ? "停用网络代理" : "启用网络代理"}
+                        onClick={() =>
+                          setLocal((prev) => ({
+                            ...prev,
+                            proxyEnabled: !prev.proxyEnabled,
+                          }))
+                        }
+                        className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border border-transparent transition-colors duration-200 ease-in-out focus:outline-none shrink-0 mt-0.5 ${
+                          local.proxyEnabled ? "bg-accent" : "bg-panel3 border-edge"
+                        }`}
+                      >
+                        <span
+                          className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
+                            local.proxyEnabled ? "translate-x-4" : "translate-x-0"
+                          }`}
+                        />
+                      </button>
+                    </div>
+
+                    {/* 自定义代理地址 */}
+                    <div
+                      className={`border border-edge rounded-xl p-4 bg-panel flex flex-col gap-3 transition-opacity ${
+                        local.proxyEnabled ? "opacity-100" : "opacity-60"
+                      }`}
+                    >
+                      <label className="font-medium text-[13px] text-ink">代理服务器地址</label>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          className="flex-1 bg-panel2 border border-edge rounded-lg px-3 py-1.5 text-[13px] font-mono focus:outline-none focus:border-accent disabled:opacity-50"
+                          placeholder="http://127.0.0.1:7890"
+                          value={local.proxyUrl ?? ""}
+                          disabled={!local.proxyEnabled}
+                          onChange={(e) =>
+                            setLocal((prev) => ({
+                              ...prev,
+                              proxyUrl: e.target.value,
+                            }))
+                          }
+                        />
+                        <button
+                          type="button"
+                          className="px-3 py-1.5 rounded-lg border border-edge bg-panel2 hover:bg-edge/40 text-[12px] font-medium text-ink shrink-0 transition-colors disabled:opacity-50"
+                          disabled={!local.proxyEnabled || proxyTesting}
+                          onClick={async () => {
+                            const target = (local.proxyUrl ?? "").trim() || "http://127.0.0.1:7890";
+                            setProxyTesting(true);
+                            setProxyTestResult(null);
+                            try {
+                              const ms = await ipc.testProxyConnection(target);
+                              setProxyTestResult({ ok: true, msg: `连接正常（延迟 ${ms}ms）` });
+                            } catch (err) {
+                              setProxyTestResult({ ok: false, msg: String(err) });
+                            } finally {
+                              setProxyTesting(false);
+                            }
+                          }}
+                        >
+                          {proxyTesting ? "测试中..." : "测试连接"}
+                        </button>
+                      </div>
+
+                      {/* 测试反馈状态 */}
+                      {proxyTestResult && (
+                        <div
+                          className={`text-[12px] px-2.5 py-1.5 rounded-lg border ${
+                            proxyTestResult.ok
+                              ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                              : "bg-rose-500/10 text-rose-400 border-rose-500/20"
+                          }`}
+                        >
+                          {proxyTestResult.msg}
+                        </div>
+                      )}
+
+                      <div className="text-[12px] text-inkdim/80 leading-relaxed space-y-1 mt-1">
+                        <div>• 支持协议：HTTP / HTTPS / SOCKS5（例如 <code className="font-mono text-[11px] bg-panel2 px-1 py-0.5 rounded">http://127.0.0.1:7890</code> 或 <code className="font-mono text-[11px] bg-panel2 px-1 py-0.5 rounded">socks5://127.0.0.1:7890</code>）。</div>
+                        <div>• 本地回环直连：内部通信及本地模型服务（<code className="font-mono text-[11px] bg-panel2 px-1 py-0.5 rounded">localhost</code>、<code className="font-mono text-[11px] bg-panel2 px-1 py-0.5 rounded">127.0.0.1</code>）将自动直连白名单，不受代理拦截。</div>
+                      </div>
+                    </div>
+                  </div>
                 </section>
               </div>
             )}

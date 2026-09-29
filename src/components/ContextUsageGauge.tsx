@@ -5,6 +5,7 @@ import {
   DRAFT_ID,
   formatTokens,
   resolveActiveModel,
+  resolveSessionActiveModel,
   resolveModelContextLimit,
   type Message,
   type Session,
@@ -53,9 +54,10 @@ export function computeContextUsage(
   compactions: SessionCompaction[],
   session: Session | null,
   settings: Settings,
-  draftLimit?: number | null
+  draftLimit?: number | null,
+  draft?: { providerId?: string | null; modelId?: string | null } | null
 ): ContextUsageInfo {
-  const active = resolveActiveModel(settings);
+  const active = resolveSessionActiveModel(settings, session, draft);
   const modelName = active?.model ?? "default";
   const providerName = active?.provider.name ?? "";
   const providerId = active?.provider.id ?? "";
@@ -189,9 +191,10 @@ export function ContextUsageGauge({ session, className = "" }: ContextUsageGauge
       compactions,
       session ?? null,
       settings,
-      sessionId === DRAFT_ID ? draft?.contextTokenLimit ?? null : null
+      sessionId === DRAFT_ID ? draft?.contextTokenLimit ?? null : null,
+      sessionId === DRAFT_ID ? draft : null
     );
-  }, [messages, compactions, session, settings, sessionId, draft?.contextTokenLimit]);
+  }, [messages, compactions, session, settings, sessionId, draft?.contextTokenLimit, draft?.providerId, draft?.modelId]);
 
   const handleMouseEnter = () => {
     if (closeTimerRef.current) {

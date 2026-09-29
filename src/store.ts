@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "./ipc";
-import { DRAFT_ID, samePath, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem, type FocusFloatingTarget } from "./types";
+import { DRAFT_ID, resolveActiveModel, samePath, sortMessages, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem, type FocusFloatingTarget } from "./types";
 
 
 export interface EditingMessageTarget {
@@ -67,6 +67,9 @@ const SUBAGENT_WIDTH_KEY = "harness_mini.subagentPanelWidth";
 export const MAIN_PANEL_MIN_WIDTH = 460;
 export const SUBAGENT_MIN_PANEL_WIDTH = 380;
 export const SUBAGENT_DEFAULT_PANEL_WIDTH = 480;
+export const INITIAL_MESSAGES_LIMIT = 100;
+export const LOAD_MORE_LIMIT = 100;
+let latestSelectSessionToken = 0;
 
 function loadSessionDrafts(): Record<string, string> {
   try {
@@ -125,6 +128,9 @@ interface Store {
     accessMode: "confirm" | "full_access";
     /** 会话专属上下文上限（草稿阶段设置，落库时随会话持久化） */
     contextTokenLimit?: number | null;
+    /** 草稿专属主对话模型 */
+    providerId?: string | null;
+    modelId?: string | null;
     /** 草稿专属生图模型配置 */
     imageProviderId?: string | null;
     imageModelId?: string | null;
@@ -134,6 +140,7 @@ interface Store {
     /** 草稿专属思考程度 */
     reasoningEffort?: string | null;
   } | null;
+  setDraftModel: (providerId: string | null, modelId: string | null) => void;
   setDraftContextTokenLimit: (limit: number | null) => void;
   setDraftReasoningEffort: (effort: string | null) => void;
   setDraftCapabilityModels: (input: {
@@ -380,12 +387,14 @@ interface Store {
 
 function upsertMessage(list: Message[], m: Message): Message[] {
   const idx = list.findIndex((x) => x.id === m.id);
+  let next: Message[];
   if (idx >= 0) {
-    const next = list.slice();
-    next[idx] = { ...next[idx], ...m, toolEvents: m.toolEvents.length ? m.toolEvents : next[idx].toolEvents };
-    return next;
+    next = list.slice();
+    next[idx] = { ...next[idx], ...m, toolEvents: m.toolEvents && m.toolEvents.length ? m.toolEvents : next[idx].toolEvents };
+  } else {
+    next = [...list, m];
   }
-  return [...list, m];
+  return sortMessages(next);
 }
 
 function upsertToolEvent(list: Message[], ev: ToolEvent, sessionId: string): Message[] {
@@ -405,7 +414,7 @@ function upsertToolEvent(list: Message[], ev: ToolEvent, sessionId: string): Mes
       createdAt: ev.createdAt ?? new Date().toISOString(),
       toolEvents: [ev],
     };
-    return [...list, msg];
+    return sortMessages([...list, msg]);
   }
   const next = list.slice();
   msg = { ...next[idx] };
@@ -451,27 +460,36 @@ function mergeToolEvents(localEvs: ToolEvent[] = [], fetchedEvs: ToolEvent[] = [
 /**
  * 用库中消息合并本地消息后作为会话消息列表：
  * - 流式占位消息的内容领先于库里定期落库的内容（且可能尚未落库），合并时取较新一侧，避免刷新瞬间文字闪断
- * - 本地独有的消息（正在流式、尚未落库）保持在末尾
+ * - 本地独有的消息（正在流式、尚未落库）保持在末尾，所有消息按 seq 强制单调递增排序，杜绝前后倒置
  */
 function mergeSessionMessages(local: Message[] | undefined, fetched: Message[]): Message[] {
-  if (!local || local.length === 0) return fetched;
+  if (!local || local.length === 0) return sortMessages(fetched);
   const byId = new Map(local.map((m) => [m.id, m]));
-  const out = fetched.map((m) => {
+  const mergedMap = new Map<string, Message>();
+
+  for (const m of fetched) {
     const l = byId.get(m.id);
-    if (!l) return m;
-    return {
-      ...m,
-      content: (l.content?.length ?? 0) >= (m.content?.length ?? 0) ? l.content : m.content,
-      reasoning: (l.reasoning?.length ?? 0) >= (m.reasoning?.length ?? 0) ? l.reasoning : m.reasoning,
-      toolEvents: mergeToolEvents(l.toolEvents, m.toolEvents),
-      toolCalls: (m.toolCalls?.length ?? 0) > 0 ? m.toolCalls : l.toolCalls,
-    };
-  });
-  const fetchedIds = new Set(fetched.map((m) => m.id));
-  for (const l of local) {
-    if (!fetchedIds.has(l.id)) out.push(l);
+    if (!l) {
+      mergedMap.set(m.id, m);
+    } else {
+      mergedMap.set(m.id, {
+        ...m,
+        content: (l.content?.length ?? 0) >= (m.content?.length ?? 0) ? l.content : m.content,
+        reasoning: (l.reasoning?.length ?? 0) >= (m.reasoning?.length ?? 0) ? l.reasoning : m.reasoning,
+        toolEvents: mergeToolEvents(l.toolEvents, m.toolEvents),
+        toolCalls: (m.toolCalls?.length ?? 0) > 0 ? m.toolCalls : l.toolCalls,
+        revertedAt: m.revertedAt ?? l.revertedAt,
+      });
+    }
   }
-  return out;
+
+  for (const l of local) {
+    if (!mergedMap.has(l.id)) {
+      mergedMap.set(l.id, l);
+    }
+  }
+
+  return sortMessages(Array.from(mergedMap.values()));
 }
 
 export const useStore = create<Store>((set, get) => ({
@@ -488,6 +506,8 @@ export const useStore = create<Store>((set, get) => ({
     contextTokenLimit: 64000,
     lastWorkspacePath: null,
     disabledTools: [],
+    proxyEnabled: false,
+    proxyUrl: "http://127.0.0.1:7890",
   },
   projects: [],
   sessions: [],
@@ -652,7 +672,9 @@ export const useStore = create<Store>((set, get) => ({
           if (
             lastMsg &&
             lastMsg.role === "assistant" &&
-            (!lastMsg.runId || !activeState.activeRunId || lastMsg.runId === activeState.activeRunId)
+            activeState.isRunning &&
+            (!lastMsg.runId || !activeState.activeRunId || lastMsg.runId === activeState.activeRunId) &&
+            (!activeState.currentMessageId || lastMsg.id === activeState.currentMessageId)
           ) {
             const updated = { ...lastMsg };
             if (
@@ -895,6 +917,11 @@ export const useStore = create<Store>((set, get) => ({
       boundProjectId = null;
     }
     localStorage.removeItem(LAST_SESSION_KEY); // 草稿不可恢复，清除记住的会话
+    // 专属对话模型：继承上一条对话；无可继承来源时取当前全局默认模型作为草稿专属初始值
+    const activeGlobal = resolveActiveModel(st.settings);
+    const initProviderId = (inherit ? (prev?.providerId || prev?.provider_id) : undefined) ?? activeGlobal?.provider.id ?? null;
+    const initModelId = (inherit ? (prev?.modelId || prev?.model_id) : undefined) ?? activeGlobal?.model ?? null;
+
     set({
       draft: {
         projectId: boundProjectId,
@@ -903,6 +930,8 @@ export const useStore = create<Store>((set, get) => ({
         // 模式继承上一条对话；无可继承来源时用设置页的新对话默认值
         accessMode: (inherit ? prev?.accessMode : undefined) ?? st.settings.globalAccessMode,
         contextTokenLimit: inherit ? prev?.contextTokenLimit ?? null : null,
+        providerId: initProviderId,
+        modelId: initModelId,
         imageProviderId: inherit ? prev?.imageProviderId ?? null : null,
         imageModelId: inherit ? prev?.imageModelId ?? null : null,
         visionProviderId: inherit ? prev?.visionProviderId ?? null : null,
@@ -927,6 +956,9 @@ export const useStore = create<Store>((set, get) => ({
       const temp = await ipc.allocTempCode(projectId);
       const st = get();
       const prev = currentSession(st);
+      const activeGlobal = resolveActiveModel(st.settings);
+      const initProviderId = prev?.providerId || prev?.provider_id || activeGlobal?.provider.id || null;
+      const initModelId = prev?.modelId || prev?.model_id || activeGlobal?.model || null;
       set({
         draft: {
           projectId,
@@ -935,6 +967,8 @@ export const useStore = create<Store>((set, get) => ({
           // 临时空间对话同样继承上一条对话的访问模式与思考程度
           accessMode: prev?.accessMode ?? st.settings.globalAccessMode,
           contextTokenLimit: prev?.contextTokenLimit ?? null,
+          providerId: initProviderId,
+          modelId: initModelId,
           imageProviderId: prev?.imageProviderId ?? null,
           imageModelId: prev?.imageModelId ?? null,
           visionProviderId: prev?.visionProviderId ?? null,
@@ -969,6 +1003,12 @@ export const useStore = create<Store>((set, get) => ({
     set({ draft: { ...d, accessMode: mode } });
   },
 
+  setDraftModel(providerId, modelId) {
+    const d = get().draft;
+    if (!d) return;
+    set({ draft: { ...d, providerId, modelId } });
+  },
+
   setDraftContextTokenLimit(limit) {
     const d = get().draft;
     if (!d) return;
@@ -996,78 +1036,103 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   async selectSession(id, readOnly = false) {
-    // 先取消息、后原子切换：避免「currentId 已切换、消息未到达」期间消息区整块空白的闪现
+    const currentToken = ++latestSelectSessionToken;
+    const curSession = get().sessions.find((s) => s.id === id);
+    const initialOutcome = curSession?.lastRunStatus;
+    const isTemp = Boolean(curSession?.isTemp);
+
+    // 1. 立即乐观切换：侧边栏高亮、标题栏秒级同步，若内存已有缓存直出渲染
+    set((st) => ({
+      currentId: id,
+      readOnly,
+      editingMessage: null,
+      focusFloatingTaskId: null,
+      lastRunOutcome: initialOutcome ? { ...st.lastRunOutcome, [id]: initialOutcome } : st.lastRunOutcome,
+    }));
+    localStorage.setItem(LAST_SESSION_KEY, id);
+
+    // 2. 首屏轻量分页拉取（从 200 精简为 INITIAL_MESSAGES_LIMIT = 30）
     try {
-      const msgs = await ipc.getMessages(id, undefined, 200);
-      const curSession = get().sessions.find((s) => s.id === id);
-      const initialOutcome = curSession?.lastRunStatus;
+      const msgs = await ipc.getMessages(id, undefined, INITIAL_MESSAGES_LIMIT);
+      if (currentToken !== latestSelectSessionToken) return;
+
       set((st) => ({
-        currentId: id,
-        readOnly,
-        editingMessage: null,
-        focusFloatingTaskId: null,
         messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], msgs) },
-        hasMore: { ...st.hasMore, [id]: msgs.length >= 200 },
-        lastRunOutcome: initialOutcome ? { ...st.lastRunOutcome, [id]: initialOutcome } : st.lastRunOutcome,
+        hasMore: { ...st.hasMore, [id]: msgs.length >= INITIAL_MESSAGES_LIMIT },
       }));
-      localStorage.setItem(LAST_SESSION_KEY, id);
-      const q = await ipc.listQueued(id);
-      set((st) => ({ queues: { ...st.queues, [id]: q.filter((m) => m.queued).map((m) => ({ id: m.id, content: m.content ?? "", createdAt: m.createdAt })) } }));
-      // 临时空间会话：拉取按钮禁用态所需的运行时状态（临时目录是否存在 / 有无变更）
-      if (get().sessions.find((s) => s.id === id)?.isTemp) {
-        const info = await ipc.getTempInfo(id);
-        set((st) => ({ tempInfo: { ...st.tempInfo, [id]: info } }));
-      }
-      // 拉取会话任务清单快照
-      ipc.getSessionTodos(id).then((val) => {
-        if (val && Array.isArray(val.todos)) {
-          set((st) => ({ sessionTodos: { ...st.sessionTodos, [id]: val.todos } }));
-        } else {
-          set((st) => ({ sessionTodos: { ...st.sessionTodos, [id]: [] } }));
-        }
-      }).catch(() => {
-        set((st) => ({ sessionTodos: { ...st.sessionTodos, [id]: [] } }));
-      });
-      // 拉取会话历史压缩记录
-      void get().refreshSessionCompactions(id);
-      // 拉取该会话待审阅的成长提案
-      ipc.listGrowths(undefined, "proposed").then((list) => {
-        const forThis = list.filter((g) => g.sessionId === id);
-        if (forThis.length > 0) {
-          set((st) => ({ activeProposals: { ...st.activeProposals, [id]: forThis } }));
-        }
-      }).catch(() => {});
-      // 即时拉取并恢复运行态快照（流式文字、思考流、活跃工具卡片、审批卡片）
-      void get().syncSessionActiveState(id);
-      // 拉取该会话的项目协作者与子进程列表
-      void get().loadCollaborators(id);
-      void get().loadSubprocesses(id);
-      void get().loadSubagents(id);
-      void get().fetchActiveTask(id);
-      // 切换主会话时，如果分屏中的协作者/子 Agent 不属于当前会话，则关闭分屏
-      const curCollabId = get().activeCollaboratorId;
-      if (curCollabId) {
-        const collabs = get().collaborators[id] ?? [];
-        if (!collabs.some((s) => s.id === curCollabId)) {
-          set({ activeCollaboratorId: null });
-        }
-      }
-      const curSubprocId = get().activeSubprocessId;
-      if (curSubprocId) {
-        const subprocs = get().subprocesses[id] ?? [];
-        if (!subprocs.some((s) => s.id === curSubprocId)) {
-          set({ activeSubprocessId: null });
-        }
-      }
-      const curSubId = get().activeSubagentId;
-      if (curSubId) {
-        const subs = get().subagents[id] ?? [];
-        if (!subs.some((s) => s.id === curSubId)) {
-          set({ activeSubagentId: null });
-        }
-      }
     } catch (e) {
-      get().pushToast(String(e));
+      if (currentToken === latestSelectSessionToken) {
+        get().pushToast(String(e));
+      }
+    }
+
+    if (currentToken !== latestSelectSessionToken) return;
+
+    // 3. 并行拉取其他辅助状态并单次聚合提交，消除连续触发的频繁 re-render
+    void Promise.allSettled([
+      ipc.listQueued(id),
+      isTemp ? ipc.getTempInfo(id) : Promise.resolve(null),
+      ipc.getSessionTodos(id),
+      ipc.listGrowths(undefined, "proposed"),
+    ]).then(([qRes, tempRes, todosRes, growthsRes]) => {
+      if (currentToken !== latestSelectSessionToken) return;
+      set((st) => {
+        const next: Partial<Store> = {};
+        if (qRes.status === "fulfilled" && Array.isArray(qRes.value)) {
+          next.queues = {
+            ...st.queues,
+            [id]: qRes.value.filter((m) => m.queued).map((m) => ({ id: m.id, content: m.content ?? "", createdAt: m.createdAt })),
+          };
+        }
+        if (tempRes.status === "fulfilled" && tempRes.value) {
+          next.tempInfo = { ...st.tempInfo, [id]: tempRes.value };
+        }
+        if (todosRes.status === "fulfilled") {
+          const val = todosRes.value;
+          next.sessionTodos = {
+            ...st.sessionTodos,
+            [id]: val && Array.isArray(val.todos) ? val.todos : [],
+          };
+        }
+        if (growthsRes.status === "fulfilled" && Array.isArray(growthsRes.value)) {
+          const forThis = growthsRes.value.filter((g) => g.sessionId === id);
+          if (forThis.length > 0) {
+            next.activeProposals = { ...st.activeProposals, [id]: forThis };
+          }
+        }
+        return next as Store;
+      });
+    });
+
+    // 4. 静默拉取/刷新运行态快照与协作者/任务列表
+    void get().refreshSessionCompactions(id);
+    void get().syncSessionActiveState(id);
+    void get().loadCollaborators(id);
+    void get().loadSubprocesses(id);
+    void get().loadSubagents(id);
+    void get().fetchActiveTask(id);
+
+    // 5. 切换主会话时，如果分屏中的协作者/子 Agent 不属于当前会话，则关闭分屏
+    const curCollabId = get().activeCollaboratorId;
+    if (curCollabId) {
+      const collabs = get().collaborators[id] ?? [];
+      if (!collabs.some((s) => s.id === curCollabId)) {
+        set({ activeCollaboratorId: null });
+      }
+    }
+    const curSubprocId = get().activeSubprocessId;
+    if (curSubprocId) {
+      const subprocs = get().subprocesses[id] ?? [];
+      if (!subprocs.some((s) => s.id === curSubprocId)) {
+        set({ activeSubprocessId: null });
+      }
+    }
+    const curSubId = get().activeSubagentId;
+    if (curSubId) {
+      const subs = get().subagents[id] ?? [];
+      if (!subs.some((s) => s.id === curSubId)) {
+        set({ activeSubagentId: null });
+      }
     }
   },
 
@@ -1103,10 +1168,10 @@ export const useStore = create<Store>((set, get) => ({
     if (msgs.length === 0) return;
     const oldest = msgs[0].seq;
     try {
-      const earlier = await ipc.getMessages(id, oldest, 200);
+      const earlier = await ipc.getMessages(id, oldest, LOAD_MORE_LIMIT);
       set((st) => ({
-        messages: { ...st.messages, [id]: [...earlier, ...msgs] },
-        hasMore: { ...st.hasMore, [id]: earlier.length >= 200 },
+        messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], earlier) },
+        hasMore: { ...st.hasMore, [id]: earlier.length >= LOAD_MORE_LIMIT },
       }));
     } catch (e) {
       get().pushToast(String(e));
@@ -1120,7 +1185,7 @@ export const useStore = create<Store>((set, get) => ({
   async reloadMessages(id) {
     try {
       const msgs = await ipc.getMessages(id, undefined, 200);
-      set((st) => ({ messages: { ...st.messages, [id]: msgs } }));
+      set((st) => ({ messages: { ...st.messages, [id]: sortMessages(msgs) } }));
     } catch (e) {
       get().pushToast(String(e));
     }
@@ -1266,7 +1331,7 @@ export const useStore = create<Store>((set, get) => ({
           createdAt: new Date().toISOString(),
           toolEvents: [],
         };
-        return { messages: { ...st.messages, [sessionId]: [...list, placeholder] } };
+        return { messages: { ...st.messages, [sessionId]: sortMessages([...list, placeholder]) } };
       }
       const next = list.slice();
       next[idx] = { ...next[idx], content: (next[idx].content ?? "") + delta };
@@ -1292,7 +1357,7 @@ export const useStore = create<Store>((set, get) => ({
           createdAt: new Date().toISOString(),
           toolEvents: [],
         };
-        return { messages: { ...st.messages, [sessionId]: [...list, placeholder] } };
+        return { messages: { ...st.messages, [sessionId]: sortMessages([...list, placeholder]) } };
       }
       const next = list.slice();
       next[idx] = { ...next[idx], reasoning: (next[idx].reasoning ?? "") + delta };
@@ -2003,10 +2068,10 @@ export const useStore = create<Store>((set, get) => ({
   setActiveSubprocessId(id: string | null) {
     set({ activeSubprocessId: id, activeCollaboratorId: null, activeSubagentId: id });
     if (id) {
-      ipc.getMessages(id, undefined, 200).then((msgs) => {
+      ipc.getMessages(id, undefined, INITIAL_MESSAGES_LIMIT).then((msgs) => {
         set((st) => ({
           messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], msgs) },
-          hasMore: { ...st.hasMore, [id]: msgs.length >= 200 },
+          hasMore: { ...st.hasMore, [id]: msgs.length >= INITIAL_MESSAGES_LIMIT },
         }));
       }).catch((e) => get().pushToast(String(e)));
       void get().syncSessionActiveState(id);
@@ -2016,10 +2081,10 @@ export const useStore = create<Store>((set, get) => ({
   setActiveCollaboratorId(id: string | null) {
     set({ activeCollaboratorId: id, activeSubagentId: id, activeSubprocessId: null });
     if (id) {
-      ipc.getMessages(id, undefined, 200).then((msgs) => {
+      ipc.getMessages(id, undefined, INITIAL_MESSAGES_LIMIT).then((msgs) => {
         set((st) => ({
           messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], msgs) },
-          hasMore: { ...st.hasMore, [id]: msgs.length >= 200 },
+          hasMore: { ...st.hasMore, [id]: msgs.length >= INITIAL_MESSAGES_LIMIT },
         }));
       }).catch((e) => get().pushToast(String(e)));
       void get().syncSessionActiveState(id);
@@ -2274,6 +2339,13 @@ export const useStore = create<Store>((set, get) => ({
           accessMode: draft?.accessMode || undefined,
           contextTokenLimit: draft?.contextTokenLimit || undefined,
           temp: draft?.temp || undefined,
+          providerId: draft?.providerId || undefined,
+          modelId: draft?.modelId || undefined,
+          imageProviderId: draft?.imageProviderId || undefined,
+          imageModelId: draft?.imageModelId || undefined,
+          visionProviderId: draft?.visionProviderId || undefined,
+          visionModelId: draft?.visionModelId || undefined,
+          reasoningEffort: draft?.reasoningEffort || undefined,
         });
         st.onSessionUpdate(newSession);
         await st.selectSession(newSession.id);
@@ -2450,10 +2522,10 @@ export const useStore = create<Store>((set, get) => ({
   setActiveSubagentId(id: string | null) {
     set({ activeSubagentId: id });
     if (id) {
-      ipc.getMessages(id, undefined, 200).then((msgs) => {
+      ipc.getMessages(id, undefined, INITIAL_MESSAGES_LIMIT).then((msgs) => {
         set((st) => ({
           messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], msgs) },
-          hasMore: { ...st.hasMore, [id]: msgs.length >= 200 },
+          hasMore: { ...st.hasMore, [id]: msgs.length >= INITIAL_MESSAGES_LIMIT },
         }));
       }).catch((e) => get().pushToast(String(e)));
       void get().syncSessionActiveState(id);
@@ -2808,7 +2880,9 @@ export function currentSession(s: Store): Session | null {
 
 export function currentMessages(s: Store): Message[] {
   if (!s.currentId) return [];
-  return s.messages[s.currentId] ?? [];
+  const list = s.messages[s.currentId];
+  if (!list || list.length === 0) return [];
+  return sortMessages(list);
 }
 
 export function currentQueue(s: Store): QueuedItem[] {

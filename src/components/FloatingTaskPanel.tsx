@@ -33,16 +33,18 @@ import {
 /** 从当前会话消息中提取所有正在执行的 run_command 工具事件 */
 function useRunningCommands(): ToolEvent[] {
   const msgs = useStore((s) => currentMessages(s));
-  const result: ToolEvent[] = [];
-  for (const m of msgs) {
-    if (!m.toolEvents) continue;
-    for (const ev of m.toolEvents) {
-      if (ev.toolName === "run_command" && ev.status === "running") {
-        result.push(ev);
+  return useMemo(() => {
+    const result: ToolEvent[] = [];
+    for (const m of msgs) {
+      if (!m.toolEvents) continue;
+      for (const ev of m.toolEvents) {
+        if (ev.toolName === "run_command" && ev.status === "running") {
+          result.push(ev);
+        }
       }
     }
-  }
-  return result;
+    return result;
+  }, [msgs]);
 }
 
 function TodoSection({
@@ -183,6 +185,7 @@ export function FloatingTaskPanel() {
   );
   const isRunning = useStore((s) => (s.currentId ? s.runStatus[s.currentId] === "running" : false));
   const rawTodos: TodoItem[] = useStore((s) => (s.currentId ? s.sessionTodos[s.currentId] ?? [] : []));
+  const lastRunOutcome = useStore((s) => (s.currentId ? s.lastRunOutcome[s.currentId] : undefined));
   const runningCmds = useRunningCommands();
   const msgs = useStore((s) => currentMessages(s));
   const pushToast = useStore((s) => s.pushToast);
@@ -402,19 +405,41 @@ export function FloatingTaskPanel() {
     }
 
     const totalValidTurns = parsedTurns.length;
+    const isAbnormalStop =
+      lastRunOutcome === "cancelled" ||
+      lastRunOutcome === "interrupted" ||
+      lastRunOutcome === "failed" ||
+      lastRunOutcome === "error";
+
     for (let i = 0; i < totalValidTurns; i++) {
       const pt = parsedTurns[i];
       const isTaskRunning = isRunning && pt.isLatestTurn;
 
-      const items: TimelineTaskItem[] = pt.rawItems.map((t: any, idx: number) => ({
-        index: idx + 1,
-        content: String(t.content || ""),
-        status: isTaskRunning
-          ? (t.status || "pending")
-          : t.status === "in_progress"
-          ? "done"
-          : t.status || "done",
-      }));
+      const items: TimelineTaskItem[] = pt.rawItems.map((t: any, idx: number) => {
+        let itemStatus: TaskStatus;
+        if (isTaskRunning) {
+          itemStatus = t.status || "pending";
+        } else if (isAbnormalStop && pt.isLatestTurn) {
+          itemStatus = t.status === "in_progress" ? "pending" : (t.status || "pending");
+        } else {
+          // 正常完成（历史轮次已沉淀，或当前轮次正常交付结束）：
+          // 优先采用 rawTodos（经过后端 auto_finish_session_todos 校准为 done）对应项状态；
+          // 若对应项为 done，或原始为 in_progress/pending，均标记为 done
+          const rawMatch = pt.isLatestTurn ? rawTodos[idx]?.status : undefined;
+          if (rawMatch === "done") {
+            itemStatus = "done";
+          } else if (t.status === "in_progress" || t.status === "pending" || !t.status) {
+            itemStatus = "done";
+          } else {
+            itemStatus = t.status;
+          }
+        }
+        return {
+          index: idx + 1,
+          content: String(t.content || ""),
+          status: itemStatus,
+        };
+      });
 
       const allDone = items.every((t) => t.status === "done");
       const status: TaskStatus = isTaskRunning ? "in_progress" : allDone ? "completed" : "pending";
@@ -438,19 +463,24 @@ export function FloatingTaskPanel() {
       const items: TimelineTaskItem[] = rawTodos.map((t, idx) => ({
         index: idx + 1,
         content: t.content,
-        status: isRunning ? t.status : t.status === "in_progress" ? "done" : t.status,
+        status: isRunning
+          ? t.status
+          : isAbnormalStop
+          ? (t.status === "in_progress" ? "pending" : t.status)
+          : "done",
       }));
+      const allDone = items.every((t) => t.status === "done");
       list.push({
         id: "raw-session-todos",
         type: "todo",
         title: "当前任务清单",
-        status: isRunning ? "in_progress" : "completed",
+        status: isRunning ? "in_progress" : allDone ? "completed" : "pending",
         items,
       });
     }
 
     return list;
-  }, [currentId, msgs, rawTodos, isRunning]);
+  }, [currentId, msgs, rawTodos, isRunning, lastRunOutcome]);
 
   // 3. 将物理方案转换为 TimelineTask，并关联其在对话消息流中的出处位置（收集所有关联事件，支持多事件反查）
   const planTasks = useMemo(() => {

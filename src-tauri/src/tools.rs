@@ -48,6 +48,8 @@ pub struct ToolCtx {
     pub event_id: Option<String>,
     /// 当前正在执行的助手消息 ID（用于影子快照归属）
     pub message_id: Option<String>,
+    /// 当前生效的代理地址（若未开启代理则为 None）
+    pub proxy_url: Option<String>,
 }
 
 /// 把变更类型字符渲染为可读标记（工具输出用）
@@ -202,6 +204,19 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "cwd": {"type": "string", "description": "相对工作区的子目录（默认工作区根目录）"}
                 },
                 "required": ["command"]
+            }),
+        },
+        ToolSpec {
+            name: "fetch_web_page",
+            description: "通过 HTTP/HTTPS 请求获取指定网页的内容，并清洗转换为结构清晰的纯文本或 Markdown（自动过滤脚本、样式与无意义标签）。用于查阅外部技术文档、GitHub 内容、API 参考或网页资料。支持通过统一配置的代理访问网络。",
+            risk: Risk::ReadOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "目标网页的完整 URL 地址（必须以 http:// 或 https:// 开头）"},
+                    "max_chars": {"type": "integer", "description": "最多返回的文本字符数（默认 8000，防止超大页面消耗过多 Token）"}
+                },
+                "required": ["url"]
             }),
         },
         ToolSpec {
@@ -927,6 +942,7 @@ pub async fn execute(
         "write_file" => write_file(args, ctx).await,
         "edit_file" => edit_file(args, ctx).await,
         "run_command" => run_command(args, ctx, on_partial).await,
+        "fetch_web_page" => fetch_web_page(args, ctx).await,
         "todo" => Ok("ok".to_string()),
         "list_skills" => list_skills_tool(ctx).await,
         "save_skill" => save_skill_tool(args, ctx).await,
@@ -1703,6 +1719,19 @@ async fn run_command(
         c.arg("-c").arg(command);
         c
     };
+    if let Some(ref proxy) = ctx.proxy_url {
+        let norm = crate::llm::normalize_proxy_url(proxy);
+        if !norm.is_empty() {
+            cmd.env("HTTP_PROXY", &norm);
+            cmd.env("HTTPS_PROXY", &norm);
+            cmd.env("ALL_PROXY", &norm);
+            cmd.env("http_proxy", &norm);
+            cmd.env("https_proxy", &norm);
+            cmd.env("all_proxy", &norm);
+            cmd.env("NO_PROXY", "localhost,127.0.0.1,::1");
+            cmd.env("no_proxy", "localhost,127.0.0.1,::1");
+        }
+    }
     cmd.current_dir(&cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1808,6 +1837,128 @@ async fn run_command(
         Err(_) => -1,
     };
     Ok(truncate_result(&format!("{output}\n[exit code: {code}]")))
+}
+
+/// fetch_web_page：通过 HTTP/HTTPS 请求获取网页内容并清洗为 Markdown 文本
+async fn fetch_web_page(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let url = args.get("url").and_then(|v| v.as_str()).ok_or("缺少 url 参数")?.trim();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("URL 格式无效，必须以 http:// 或 https:// 开头".into());
+    }
+    let max_chars = args.get("max_chars").and_then(|v| v.as_u64()).unwrap_or(8000) as usize;
+
+    let client = crate::llm::get_client(ctx.proxy_url.as_deref());
+    let resp = client
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .timeout(std::time::Duration::from_secs(25))
+        .send()
+        .await
+        .map_err(|e| format!("网页请求失败: {e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("网页请求返回错误状态码: {status}"));
+    }
+
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let raw_text = resp.text().await.map_err(|e| format!("读取网页内容失败: {e}"))?;
+
+    let clean = if content_type.contains("html") || raw_text.contains("<html") || raw_text.contains("<!DOCTYPE") {
+        html_to_markdown(&raw_text)
+    } else {
+        raw_text
+    };
+
+    let total_len = clean.chars().count();
+    let truncated: String = clean.chars().take(max_chars).collect();
+    if total_len > max_chars {
+        Ok(format!("{truncated}\n\n[内容已截断，共 {total_len} 字符，已展示前 {max_chars} 字符]"))
+    } else {
+        Ok(truncated)
+    }
+}
+
+/// 快速清洗 HTML 并转换为结构化 Markdown 文本
+fn html_to_markdown(html: &str) -> String {
+    use regex::Regex;
+    // 1. 移除 script, style, noscript, svg, head
+    let re_script = Regex::new(r"(?is)<script[^>]*>.*?</script>").unwrap();
+    let re_style = Regex::new(r"(?is)<style[^>]*>.*?</style>").unwrap();
+    let re_noscript = Regex::new(r"(?is)<noscript[^>]*>.*?</noscript>").unwrap();
+    let re_svg = Regex::new(r"(?is)<svg[^>]*>.*?</svg>").unwrap();
+    let re_head = Regex::new(r"(?is)<head[^>]*>.*?</head>").unwrap();
+
+    let s = re_script.replace_all(html, "");
+    let s = re_style.replace_all(&s, "");
+    let s = re_noscript.replace_all(&s, "");
+    let s = re_svg.replace_all(&s, "");
+    let s = re_head.replace_all(&s, "");
+
+    // 2. 标题转换 <h1>..<h6> -> # .. ######
+    let re_h = Regex::new(r"(?i)<h([1-6])[^>]*>(.*?)</h[1-6]>").unwrap();
+    let s = re_h.replace_all(&s, |caps: &regex::Captures| {
+        let level: usize = caps[1].parse().unwrap_or(1);
+        let prefix = "#".repeat(level);
+        format!("\n\n{prefix} {}\n", &caps[2])
+    });
+
+    // 3. 换行与段落
+    let re_br = Regex::new(r"(?i)<(br|hr)\s*/?>").unwrap();
+    let s = re_br.replace_all(&s, "\n");
+    let re_p = Regex::new(r"(?i)</(p|div|li|tr|pre|blockquote)>").unwrap();
+    let s = re_p.replace_all(&s, "\n");
+
+    // 4. 链接转换 <a href="...">text</a> -> [text](href)
+    let re_a = Regex::new(r#"(?i)<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>"#).unwrap();
+    let s = re_a.replace_all(&s, |caps: &regex::Captures| {
+        let href = &caps[1];
+        let text = &caps[2].trim();
+        if text.is_empty() {
+            String::new()
+        } else {
+            format!("[{text}]({href})")
+        }
+    });
+
+    // 5. 剥离所有剩余标签
+    let re_tags = Regex::new(r"<[^>]+>").unwrap();
+    let s = re_tags.replace_all(&s, " ");
+
+    // 6. 还原基础 HTML 实体
+    let s = s
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&mdash;", "—")
+        .replace("&ndash;", "–");
+
+    // 7. 规范化空白行与空格
+    let mut out = String::new();
+    let mut empty_line_count = 0;
+    for line in s.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            empty_line_count += 1;
+            if empty_line_count <= 2 {
+                out.push('\n');
+            }
+        } else {
+            empty_line_count = 0;
+            out.push_str(trimmed);
+            out.push('\n');
+        }
+    }
+    out.trim().to_string()
 }
 
 // ---------- 临时空间工具实现 ----------
@@ -3002,6 +3153,7 @@ async fn generate_image_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
         api_key: provider.api_key.clone(),
         model: model_name.clone(),
         reasoning_effort: None,
+        proxy_url: ctx.proxy_url.clone(),
     };
 
     let img_bytes = crate::llm::generate_image_api(&cfg, prompt, size).await?;
@@ -3130,6 +3282,7 @@ const handleClick = async () => {
             host: None,
             event_id: None,
             message_id: None,
+            proxy_url: None,
         };
 
         // 工作区内已存在目录
@@ -3179,6 +3332,7 @@ const handleClick = async () => {
             host: None,
             event_id: None,
             message_id: None,
+            proxy_url: None,
         };
 
         let resolved_normal = resolve(&ctx, "src/main.rs");
@@ -3244,6 +3398,7 @@ const handleClick = async () => {
             host: None,
             event_id: None,
             message_id: None,
+            proxy_url: None,
         };
 
         // LLM 发送 LF 换行的 old_string 与 new_string
@@ -3299,5 +3454,30 @@ const handleClick = async () => {
         assert!(summary.contains("内容已自动压缩提炼"));
 
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn test_html_to_markdown() {
+        let sample_html = r#"
+            <!DOCTYPE html>
+            <html>
+            <head><title>Test Page</title><style>.hidden { display: none; }</style></head>
+            <body>
+                <script>alert("evil");</script>
+                <svg><path d="M0 0"/></svg>
+                <h1>Article Title</h1>
+                <p>Hello, this is a <a href="https://example.com">link</a> to example.</p>
+                <p>Line with &quot;quotes&quot; and &amp; ampersand.</p>
+            </body>
+            </html>
+        "#;
+        let md = html_to_markdown(sample_html);
+        assert!(!md.contains("alert"));
+        assert!(!md.contains("<script"));
+        assert!(!md.contains("<svg"));
+        assert!(!md.contains(".hidden"));
+        assert!(md.contains("# Article Title"));
+        assert!(md.contains("[link](https://example.com)"));
+        assert!(md.contains(r#""quotes" and & ampersand"#));
     }
 }

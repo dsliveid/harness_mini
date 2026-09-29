@@ -64,11 +64,15 @@ export function ModelMatrixModal() {
   const currentChatModelName =
     isConfiguringSession && targetSession
       ? targetSession.modelId || targetSession.model_id || settings.activeModelId || settings.activeModel || "未指定（跟随系统）"
+      : isDraft && draft
+      ? draft.modelId || settings.activeModelId || settings.activeModel || "未配置"
       : settings.activeModelId || settings.activeModel || "未配置";
 
   const currentChatPid =
     isConfiguringSession && targetSession
       ? targetSession.providerId || targetSession.provider_id || settings.activeProviderId || null
+      : isDraft && draft
+      ? draft.providerId || settings.activeProviderId || null
       : settings.activeProviderId || null;
 
   const chatLimit =
@@ -140,9 +144,9 @@ export function ModelMatrixModal() {
       }
 
       if (isConfiguringSession && targetSession) {
-        // 仅更新当前会话专属配置（保留会话现有的主对话模型不变）
-        const chatPid = targetSession.providerId ?? targetSession.provider_id ?? null;
-        const chatMid = targetSession.modelId ?? targetSession.model_id ?? null;
+        // 仅更新当前会话专属配置（保留会话现有的主对话模型不变，若为旧历史会话则补全当前模型）
+        const chatPid = targetSession.providerId ?? targetSession.provider_id ?? settings.activeProviderId ?? null;
+        const chatMid = targetSession.modelId ?? targetSession.model_id ?? settings.activeModelId ?? settings.activeModel ?? null;
 
         const success = await setSessionModels({
           sessionId: targetSession.id,

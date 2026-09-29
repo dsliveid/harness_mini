@@ -52,6 +52,7 @@ pub fn trigger_reflection_on_denial(
             api_key: pc.api_key.clone(),
             model: model.to_string(),
             reasoning_effort: None,
+            proxy_url: settings.effective_proxy_url(),
         };
 
         let _ = app.emit(
@@ -179,6 +180,7 @@ pub fn trigger_manual_reflection(
             api_key: pc.api_key.clone(),
             model: model.to_string(),
             reasoning_effort: None,
+            proxy_url: settings.effective_proxy_url(),
         };
 
         let _ = app.emit(

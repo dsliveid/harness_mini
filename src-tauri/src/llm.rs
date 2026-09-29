@@ -1,11 +1,13 @@
 use serde_json::{json, Value};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
+#[derive(Clone, Debug)]
 pub struct LlmCfg {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
     pub reasoning_effort: Option<String>,
+    pub proxy_url: Option<String>,
 }
 
 /// 规整 endpoint：容忍用户把完整路径 /chat/completions 填进 Base URL
@@ -30,16 +32,69 @@ pub struct LlmResult {
     pub usage: Option<Value>,
 }
 
-fn client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(20))
-            .tcp_keepalive(std::time::Duration::from_secs(15))
-            .pool_idle_timeout(std::time::Duration::from_secs(60))
-            .build()
-            .expect("reqwest client")
-    })
+/// 规整代理 URL：若未提供协议头，自动补齐 http://
+pub fn normalize_proxy_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if !trimmed.starts_with("http://")
+        && !trimmed.starts_with("https://")
+        && !trimmed.starts_with("socks5://")
+        && !trimmed.starts_with("socks5h://")
+    {
+        format!("http://{trimmed}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// 根据可选的代理 URL 构建 reqwest::Client。
+/// 若 proxy_url 为 Some 且非空，则配置全局代理并排除本地回环（localhost, 127.0.0.1, ::1）。
+pub fn build_client(proxy_url: Option<&str>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(25))
+        .tcp_keepalive(std::time::Duration::from_secs(15))
+        .pool_idle_timeout(std::time::Duration::from_secs(60));
+
+    if let Some(raw) = proxy_url {
+        let norm = normalize_proxy_url(raw);
+        if !norm.is_empty() {
+            if let Ok(proxy) = reqwest::Proxy::all(&norm) {
+                // 排除本地回环地址，防止拦截内部通讯和本地 Ollama / vLLM
+                let proxy = proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1"));
+                builder = builder.proxy(proxy);
+            }
+        }
+    }
+
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+static CACHED_CLIENT: OnceLock<RwLock<(Option<String>, reqwest::Client)>> = OnceLock::new();
+
+/// 获取带缓存的 reqwest 客户端（支持根据代理 URL 变化热刷新）
+pub fn get_client(proxy_url: Option<&str>) -> reqwest::Client {
+    let normalized = proxy_url.map(normalize_proxy_url).filter(|s| !s.is_empty());
+    let lock = CACHED_CLIENT.get_or_init(|| {
+        let c = build_client(None);
+        RwLock::new((None, c))
+    });
+
+    {
+        let r = lock.read().unwrap();
+        if r.0 == normalized {
+            return r.1.clone();
+        }
+    }
+
+    let mut w = lock.write().unwrap();
+    if w.0 == normalized {
+        return w.1.clone();
+    }
+    let new_client = build_client(normalized.as_deref());
+    *w = (normalized, new_client.clone());
+    new_client
 }
 
 /// 调用 OpenAI 兼容 /chat/completions（流式）。
@@ -69,7 +124,7 @@ pub async fn chat_stream(
         }
     }
 
-    let resp = client()
+    let resp = get_client(cfg.proxy_url.as_deref())
         .post(&url)
         .bearer_auth(&cfg.api_key)
         .json(&body)
@@ -193,7 +248,7 @@ pub async fn test_connection(cfg: &LlmCfg) -> Result<String, String> {
         "messages": [{"role": "user", "content": "ping"}],
         "max_tokens": 1,
     });
-    let resp = client()
+    let resp = get_client(cfg.proxy_url.as_deref())
         .post(&url)
         .bearer_auth(&cfg.api_key)
         .json(&body)
@@ -244,7 +299,7 @@ pub async fn generate_image_api(
         body["size"] = json!(s);
     }
 
-    let resp = client()
+    let resp = get_client(cfg.proxy_url.as_deref())
         .post(&url)
         .bearer_auth(cfg.api_key.trim())
         .json(&body)
@@ -305,7 +360,7 @@ pub async fn generate_image_api(
         .and_then(|item| item.get("url"))
         .and_then(|v| v.as_str())
     {
-        let img_resp = client()
+        let img_resp = get_client(cfg.proxy_url.as_deref())
             .get(img_url)
             .send()
             .await
@@ -318,5 +373,20 @@ pub async fn generate_image_api(
     }
 
     Err(format!("未能从生图响应中解析到图片数据: {}", truncate(&val.to_string(), 500)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_proxy_url() {
+        assert_eq!(normalize_proxy_url("127.0.0.1:7890"), "http://127.0.0.1:7890");
+        assert_eq!(normalize_proxy_url("http://127.0.0.1:7890"), "http://127.0.0.1:7890");
+        assert_eq!(normalize_proxy_url("https://proxy.example.com:8443"), "https://proxy.example.com:8443");
+        assert_eq!(normalize_proxy_url("socks5://127.0.0.1:1080"), "socks5://127.0.0.1:1080");
+        assert_eq!(normalize_proxy_url(""), "");
+        assert_eq!(normalize_proxy_url("   "), "");
+    }
 }
 

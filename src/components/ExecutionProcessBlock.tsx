@@ -213,6 +213,15 @@ export function groupTimelineItems(
       flushAssistantSteps(false);
       result.push(item);
     } else if (item.msg.role === "assistant") {
+      // 检查 runId 边界：若新步骤与当前累积步骤的 runId 明确不同，强制切断并结算前序抽屉，杜绝跨轮次混合
+      if (
+        currentAssistantSteps.length > 0 &&
+        currentAssistantSteps[0].runId &&
+        item.msg.runId &&
+        currentAssistantSteps[0].runId !== item.msg.runId
+      ) {
+        flushAssistantSteps(false);
+      }
       currentAssistantSteps.push(item.msg);
     } else {
       // user 消息或其他非 assistant 角色

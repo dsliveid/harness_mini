@@ -1413,6 +1413,8 @@ mod tests {
             None,
             "能力模型测试会话",
             "confirm",
+            Some("openai"),
+            Some("gpt-4o-mini"),
             Some("volcengine"),
             Some("doubao-seedream-5.0-lite"),
             Some("openai"),
@@ -1421,6 +1423,8 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(s.provider_id.as_deref(), Some("openai"));
+        assert_eq!(s.model_id.as_deref(), Some("gpt-4o-mini"));
         assert_eq!(s.image_provider_id.as_deref(), Some("volcengine"));
         assert_eq!(s.image_model_id.as_deref(), Some("doubao-seedream-5.0-lite"));
         assert_eq!(s.vision_provider_id.as_deref(), Some("openai"));
@@ -1428,6 +1432,8 @@ mod tests {
 
         // 从数据库重新读取验证
         let loaded = get_session(&conn, &s.id).unwrap().unwrap();
+        assert_eq!(loaded.provider_id.as_deref(), Some("openai"));
+        assert_eq!(loaded.model_id.as_deref(), Some("gpt-4o-mini"));
         assert_eq!(loaded.image_provider_id.as_deref(), Some("volcengine"));
         assert_eq!(loaded.image_model_id.as_deref(), Some("doubao-seedream-5.0-lite"));
         assert_eq!(loaded.vision_provider_id.as_deref(), Some("openai"));
@@ -2046,6 +2052,8 @@ pub fn create_session(
         None,
         None,
         None,
+        None,
+        None,
     )
 }
 
@@ -2055,6 +2063,8 @@ pub fn create_session_with_models(
     project_id: Option<&str>,
     title: &str,
     access_mode: &str,
+    provider_id: Option<&str>,
+    model_id: Option<&str>,
     image_provider_id: Option<&str>,
     image_model_id: Option<&str>,
     vision_provider_id: Option<&str>,
@@ -2092,8 +2102,8 @@ pub fn create_session_with_models(
         last_reported_msg_id: None,
         auto_report: None,
         trigger_tool_event_id: None,
-        provider_id: None,
-        model_id: None,
+        provider_id: provider_id.map(|s| s.to_string()),
+        model_id: model_id.map(|s| s.to_string()),
         dispatch_rule: None,
         image_provider_id: image_provider_id.map(|s| s.to_string()),
         image_model_id: image_model_id.map(|s| s.to_string()),
@@ -2110,9 +2120,10 @@ pub fn create_session_with_models(
             last_message_at, created_at, updated_at, 
             parent_session_id, session_type, subagent_role, subagent_task,
             last_reported_msg_id, auto_report,
+            provider_id, model_id,
             image_provider_id, image_model_id, vision_provider_id, vision_model_id,
             reasoning_effort
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,'main',NULL,NULL,NULL,NULL,?10,?11,?12,?13,?14)",
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,'main',NULL,NULL,NULL,NULL,?10,?11,?12,?13,?14,?15,?16)",
         params![
             s.id,
             s.title,
@@ -2123,6 +2134,8 @@ pub fn create_session_with_models(
             s.last_message_at,
             s.created_at,
             s.updated_at,
+            s.provider_id,
+            s.model_id,
             s.image_provider_id,
             s.image_model_id,
             s.vision_provider_id,
@@ -3173,47 +3186,59 @@ pub fn get_messages(
         .map_err(|e| e.to_string())?;
     msgs.reverse();
 
-    // join tool events（挂到所属 assistant 消息上）
+    // 批量加载 tool events 并挂载到对应消息上，彻底消除 N+1 循环查询
     let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+    let mut events_map = tool_events_for_batch(conn, &ids)?;
     for m in msgs.iter_mut() {
-        m.tool_events = tool_events_for(conn, &ids, &m.id)?;
+        m.tool_events = events_map.remove(&m.id).unwrap_or_default();
     }
     Ok(msgs)
 }
 
-fn tool_events_for(
+fn tool_events_for_batch(
     conn: &Connection,
     message_ids: &[String],
-    message_id: &str,
-) -> Result<Vec<ToolEvent>, String> {
-    // 简单起见按单个 message 查询（消息量小）
-    let _ = message_ids;
-    let mut stmt = conn
-        .prepare(
+) -> Result<std::collections::HashMap<String, Vec<ToolEvent>>, String> {
+    let mut map: std::collections::HashMap<String, Vec<ToolEvent>> = std::collections::HashMap::new();
+    if message_ids.is_empty() {
+        return Ok(map);
+    }
+
+    // 分块查询避免参数过多（每块最多 100 个 ID）
+    for chunk in message_ids.chunks(100) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
             "SELECT te.id, te.message_id, te.tool_name, te.tool_call_id, te.params_json, te.result_text, te.status, te.approval_scope, te.created_at, te.subprocess_id,
                     (SELECT reverted_at FROM tool_file_snapshots WHERE tool_event_id = te.id ORDER BY rowid DESC LIMIT 1)
-             FROM tool_events te WHERE te.message_id = ?1 ORDER BY te.rowid ASC",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(params![message_id], |r| {
-            let pj: String = r.get(4)?;
-            Ok(ToolEvent {
-                id: r.get(0)?,
-                message_id: r.get(1)?,
-                tool_name: r.get(2)?,
-                tool_call_id: r.get(3)?,
-                params: serde_json::from_str(&pj).unwrap_or(serde_json::Value::Null),
-                result_text: r.get(5)?,
-                status: r.get(6)?,
-                approval_scope: r.get(7)?,
-                created_at: r.get(8)?,
-                subprocess_id: r.get(9)?,
-                reverted_at: r.get(10)?,
+             FROM tool_events te WHERE te.message_id IN ({}) ORDER BY te.rowid ASC",
+            placeholders
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                let pj: String = r.get(4)?;
+                Ok(ToolEvent {
+                    id: r.get(0)?,
+                    message_id: r.get(1)?,
+                    tool_name: r.get(2)?,
+                    tool_call_id: r.get(3)?,
+                    params: serde_json::from_str(&pj).unwrap_or(serde_json::Value::Null),
+                    result_text: r.get(5)?,
+                    status: r.get(6)?,
+                    approval_scope: r.get(7)?,
+                    created_at: r.get(8)?,
+                    subprocess_id: r.get(9)?,
+                    reverted_at: r.get(10)?,
+                })
             })
-        })
-        .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+
+        for item in rows {
+            let ev = item.map_err(|e| e.to_string())?;
+            map.entry(ev.message_id.clone()).or_default().push(ev);
+        }
+    }
+    Ok(map)
 }
 
 pub fn all_messages(conn: &Connection, session_id: &str) -> Result<Vec<Message>, String> {

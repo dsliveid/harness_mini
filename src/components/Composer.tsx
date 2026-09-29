@@ -301,7 +301,7 @@ export function Composer() {
   };
 
   const activeModel =
-    session?.modelId || session?.model_id || settings?.activeModelId || settings?.activeModel || "";
+    session?.modelId || session?.model_id || draft?.modelId || settings?.activeModelId || settings?.activeModel || "";
 
   const checkVisionAndSend = async (bypassVisionCheck = false) => {
     const t = text.trim();
@@ -397,6 +397,8 @@ export function Composer() {
         isDraftLike ? draft?.accessMode ?? undefined : undefined,
         isDraftLike ? draft?.contextTokenLimit ?? undefined : undefined,
         sendingAttachments.length > 0 ? sendingAttachments : undefined,
+        isDraftLike ? draft?.providerId ?? undefined : undefined,
+        isDraftLike ? draft?.modelId ?? undefined : undefined,
         isDraftLike ? draft?.imageProviderId ?? undefined : undefined,
         isDraftLike ? draft?.imageModelId ?? undefined : undefined,
         isDraftLike ? draft?.visionProviderId ?? undefined : undefined,

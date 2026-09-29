@@ -97,14 +97,17 @@ pub async fn test_provider(
     state: State<'_, crate::AppState>,
     provider: ProviderCfg,
 ) -> Result<String, String> {
-    let mut key = provider.api_key.clone();
-    if key.is_empty() {
+    let (key, proxy_url) = {
         let db = state.db.lock().unwrap();
         let master = state.master_key.lock().unwrap();
-        if let Ok(Some(k)) = store::secret_get(&db, &master, &provider.id) {
-            key = k;
-        }
-    }
+        let k = if provider.api_key.is_empty() {
+            store::secret_get(&db, &master, &provider.id).ok().flatten().unwrap_or_default()
+        } else {
+            provider.api_key.clone()
+        };
+        let p = store::get_settings(&db).ok().and_then(|s| s.effective_proxy_url());
+        (k, p)
+    };
     let model = provider
         .models
         .first()
@@ -119,8 +122,49 @@ pub async fn test_provider(
         api_key: key,
         model,
         reasoning_effort: None,
+        proxy_url,
     };
     llm::test_connection(&cfg).await
+}
+
+#[tauri::command]
+pub async fn test_proxy_connection(proxy_url: String) -> Result<u64, String> {
+    let norm = crate::llm::normalize_proxy_url(&proxy_url);
+    if norm.is_empty() {
+        return Err("代理地址不能为空".into());
+    }
+
+    let client = crate::llm::build_client(Some(&norm));
+    let start = std::time::Instant::now();
+    let res = client
+        .get("https://www.google.com")
+        .timeout(std::time::Duration::from_secs(6))
+        .send()
+        .await;
+
+    match res {
+        Ok(resp) => {
+            let elapsed = start.elapsed().as_millis() as u64;
+            if resp.status().is_success() || resp.status().is_redirection() {
+                Ok(elapsed)
+            } else {
+                Err(format!("代理返回 HTTP 状态码: {}", resp.status()))
+            }
+        }
+        Err(e1) => {
+            // 备用端点 1.1.1.1
+            let start2 = std::time::Instant::now();
+            match client
+                .get("https://1.1.1.1")
+                .timeout(std::time::Duration::from_secs(6))
+                .send()
+                .await
+            {
+                Ok(_) => Ok(start2.elapsed().as_millis() as u64),
+                Err(_) => Err(format!("代理连接失败: {e1}")),
+            }
+        }
+    }
 }
 
 // ---------- projects ----------
@@ -380,9 +424,10 @@ fn resolve_pending_approvals(state: &crate::AppState, app: &AppHandle, session_i
     };
     for (event_id, tx) in pending {
         let _ = tx.send(crate::approval::Decision::AllowOnce);
-        let _ = app.emit(
+        crate::emit_event(
+            &app,
             "approval:resolved",
-            json!({"eventId": event_id, "decision": "allow_once"}),
+            &json!({"eventId": event_id, "decision": "allow_once"}),
         );
     }
 }
@@ -484,6 +529,8 @@ pub fn create_session(
     access_mode: Option<String>,
     context_token_limit: Option<usize>,
     temp: Option<TempAlloc>,
+    provider_id: Option<String>,
+    model_id: Option<String>,
     image_provider_id: Option<String>,
     image_model_id: Option<String>,
     vision_provider_id: Option<String>,
@@ -519,6 +566,8 @@ pub fn create_session(
             Some(&proj_id),
             &title,
             &access_mode,
+            provider_id.as_deref(),
+            model_id.as_deref(),
             image_provider_id.as_deref(),
             image_model_id.as_deref(),
             vision_provider_id.as_deref(),
@@ -558,6 +607,8 @@ pub fn create_session(
         project_id.as_deref(),
         &title,
         &access_mode,
+        provider_id.as_deref(),
+        model_id.as_deref(),
         image_provider_id.as_deref(),
         image_model_id.as_deref(),
         vision_provider_id.as_deref(),
@@ -597,6 +648,8 @@ pub fn send_message(
     access_mode: Option<String>,
     context_token_limit: Option<usize>,
     attachments: Option<Vec<crate::models::Attachment>>,
+    provider_id: Option<String>,
+    model_id: Option<String>,
     image_provider_id: Option<String>,
     image_model_id: Option<String>,
     vision_provider_id: Option<String>,
@@ -647,6 +700,8 @@ pub fn send_message(
                     Some(&proj_id),
                     &title,
                     &access_mode,
+                    provider_id.as_deref(),
+                    model_id.as_deref(),
                     image_provider_id.as_deref(),
                     image_model_id.as_deref(),
                     vision_provider_id.as_deref(),
@@ -694,6 +749,8 @@ pub fn send_message(
                     project_id.as_deref(),
                     &title,
                     &access_mode,
+                    provider_id.as_deref(),
+                    model_id.as_deref(),
                     image_provider_id.as_deref(),
                     image_model_id.as_deref(),
                     vision_provider_id.as_deref(),
@@ -1352,6 +1409,8 @@ pub fn do_report_collaborator_increment(
         None,
         None,
         None,
+        None,
+        None,
     )?;
 
     {
@@ -1391,7 +1450,7 @@ pub fn report_subagent_to_parent(
 /// 手动关闭正在执行的控制台命令进程
 #[tauri::command]
 pub fn kill_command(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, crate::AppState>,
     event_id: String,
 ) -> Result<(), String> {
@@ -1415,9 +1474,9 @@ pub fn kill_command(
                 ev.result_text = Some(msg.clone());
                 let _ = store::update_tool_event(&db, &ev.id, "failed", Some(&msg), None);
                 drop(db);
-                let _ = app.emit(
+                state.emit(
                     "tool:update",
-                    json!({"sessionId": session_id, "event": ev}),
+                    &json!({"sessionId": session_id, "event": ev}),
                 );
             }
         }
@@ -1528,7 +1587,7 @@ pub fn respond_approval(
 #[tauri::command]
 pub fn respond_compaction(
     state: State<'_, crate::AppState>,
-    app: AppHandle,
+    _app: AppHandle,
     event_id: String,
     approved: bool,
     final_summary: String,
@@ -1540,7 +1599,7 @@ pub fn respond_compaction(
             approved,
             final_summary,
         });
-        let _ = app.emit("compaction:resolved", json!({ "eventId": event_id, "approved": approved, "sessionId": p.session_id }));
+        state.emit("compaction:resolved", &json!({ "eventId": event_id, "approved": approved, "sessionId": p.session_id }));
         Ok(())
     } else {
         Err("压缩请求不存在或已处理".into())
@@ -1569,7 +1628,22 @@ pub fn get_session_todos(state: State<'_, crate::AppState>, session_id: String) 
         .ok();
     let mut val: Value = raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
 
-    // 会话当前若未在执行，检查最近一次运行结果；若正常完成（或无记录），自愈修复遗留的 in_progress 任务为 done
+    // 若 session_kv 中未找到，尝试从最近的 todo tool event 中获取
+    if val.is_null() {
+        let ev_params: Option<String> = db
+            .query_row(
+                "SELECT te.params_json FROM tool_events te JOIN messages m ON te.message_id = m.id WHERE m.session_id = ?1 AND te.tool_name = 'todo' ORDER BY te.created_at DESC LIMIT 1",
+                rusqlite::params![session_id],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        if let Some(p) = ev_params {
+            val = serde_json::from_str(&p).unwrap_or(Value::Null);
+        }
+    }
+
+    // 会话当前若未在执行，检查最近一次运行结果；若正常完成（或无记录），自愈修复遗留的 in_progress / pending 任务为 done
     if !running {
         let last_run_status: Option<String> = db
             .query_row(
@@ -1585,17 +1659,38 @@ pub fn get_session_todos(state: State<'_, crate::AppState>, session_id: String) 
         if let Some(todos_arr) = val.get_mut("todos").and_then(|v| v.as_array_mut()) {
             let mut changed = false;
             for item in todos_arr.iter_mut() {
-                if item.get("status").and_then(|s| s.as_str()) == Some("in_progress") {
-                    item["status"] = if should_mark_done {
-                        serde_json::json!("done")
-                    } else {
-                        serde_json::json!("pending")
-                    };
+                let st = item.get("status").and_then(|s| s.as_str());
+                if should_mark_done {
+                    if st == Some("in_progress") || st == Some("pending") {
+                        item["status"] = serde_json::json!("done");
+                        changed = true;
+                    }
+                } else if st == Some("in_progress") {
+                    item["status"] = serde_json::json!("pending");
                     changed = true;
                 }
             }
             if changed {
-                let _ = store::set_kv(&db, &session_id, "todos", &val.to_string());
+                let new_raw = val.to_string();
+                let _ = store::set_kv(&db, &session_id, "todos", &new_raw);
+                let last_todo_ev_id: Option<String> = db
+                    .query_row(
+                        "SELECT te.id FROM tool_events te JOIN messages m ON te.message_id = m.id WHERE m.session_id = ?1 AND te.tool_name = 'todo' ORDER BY te.created_at DESC LIMIT 1",
+                        rusqlite::params![session_id],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                if let Some(ref ev_id) = last_todo_ev_id {
+                    let _ = store::update_tool_event_full(
+                        &db,
+                        ev_id,
+                        "success",
+                        None,
+                        None,
+                        None,
+                        Some(&new_raw),
+                    );
+                }
             }
         }
     }

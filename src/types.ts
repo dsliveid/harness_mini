@@ -121,6 +121,8 @@ export interface Settings {
   disabledTools?: string[];
   disabledSops?: string[];
   reasoningEffort?: ReasoningEffort | string | null;
+  proxyEnabled?: boolean;
+  proxyUrl?: string;
 }
 
 export interface AgentSopInfo {
@@ -350,6 +352,8 @@ export interface SessionCreateInput {
   accessMode?: string;
   contextTokenLimit?: number | null;
   temp?: TempAlloc;
+  providerId?: string | null;
+  modelId?: string | null;
   imageProviderId?: string | null;
   imageModelId?: string | null;
   visionProviderId?: string | null;
@@ -550,11 +554,24 @@ export interface TurnMetrics {
 }
 
 /**
+ * 确保消息列表严格单调递增排序（按 seq 升序；占位符按创建时间稳定置于末尾）。
+ */
+export function sortMessages(msgs: Message[]): Message[] {
+  return [...msgs].sort((a, b) => {
+    if (a.seq !== b.seq) return a.seq - b.seq;
+    const tA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+    const tB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+    return tA - tB;
+  });
+}
+
+/**
  * 按轮次分组计算对话消息的耗时和 Token 指标。
  * 一轮对话以 user 消息发起，以该 user 后的最后一条 assistant 消息结束。
  */
 export function computeTurnMetrics(messages: Message[], running: boolean): Map<string, TurnMetrics> {
   const map = new Map<string, TurnMetrics>();
+  const sorted = sortMessages(messages);
 
   let currentTurnUser: Message | null = null;
   let currentTurnAssistants: Message[] = [];
@@ -628,13 +645,24 @@ export function computeTurnMetrics(messages: Message[], running: boolean): Map<s
     }
   };
 
-  for (const m of messages) {
+  for (const m of sorted) {
     if (m.role === "tool" || m.queued) continue;
     if (m.role === "user") {
       flushTurn(false);
       currentTurnUser = m;
       currentTurnAssistants = [];
     } else if (m.role === "assistant") {
+      // 强化隔离：若相邻 assistant 的 runId 明确不同，即使因历史截断丢失了中间 user 消息，也绝不跨轮混合
+      if (
+        currentTurnAssistants.length > 0 &&
+        currentTurnAssistants[0].runId &&
+        m.runId &&
+        currentTurnAssistants[0].runId !== m.runId
+      ) {
+        flushTurn(false);
+        currentTurnUser = null;
+        currentTurnAssistants = [];
+      }
       currentTurnAssistants.push(m);
     }
   }
@@ -737,6 +765,28 @@ export function resolveActiveModel(settings: Settings): { provider: Provider; mo
       ? active
       : provider.models[0];
   return { provider, model };
+}
+
+/**
+ * 解析会话或草稿中实际生效的对话主模型（会话/草稿专属模型优先，未配置时回落至全局配置）
+ */
+export function resolveSessionActiveModel(
+  settings: Settings,
+  session?: { providerId?: string | null; modelId?: string | null; provider_id?: string | null; model_id?: string | null } | null,
+  draft?: { providerId?: string | null; modelId?: string | null } | null
+): { provider: Provider; model: string } | null {
+  const pid = session?.providerId || session?.provider_id || draft?.providerId;
+  const mid = session?.modelId || session?.model_id || draft?.modelId;
+
+  if (pid && mid) {
+    const p = settings.providers.find((item) => item.id === pid && (item.models ?? []).includes(mid));
+    if (p) {
+      return { provider: p, model: mid };
+    }
+  }
+
+  // 回落全局默认模型
+  return resolveActiveModel(settings);
 }
 
 /** 顶栏下拉项的复合值：厂商 id 与模型名拼合（厂商 id 为 base36，不含冒号） */

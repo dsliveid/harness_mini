@@ -76,7 +76,11 @@ impl SnapshotStore {
         let mut map = self.inner.lock().unwrap();
         let st = map.entry(session_id.to_string()).or_default();
         if let Some(mid) = message_id {
-            st.current_message_id = Some(mid.to_string());
+            if st.current_message_id.as_deref() != Some(mid) {
+                st.current_message_id = Some(mid.to_string());
+                st.streaming_content.clear();
+                st.streaming_reasoning.clear();
+            }
         }
         st.streaming_content.push_str(delta);
     }
@@ -85,7 +89,11 @@ impl SnapshotStore {
         let mut map = self.inner.lock().unwrap();
         let st = map.entry(session_id.to_string()).or_default();
         if let Some(mid) = message_id {
-            st.current_message_id = Some(mid.to_string());
+            if st.current_message_id.as_deref() != Some(mid) {
+                st.current_message_id = Some(mid.to_string());
+                st.streaming_content.clear();
+                st.streaming_reasoning.clear();
+            }
         }
         st.streaming_reasoning.push_str(delta);
     }

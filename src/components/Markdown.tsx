@@ -85,6 +85,9 @@ class MarkdownErrorBoundary extends Component<MarkdownErrorBoundaryProps, Markdo
   }
 }
 
+const REMARK_PLUGINS = [remarkGfm];
+const REHYPE_PLUGINS = [rehypeHighlight];
+
 export const Markdown = memo(function Markdown({
   content,
   workspacePath,
@@ -136,8 +139,8 @@ export const Markdown = memo(function Markdown({
       <MarkdownErrorBoundary fallbackText={content}>
         <ReactMarkdown
           urlTransform={safeUrlTransform}
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeHighlight]}
+          remarkPlugins={REMARK_PLUGINS}
+          rehypePlugins={REHYPE_PLUGINS}
         components={{
           a: ({ href, children, ...props }) => {
             const trimmedHref = (href || "").trim();

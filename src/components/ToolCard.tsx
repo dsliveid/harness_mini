@@ -475,11 +475,29 @@ function MemoryCardView({
   );
 }
 
-function TodoList({ todos, isRunning }: { todos: any[]; isRunning: boolean }) {
+function TodoList({
+  todos,
+  isRunning,
+  lastRunOutcome,
+}: {
+  todos: any[];
+  isRunning: boolean;
+  lastRunOutcome?: string;
+}) {
+  const isAbnormalStop =
+    lastRunOutcome === "cancelled" ||
+    lastRunOutcome === "interrupted" ||
+    lastRunOutcome === "failed" ||
+    lastRunOutcome === "error";
+
   return (
     <div className="flex flex-col gap-1.5 py-1.5 pl-5">
       {todos.map((t, i) => {
-        const isDone = t.status === "done" || (!isRunning && t.status === "in_progress");
+        const isDone =
+          t.status === "done" ||
+          (!isRunning &&
+            !isAbnormalStop &&
+            (t.status === "in_progress" || t.status === "pending" || i === todos.length - 1));
         const inProgress = t.status === "in_progress" && isRunning;
         return (
           <div key={i} className="flex items-center gap-2 text-[13px]">
@@ -878,6 +896,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
   const pushToast = useStore((s) => s.pushToast);
   const setLightboxImage = useStore((s) => s.setLightboxImage);
   const isRunning = useStore((s) => (s.currentId ? s.runStatus[s.currentId] === "running" : false));
+  const lastRunOutcome = useStore((s) => (s.currentId ? s.lastRunOutcome[s.currentId] : undefined));
   const [terminating, setTerminating] = useState(false);
   const [copied, setCopied] = useState(false);
   const title = paramTitle(ev);
@@ -1419,7 +1438,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
       </div>
 
       {ev.toolName === "todo" && Array.isArray(ev.params?.todos) && (
-        <TodoList todos={ev.params.todos} isRunning={isRunning} />
+        <TodoList todos={ev.params.todos} isRunning={isRunning} lastRunOutcome={lastRunOutcome} />
       )}
 
       {/* 展开时：若是方案计划工具，展示专用计划卡片 */}

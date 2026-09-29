@@ -42,6 +42,10 @@ fn default_ctx_tokens() -> usize {
     64000
 }
 
+pub fn default_proxy_url() -> Option<String> {
+    Some("http://127.0.0.1:7890".to_string())
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolInfo {
@@ -98,6 +102,12 @@ pub struct SettingsData {
     /// 全局默认思考程度（"low" | "medium" | "high" | None / "default" 不传）
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// 是否启用全局网络代理
+    #[serde(default)]
+    pub proxy_enabled: bool,
+    /// 自定义代理地址（例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:7890）
+    #[serde(default = "default_proxy_url")]
+    pub proxy_url: Option<String>,
 }
 
 impl Default for SettingsData {
@@ -122,6 +132,8 @@ impl Default for SettingsData {
             disabled_tools: vec![],
             disabled_sops: vec![],
             reasoning_effort: None,
+            proxy_enabled: false,
+            proxy_url: default_proxy_url(),
         }
     }
 }
@@ -212,6 +224,20 @@ impl SettingsData {
         let m = self.active_model_id.clone().or_else(|| self.active_model.clone());
         self.active_model_id = m.clone();
         self.active_model = m;
+    }
+
+    /// 获取当前生效的代理地址（若未启用代理或地址为空则返回 None）
+    pub fn effective_proxy_url(&self) -> Option<String> {
+        if self.proxy_enabled {
+            self.proxy_url
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .or_else(default_proxy_url)
+        } else {
+            None
+        }
     }
 
     /// 解析指定模型的生效上下文上限（三级回落）：

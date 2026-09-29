@@ -113,7 +113,7 @@ impl AppState {
                     if status == "running" {
                         let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or("");
                         self.snapshot.start_run(sid, run_id);
-                    } else if status == "done" || status == "failed" || status == "cancelled" || status == "idle" {
+                    } else {
                         self.snapshot.finish_run(sid);
                     }
                 }
@@ -154,6 +154,15 @@ impl AppState {
             }
             _ => {}
         }
+    }
+}
+
+/// 统一事件派发入口：若已注入 AppState 则通过 AppState::emit 维护内存快照与事件总线，否则走原生 Tauri emit
+pub fn emit_event(app: &tauri::AppHandle, event: &str, payload: &impl serde::Serialize) {
+    if let Some(state) = app.try_state::<AppState>() {
+        state.emit(event, payload);
+    } else {
+        let _ = tauri::Emitter::emit(app, event, payload);
     }
 }
 
@@ -351,6 +360,7 @@ pub fn run() {
             commands::set_settings,
             commands::list_tools,
             commands::test_provider,
+            commands::test_proxy_connection,
             commands::list_projects,
             commands::create_project,
             commands::remove_project,

@@ -2,7 +2,6 @@ use crate::models::{ApprovalRequest, ApprovalRule};
 use crate::tools::ToolCtx;
 use serde_json::Value;
 use std::time::Duration;
-use tauri::Emitter;
 use tokio::sync::oneshot;
 
 #[derive(Clone, Debug)]
@@ -34,7 +33,7 @@ impl Decision {
 
 /// 向 UI 发起审批并等待结果；超时（5 分钟）自动拒绝（无人值守安全）
 pub async fn request_approval(
-    app: &tauri::AppHandle,
+    _app: &tauri::AppHandle,
     state: &crate::AppState,
     req: ApprovalRequest,
 ) -> Decision {
@@ -44,7 +43,7 @@ pub async fn request_approval(
         .lock()
         .unwrap()
         .insert(req.event_id.clone(), crate::PendingApproval { session_id: req.session_id.clone(), tx });
-    let _ = app.emit("approval:request", &req);
+    state.emit("approval:request", &req);
 
     match tokio::time::timeout(Duration::from_secs(300), rx).await {
         Ok(Ok(d)) => d,

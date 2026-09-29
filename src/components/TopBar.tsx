@@ -2,7 +2,7 @@ import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ipc } from "../ipc";
 import { currentSession, useStore } from "../store";
-import { DRAFT_ID, formatTokens, modelKey, parseModelKey, resolveActiveModel, resolveModelContextLimit, samePath, type Project, type ReasoningEffort } from "../types";
+import { DRAFT_ID, formatTokens, modelKey, parseModelKey, resolveActiveModel, resolveSessionActiveModel, resolveModelContextLimit, samePath, type Project, type ReasoningEffort } from "../types";
 import { askConfirm } from "./PromptModal";
 import { ModelContextModal } from "./ModelContextModal";
 
@@ -45,6 +45,8 @@ export function TopBar() {
   const setSettingsLocal = useStore((s) => s.setSettingsLocal);
   const pushToast = useStore((s) => s.pushToast);
   const setDraftAccessMode = useStore((s) => s.setDraftAccessMode);
+  const setDraftModel = useStore((s) => s.setDraftModel);
+  const setSessionModels = useStore((s) => s.setSessionModels);
   const setDraftContextTokenLimit = useStore((s) => s.setDraftContextTokenLimit);
   const setDraftReasoningEffort = useStore((s) => s.setDraftReasoningEffort);
   const openModelMatrixModal = useStore((s) => s.openModelMatrixModal);
@@ -56,9 +58,9 @@ export function TopBar() {
   const workspacePath = session?.workspacePath ?? draft?.workspacePath ?? "";
   // 临时空间对话（含未落库草稿）：工作区为临时副本，固定不可切换
   const isTempConv = !!session?.isTemp || (currentId === DRAFT_ID && !!draft?.temp);
-  // 顶栏模型选择：按厂商分组（optgroup）；激活厂商失效时回落到第一个有模型的厂商
+  // 顶栏模型选择：按厂商分组（optgroup）；优先解析当前会话/草稿专属模型，未配置时回落至全局配置
   const groups = settings.providers.filter((p) => (p.models ?? []).length > 0);
-  const active = resolveActiveModel(settings);
+  const active = resolveSessionActiveModel(settings, session, currentId === DRAFT_ID ? draft : null);
 
   // 上下文上限三级解析：会话专属设置 -> 模型独立配置/推断 -> 全局保底值
   const sessionLimitOverride = session
@@ -166,17 +168,24 @@ export function TopBar() {
 
   const handleSelectModel = async (providerId: string, model: string) => {
     setOpenMenu(null);
-    const next = {
-      ...settings,
-      activeProviderId: providerId,
-      activeModelId: model,
-      activeModel: model,
-    };
-    setSettingsLocal(next);
-    try {
-      await ipc.setSettings(next);
-    } catch (err) {
-      pushToast(String(err));
+    if (session) {
+      // 已有会话：仅持久化更新当前会话专属主模型，不修改全局设置，保留已有专属能力模型
+      try {
+        await setSessionModels({
+          sessionId: session.id,
+          providerId,
+          modelId: model,
+          imageProviderId: session.imageProviderId ?? session.image_model_id ?? null,
+          imageModelId: session.imageModelId ?? session.image_model_id ?? null,
+          visionProviderId: session.visionProviderId ?? session.vision_model_id ?? null,
+          visionModelId: session.visionModelId ?? session.vision_model_id ?? null,
+        });
+      } catch (err) {
+        pushToast(`更新当前会话模型失败: ${String(err)}`);
+      }
+    } else if (currentId === DRAFT_ID) {
+      // 草稿会话：更新草稿专属模型，在首发消息时随会话落库，不修改全局设置
+      setDraftModel(providerId, model);
     }
   };
 

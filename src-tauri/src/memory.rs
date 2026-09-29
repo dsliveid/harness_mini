@@ -503,6 +503,7 @@ pub fn trigger_auto_distillation(
             api_key: pc.api_key.clone(),
             model: model.to_string(),
             reasoning_effort: None,
+            proxy_url: settings.effective_proxy_url(),
         };
 
         let all_msgs = {

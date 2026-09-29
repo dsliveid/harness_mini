@@ -356,12 +356,14 @@ pub async fn dispatch_rpc(
             let access_mode = params.get("accessMode").and_then(|v| v.as_str()).map(|s| s.to_string());
             let context_token_limit = params.get("contextTokenLimit").and_then(|v| v.as_u64()).map(|s| s as usize);
             let attachments: Option<Vec<crate::models::Attachment>> = params.get("attachments").and_then(|v| serde_json::from_value(v.clone()).ok());
+            let provider_id = params.get("providerId").or_else(|| params.get("provider_id")).and_then(|v| v.as_str()).map(|s| s.to_string());
+            let model_id = params.get("modelId").or_else(|| params.get("model_id")).and_then(|v| v.as_str()).map(|s| s.to_string());
             let image_provider_id = params.get("imageProviderId").and_then(|v| v.as_str()).map(|s| s.to_string());
             let image_model_id = params.get("imageModelId").and_then(|v| v.as_str()).map(|s| s.to_string());
             let vision_provider_id = params.get("visionProviderId").and_then(|v| v.as_str()).map(|s| s.to_string());
             let vision_model_id = params.get("visionModelId").and_then(|v| v.as_str()).map(|s| s.to_string());
             let reasoning_effort = params.get("reasoningEffort").or_else(|| params.get("reasoning_effort")).and_then(|v| v.as_str()).map(|s| s.to_string());
-            let res = commands::send_message(st, app.clone(), session_id, text, workspace_path, project_id, temp, access_mode, context_token_limit, attachments, image_provider_id, image_model_id, vision_provider_id, vision_model_id, reasoning_effort)?;
+            let res = commands::send_message(st, app.clone(), session_id, text, workspace_path, project_id, temp, access_mode, context_token_limit, attachments, provider_id, model_id, image_provider_id, image_model_id, vision_provider_id, vision_model_id, reasoning_effort)?;
             Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
         }
         "list_queued" => {
