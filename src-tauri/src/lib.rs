@@ -363,6 +363,8 @@ pub fn run() {
             commands::test_provider,
             commands::test_jev,
             commands::evaluate_plan,
+            commands::get_session_jev_events,
+            commands::query_jev_events,
             commands::test_proxy_connection,
             commands::list_projects,
             commands::create_project,

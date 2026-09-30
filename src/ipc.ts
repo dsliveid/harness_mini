@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, DataStatus, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult, JevCfg, PlanReviewReport, ToolLogFilter, ToolLogQueryResult } from "./types";
+import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, DataStatus, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult, JevCfg, PlanReviewReport, ToolLogFilter, ToolLogQueryResult, JevDecisionEvent, JevEventFilter, JevEventQueryResult } from "./types";
 
 /**
  * 读请求防重入去重拦截器：
@@ -30,6 +30,10 @@ export const ipc = {
   testJev: (jevCfg: JevCfg) => invoke<string>("test_jev", { jevCfg }),
   evaluatePlan: (planId: string, workspace: string) =>
     deduplicatedInvoke<PlanReviewReport>("evaluate_plan", { planId, workspace }),
+  getSessionJevEvents: (sessionId: string, limit?: number) =>
+    invoke<JevDecisionEvent[]>("get_session_jev_events", { sessionId, limit: limit ?? null }),
+  queryJevEvents: (filter: JevEventFilter) =>
+    invoke<JevEventQueryResult>("query_jev_events", { filter }),
 
   // 数据目录
   getDataStatus: () => deduplicatedInvoke<DataStatus>("get_data_status"),

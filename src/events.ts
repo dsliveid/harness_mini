@@ -99,6 +99,7 @@ export function useAppEvents() {
       listen<any>("task:update", (e) => s.onTaskUpdate(e.payload)),
       listen<any>("task:checkpoint", (e) => s.onTaskCheckpoint(e.payload)),
       listen<any>("task:finished", () => s.pushToast("长任务已圆满完成！", "success")),
+      listen<any>("jev:event", (e) => s.onJevEvent(e.payload)),
       listen<any>("run:error", (ev) => s.pushToast(ev.payload?.message || "运行遇到异常", "error")),
       listen<any>("error", (ev) => s.onError(ev.payload)),
     ];

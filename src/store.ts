@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "./ipc";
-import { DRAFT_ID, resolveActiveModel, samePath, sortMessages, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem, type FocusFloatingTarget, type PlanSummary } from "./types";
+import { DRAFT_ID, resolveActiveModel, samePath, sortMessages, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem, type FocusFloatingTarget, type PlanSummary, type JevDecisionEvent } from "./types";
 
 
 export interface EditingMessageTarget {
@@ -158,6 +158,7 @@ interface Store {
   runStatus: Record<string, "idle" | "running">;
   lastRunOutcome: Record<string, string>;
   approvals: Record<string, ApprovalReq>;
+  jevEvents: Record<string, JevDecisionEvent[]>;
   pendingCompactions: Record<string, CompactionReq>;
   sessionCompactions: Record<string, SessionCompaction[]>;
   /** 上下文硬截断提醒列表（不阻塞对话，用户可手动逐条关闭或批量关闭） */
@@ -327,6 +328,8 @@ interface Store {
   onGrowthDeleted: (id: string) => void;
   sopStatus: Record<string, { status: "checking" | "passed" | "failed" | "error"; command: string; output?: string }>;
   onSopStatus: (p: { sessionId: string; status: "checking" | "passed" | "failed" | "error"; command: string; output?: string }) => void;
+  onJevEvent: (ev: JevDecisionEvent) => void;
+  loadSessionJevEvents: (sessionId: string) => Promise<void>;
   toolRetryStatus: Record<string, ToolRetryStatus>;
   dismissToolRetry: (sessionId: string) => void;
   onToolRetryGuidance: (p: ToolRetryGuidanceEvent) => void;
@@ -550,6 +553,7 @@ export const useStore = create<Store>((set, get) => ({
   runStatus: {},
   lastRunOutcome: {},
   approvals: {},
+  jevEvents: {},
   pendingCompactions: {},
   sessionCompactions: {},
   truncationNotices: [],
@@ -1147,6 +1151,7 @@ export const useStore = create<Store>((set, get) => ({
     void get().loadSubagents(id);
     void get().fetchActiveTask(id);
     void get().loadPlans(id);
+    void get().loadSessionJevEvents(id);
 
     // 5. 切换主会话时，如果分屏中的协作者/子 Agent 不属于当前会话，则关闭分屏
     const curCollabId = get().activeCollaboratorId;
@@ -2960,6 +2965,34 @@ export const useStore = create<Store>((set, get) => ({
         },
       };
     });
+  },
+
+  onJevEvent(ev: JevDecisionEvent) {
+    if (!ev || !ev.sessionId) return;
+    set((st) => {
+      const list = st.jevEvents[ev.sessionId] ?? [];
+      const exists = list.some((e) => e.id === ev.id);
+      return {
+        jevEvents: {
+          ...st.jevEvents,
+          [ev.sessionId]: exists ? list.map((e) => (e.id === ev.id ? ev : e)) : [...list, ev],
+        },
+      };
+    });
+  },
+
+  async loadSessionJevEvents(sessionId: string) {
+    try {
+      const events = await ipc.getSessionJevEvents(sessionId);
+      set((st) => ({
+        jevEvents: {
+          ...st.jevEvents,
+          [sessionId]: events,
+        },
+      }));
+    } catch (e) {
+      console.warn("loadSessionJevEvents failed:", e);
+    }
   },
 
   onError(p) {

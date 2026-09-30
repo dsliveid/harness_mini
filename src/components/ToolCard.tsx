@@ -380,6 +380,23 @@ function MemoryCardView({
   const isRecord = ev.toolName === "record_memory";
   const isRead = ev.toolName === "read_memory";
 
+  const currentSessionId = useStore((s) => s.currentId);
+  const jevEvents = useStore((s) => (currentSessionId ? s.jevEvents[currentSessionId] : undefined));
+
+  const memoryGateEvent = useMemo(() => {
+    if (!jevEvents || !jevEvents.length) return null;
+    const evTime = ev.createdAt ? new Date(ev.createdAt).getTime() : 0;
+    return jevEvents.find((je) => {
+      if (je.scene !== "memory_gate") return false;
+      if (p.title && je.promptSummary && je.promptSummary.includes(String(p.title))) return true;
+      if (evTime > 0) {
+        const jeTime = new Date(je.createdAt).getTime();
+        return Math.abs(jeTime - evTime) < 30000;
+      }
+      return false;
+    });
+  }, [jevEvents, p.title, ev.createdAt]);
+
   const categoryName = useMemo(() => {
     const c = String(p.category || "").toLowerCase();
     if (c === "profile" || c === "tech_stack") return "技术大盘 profile";
@@ -413,7 +430,26 @@ function MemoryCardView({
             {categoryName}
           </span>
         )}
+        {isRecord && memoryGateEvent && (
+          <span
+            className={`text-[10px] px-1.5 py-0.5 rounded border inline-flex items-center gap-1 font-mono ${
+              memoryGateEvent.verdict === "allow"
+                ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                : "bg-red-500/15 text-red-300 border-red-500/30"
+            }`}
+            title={`Jev 记忆门控质检: ${memoryGateEvent.verdict === "allow" ? "放行" : "拦截"} (耗时: ${memoryGateEvent.latencyMs}ms, 置信度: ${(memoryGateEvent.confidence * 100).toFixed(0)}%)\n${memoryGateEvent.reason || ""}`}
+          >
+            <Zap size={10} className={memoryGateEvent.verdict === "allow" ? "text-emerald-400 fill-emerald-400" : "text-red-400 fill-red-400"} />
+            <span>质检: {memoryGateEvent.verdict === "allow" ? "通过" : "拦截"} · {memoryGateEvent.latencyMs}ms</span>
+          </span>
+        )}
       </div>
+
+      {isRecord && memoryGateEvent?.reason && (
+        <div className="text-[11px] text-teal-200/90 bg-teal-900/30 border border-teal-500/25 rounded-md px-2 py-1 leading-snug">
+          <span className="font-medium text-teal-300">Jev 质检评估：</span>{memoryGateEvent.reason}
+        </div>
+      )}
 
       {isRecord && p.content && (
         <div className="text-ink/90 text-[11.5px] max-h-36 overflow-y-auto bg-panel/60 p-2.5 rounded border border-edge/30 font-mono whitespace-pre-wrap select-text leading-relaxed">
@@ -559,10 +595,16 @@ function ApprovalSection({ ev }: { ev: ToolEvent }) {
 
   return (
     <div className="mt-2.5 border border-amber-500/40 bg-amber-500/5 rounded-xl p-3 shadow-sm animate-in fade-in duration-150">
-      <div className="text-[13px] font-medium text-amber-400 mb-1.5 flex items-center justify-between gap-1.5">
-        <div className="flex items-center gap-1.5">
+      <div className="text-[13px] font-medium text-amber-400 mb-1.5 flex items-center justify-between gap-1.5 flex-wrap">
+        <div className="flex items-center gap-1.5 flex-wrap">
           <ShieldAlert size={16} className="shrink-0 text-amber-400" />
           <span>需要你的确认：{riskLabel}</span>
+          {req.riskSource === "jev" && (
+            <span className="text-[11px] px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/30 inline-flex items-center gap-1 font-mono">
+              <Zap size={10} className="fill-purple-400 text-purple-400" />
+              <span>⚡ Jev 语义风控</span>
+            </span>
+          )}
         </div>
         <button
           type="button"
@@ -574,11 +616,21 @@ function ApprovalSection({ ev }: { ev: ToolEvent }) {
           <span>{copied ? "已复制" : "复制"}</span>
         </button>
       </div>
+      {req.riskSource === "jev" && req.jevReason && (
+        <div className="text-[12px] text-purple-200/90 bg-purple-950/40 border border-purple-500/30 rounded-lg px-2.5 py-1.5 mb-2 leading-relaxed">
+          <span className="font-semibold text-purple-300">拦截理由：</span>
+          {req.jevReason}
+        </div>
+      )}
       <pre className="text-[12px] font-mono whitespace-pre-wrap break-all bg-panel border border-edge/60 rounded-lg p-2.5 max-h-48 overflow-y-auto text-ink select-text">
         {req.preview}
       </pre>
       {req.forceOnce && (
-        <div className="text-[11px] text-amber-500/80 mt-1">检测到高危命令，仅允许逐次确认，不可记忆放行。</div>
+        <div className="text-[11px] text-amber-500/80 mt-1">
+          {req.riskSource === "jev"
+            ? "Jev 研判该命令具有不可逆或破坏性风险，已强制开启逐次人工确认，不可记忆放行。"
+            : "检测到高危命令，仅允许逐次确认，不可记忆放行。"}
+        </div>
       )}
       <div className="flex items-center gap-2 mt-2 flex-wrap">
         <button

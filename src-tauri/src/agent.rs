@@ -899,7 +899,11 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
 
         if let Some(user_txt) = last_user_prompt {
             if let Some(client) = crate::jev::JevClient::from_cfg(&settings.jev, settings.effective_proxy_url()) {
-                if let Some((complexity, needs_research, conf)) = client.classify_task_complexity(&user_txt, settings.jev.min_confidence).await {
+                let start = std::time::Instant::now();
+                let class_res = client.classify_task_complexity(&user_txt, settings.jev.min_confidence).await;
+                let latency_ms = start.elapsed().as_millis() as u64;
+
+                if let Some((complexity, needs_research, conf)) = class_res {
                     match complexity {
                         crate::jev::TaskComplexity::Trivial | crate::jev::TaskComplexity::Small => {
                             // 小任务快速收敛，调低推理深度，避免过度思考与大量上下文浪费
@@ -936,6 +940,34 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
                             dynamic_guidance_prompt = Some(research_guide.to_string());
                         }
                     }
+
+                    let prompt_summary = if user_txt.chars().count() > 120 {
+                        format!("{}...", user_txt.chars().take(120).collect::<String>())
+                    } else {
+                        user_txt.clone()
+                    };
+
+                    let jev_ev = crate::models::JevDecisionEvent {
+                        id: format!("jev_{}", uuid::Uuid::new_v4().simple()),
+                        session_id: session_id.to_string(),
+                        run_id: Some(run_id.to_string()),
+                        scene: "task_complexity".to_string(),
+                        verdict: "choice".to_string(),
+                        decision_value: Some(complexity.as_str().to_string()),
+                        confidence: conf,
+                        latency_ms,
+                        reason: Some(format!("复杂度评定为 {}，置信度 {:.0}%", complexity.as_str(), conf * 100.0)),
+                        adapted_effort: effective_reasoning_effort.clone(),
+                        needs_research: Some(needs_research),
+                        prompt_summary: Some(prompt_summary),
+                        created_at: chrono::Local::now().to_rfc3339(),
+                    };
+
+                    {
+                        let db = state.db.lock().unwrap();
+                        let _ = store::insert_jev_event(&db, &jev_ev);
+                    }
+                    let _ = app.emit("jev:event", &jev_ev);
                 }
             }
         }
@@ -1936,6 +1968,8 @@ async fn handle_tool_call(
     let mut need_ask = false;
     let mut ask_risk = "write";
     let mut force_once = false;
+    let mut risk_source: Option<String> = None;
+    let mut jev_risk_desc: Option<String> = None;
 
     // 检查是否命中 .harness 目录全量读写白名单（系统记忆、方案、配置、自省目录免审放行）
     let is_harness_operation = {
@@ -1961,16 +1995,57 @@ async fn handle_tool_call(
     } else {
         let mut high_danger =
             tool_name == "run_command" && args.get("command").and_then(|c| c.as_str()).map(tools::is_high_danger).unwrap_or(false);
+        if high_danger {
+            risk_source = Some("regex".to_string());
+        }
 
         // --- Jev 决策网关：场景 4 终端命令破坏性高危语义双保险 ---
         if !high_danger && tool_name == "run_command" && settings.jev.enabled && settings.jev.features.command_guard {
             if let Some(cmd_str) = args.get("command").and_then(|c| c.as_str()) {
                 if let Some(client) = crate::jev::JevClient::from_cfg(&settings.jev, settings.effective_proxy_url()) {
                     let ws_str = ctx.workspace.to_string_lossy();
+                    let start = std::time::Instant::now();
                     let gate = client.check_command_safety(cmd_str, &ws_str, settings.jev.min_confidence).await;
-                    if let crate::jev::Gate::Deny(_) = gate {
-                        high_danger = true;
+                    let latency_ms = start.elapsed().as_millis() as u64;
+
+                    let (verdict_str, reason_opt) = match &gate {
+                        crate::jev::Gate::Allow => ("allow".to_string(), Some("安全：未检测到破坏性行为".to_string())),
+                        crate::jev::Gate::Deny(r) => {
+                            high_danger = true;
+                            risk_source = Some("jev".to_string());
+                            jev_risk_desc = Some(r.clone());
+                            ("deny".to_string(), Some(r.clone()))
+                        }
+                        crate::jev::Gate::Abstain => ("abstain".to_string(), Some("置信度不足或决策弃权".to_string())),
+                    };
+
+                    let prompt_summary = if cmd_str.chars().count() > 120 {
+                        format!("{}...", cmd_str.chars().take(120).collect::<String>())
+                    } else {
+                        cmd_str.to_string()
+                    };
+
+                    let jev_ev = crate::models::JevDecisionEvent {
+                        id: format!("jev_{}", uuid::Uuid::new_v4().simple()),
+                        session_id: session_id.to_string(),
+                        run_id: None,
+                        scene: "command_guard".to_string(),
+                        verdict: verdict_str,
+                        decision_value: Some(if high_danger { "dangerous".into() } else { "safe".into() }),
+                        confidence: settings.jev.min_confidence,
+                        latency_ms,
+                        reason: reason_opt,
+                        adapted_effort: None,
+                        needs_research: None,
+                        prompt_summary: Some(prompt_summary),
+                        created_at: chrono::Local::now().to_rfc3339(),
+                    };
+
+                    {
+                        let db = state.db.lock().unwrap();
+                        let _ = store::insert_jev_event(&db, &jev_ev);
                     }
+                    let _ = app.emit("jev:event", &jev_ev);
                 }
             }
         }
@@ -2023,6 +2098,8 @@ async fn handle_tool_call(
             risk: ask_risk.into(),
             preview,
             force_once,
+            risk_source,
+            jev_reason: jev_risk_desc,
         };
         let decision = approval::request_approval(app, &state, req).await;
         match decision {

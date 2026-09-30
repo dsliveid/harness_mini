@@ -125,6 +125,73 @@ impl Default for JevFeatures {
     }
 }
 
+/// Jev 决策网关的单次运行轨迹事件
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct JevDecisionEvent {
+    pub id: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// 触发场景：task_complexity | memory_gate | command_guard | plan_review | auto_distill
+    pub scene: String,
+    /// 决策结果状态：allow | deny | abstain | choice | score
+    pub verdict: String,
+    /// 具体决策值（如 "small", "true", "0.92"）
+    #[serde(default)]
+    pub decision_value: Option<String>,
+    /// 模型置信度 (0.0 ~ 1.0)
+    pub confidence: f32,
+    /// 决策耗时（毫秒）
+    pub latency_ms: u64,
+    /// 判定理由或触发说明
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// 自适应调节的思考深度（如 "low", "high"）
+    #[serde(default)]
+    pub adapted_effort: Option<String>,
+    /// 是否需要外部调研
+    #[serde(default)]
+    pub needs_research: Option<bool>,
+    /// 判定所依据的输入摘要
+    #[serde(default)]
+    pub prompt_summary: Option<String>,
+    /// ISO 8601 时间戳
+    pub created_at: String,
+}
+
+/// Jev 决策日志查询过滤参数
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct JevEventFilter {
+    pub session_id: Option<String>,
+    pub scene: Option<String>,
+    pub verdict: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+/// Jev 决策日志统计摘要
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct JevStatsSummary {
+    pub total_count: u64,
+    pub avg_latency_ms: u64,
+    pub allow_count: u64,
+    pub deny_count: u64,
+    pub abstain_count: u64,
+    pub today_count: u64,
+}
+
+/// Jev 决策日志查询结果集
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct JevEventQueryResult {
+    pub items: Vec<JevDecisionEvent>,
+    pub total: usize,
+    pub stats: JevStatsSummary,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolInfo {
@@ -1140,6 +1207,10 @@ pub struct ApprovalRequest {
     pub risk: String,    // write | execute | path
     pub preview: String, // 命令文本或 diff 预览
     pub force_once: bool,
+    #[serde(default)]
+    pub risk_source: Option<String>,
+    #[serde(default)]
+    pub jev_reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

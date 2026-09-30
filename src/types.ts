@@ -158,6 +158,45 @@ export interface PlanReviewReport {
   details: string[];
 }
 
+export interface JevDecisionEvent {
+  id: string;
+  sessionId: string;
+  runId?: string | null;
+  scene: "task_complexity" | "memory_gate" | "command_guard" | "plan_review" | "auto_distill" | string;
+  verdict: "allow" | "deny" | "abstain" | "choice" | "score" | string;
+  decisionValue?: string | null;
+  confidence: number;
+  latencyMs: number;
+  reason?: string | null;
+  adaptedEffort?: string | null;
+  needsResearch?: boolean | null;
+  promptSummary?: string | null;
+  createdAt: string;
+}
+
+export interface JevEventFilter {
+  sessionId?: string;
+  scene?: string;
+  verdict?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface JevStatsSummary {
+  totalCount: number;
+  avgLatencyMs: number;
+  allowCount: number;
+  denyCount: number;
+  abstainCount: number;
+  todayCount: number;
+}
+
+export interface JevEventQueryResult {
+  items: JevDecisionEvent[];
+  total: number;
+  stats: JevStatsSummary;
+}
+
 export interface AgentSopInfo {
   id: string;
   name: string;
@@ -782,6 +821,8 @@ export interface ApprovalReq {
   risk: string; // write | execute | path
   preview: string;
   forceOnce: boolean;
+  riskSource?: "rule" | "regex" | "jev" | string;
+  jevReason?: string | null;
 }
 
 /** 上下文自动压缩挂起请求（等待用户确认/补充） */

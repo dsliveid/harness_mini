@@ -2177,7 +2177,44 @@ async fn record_memory_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Strin
 
         if let Some(client) = jev_client_opt {
             let ws_str = ctx.workspace.to_string_lossy();
+            let start = std::time::Instant::now();
             let gate = client.judge_memory_quality(content, &ws_str, min_conf).await;
+            let latency_ms = start.elapsed().as_millis() as u64;
+
+            let (verdict_str, reason_opt) = match &gate {
+                crate::jev::Gate::Allow => ("allow".to_string(), Some("确定性经验，放行落盘".to_string())),
+                crate::jev::Gate::Deny(r) => ("deny".to_string(), Some(r.clone())),
+                crate::jev::Gate::Abstain => ("abstain".to_string(), Some("置信度不足或决策弃权".to_string())),
+            };
+
+            let prompt_summary = if content.chars().count() > 120 {
+                format!("{}...", content.chars().take(120).collect::<String>())
+            } else {
+                content.to_string()
+            };
+
+            let jev_ev = crate::models::JevDecisionEvent {
+                id: format!("jev_{}", uuid::Uuid::new_v4().simple()),
+                session_id: host.session_id.clone(),
+                run_id: None,
+                scene: "memory_gate".to_string(),
+                verdict: verdict_str,
+                decision_value: Some(title.to_string()),
+                confidence: min_conf,
+                latency_ms,
+                reason: reason_opt,
+                adapted_effort: None,
+                needs_research: None,
+                prompt_summary: Some(prompt_summary),
+                created_at: chrono::Local::now().to_rfc3339(),
+            };
+
+            {
+                let db = state.db.lock().unwrap();
+                let _ = crate::store::insert_jev_event(&db, &jev_ev);
+            }
+            let _ = host.app.emit("jev:event", &jev_ev);
+
             match gate {
                 crate::jev::Gate::Deny(reason) => {
                     return Ok(format!("【⚠️ Jev 决策网关拦截】该知识/经验未予入库：{reason}。请仅在对代码实地验证后且具备长期复用价值时沉淀知识。"));

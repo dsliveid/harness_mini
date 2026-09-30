@@ -204,6 +204,25 @@ pub async fn evaluate_plan(
 }
 
 #[tauri::command]
+pub async fn get_session_jev_events(
+    state: State<'_, crate::AppState>,
+    session_id: String,
+    limit: Option<usize>,
+) -> Result<Vec<crate::models::JevDecisionEvent>, String> {
+    let db = state.db.lock().unwrap();
+    store::get_session_jev_events(&db, &session_id, limit)
+}
+
+#[tauri::command]
+pub async fn query_jev_events(
+    state: State<'_, crate::AppState>,
+    filter: crate::models::JevEventFilter,
+) -> Result<crate::models::JevEventQueryResult, String> {
+    let db = state.db.lock().unwrap();
+    store::query_jev_events(&db, &filter)
+}
+
+#[tauri::command]
 pub async fn test_proxy_connection(proxy_url: String) -> Result<u64, String> {
     let norm = crate::llm::normalize_proxy_url(&proxy_url);
     if norm.is_empty() {
