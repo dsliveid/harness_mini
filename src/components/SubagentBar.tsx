@@ -1,5 +1,5 @@
 import { useStore, currentSession } from "../store";
-import { DRAFT_ID } from "../types";
+import { DRAFT_ID, type Session } from "../types";
 import {
   Layers,
   Plus,
@@ -15,10 +15,12 @@ import {
   Zap,
 } from "./Icons";
 
+const EMPTY_SUBAGENTS: Session[] = [];
+
 export function SubagentBar() {
   const currentId = useStore((s) => s.currentId);
   const session = useStore((s) => currentSession(s));
-  const subagents = useStore((s) => (s.currentId ? s.subagents[s.currentId] ?? [] : []));
+  const subagents = useStore((s) => (s.currentId ? s.subagents[s.currentId] ?? EMPTY_SUBAGENTS : EMPTY_SUBAGENTS));
   const activeSubagentId = useStore((s) => s.activeSubagentId);
   const setActiveSubagentId = useStore((s) => s.setActiveSubagentId);
   const setShowCreateSubagentModal = useStore((s) => s.setShowCreateSubagentModal);

@@ -561,7 +561,9 @@ pub async fn dispatch_rpc(
         "get_token_stats" => {
             let project_id = params.get("projectId").and_then(|v| v.as_str()).map(|s| s.to_string());
             let days = params.get("days").and_then(|v| v.as_u64()).map(|d| d as u32);
-            let res = commands::get_token_stats(st, project_id, days)?;
+            let start_date = params.get("startDate").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let end_date = params.get("endDate").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let res = commands::get_token_stats(st, project_id, days, start_date, end_date)?;
             Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
         }
 

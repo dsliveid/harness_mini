@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useMemo } from "react";
 import { useStore } from "../store";
-import { computeTurnMetrics } from "../types";
+import { computeTurnMetrics, type Session, type Message } from "../types";
 import { ipc } from "../ipc";
 import { MessageItem } from "./MessageItem";
 import { ExecutionProcessBlock, groupTimelineItems } from "./ExecutionProcessBlock";
@@ -35,11 +35,14 @@ function formatTokens(n?: number | null): string {
   return n.toLocaleString("zh-CN");
 }
 
+const EMPTY_SUBAGENTS: Session[] = [];
+const EMPTY_MSGS: Message[] = [];
+
 export function SubagentView({ subagentId }: { subagentId: string }) {
   const currentParentId = useStore((s) => s.currentId);
-  const subagents = useStore((s) => (currentParentId ? s.subagents[currentParentId] ?? [] : []));
+  const subagents = useStore((s) => (currentParentId ? s.subagents[currentParentId] ?? EMPTY_SUBAGENTS : EMPTY_SUBAGENTS));
   const subagent = subagents.find((s) => s.id === subagentId);
-  const msgs = useStore((s) => s.messages[subagentId] ?? []);
+  const msgs = useStore((s) => s.messages[subagentId] ?? EMPTY_MSGS);
   const runStatus = useStore((s) => s.runStatus);
   const isRunning = runStatus[subagentId] === "running";
 

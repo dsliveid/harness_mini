@@ -3,6 +3,7 @@ mod approval;
 mod commands;
 mod diffutil;
 mod growth;
+pub mod jev;
 mod llm;
 pub mod memory;
 mod models;
@@ -360,6 +361,8 @@ pub fn run() {
             commands::set_settings,
             commands::list_tools,
             commands::test_provider,
+            commands::test_jev,
+            commands::evaluate_plan,
             commands::test_proxy_connection,
             commands::list_projects,
             commands::create_project,
@@ -472,6 +475,7 @@ pub fn run() {
             commands::revert_turn_file,
             commands::reapply_turn_file,
             commands::get_turn_diff,
+            commands::query_tool_logs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

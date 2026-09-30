@@ -204,13 +204,22 @@ pub fn load_project_memory(workspace: &Path) -> Option<String> {
     }
 }
 
-/// 沉淀/记录记忆
-pub fn record_memory(
+/// 知识记忆持久化影响（用于快照时光机联动与无损撤回）
+#[derive(Debug, Clone)]
+pub struct MemoryEffect {
+    pub rel_path: String,
+    pub old_bytes: Option<Vec<u8>>,
+    pub new_bytes: Vec<u8>,
+    pub message: String,
+}
+
+/// 沉淀/记录记忆并返回影响的文件变更信息（便于关联影子快照）
+pub fn record_memory_with_effect(
     workspace: &Path,
     category: &str,
     title: &str,
     content: &str,
-) -> Result<String, String> {
+) -> Result<MemoryEffect, String> {
     ensure_memory_dir(workspace)?;
     let mem = memory_dir(workspace);
     let title = title.trim();
@@ -219,27 +228,54 @@ pub fn record_memory(
     match category {
         "profile" | "tech_stack" => {
             let path = mem.join("profile.md");
+            let old_bytes = if path.exists() {
+                fs::read(&path).ok()
+            } else {
+                None
+            };
             let new_content = if content.starts_with('#') {
                 content.to_string()
             } else {
                 format!("# 项目技术大盘与架构档案 (Project Profile)\n\n{}\n", content)
             };
-            fs::write(&path, new_content).map_err(|e| format!("写入 profile.md 失败: {e}"))?;
-            Ok("已成功将最新技术栈与架构档案持久化至 `.harness/memory/profile.md`，后续所有新会话均会自动秒级召回。".into())
+            let new_bytes = new_content.as_bytes().to_vec();
+            fs::write(&path, &new_content).map_err(|e| format!("写入 profile.md 失败: {e}"))?;
+            Ok(MemoryEffect {
+                rel_path: ".harness/memory/profile.md".into(),
+                old_bytes,
+                new_bytes,
+                message: "已成功将最新技术栈与架构档案持久化至 `.harness/memory/profile.md`，后续所有新会话均会自动秒级召回。".into(),
+            })
         }
         "convention" | "notes" => {
             let path = mem.join("conventions.md");
+            let old_bytes = if path.exists() {
+                fs::read(&path).ok()
+            } else {
+                None
+            };
             let mut existing = fs::read_to_string(&path).unwrap_or_default();
             let timestamp = Utc::now().format("%Y-%m-%d").to_string();
             existing.push_str(&format!("\n\n### {} ({})\n{}\n", title, timestamp, content));
-            fs::write(&path, existing).map_err(|e| format!("写入 conventions.md 失败: {e}"))?;
-            Ok(format!("已成功将规范约定【{}】追加至 `.harness/memory/conventions.md`。", title))
+            let new_bytes = existing.as_bytes().to_vec();
+            fs::write(&path, &existing).map_err(|e| format!("写入 conventions.md 失败: {e}"))?;
+            Ok(MemoryEffect {
+                rel_path: ".harness/memory/conventions.md".into(),
+                old_bytes,
+                new_bytes,
+                message: format!("已成功将规范约定【{}】追加至 `.harness/memory/conventions.md`。", title),
+            })
         }
         _ => {
             // 默认存入 digests/*.md
             let slug = sanitize_slug(title);
             let filename = format!("{}.md", slug);
             let path = digests_dir(workspace).join(&filename);
+            let old_bytes = if path.exists() {
+                fs::read(&path).ok()
+            } else {
+                None
+            };
 
             let mut meta = if path.exists() {
                 let old_str = fs::read_to_string(&path).unwrap_or_default();
@@ -267,10 +303,26 @@ pub fn record_memory(
             }
 
             let full = format_with_frontmatter(&meta, content);
-            fs::write(&path, full).map_err(|e| format!("写入碎记失败: {e}"))?;
-            Ok(format!("已成功将知识碎片【{}】固化至 `.harness/memory/digests/{}`。", title, filename))
+            let new_bytes = full.as_bytes().to_vec();
+            fs::write(&path, &full).map_err(|e| format!("写入碎记失败: {e}"))?;
+            Ok(MemoryEffect {
+                rel_path: format!(".harness/memory/digests/{}", filename),
+                old_bytes,
+                new_bytes,
+                message: format!("已成功将知识碎片【{}】固化至 `.harness/memory/digests/{}`。", title, filename),
+            })
         }
     }
+}
+
+/// 沉淀/记录记忆
+pub fn record_memory(
+    workspace: &Path,
+    category: &str,
+    title: &str,
+    content: &str,
+) -> Result<String, String> {
+    record_memory_with_effect(workspace, category, title, content).map(|e| e.message)
 }
 
 /// 读取记忆内容
@@ -626,7 +678,37 @@ pub fn trigger_auto_distillation(
             let cleaned = clean_json_text(&res.content);
             if let Ok(parsed) = serde_json::from_str::<AutoDistillOutput>(cleaned) {
                 if parsed.should_record && !parsed.title.trim().is_empty() && !parsed.content.trim().is_empty() {
-                    let _ = record_memory(&ws_path, "digest", &parsed.title, &parsed.content);
+                    // --- Jev 决策网关：痛点 1 自动提炼门控 ---
+                    if settings.jev.enabled && settings.jev.features.memory_gate {
+                        if let Some(client) = crate::jev::JevClient::from_cfg(&settings.jev, settings.effective_proxy_url()) {
+                            let gate = client.judge_memory_quality(&parsed.content, &session.workspace_path, settings.jev.min_confidence).await;
+                            if let crate::jev::Gate::Deny(_) = gate {
+                                // Jev 判定疑似推测脑补或无长期价值，丢弃提炼候选，不予落盘
+                                return;
+                            }
+                        }
+                    }
+
+                    let last_assistant_msg_id = messages
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == "assistant")
+                        .map(|m| m.id.clone());
+
+                    if let Ok(effect) = record_memory_with_effect(&ws_path, "digest", &parsed.title, &parsed.content) {
+                        if let Some(ref mid) = last_assistant_msg_id {
+                            crate::tools::record_file_snapshot_raw(
+                                &app,
+                                &session_id,
+                                mid,
+                                &format!("auto_distill_{}", uuid::Uuid::new_v4()),
+                                &effect.rel_path,
+                                effect.old_bytes.as_deref(),
+                                &effect.new_bytes,
+                            )
+                            .await;
+                        }
+                    }
                     let _ = app.emit(
                         "memory:updated",
                         json!({
@@ -646,7 +728,20 @@ pub fn trigger_auto_distillation(
                         let prof_path = memory_dir(&ws_path).join("profile.md");
                         if let Ok(c) = fs::read_to_string(&prof_path) {
                             if c.contains("（待提炼沉淀：") {
-                                let _ = record_memory(&ws_path, "profile", &parsed.title, &parsed.content);
+                                if let Ok(prof_effect) = record_memory_with_effect(&ws_path, "profile", &parsed.title, &parsed.content) {
+                                    if let Some(ref mid) = last_assistant_msg_id {
+                                        crate::tools::record_file_snapshot_raw(
+                                            &app,
+                                            &session_id,
+                                            mid,
+                                            &format!("auto_distill_{}", uuid::Uuid::new_v4()),
+                                            &prof_effect.rel_path,
+                                            prof_effect.old_bytes.as_deref(),
+                                            &prof_effect.new_bytes,
+                                        )
+                                        .await;
+                                    }
+                                }
                             }
                         }
                     }
@@ -789,6 +884,51 @@ mod tests {
         let err2 = read_memory(&temp_dir, Some("non_existent")).unwrap_err();
         assert!(err2.contains("数据库连接池配置"));
         assert!(err2.contains("已有的主题碎记包括"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_memory_effects_and_revert() {
+        let temp_dir = std::env::temp_dir().join(format!("harness_test_mem_revert_{}", uuid::Uuid::new_v4()));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        // 1. 初始状态
+        ensure_memory_dir(&temp_dir).unwrap();
+        let prof_path = temp_dir.join(".harness").join("memory").join("profile.md");
+        let initial_prof = fs::read(&prof_path).unwrap();
+
+        // 2. 沉淀碎记（模拟新建）
+        let effect1 = record_memory_with_effect(
+            &temp_dir,
+            "digest",
+            "临时主题",
+            "这是要被撤回的内容",
+        ).unwrap();
+        assert!(effect1.old_bytes.is_none());
+        assert!(effect1.rel_path.contains("temporary-topic") || effect1.rel_path.contains("digest"));
+        let digest_full_path = temp_dir.join(&effect1.rel_path);
+        assert!(digest_full_path.exists());
+
+        // 3. 修改 profile.md
+        let effect2 = record_memory_with_effect(
+            &temp_dir,
+            "profile",
+            "新架构",
+            "微服务改造",
+        ).unwrap();
+        assert!(effect2.old_bytes.is_some());
+        assert_eq!(effect2.rel_path, ".harness/memory/profile.md");
+
+        // 4. 模拟撤回：删除新建 digest，将 profile.md 还原
+        let _ = fs::remove_file(&digest_full_path);
+        assert!(!digest_full_path.exists());
+
+        let before_bytes = effect2.old_bytes.unwrap();
+        fs::write(&prof_path, &before_bytes).unwrap();
+
+        let restored_prof = fs::read(&prof_path).unwrap();
+        assert_eq!(restored_prof, initial_prof);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

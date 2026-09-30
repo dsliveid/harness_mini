@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useMemo } from "react";
 import { useStore } from "../store";
-import { computeTurnMetrics } from "../types";
+import { computeTurnMetrics, type Message, type Session } from "../types";
 import { ipc } from "../ipc";
 import { MessageItem } from "./MessageItem";
 import { ExecutionProcessBlock, groupTimelineItems } from "./ExecutionProcessBlock";
@@ -43,12 +43,14 @@ const ROLE_INFO: Record<string, { label: string; Icon: any; color: string }> = {
   fullstack: { label: "全栈开发", Icon: Layers, color: "text-indigo-400 bg-indigo-500/10 border-indigo-500/20" },
 };
 
+const EMPTY_MESSAGES: Message[] = [];
+
 export function SubprocessView({ subprocessId }: { subprocessId: string }) {
   const currentParentId = useStore((s) => s.currentId);
   const storeSubprocesses = useStore((s) => s.subprocesses);
   const storeSubagents = useStore((s) => s.subagents);
   const storeSessions = useStore((s) => s.sessions);
-  const currentMessages = useStore((s) => (currentParentId ? s.messages[currentParentId] ?? [] : []));
+  const currentMessages = useStore((s) => (currentParentId ? s.messages[currentParentId] ?? EMPTY_MESSAGES : EMPTY_MESSAGES));
 
   // 1. 全维定位子进程 Session 对象
   const sub = useMemo(() => {
@@ -84,7 +86,7 @@ export function SubprocessView({ subprocessId }: { subprocessId: string }) {
 
   const realSubId = sub?.id || subprocessId;
 
-  const msgs = useStore((s) => s.messages[realSubId] ?? s.messages[subprocessId] ?? []);
+  const msgs = useStore((s) => s.messages[realSubId] ?? s.messages[subprocessId] ?? EMPTY_MESSAGES);
   const runStatus = useStore((s) => s.runStatus);
   const isRunning = runStatus[realSubId] === "running" || runStatus[subprocessId] === "running";
 

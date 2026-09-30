@@ -170,6 +170,9 @@ export interface ContextUsageGaugeProps {
   className?: string;
 }
 
+const EMPTY_MESSAGES: Message[] = [];
+const EMPTY_COMPACTIONS: SessionCompaction[] = [];
+
 export function ContextUsageGauge({ session, className = "" }: ContextUsageGaugeProps) {
   const currentId = useStore((s) => s.currentId);
   const draft = useStore((s) => s.draft);
@@ -178,8 +181,8 @@ export function ContextUsageGauge({ session, className = "" }: ContextUsageGauge
   const setDraftContextTokenLimit = useStore((s) => s.setDraftContextTokenLimit);
 
   const sessionId = session?.id ?? currentId ?? DRAFT_ID;
-  const messages = useStore((s) => (sessionId ? s.messages[sessionId] ?? [] : []));
-  const compactions = useStore((s) => (sessionId ? s.sessionCompactions[sessionId] ?? [] : []));
+  const messages = useStore((s) => (sessionId ? s.messages[sessionId] ?? EMPTY_MESSAGES : EMPTY_MESSAGES));
+  const compactions = useStore((s) => (sessionId ? s.sessionCompactions[sessionId] ?? EMPTY_COMPACTIONS : EMPTY_COMPACTIONS));
 
   const [openModal, setOpenModal] = useState(false);
   const [showTooltip, setShowTooltip] = useState(false);

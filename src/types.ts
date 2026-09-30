@@ -51,6 +51,8 @@ export interface PlanSummary {
   total_steps: number;
   completed_steps: number;
   is_active: boolean;
+  steps?: PlanStep[];
+  body?: string;
 }
 
 export interface ActivePlanDetail {
@@ -123,6 +125,37 @@ export interface Settings {
   reasoningEffort?: ReasoningEffort | string | null;
   proxyEnabled?: boolean;
   proxyUrl?: string;
+  jev?: JevCfg;
+}
+
+export interface JevFeatures {
+  memoryGate: boolean;
+  thinkingDepth: boolean;
+  commandGuard: boolean;
+  planReviewManual: boolean;
+  planReviewAuto: boolean;
+}
+
+export interface JevCfg {
+  enabled: boolean;
+  baseUrl: string;
+  model: string;
+  apiKey: string;
+  timeoutMs: number;
+  minConfidence: number;
+  features: JevFeatures;
+}
+
+export interface PlanReviewReport {
+  completenessProb?: number | null;
+  consistencyProb?: number | null;
+  verificationGapProb?: number | null;
+  contextFitScore?: number | null;
+  riskLevel?: string | null;
+  overallVerdict: string;
+  confidence: number;
+  passed: boolean;
+  details: string[];
 }
 
 export interface AgentSopInfo {
@@ -474,6 +507,54 @@ export interface ToolEvent {
   revertedAt?: string | null;
 }
 
+export interface ToolLogFilter {
+  projectId?: string | null;
+  sessionId?: string | null;
+  status?: string | null; // "all" | "error_only" | "failed" | "denied" | "timeout" | "success"
+  toolName?: string | null;
+  keyword?: string | null;
+  startDate?: string | null;
+  endDate?: string | null;
+  page?: number;
+  pageSize?: number;
+}
+
+export interface ToolLogItem {
+  id: string;
+  messageId: string;
+  toolName: string;
+  toolCallId?: string | null;
+  params: any;
+  resultText?: string | null;
+  status: string;
+  approvalScope?: string | null;
+  createdAt: string;
+  subprocessId?: string | null;
+  sessionId: string;
+  sessionTitle: string;
+  projectId?: string | null;
+  projectName?: string | null;
+  reasoning?: string | null;
+}
+
+export interface TopErrorSummary {
+  toolName: string;
+  errorSummary: string;
+  count: number;
+  sessionCount: number;
+  latestAt: string;
+}
+
+export interface ToolLogQueryResult {
+  totalCount: number;
+  errorCount: number;
+  items: ToolLogItem[];
+  topErrors: TopErrorSummary[];
+  page: number;
+  pageSize: number;
+  totalPages: number;
+}
+
 export interface Message {
   id: string;
   sessionId: string;
@@ -557,6 +638,26 @@ export interface TurnMetrics {
  * 确保消息列表严格单调递增排序（按 seq 升序；占位符按创建时间稳定置于末尾）。
  */
 export function sortMessages(msgs: Message[]): Message[] {
+  if (msgs.length <= 1) return msgs;
+  let sorted = true;
+  for (let i = 0; i < msgs.length - 1; i++) {
+    const a = msgs[i];
+    const b = msgs[i + 1];
+    if (a.seq > b.seq) {
+      sorted = false;
+      break;
+    }
+    if (a.seq === b.seq) {
+      const tA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const tB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      if (tA > tB) {
+        sorted = false;
+        break;
+      }
+    }
+  }
+  if (sorted) return msgs;
+
   return [...msgs].sort((a, b) => {
     if (a.seq !== b.seq) return a.seq - b.seq;
     const tA = a.createdAt ? new Date(a.createdAt).getTime() : 0;

@@ -16,6 +16,7 @@ import { Sidebar } from "./components/Sidebar";
 import { TempActions } from "./components/TempActions";
 import { Toasts } from "./components/Toasts";
 import { TokenStatsModal } from "./components/TokenStatsModal";
+import { LogViewerModal } from "./components/LogViewerModal";
 import { TopBar } from "./components/TopBar";
 import { TaskDetailModal } from "./components/TaskDetailModal";
 import { CollaboratorBar } from "./components/CollaboratorBar";
@@ -120,6 +121,7 @@ export default function App() {
       <DiffModal />
       <GrowthModal />
       <TokenStatsModal />
+      <LogViewerModal />
       <TaskDetailModal />
       <CreateCollaboratorModal />
       <EditCollaboratorModal />

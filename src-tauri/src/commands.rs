@@ -64,6 +64,10 @@ pub fn set_settings(state: State<'_, crate::AppState>, settings: SettingsData) -
             p.api_key = String::new();
         }
     }
+    if !clean.jev.api_key.is_empty() {
+        store::secret_set(&db, &master, crate::secrets::JEV_API_KEY_ID, &clean.jev.api_key)?;
+        clean.jev.api_key = String::new();
+    }
     // 清理已删除 Provider 的凭据
     for old_p in &old.providers {
         if !clean.providers.iter().any(|p| p.id == old_p.id) {
@@ -125,6 +129,78 @@ pub async fn test_provider(
         proxy_url,
     };
     llm::test_connection(&cfg).await
+}
+
+#[tauri::command]
+pub async fn test_jev(
+    state: State<'_, crate::AppState>,
+    jev_cfg: JevCfg,
+) -> Result<String, String> {
+    let (key, proxy_url) = {
+        let db = state.db.lock().unwrap();
+        let master = state.master_key.lock().unwrap();
+        let k = if jev_cfg.api_key.trim().is_empty() {
+            store::secret_get(&db, &master, crate::secrets::JEV_API_KEY_ID).ok().flatten().unwrap_or_default()
+        } else {
+            jev_cfg.api_key.trim().to_string()
+        };
+        let p = store::get_settings(&db).ok().and_then(|s| s.effective_proxy_url());
+        (k, p)
+    };
+
+    if key.trim().is_empty() {
+        return Err("未配置 Jev API Key（本地暂无已保存密钥），请先输入 API Key".into());
+    }
+
+    let client = crate::jev::JevClient::new(
+        jev_cfg.base_url.clone(),
+        key,
+        jev_cfg.model.clone(),
+        jev_cfg.timeout_ms.max(5000), // 测试连接放宽至 5 秒
+        proxy_url,
+    );
+
+    let start = std::time::Instant::now();
+    let mut q = std::collections::HashMap::new();
+    q.insert(
+        "ping".into(),
+        crate::jev::JevQuestion::Noul {
+            instructions: "This is a connectivity check. Please evaluate true if reachable.".into(),
+        },
+    );
+
+    let target_endpoint = client.resolve_endpoint();
+    match client.systemone("harness_mini connectivity check", q).await {
+        Ok(res) => {
+            let elapsed = start.elapsed().as_millis();
+            let noul_val = res.get("ping").and_then(|a| a.noul).unwrap_or(1.0);
+            Ok(format!("Jev 连接成功！耗时: {}ms，端点: {}，模型: {}，响应值: {:.2}", elapsed, target_endpoint, jev_cfg.model, noul_val))
+        }
+        Err(e) => Err(format!("Jev 连接失败: {e}")),
+    }
+}
+
+#[tauri::command]
+pub async fn evaluate_plan(
+    state: State<'_, crate::AppState>,
+    plan_id: String,
+    workspace: String,
+) -> Result<crate::jev::PlanReviewReport, String> {
+    let ws_path = Path::new(&workspace);
+    let (settings, plan_content) = {
+        let db = state.db.lock().unwrap();
+        let m = *state.master_key.lock().unwrap();
+        let s = store::get_settings_with_secrets(&db, &m)?;
+        let text = crate::plan::read_plan(ws_path, "", Some(&plan_id), Some(&db))?;
+        (s, text)
+    };
+
+    let client = crate::jev::JevClient::from_cfg(&settings.jev, settings.effective_proxy_url())
+        .ok_or("Jev 决策网关未启用或未配置 API Key")?;
+
+    let (tech_stack, _) = crate::sop::detect_project_stack(ws_path);
+
+    client.evaluate_plan_feasibility(&plan_content, &tech_stack, settings.jev.min_confidence).await
 }
 
 #[tauri::command]
@@ -2334,9 +2410,17 @@ pub fn get_token_stats(
     state: State<'_, crate::AppState>,
     project_id: Option<String>,
     days: Option<u32>,
+    start_date: Option<String>,
+    end_date: Option<String>,
 ) -> Result<TokenStatsReport, String> {
     let db = state.db.lock().unwrap();
-    store::get_token_stats(&db, project_id.as_deref(), days)
+    store::get_token_stats(
+        &db,
+        project_id.as_deref(),
+        days,
+        start_date.as_deref(),
+        end_date.as_deref(),
+    )
 }
 
 #[tauri::command]
@@ -3395,6 +3479,17 @@ pub async fn revert_to_message(
                 "todos": todos,
             }));
         }
+        let active_plan_opt = crate::plan::sync_session_plans_after_revert(&db, &ws, &session_id).unwrap_or(None);
+        let _ = app.emit("session:plans", &serde_json::json!({
+            "sessionId": session_id,
+            "activePlanId": active_plan_opt,
+        }));
+        let _ = app.emit("file_viewer:file_changed", serde_json::json!({
+            "path": format!("{}/.harness/plans", ws.to_string_lossy())
+        }));
+        let _ = app.emit("file_viewer:file_changed", serde_json::json!({
+            "path": format!("{}/.harness/memory", ws.to_string_lossy())
+        }));
         let _ = app.emit("messages:changed", &serde_json::json!({ "sessionId": session_id }));
     }
 
@@ -3444,6 +3539,17 @@ pub async fn reapply_from_message(
                 "todos": todos,
             }));
         }
+        let active_plan_opt = crate::plan::sync_session_plans_after_revert(&db, &ws, &session_id).unwrap_or(None);
+        let _ = app.emit("session:plans", &serde_json::json!({
+            "sessionId": session_id,
+            "activePlanId": active_plan_opt,
+        }));
+        let _ = app.emit("file_viewer:file_changed", serde_json::json!({
+            "path": format!("{}/.harness/plans", ws.to_string_lossy())
+        }));
+        let _ = app.emit("file_viewer:file_changed", serde_json::json!({
+            "path": format!("{}/.harness/memory", ws.to_string_lossy())
+        }));
         let _ = app.emit("messages:changed", &serde_json::json!({ "sessionId": session_id }));
     }
 
@@ -3488,6 +3594,17 @@ pub async fn revert_message_turn(
                 "todos": todos,
             }));
         }
+        let active_plan_opt = crate::plan::sync_session_plans_after_revert(&db, &ws, &session_id).unwrap_or(None);
+        state.emit("session:plans", &serde_json::json!({
+            "sessionId": session_id,
+            "activePlanId": active_plan_opt,
+        }));
+        state.emit("file_viewer:file_changed", &serde_json::json!({
+            "path": format!("{}/.harness/plans", ws.to_string_lossy())
+        }));
+        state.emit("file_viewer:file_changed", &serde_json::json!({
+            "path": format!("{}/.harness/memory", ws.to_string_lossy())
+        }));
         state.emit("messages:changed", &serde_json::json!({ "sessionId": session_id }));
     }
 
@@ -3531,6 +3648,17 @@ pub async fn reapply_message_turn(
                 "todos": todos,
             }));
         }
+        let active_plan_opt = crate::plan::sync_session_plans_after_revert(&db, &ws, &session_id).unwrap_or(None);
+        state.emit("session:plans", &serde_json::json!({
+            "sessionId": session_id,
+            "activePlanId": active_plan_opt,
+        }));
+        state.emit("file_viewer:file_changed", &serde_json::json!({
+            "path": format!("{}/.harness/plans", ws.to_string_lossy())
+        }));
+        state.emit("file_viewer:file_changed", &serde_json::json!({
+            "path": format!("{}/.harness/memory", ws.to_string_lossy())
+        }));
         state.emit("messages:changed", &serde_json::json!({ "sessionId": session_id }));
     }
 
@@ -3739,6 +3867,15 @@ pub async fn get_turn_diff(
     };
 
     crate::snapshot_revert::get_snapshots_diff_details(&data_dir, &snapshots).await
+}
+
+#[tauri::command]
+pub async fn query_tool_logs(
+    state: State<'_, crate::AppState>,
+    filter: crate::models::ToolLogFilter,
+) -> Result<crate::models::ToolLogQueryResult, String> {
+    let db = state.db.lock().unwrap();
+    store::query_tool_logs(&db, &filter)
 }
 
 #[cfg(test)]

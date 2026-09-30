@@ -170,6 +170,12 @@ function RunningCommandCard({ ev }: { ev: ToolEvent }) {
   );
 }
 
+const EMPTY_TODOS: TodoItem[] = [];
+const EMPTY_PLANS: PlanSummary[] = [];
+const EMPTY_COLLABS: any[] = [];
+const EMPTY_SUBPROCESSES: any[] = [];
+const EMPTY_SUBAGENTS: any[] = [];
+
 export function FloatingTaskPanel() {
   const currentId = useStore((s) => s.currentId);
   const currentWorkspace = useStore(
@@ -184,7 +190,9 @@ export function FloatingTaskPanel() {
       ""
   );
   const isRunning = useStore((s) => (s.currentId ? s.runStatus[s.currentId] === "running" : false));
-  const rawTodos: TodoItem[] = useStore((s) => (s.currentId ? s.sessionTodos[s.currentId] ?? [] : []));
+  const rawTodos: TodoItem[] = useStore((s) => (s.currentId ? s.sessionTodos[s.currentId] ?? EMPTY_TODOS : EMPTY_TODOS));
+  const plans: PlanSummary[] = useStore((s) => (s.currentId ? s.sessionPlans[s.currentId] ?? EMPTY_PLANS : EMPTY_PLANS));
+  const loadPlans = useStore((s) => s.loadPlans);
   const lastRunOutcome = useStore((s) => (s.currentId ? s.lastRunOutcome[s.currentId] : undefined));
   const runningCmds = useRunningCommands();
   const msgs = useStore((s) => currentMessages(s));
@@ -194,9 +202,9 @@ export function FloatingTaskPanel() {
 
   // 会话隔离上下文：当前会话及其关联协作者/父子会话
   const currentSessionObj = useStore((s) => currentSession(s));
-  const collabs = useStore((s) => (s.currentId ? s.collaborators[s.currentId] ?? [] : []));
-  const subprocesses = useStore((s) => (s.currentId ? s.subprocesses[s.currentId] ?? [] : []));
-  const subagents = useStore((s) => (s.currentId ? s.subagents[s.currentId] ?? [] : []));
+  const collabs = useStore((s) => (s.currentId ? s.collaborators[s.currentId] ?? EMPTY_COLLABS : EMPTY_COLLABS));
+  const subprocesses = useStore((s) => (s.currentId ? s.subprocesses[s.currentId] ?? EMPTY_SUBPROCESSES : EMPTY_SUBPROCESSES));
+  const subagents = useStore((s) => (s.currentId ? s.subagents[s.currentId] ?? EMPTY_SUBAGENTS : EMPTY_SUBAGENTS));
 
   const relatedSessionIds = useMemo(() => {
     const set = new Set<string>();
@@ -209,91 +217,23 @@ export function FloatingTaskPanel() {
   }, [currentId, currentSessionObj?.parentSessionId, collabs, subprocesses, subagents]);
 
   const [collapsed, setCollapsed] = useState(false);
-  const [plans, setPlans] = useState<PlanSummary[]>([]);
-  const [planDetails, setPlanDetails] = useState<Record<string, ActivePlanDetail>>({});
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [showPlanModal, setShowPlanModal] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [highlightedTaskId, setHighlightedTaskId] = useState<string | null>(null);
   const retryCountRef = useRef(0);
 
-  // 1. 获取当前会话关联的所有方案文档与详细信息
-  const fetchPlans = useCallback(async () => {
-    if (!currentId || currentId === DRAFT_ID) {
-      setPlans([]);
-      setPlanDetails({});
-      return;
-    }
-    setRefreshing(true);
-    try {
-      const summaries = currentWorkspace
-        ? await ipc.listWorkspacePlans(currentWorkspace, currentId, true)
-        : [];
-
-      // 前端二次安全过滤：确保仅包含归属于当前会话或关联会话的方案
-      const filteredSummaries = summaries.filter(
-        (p) => !p.session_id || p.session_id === currentId || relatedSessionIds.has(p.session_id)
-      );
-
-      const detailsMap: Record<string, ActivePlanDetail> = {};
-      for (const p of filteredSummaries) {
-        try {
-          const detail = await ipc.getPlanDetail(currentWorkspace, currentId, p.id);
-          if (detail) {
-            detailsMap[p.id] = detail;
-          }
-        } catch {
-          // ignore error for single plan
-        }
-      }
-
-      // 兜底：若未列出，尝试直接拉取活动计划
-      if (filteredSummaries.length === 0) {
-        try {
-          const active = await ipc.getActivePlan(currentId);
-          if (
-            active &&
-            active.meta &&
-            (!active.meta.session_id ||
-              active.meta.session_id === currentId ||
-              relatedSessionIds.has(active.meta.session_id))
-          ) {
-            filteredSummaries.push({
-              id: active.meta.id,
-              title: active.meta.title,
-              status: active.meta.status,
-              version: active.meta.version,
-              filename: active.filename,
-              created_at: active.meta.created_at,
-              updated_at: active.meta.updated_at,
-              session_id: active.meta.session_id,
-              total_steps: active.steps?.length ?? 0,
-              completed_steps: active.steps?.filter((s) => s.status === "done").length ?? 0,
-              is_active: active.meta.status === "in_progress",
-            });
-            detailsMap[active.meta.id] = active;
-          }
-        } catch {
-          // ignore
-        }
-      }
-
-      setPlans(filteredSummaries);
-      setPlanDetails(detailsMap);
-    } catch (err) {
-      console.error("加载方案清单失败:", err);
-    } finally {
-      setRefreshing(false);
-    }
-  }, [currentId, currentWorkspace, relatedSessionIds]);
-
+  // 当会话切换时按需拉取方案清单
   useEffect(() => {
-    fetchPlans();
-  }, [currentId, isRunning, fetchPlans]);
+    if (currentId && currentId !== DRAFT_ID) {
+      void loadPlans(currentId);
+    }
+  }, [currentId, loadPlans]);
 
   // 监听消息流中最近发生的方案工具更新（create_plan / update_plan / switch_plan）
   const lastPlanEventKey = useMemo(() => {
     for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].revertedAt) continue;
       const evs = msgs[i].toolEvents;
       if (!evs) continue;
       const found = evs.find((e) => ["create_plan", "update_plan", "switch_plan"].includes(e.toolName));
@@ -303,10 +243,10 @@ export function FloatingTaskPanel() {
   }, [msgs]);
 
   useEffect(() => {
-    if (lastPlanEventKey) {
-      fetchPlans();
+    if (lastPlanEventKey && currentId) {
+      void loadPlans(currentId);
     }
-  }, [lastPlanEventKey, fetchPlans]);
+  }, [lastPlanEventKey, currentId, loadPlans]);
 
   // 2. 从消息流中提取独立的 todo 任务清单（按真实对话轮次 Turn 折叠聚合）
   const todoTasks = useMemo(() => {
@@ -493,9 +433,8 @@ export function FloatingTaskPanel() {
         continue;
       }
 
-      const detail = planDetails[p.id];
-      const items: TimelineTaskItem[] = detail?.steps
-        ? detail.steps.map((s) => ({
+      const items: TimelineTaskItem[] = p.steps
+        ? p.steps.map((s) => ({
             index: s.index,
             content: `步骤 ${s.index}：${s.content}`,
             status: s.status,
@@ -552,7 +491,7 @@ export function FloatingTaskPanel() {
         filename: p.filename,
         status: p.status as TaskStatus,
         items,
-        body: detail?.body || "",
+        body: p.body || "",
         messageId: foundMsgId,
         toolEventId: foundEventId,
         toolEventIds: matchedEventIds,
@@ -561,7 +500,7 @@ export function FloatingTaskPanel() {
       });
     }
     return list;
-  }, [plans, planDetails, msgs, currentId, relatedSessionIds]);
+  }, [plans, msgs, currentId, relatedSessionIds]);
 
   // 4. 统一任务时间线（按时间升序排列，最新项排在末尾）
   const timeline: TimelineTask[] = useMemo(() => {
@@ -645,10 +584,10 @@ export function FloatingTaskPanel() {
       return;
     }
 
-    // 若未直接命中，且重试次数小于 3 次，主动触发 fetchPlans 并在异步返回后由 timeline 变化重新触发本 effect
+    // 若未直接命中，且重试次数小于 3 次，主动触发 loadPlans 并在异步返回后由 timeline 变化重新触发本 effect
     if (retryCountRef.current < 3) {
       retryCountRef.current += 1;
-      fetchPlans();
+      if (currentId) void loadPlans(currentId);
       const timer = setTimeout(() => {
         // 等待下一渲染帧重新触发
       }, 250);
@@ -661,7 +600,7 @@ export function FloatingTaskPanel() {
       setFocusFloatingTaskId(null);
       retryCountRef.current = 0;
     }
-  }, [focusFloatingTaskId, timeline, matchTarget, fetchPlans, setFocusFloatingTaskId]);
+  }, [focusFloatingTaskId, timeline, matchTarget, currentId, loadPlans, setFocusFloatingTaskId]);
 
   // 6. 默认选中逻辑：若未选中或旧项失效，优先选处于进行中的任务，否则选最新任务（末尾项）
   useEffect(() => {
@@ -694,16 +633,20 @@ export function FloatingTaskPanel() {
     if (!currentTask) return;
     const nextStatus = currentStatus === "done" ? "pending" : "done";
 
-    if (currentTask.type === "plan" && currentWorkspace) {
-      const planDetail = planDetails[currentTask.id];
-      if (planDetail) {
-        const oldSteps = planDetail.steps;
+    if (currentTask.type === "plan" && currentWorkspace && currentId) {
+      const targetPlan = plans.find((p) => p.id === currentTask.id);
+      if (targetPlan && targetPlan.steps) {
+        const oldSteps = targetPlan.steps;
         const updatedSteps = oldSteps.map((s) =>
           s.index === stepIndex ? { ...s, status: nextStatus as "pending" | "done" } : s
         );
-        setPlanDetails((prev) => ({
-          ...prev,
-          [currentTask.id]: { ...planDetail, steps: updatedSteps },
+        useStore.setState((st) => ({
+          sessionPlans: {
+            ...st.sessionPlans,
+            [currentId]: (st.sessionPlans[currentId] || []).map((p) =>
+              p.id === currentTask.id ? { ...p, steps: updatedSteps } : p
+            ),
+          },
         }));
 
         try {
@@ -712,13 +655,17 @@ export function FloatingTaskPanel() {
             currentTask.id,
             stepIndex,
             nextStatus,
-            currentId || undefined
+            currentId
           );
         } catch (err) {
           console.error("更新计划步骤状态失败:", err);
-          setPlanDetails((prev) => ({
-            ...prev,
-            [currentTask.id]: { ...planDetail, steps: oldSteps },
+          useStore.setState((st) => ({
+            sessionPlans: {
+              ...st.sessionPlans,
+              [currentId]: (st.sessionPlans[currentId] || []).map((p) =>
+                p.id === currentTask.id ? { ...p, steps: oldSteps } : p
+              ),
+            },
           }));
         }
       }
@@ -738,7 +685,7 @@ export function FloatingTaskPanel() {
     try {
       await ipc.switchPlan(currentWorkspace, currentId, planId);
       pushToast("已切换为当前活动方案", "success");
-      await fetchPlans();
+      await loadPlans(currentId);
       setSelectedTaskId(planId);
     } catch (err) {
       console.error("切换活动方案失败:", err);
@@ -872,7 +819,16 @@ export function FloatingTaskPanel() {
             <button
               type="button"
               className="p-1 text-inkdim hover:text-ink rounded-md hover:bg-panel3 transition-colors cursor-pointer"
-              onClick={fetchPlans}
+              onClick={async () => {
+                if (currentId && currentId !== DRAFT_ID) {
+                  setRefreshing(true);
+                  try {
+                    await loadPlans(currentId);
+                  } finally {
+                    setRefreshing(false);
+                  }
+                }
+              }}
               title="重新从工作区与数据库读取方案与任务进度"
             >
               <RotateCcw size={12} className={refreshing ? "animate-spin text-emerald-400" : ""} />

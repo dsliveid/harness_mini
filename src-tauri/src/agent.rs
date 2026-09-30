@@ -877,13 +877,69 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         );
         return (RunOutcome::Failed, None, run_tokens);
     };
-    let effective_reasoning_effort = session
+    let mut effective_reasoning_effort = session
         .reasoning_effort
         .as_deref()
         .filter(|s| !s.is_empty())
         .or(settings.reasoning_effort.as_deref())
         .filter(|s| !s.is_empty() && *s != "default")
         .map(|s| s.to_string());
+
+    // --- Jev 决策网关：痛点 2 & 3 任务复杂度感知与动态思考深度/调研路由 ---
+    let mut dynamic_guidance_prompt: Option<String> = None;
+    if settings.jev.enabled && settings.jev.features.thinking_depth {
+        let last_user_prompt = {
+            let db = state.db.lock().unwrap();
+            store::all_messages(&db, session_id).unwrap_or_default()
+                .into_iter()
+                .filter(|m| m.role == "user")
+                .last()
+                .and_then(|m| m.content)
+        };
+
+        if let Some(user_txt) = last_user_prompt {
+            if let Some(client) = crate::jev::JevClient::from_cfg(&settings.jev, settings.effective_proxy_url()) {
+                if let Some((complexity, needs_research, conf)) = client.classify_task_complexity(&user_txt, settings.jev.min_confidence).await {
+                    match complexity {
+                        crate::jev::TaskComplexity::Trivial | crate::jev::TaskComplexity::Small => {
+                            // 小任务快速收敛，调低推理深度，避免过度思考与大量上下文浪费
+                            effective_reasoning_effort = Some("low".to_string());
+                            dynamic_guidance_prompt = Some(format!(
+                                "【⚡ Jev 快决策引导（置信度 {:.0}%）】: 本轮任务被评估为轻量级改动（{}）。请直奔目标快速收敛，严禁过度扩散探索或产生冗余工具调用。",
+                                conf * 100.0,
+                                complexity.as_str()
+                            ));
+                        }
+                        crate::jev::TaskComplexity::Large => {
+                            // 保持正常或按需规划
+                            dynamic_guidance_prompt = Some(format!(
+                                "【⚡ Jev 快决策引导（置信度 {:.0}%）】: 本轮任务涉及较大模块或多文件改动。请遵循方案先行与严密分步推进。",
+                                conf * 100.0
+                            ));
+                        }
+                        crate::jev::TaskComplexity::DeepResearch => {
+                            // 复杂疑难任务，上调推理深度
+                            effective_reasoning_effort = Some("high".to_string());
+                            dynamic_guidance_prompt = Some(format!(
+                                "【⚡ Jev 快决策引导（置信度 {:.0}%）】: 本轮任务被评估为复杂深度任务。已自动开启深度推理，请先深入排查根本原因或调研现有实现。",
+                                conf * 100.0
+                            ));
+                        }
+                    }
+
+                    if needs_research {
+                        // 判定超出既有认知，注入外部调研引导
+                        let research_guide = "\n【🔍 外部调研建议】: 当前需求涉及外部知识或新规范，建议优先调用 `fetch_web_page` 等调研工具查阅官方文档，切勿凭空盲目编写。";
+                        if let Some(ref mut dg) = dynamic_guidance_prompt {
+                            dg.push_str(research_guide);
+                        } else {
+                            dynamic_guidance_prompt = Some(research_guide.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let effective_proxy_url = settings.effective_proxy_url();
     let cfg = LlmCfg {
@@ -1183,13 +1239,18 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
         };
         (sec, effective_plan_mode, neg_intent)
     };
-    let sys = system_prompt(
+    let mut sys = system_prompt(
         &session,
         project_section.as_deref(),
         &settings.disabled_sops,
         &project_plan_mode,
     );
+    if let Some(ref guide) = dynamic_guidance_prompt {
+        sys.push_str("\n\n");
+        sys.push_str(guide);
+    }
     let mut files_modified = false;
+    let mut code_modified = false;
     let mut sop_retry_count = 0usize;
     let mut sop_verified = false;
     let mut tool_tracker = ToolErrorTracker::new(2);
@@ -1429,7 +1490,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
 
         if result.tool_calls.is_empty() {
             // ---- 步骤 4：纯文本回复，交付前检查 SOP 自检 ----
-            if files_modified && !sop_verified && sop_retry_count < 2 {
+            if code_modified && !sop_verified && sop_retry_count < 2 {
                 let sop_opt = {
                     let db = state.db.lock().unwrap();
                     let proj = match &session.project_id {
@@ -1557,6 +1618,8 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
             // 避免 Agent 执行完最后一步直接给出最终回复后遗留转圈状态
             auto_finish_session_todos(&state, app, session_id);
             let _ = sop_verified;
+            let _ = files_modified;
+            let _ = code_modified;
             return (RunOutcome::Done, last_assistant_id, run_tokens);
         }
 
@@ -1720,9 +1783,8 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
             if let Ok(m) = tool_msg {
                 let _ = app.emit("message:final", &m);
             }
-            if (tc.name == "write_file" || tc.name == "edit_file") && status == "success" {
+            if (tc.name == "write_file" || tc.name == "edit_file" || tc.name == "apply_diff") && status == "success" {
                 files_modified = true;
-                sop_verified = false;
                 if let Some(rel) = args.get("path").and_then(|v| v.as_str()) {
                     let p = std::path::Path::new(rel);
                     let full_path = if p.is_absolute() {
@@ -1730,9 +1792,19 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str) -> (RunOutcom
                     } else {
                         std::path::Path::new(&session.workspace_path).join(p)
                     };
+                    if crate::sop::is_code_or_build_file_with_workspace(
+                        &full_path,
+                        Some(std::path::Path::new(&session.workspace_path)),
+                    ) {
+                        code_modified = true;
+                        sop_verified = false;
+                    }
                     let _ = app.emit("file_viewer:file_changed", serde_json::json!({
                         "path": full_path.to_string_lossy().to_string()
                     }));
+                } else {
+                    code_modified = true;
+                    sop_verified = false;
                 }
             }
             if tc.name == "create_plan" && status == "success" {
@@ -1845,16 +1917,19 @@ async fn handle_tool_call(
     // ---- 权限判定：访问模式 → 会话规则 → 风险级 → 审批 ----
     // 访问模式与会话规则均在此实时读取：对话进行中在顶栏改模式、审批时选「本会话允许」，
     // 都能对本次运行内后续的工具调用立即生效，不必等下一轮运行。
-    let (full_access, session_rules) = {
+    let (full_access, session_rules, settings) = {
         let db = state.db.lock().unwrap();
+        let master = state.master_key.lock().unwrap();
         let mode = store::get_session(&db, session_id)
             .ok()
             .flatten()
             .and_then(|s| s.access_mode)
             .unwrap_or_else(|| "confirm".into());
+        let s = store::get_settings_with_secrets(&db, &master).unwrap_or_default();
         (
             mode == "full_access",
             store::list_session_rules(&db, session_id).unwrap_or_default(),
+            s,
         )
     };
     let mut scope: Option<&'static str> = None;
@@ -1884,8 +1959,21 @@ async fn handle_tool_call(
         // .harness 目录全量读写放行白名单（方案/记忆/治理系统），免去底层写审批
         scope = Some("harness_whitelist");
     } else {
-        let high_danger =
+        let mut high_danger =
             tool_name == "run_command" && args.get("command").and_then(|c| c.as_str()).map(tools::is_high_danger).unwrap_or(false);
+
+        // --- Jev 决策网关：场景 4 终端命令破坏性高危语义双保险 ---
+        if !high_danger && tool_name == "run_command" && settings.jev.enabled && settings.jev.features.command_guard {
+            if let Some(cmd_str) = args.get("command").and_then(|c| c.as_str()) {
+                if let Some(client) = crate::jev::JevClient::from_cfg(&settings.jev, settings.effective_proxy_url()) {
+                    let ws_str = ctx.workspace.to_string_lossy();
+                    let gate = client.check_command_safety(cmd_str, &ws_str, settings.jev.min_confidence).await;
+                    if let crate::jev::Gate::Deny(_) = gate {
+                        high_danger = true;
+                    }
+                }
+            }
+        }
         if high_danger {
             // 高危命令：强制逐次审批，不可记忆放行
             need_ask = true;
@@ -3960,6 +4048,45 @@ mod tests {
         let (ev, _) = store::get_tool_event_with_session(&conn, &ev_id).unwrap().unwrap();
         for t in ev.params["todos"].as_array().unwrap() {
             assert_eq!(t["status"].as_str(), Some("done"));
+        }
+    }
+
+    #[test]
+    fn test_code_modified_filtering_logic() {
+        let ws = std::path::Path::new("F:\\WorkSpace\\Other\\harness_mini");
+
+        // 纯文档、记忆与规划规范：不触发代码修改
+        let doc_paths = vec![
+            "docs/JEV_DECISION_GATEWAY_INTEGRATION_SPEC.md",
+            "docs/architecture.markdown",
+            ".harness/plans/20260930-revert-plans.md",
+            ".harness/memory/digests/test.md",
+            "README.md",
+            ".gitignore",
+        ];
+        for dp in doc_paths {
+            assert!(
+                !crate::sop::is_code_or_build_file_with_workspace(std::path::Path::new(dp), Some(ws)),
+                "{} 应被判定为非代码文件",
+                dp
+            );
+        }
+
+        // 真实代码及构建清单文件：应触发代码修改
+        let code_paths = vec![
+            "src-tauri/src/agent.rs",
+            "src-tauri/src/sop.rs",
+            "src/components/FloatingTaskPanel.tsx",
+            "src-tauri/Cargo.toml",
+            "package.json",
+            "tsconfig.json",
+        ];
+        for cp in code_paths {
+            assert!(
+                crate::sop::is_code_or_build_file_with_workspace(std::path::Path::new(cp), Some(ws)),
+                "{} 应被判定为代码/构建文件",
+                cp
+            );
         }
     }
 }

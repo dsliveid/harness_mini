@@ -10,9 +10,13 @@ import {
   ListTodo,
   FileText,
   Tag,
+  Zap,
+  AlertTriangle,
+  ShieldCheck,
 } from "./Icons";
 import { formatTimestamp } from "../utils/frontmatter";
 import { ipc } from "../ipc";
+import type { PlanReviewReport } from "../types";
 
 export interface FrontmatterCardProps {
   meta: Record<string, any>;
@@ -64,6 +68,10 @@ export function FrontmatterCard({
   const [collapsed, setCollapsed] = useState(false);
   const [showRawYaml, setShowRawYaml] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [reviewing, setReviewing] = useState(false);
+  const [reviewReport, setReviewReport] = useState<PlanReviewReport | null>(null);
+  const [reviewError, setReviewError] = useState<string | null>(null);
+  const [showReview, setShowReview] = useState(false);
 
   const copyToClipboard = (text: string, keyName: string) => {
     if (!text) return;
@@ -71,6 +79,29 @@ export function FrontmatterCard({
       setCopiedKey(keyName);
       setTimeout(() => setCopiedKey(null), 1500);
     });
+  };
+
+  const handleEvaluatePlan = async () => {
+    if (reviewReport) {
+      setShowReview(!showReview);
+      return;
+    }
+    const planId = (meta.id || "").trim();
+    if (!planId || !workspacePath) return;
+
+    setReviewing(true);
+    setReviewError(null);
+    try {
+      const rep = await ipc.evaluatePlan(planId, workspacePath);
+      setReviewReport(rep);
+      setShowReview(true);
+    } catch (e: any) {
+      const err = typeof e === "string" ? e : e?.message || "体检评估失败";
+      setReviewError(err);
+      setShowReview(true);
+    } finally {
+      setReviewing(false);
+    }
   };
 
   const handleOpenPlanViewer = () => {
@@ -139,6 +170,23 @@ export function FrontmatterCard({
               <ListTodo size={12} />
               <span>任务清单看板</span>
             </button>
+
+            {workspacePath && meta.id && (
+              <button
+                type="button"
+                className={`flex items-center gap-1 px-2 py-1 rounded-lg border transition-colors cursor-pointer ${
+                  showReview
+                    ? "bg-amber-500/20 text-amber-300 border-amber-500/40 font-medium"
+                    : "bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border-amber-500/25"
+                }`}
+                title="使用 Jev 决策网关进行方案可行性与自洽性体检"
+                onClick={handleEvaluatePlan}
+                disabled={reviewing}
+              >
+                <Zap size={12} className={reviewing ? "animate-pulse text-amber-400" : "text-amber-400"} />
+                <span>{reviewing ? "体检中..." : "Jev 体检"}</span>
+              </button>
+            )}
 
             <button
               type="button"
@@ -272,6 +320,96 @@ export function FrontmatterCard({
                 <pre className="p-2.5 rounded-lg bg-[#0e0e12] border border-edge/80 text-[11.5px] font-mono text-zinc-300 overflow-x-auto leading-relaxed">
                   {rawYaml.trim()}
                 </pre>
+              </div>
+            )}
+
+            {/* Jev 方案可行性体检面板 */}
+            {showReview && (
+              <div className="mt-3 pt-3 border-t border-edge/60 space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Zap size={14} className="text-amber-400 shrink-0" />
+                    <span className="font-medium text-[12.5px] text-ink">Jev 方案可行性体检报告</span>
+                    {reviewReport && (
+                      <span
+                        className={`text-[11px] px-2 py-0.5 rounded border font-medium ${
+                          reviewReport.passed
+                            ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/30"
+                            : "bg-amber-500/15 text-amber-400 border-amber-500/30"
+                        }`}
+                      >
+                        {reviewReport.overallVerdict}
+                      </span>
+                    )}
+                  </div>
+                  {reviewReport && (
+                    <span className="text-[11px] text-inkdim font-mono">
+                      置信度: {(reviewReport.confidence * 100).toFixed(0)}%
+                    </span>
+                  )}
+                </div>
+
+                {reviewError && (
+                  <div className="p-2.5 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-400 text-[12px] flex items-start gap-2">
+                    <AlertTriangle size={15} className="shrink-0 mt-0.5" />
+                    <span>{reviewError}</span>
+                  </div>
+                )}
+
+                {reviewReport && (
+                  <div className="space-y-2 text-[12px]">
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                      <div className="bg-panel2/80 border border-edge/60 rounded-lg p-2 flex flex-col">
+                        <span className="text-[11px] text-inkdim">目标覆盖度</span>
+                        <span className="text-[13px] font-mono text-ink mt-0.5 font-medium">
+                          {reviewReport.completenessProb !== undefined && reviewReport.completenessProb !== null
+                            ? `${(reviewReport.completenessProb * 100).toFixed(0)}%`
+                            : "—"}
+                        </span>
+                      </div>
+                      <div className="bg-panel2/80 border border-edge/60 rounded-lg p-2 flex flex-col">
+                        <span className="text-[11px] text-inkdim">步骤自洽度</span>
+                        <span className="text-[13px] font-mono text-ink mt-0.5 font-medium">
+                          {reviewReport.consistencyProb !== undefined && reviewReport.consistencyProb !== null
+                            ? `${(reviewReport.consistencyProb * 100).toFixed(0)}%`
+                            : "—"}
+                        </span>
+                      </div>
+                      <div className="bg-panel2/80 border border-edge/60 rounded-lg p-2 flex flex-col">
+                        <span className="text-[11px] text-inkdim">技术栈契合评分</span>
+                        <span className="text-[13px] font-mono text-ink mt-0.5 font-medium">
+                          {reviewReport.contextFitScore !== undefined && reviewReport.contextFitScore !== null
+                            ? `${reviewReport.contextFitScore.toFixed(1)} / 3.0`
+                            : "—"}
+                        </span>
+                      </div>
+                      <div className="bg-panel2/80 border border-edge/60 rounded-lg p-2 flex flex-col">
+                        <span className="text-[11px] text-inkdim">综合风险等级</span>
+                        <span
+                          className={`text-[13px] font-mono mt-0.5 font-semibold ${
+                            reviewReport.riskLevel === "low"
+                              ? "text-emerald-400"
+                              : reviewReport.riskLevel === "high"
+                              ? "text-rose-400"
+                              : "text-amber-400"
+                          }`}
+                        >
+                          {(reviewReport.riskLevel || "MEDIUM").toUpperCase()}
+                        </span>
+                      </div>
+                    </div>
+
+                    {reviewReport.details.length > 0 && (
+                      <div className="bg-panel2/50 border border-edge/40 rounded-lg p-2 space-y-1">
+                        {reviewReport.details.map((d, i) => (
+                          <div key={i} className="text-inkdim text-[11.5px] leading-relaxed">
+                            {d}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             )}
           </div>

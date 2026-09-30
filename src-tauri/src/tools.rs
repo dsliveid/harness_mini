@@ -1440,22 +1440,19 @@ async fn write_file(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     )))
 }
 
-async fn record_file_snapshot(
-    ctx: &ToolCtx,
+pub async fn record_file_snapshot_raw(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    message_id: &str,
+    tool_event_id: &str,
     rel_path: &str,
     old_bytes: Option<&[u8]>,
     new_bytes: &[u8],
 ) {
-    let (Some(host), Some(event_id), Some(message_id)) = (&ctx.host, &ctx.event_id, &ctx.message_id) else {
-        return;
-    };
-    let state = host.app.state::<crate::AppState>();
+    let state = app.state::<crate::AppState>();
     let data_dir = {
         let lock = state.data_dir.lock().unwrap();
-        lock.clone()
-    };
-    let Some(data_dir) = data_dir else {
-        return;
+        lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
     };
 
     let before_hash = match old_bytes {
@@ -1479,9 +1476,9 @@ async fn record_file_snapshot(
 
     let snap = crate::models::ToolFileSnapshot {
         id: uuid::Uuid::new_v4().to_string(),
-        session_id: host.session_id.clone(),
-        message_id: message_id.clone(),
-        tool_event_id: event_id.clone(),
+        session_id: session_id.to_string(),
+        message_id: message_id.to_string(),
+        tool_event_id: tool_event_id.to_string(),
         file_path: rel_path.replace('\\', "/"),
         before_hash,
         after_hash,
@@ -1494,6 +1491,26 @@ async fn record_file_snapshot(
     if let Err(e) = crate::store::insert_tool_file_snapshot(&db, &snap) {
         eprintln!("[Snapshot] 插入快照元数据失败: {e}");
     }
+}
+
+pub(crate) async fn record_file_snapshot(
+    ctx: &ToolCtx,
+    rel_path: &str,
+    old_bytes: Option<&[u8]>,
+    new_bytes: &[u8],
+) {
+    let (Some(host), Some(event_id), Some(message_id)) = (&ctx.host, &ctx.event_id, &ctx.message_id) else {
+        return;
+    };
+    record_file_snapshot_raw(
+        &host.app,
+        &host.session_id,
+        message_id,
+        event_id,
+        rel_path,
+        old_bytes,
+        new_bytes,
+    ).await;
 }
 
 async fn edit_file(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
@@ -2138,7 +2155,43 @@ async fn record_memory_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Strin
     let title = args.get("title").and_then(|v| v.as_str()).ok_or("缺少 title 参数")?;
     let content = args.get("content").and_then(|v| v.as_str()).ok_or("缺少 content 参数")?;
 
-    crate::memory::record_memory(&ctx.workspace, category, title, content)
+    // --- Jev 决策网关：痛点 1 记忆沉淀真实性与必要性门控 ---
+    if let Some(host) = &ctx.host {
+        let state = host.app.state::<crate::AppState>();
+        let (jev_client_opt, min_conf) = {
+            let db = state.db.lock().unwrap();
+            let master = state.master_key.lock().unwrap();
+            if let Ok(settings) = crate::store::get_settings_with_secrets(&db, &master) {
+                if settings.jev.enabled && settings.jev.features.memory_gate {
+                    (
+                        crate::jev::JevClient::from_cfg(&settings.jev, settings.effective_proxy_url()),
+                        settings.jev.min_confidence,
+                    )
+                } else {
+                    (None, 0.6)
+                }
+            } else {
+                (None, 0.6)
+            }
+        };
+
+        if let Some(client) = jev_client_opt {
+            let ws_str = ctx.workspace.to_string_lossy();
+            let gate = client.judge_memory_quality(content, &ws_str, min_conf).await;
+            match gate {
+                crate::jev::Gate::Deny(reason) => {
+                    return Ok(format!("【⚠️ Jev 决策网关拦截】该知识/经验未予入库：{reason}。请仅在对代码实地验证后且具备长期复用价值时沉淀知识。"));
+                }
+                crate::jev::Gate::Allow | crate::jev::Gate::Abstain => {
+                    // 放行或降级回原逻辑
+                }
+            }
+        }
+    }
+
+    let effect = crate::memory::record_memory_with_effect(&ctx.workspace, category, title, content)?;
+    record_file_snapshot(ctx, &effect.rel_path, effect.old_bytes.as_deref(), &effect.new_bytes).await;
+    Ok(effect.message)
 }
 
 async fn read_memory_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
@@ -2167,20 +2220,28 @@ async fn create_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String>
     let session_id = ctx.host.as_ref().map(|h| h.session_id.as_str()).unwrap_or("");
     let app = ctx.host.as_ref().map(|h| &h.app);
     let state = app.map(|a| a.state::<crate::AppState>());
-    let db_guard = state.as_ref().map(|s| s.db.lock().unwrap());
-    let db_ref = db_guard.as_deref();
+    let effect = {
+        let db_guard = state.as_ref().map(|s| s.db.lock().unwrap());
+        crate::plan::create_plan_with_effect(
+            &ctx.workspace,
+            session_id,
+            title,
+            goals,
+            architecture,
+            &files,
+            &steps,
+            verification,
+            db_guard.as_deref(),
+        )?
+    };
+    drop(state);
 
-    crate::plan::create_plan(
-        &ctx.workspace,
-        session_id,
-        title,
-        goals,
-        architecture,
-        &files,
-        &steps,
-        verification,
-        db_ref,
-    )
+    if let (Some(rel), Some(nb)) = (&effect.suspended_plan_rel, &effect.suspended_new_bytes) {
+        record_file_snapshot(ctx, rel, effect.suspended_old_bytes.as_deref(), nb).await;
+    }
+    record_file_snapshot(ctx, &effect.new_plan_rel, None, &effect.new_bytes).await;
+
+    Ok(effect.message)
 }
 
 async fn update_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
@@ -2194,20 +2255,25 @@ async fn update_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String>
     let session_id = ctx.host.as_ref().map(|h| h.session_id.as_str()).unwrap_or("");
     let app = ctx.host.as_ref().map(|h| &h.app);
     let state = app.map(|a| a.state::<crate::AppState>());
-    let db_guard = state.as_ref().map(|s| s.db.lock().unwrap());
-    let db_ref = db_guard.as_deref();
+    let effect = {
+        let db_guard = state.as_ref().map(|s| s.db.lock().unwrap());
+        crate::plan::update_plan_with_effect(
+            &ctx.workspace,
+            session_id,
+            plan_id,
+            reason,
+            status,
+            step_updates,
+            modified_sections,
+            revision_note,
+            db_guard.as_deref(),
+        )?
+    };
+    drop(state);
 
-    crate::plan::update_plan(
-        &ctx.workspace,
-        session_id,
-        plan_id,
-        reason,
-        status,
-        step_updates,
-        modified_sections,
-        revision_note,
-        db_ref,
-    )
+    record_file_snapshot(ctx, &effect.rel_path, Some(&effect.old_bytes), &effect.new_bytes).await;
+
+    Ok(effect.message)
 }
 
 async fn switch_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
@@ -2644,130 +2710,140 @@ async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
     let mut out = String::new();
     let is_timed_out = start_wait.elapsed() >= max_wait;
 
-    let db = state.db.lock().unwrap();
-    let mut any_interrupted_or_failed = false;
-    let mut any_still_running = false;
-    let mut sub_results = Vec::new();
+    let (sub_results, any_still_running, any_interrupted_or_failed, memory_effects) = {
+        let db = state.db.lock().unwrap();
+        let mut any_interrupted_or_failed = false;
+        let mut any_still_running = false;
+        let mut sub_results = Vec::new();
+        let mut memory_effects = Vec::new();
 
-    for id in &target_ids {
-        let is_running = crate::agent::is_run_active(&state, id);
-        if is_running {
-            any_still_running = true;
-        }
-        let s = crate::store::get_session(&db, id)?.unwrap_or_else(|| {
-            crate::models::Session {
-                id: id.clone(),
-                title: "未知子Agent".into(),
-                parent_session_id: Some(parent_id.clone()),
-                session_type: "subagent".into(),
-                ..Default::default()
+        for id in &target_ids {
+            let is_running = crate::agent::is_run_active(&state, id);
+            if is_running {
+                any_still_running = true;
             }
-        });
-        let msgs = crate::store::get_messages(&db, id, None, 50).unwrap_or_default();
-        let last_reply = msgs
-            .iter()
-            .rev()
-            .find(|m| m.role == "assistant" && !m.content.as_deref().unwrap_or("").is_empty())
-            .and_then(|m| m.content.as_deref())
-            .unwrap_or("(未产生文本回复)");
+            let s = crate::store::get_session(&db, id)?.unwrap_or_else(|| {
+                crate::models::Session {
+                    id: id.clone(),
+                    title: "未知子Agent".into(),
+                    parent_session_id: Some(parent_id.clone()),
+                    session_type: "subagent".into(),
+                    ..Default::default()
+                }
+            });
+            let msgs = crate::store::get_messages(&db, id, None, 50).unwrap_or_default();
+            let last_reply = msgs
+                .iter()
+                .rev()
+                .find(|m| m.role == "assistant" && !m.content.as_deref().unwrap_or("").is_empty())
+                .and_then(|m| m.content.as_deref())
+                .unwrap_or("(未产生文本回复)");
 
-        let last_asst = msgs.iter().rev().find(|m| m.role == "assistant");
-        let has_terminal_reply = last_asst.map(|m| {
-            m.tool_calls.is_none()
-                || m.tool_calls.as_ref().map(|t| t.is_null() || t.as_array().map(|a| a.is_empty()).unwrap_or(false)).unwrap_or(false)
-        }).unwrap_or(false);
-        let has_max_steps_msg = msgs.iter().rev().any(|m| m.role == "system" && m.content.as_deref().unwrap_or("").contains("已达到最大步数"));
+            let last_asst = msgs.iter().rev().find(|m| m.role == "assistant");
+            let has_terminal_reply = last_asst.map(|m| {
+                m.tool_calls.is_none()
+                    || m.tool_calls.as_ref().map(|t| t.is_null() || t.as_array().map(|a| a.is_empty()).unwrap_or(false)).unwrap_or(false)
+            }).unwrap_or(false);
+            let has_max_steps_msg = msgs.iter().rev().any(|m| m.role == "system" && m.content.as_deref().unwrap_or("").contains("已达到最大步数"));
 
-        let (status_code, status_display) = determine_subagent_status(
-            is_running,
-            &s.status,
-            has_terminal_reply,
-            has_max_steps_msg,
-        );
-        if status_code == "interrupted" || status_code == "failed" {
-            any_interrupted_or_failed = true;
-        }
+            let (status_code, status_display) = determine_subagent_status(
+                is_running,
+                &s.status,
+                has_terminal_reply,
+                has_max_steps_msg,
+            );
+            if status_code == "interrupted" || status_code == "failed" {
+                any_interrupted_or_failed = true;
+            }
 
-        let display_reply = if has_max_steps_msg {
-            format!("⚠️ 该子任务已达到最大步数上限中止，未生成最终交付报告。最后思考或动作：\n{}", last_reply)
-        } else if status_code == "interrupted" && last_reply != "(未产生文本回复)" {
-            format!("⚠️ 该子任务执行中断或未完全收敛交付。最后思考或动作：\n{}", last_reply)
-        } else {
-            last_reply.to_string()
-        };
+            let display_reply = if has_max_steps_msg {
+                format!("⚠️ 该子任务已达到最大步数上限中止，未生成最终交付报告。最后思考或动作：\n{}", last_reply)
+            } else if status_code == "interrupted" && last_reply != "(未产生文本回复)" {
+                format!("⚠️ 该子任务执行中断或未完全收敛交付。最后思考或动作：\n{}", last_reply)
+            } else {
+                last_reply.to_string()
+            };
 
-        let mut touched_files = std::collections::BTreeSet::new();
-        for m in &msgs {
-            for te in &m.tool_events {
-                if ["write_file", "edit_file", "apply_diff"].contains(&te.tool_name.as_str()) {
-                    if let Some(p) = te.params.get("path").and_then(|v| v.as_str()) {
-                        touched_files.insert(p.to_string());
+            let mut touched_files = std::collections::BTreeSet::new();
+            for m in &msgs {
+                for te in &m.tool_events {
+                    if ["write_file", "edit_file", "apply_diff"].contains(&te.tool_name.as_str()) {
+                        if let Some(p) = te.params.get("path").and_then(|v| v.as_str()) {
+                            touched_files.insert(p.to_string());
+                        }
                     }
                 }
             }
-        }
-        let touched_vec: Vec<String> = touched_files.into_iter().collect();
-        let touched_line = if touched_vec.is_empty() {
-            String::new()
-        } else {
-            let list = touched_vec.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ");
-            format!("- 涉及改动文件: {}\n", list)
-        };
+            let touched_vec: Vec<String> = touched_files.into_iter().collect();
+            let touched_line = if touched_vec.is_empty() {
+                String::new()
+            } else {
+                let list = touched_vec.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ");
+                format!("- 涉及改动文件: {}\n", list)
+            };
 
-        // 自动沉淀技术分析类子任务成果至项目技术大盘 (profile.md)
-        let is_tech_analysis = {
-            let role_str = s.subagent_role.as_deref().unwrap_or("");
-            let title_str = s.title.as_str();
-            let task_str = s.subagent_task.as_deref().unwrap_or("");
-            role_str.contains("技术栈") || role_str.contains("架构")
-                || title_str.contains("技术栈") || title_str.contains("架构")
-                || task_str.contains("技术栈") || task_str.contains("依赖分析")
-        };
-        if is_tech_analysis && !is_running && has_terminal_reply && last_reply.len() > 50 && last_reply != "(未产生文本回复)" {
-            let already_recorded = msgs.iter().any(|m| {
-                m.tool_events.iter().any(|te| te.tool_name == "record_memory")
-            });
-            if !already_recorded && !ctx.workspace.as_os_str().is_empty() {
-                let _ = crate::memory::record_memory(
-                    &ctx.workspace,
-                    "profile",
-                    &s.title,
-                    last_reply,
-                );
+            // 自动沉淀技术分析类子任务成果至项目技术大盘 (profile.md)
+            let is_tech_analysis = {
+                let role_str = s.subagent_role.as_deref().unwrap_or("");
+                let title_str = s.title.as_str();
+                let task_str = s.subagent_task.as_deref().unwrap_or("");
+                role_str.contains("技术栈") || role_str.contains("架构")
+                    || title_str.contains("技术栈") || title_str.contains("架构")
+                    || task_str.contains("技术栈") || task_str.contains("依赖分析")
+            };
+            if is_tech_analysis && !is_running && has_terminal_reply && last_reply.len() > 50 && last_reply != "(未产生文本回复)" {
+                let already_recorded = msgs.iter().any(|m| {
+                    m.tool_events.iter().any(|te| te.tool_name == "record_memory")
+                });
+                if !already_recorded && !ctx.workspace.as_os_str().is_empty() {
+                    if let Ok(effect) = crate::memory::record_memory_with_effect(
+                        &ctx.workspace,
+                        "profile",
+                        &s.title,
+                        last_reply,
+                    ) {
+                        memory_effects.push(effect);
+                    }
+                }
             }
-        }
 
-        // 双轨交付：将长文本落地到工件文件 .harness/subtasks/{subagent_id}_report.md
-        let artifact_path_opt = if !ctx.workspace.as_os_str().is_empty() && (display_reply.len() > 250 || display_reply.contains("```") || !touched_vec.is_empty()) {
-            save_subtask_report_artifact(
-                &ctx.workspace,
-                id,
-                &s.title,
+            // 双轨交付：将长文本落地到工件文件 .harness/subtasks/{subagent_id}_report.md
+            let artifact_path_opt = if !ctx.workspace.as_os_str().is_empty() && (display_reply.len() > 250 || display_reply.contains("```") || !touched_vec.is_empty()) {
+                save_subtask_report_artifact(
+                    &ctx.workspace,
+                    id,
+                    &s.title,
+                    s.subagent_role.as_deref().unwrap_or("协作助手"),
+                    &display_reply,
+                    &touched_vec,
+                ).ok()
+            } else {
+                None
+            };
+
+            let compact_summary = extract_compact_summary(&display_reply, 350);
+            let artifact_line = if let Some(ref ap) = artifact_path_opt {
+                format!("- 📄 完整技术报告工件: [查看完整详细报告](file:///{})\n", ap.replace('\\', "/"))
+            } else {
+                String::new()
+            };
+
+            sub_results.push(format!(
+                "### 协同子 Agent: {} ({})\n- 状态: {}\n- Token 消耗: {}\n{}{}- 交付核心结论：\n```markdown\n{}\n```\n\n",
+                s.title,
                 s.subagent_role.as_deref().unwrap_or("协作助手"),
-                &display_reply,
-                &touched_vec,
-            ).ok()
-        } else {
-            None
-        };
+                status_display,
+                s.total_tokens.unwrap_or(0),
+                touched_line,
+                artifact_line,
+                compact_summary
+            ));
+        }
+        (sub_results, any_still_running, any_interrupted_or_failed, memory_effects)
+    };
 
-        let compact_summary = extract_compact_summary(&display_reply, 350);
-        let artifact_line = if let Some(ref ap) = artifact_path_opt {
-            format!("- 📄 完整技术报告工件: [查看完整详细报告](file:///{})\n", ap.replace('\\', "/"))
-        } else {
-            String::new()
-        };
-
-        sub_results.push(format!(
-            "### 协同子 Agent: {} ({})\n- 状态: {}\n- Token 消耗: {}\n{}{}- 交付核心结论：\n```markdown\n{}\n```\n\n",
-            s.title,
-            s.subagent_role.as_deref().unwrap_or("协作助手"),
-            status_display,
-            s.total_tokens.unwrap_or(0),
-            touched_line,
-            artifact_line,
-            compact_summary
-        ));
+    for effect in memory_effects {
+        record_file_snapshot(ctx, &effect.rel_path, effect.old_bytes.as_deref(), &effect.new_bytes).await;
     }
 
     if is_timed_out || any_still_running {

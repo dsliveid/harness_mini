@@ -15,6 +15,9 @@ use std::path::Path;
 const KEY_FILE: &str = "secret.key";
 const NONCE_LEN: usize = 12;
 
+/// Jev 决策网关 API Key 在 secrets 表中的统一标识
+pub const JEV_API_KEY_ID: &str = "jev_api_key";
+
 /// 加载（或首次生成）数据目录主密钥
 pub fn load_or_create_master_key(dir: &Path) -> Result<[u8; 32], String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("创建数据目录失败: {e}"))?;

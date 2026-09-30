@@ -46,6 +46,85 @@ pub fn default_proxy_url() -> Option<String> {
     Some("http://127.0.0.1:7890".to_string())
 }
 
+fn default_jev_base_url() -> String {
+    "https://api.typesafe.ai".into()
+}
+fn default_jev_model() -> String {
+    "jev-latest".into()
+}
+fn default_jev_timeout() -> u64 {
+    800
+}
+fn default_jev_min_confidence() -> f32 {
+    0.60
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct JevCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_jev_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_jev_model")]
+    pub model: String,
+    /// 鉴权 API Key（经 secrets 表 AES-256-GCM 加密，入库时清空，读出时注入）
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_jev_timeout")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_jev_min_confidence")]
+    pub min_confidence: f32,
+    #[serde(default)]
+    pub features: JevFeatures,
+}
+
+impl Default for JevCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: default_jev_base_url(),
+            model: default_jev_model(),
+            api_key: String::new(),
+            timeout_ms: default_jev_timeout(),
+            min_confidence: default_jev_min_confidence(),
+            features: JevFeatures::default(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct JevFeatures {
+    /// 痛点 1：记忆写入与提炼门控
+    #[serde(default = "default_true")]
+    pub memory_gate: bool,
+    /// 痛点 2 & 3：任务复杂度感知与思考深度/调研路由
+    #[serde(default = "default_true")]
+    pub thinking_depth: bool,
+    /// 场景 4：命令破坏性高危语义双保险
+    #[serde(default = "default_true")]
+    pub command_guard: bool,
+    /// 场景 5：方案可行性体检（手动按钮）
+    #[serde(default = "default_true")]
+    pub plan_review_manual: bool,
+    /// 场景 5：方案自动体检
+    #[serde(default)]
+    pub plan_review_auto: bool,
+}
+
+impl Default for JevFeatures {
+    fn default() -> Self {
+        Self {
+            memory_gate: true,
+            thinking_depth: true,
+            command_guard: true,
+            plan_review_manual: true,
+            plan_review_auto: false,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolInfo {
@@ -108,6 +187,9 @@ pub struct SettingsData {
     /// 自定义代理地址（例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:7890）
     #[serde(default = "default_proxy_url")]
     pub proxy_url: Option<String>,
+    /// Jev 决策网关配置
+    #[serde(default)]
+    pub jev: JevCfg,
 }
 
 impl Default for SettingsData {
@@ -134,6 +216,7 @@ impl Default for SettingsData {
             reasoning_effort: None,
             proxy_enabled: false,
             proxy_url: default_proxy_url(),
+            jev: JevCfg::default(),
         }
     }
 }
@@ -1492,5 +1575,60 @@ pub struct TaskCheckpoint {
     pub created_at: String,
 }
 
+// ==================== 工具日志与异常审计模型 ====================
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolLogFilter {
+    pub project_id: Option<String>,
+    pub session_id: Option<String>,
+    pub status: Option<String>, // "all" | "error_only" | "failed" | "denied" | "timeout" | "success"
+    pub tool_name: Option<String>,
+    pub keyword: Option<String>,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+}
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolLogItem {
+    pub id: String,
+    pub message_id: String,
+    pub tool_name: String,
+    pub tool_call_id: Option<String>,
+    pub params: serde_json::Value,
+    pub result_text: Option<String>,
+    pub status: String,
+    pub approval_scope: Option<String>,
+    pub created_at: String,
+    pub subprocess_id: Option<String>,
+    pub session_id: String,
+    pub session_title: String,
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub reasoning: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TopErrorSummary {
+    pub tool_name: String,
+    pub error_summary: String,
+    pub count: u32,
+    pub session_count: u32,
+    pub latest_at: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolLogQueryResult {
+    pub total_count: u32,
+    pub error_count: u32,
+    pub items: Vec<ToolLogItem>,
+    pub top_errors: Vec<TopErrorSummary>,
+    pub page: u32,
+    pub page_size: u32,
+    pub total_pages: u32,
+}

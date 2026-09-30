@@ -161,14 +161,29 @@ mod tests {
 
     #[test]
     fn test_setup_webview_isolation_env_var() {
-        let test_hash = "abc123456789def0";
-        setup_webview_isolation(test_hash);
-
         #[cfg(windows)]
         {
+            let test_hash = "abc123456789def0";
+            // 该测试必须环境无关：宿主进程（如 harness_mini Tauri 应用）可能已设置
+            // WEBVIEW2_USER_DATA_FOLDER，而 setup_webview_isolation 在变量已存在时不会覆盖。
+            // 因此先清除继承的同名变量，测完再还原，避免污染其他测试。
+            let saved = std::env::var_os("WEBVIEW2_USER_DATA_FOLDER");
+            std::env::remove_var("WEBVIEW2_USER_DATA_FOLDER");
+
+            setup_webview_isolation(test_hash);
+
             let val = std::env::var("WEBVIEW2_USER_DATA_FOLDER").unwrap();
             assert!(val.contains(test_hash));
             assert!(val.contains("ebwebview_"));
+
+            match saved {
+                Some(v) => std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", v),
+                None => std::env::remove_var("WEBVIEW2_USER_DATA_FOLDER"),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            setup_webview_isolation("abc123456789def0");
         }
     }
 }

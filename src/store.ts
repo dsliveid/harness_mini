@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "./ipc";
-import { DRAFT_ID, resolveActiveModel, samePath, sortMessages, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem, type FocusFloatingTarget } from "./types";
+import { DRAFT_ID, resolveActiveModel, samePath, sortMessages, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem, type FocusFloatingTarget, type PlanSummary } from "./types";
 
 
 export interface EditingMessageTarget {
@@ -169,6 +169,11 @@ interface Store {
   showArchive: boolean;
   /** Token 消耗统计看板弹窗 */
   showTokenStatsModal: boolean;
+  tokenStatsFromSettings: boolean;
+  /** 工具调用日志与异常审计弹窗 */
+  showLogViewerModal: boolean;
+  logViewerFromSettings: boolean;
+  logViewerFilter: Partial<import("./types").ToolLogFilter> | null;
   /** 成长档案看板弹窗 */
   showGrowthModal: boolean;
   growthModalProjectId: string | null;
@@ -191,6 +196,8 @@ interface Store {
   sessionRules: Record<string, ApprovalRule[]>;
   /** 会话任务清单，按会话 id 缓存 */
   sessionTodos: Record<string, TodoItem[]>;
+  /** 会话方案计划清单，按会话 id 缓存 */
+  sessionPlans: Record<string, PlanSummary[]>;
   /** 程序数据目录状态；pending=true 时启动拦截对话框等待用户选择 */
   dataStatus: DataStatus | null;
   /** 项目协作者列表，按父会话 ID 缓存 */
@@ -262,7 +269,9 @@ interface Store {
   setCurrent: (id: string | null) => void;
   setShowSettings: (v: boolean) => void;
   setShowArchive: (v: boolean) => void;
-  setShowTokenStatsModal: (v: boolean) => void;
+  setShowTokenStatsModal: (v: boolean, fromSettings?: boolean) => void;
+  openLogViewer: (options?: { fromSettings?: boolean; filter?: Partial<import("./types").ToolLogFilter> }) => void;
+  closeLogViewer: () => void;
   setShowGrowthModal: (v: boolean, projectId?: string | null) => void;
   loadGrowths: (projectId?: string | null, status?: string | null) => Promise<void>;
   acceptGrowth: (id: string) => Promise<void>;
@@ -307,6 +316,10 @@ interface Store {
   onSessionsChanged: (p?: { deleted?: string; archived?: string; unarchived?: string; created?: string }) => Promise<void>;
   onTempUpdate: (p: { sessionId: string; info: TempInfo }) => void;
   onSessionTodos: (p: { sessionId: string; todos: TodoItem[] }) => void;
+  planRefreshTick: number;
+  triggerPlansRefresh: () => void;
+  loadPlans: (sessionId?: string) => Promise<void>;
+  onSessionPlans: (p: { sessionId: string; activePlanId?: string | null }) => void;
   onProjectsChanged: () => Promise<void>;
   onGrowthProposed: (item: GrowthItem) => void;
   onGrowthStatus: (p: { sessionId: string; status: "idle" | "analyzing" | "proposed"; message?: string; growthId?: string }) => void;
@@ -508,6 +521,21 @@ export const useStore = create<Store>((set, get) => ({
     disabledTools: [],
     proxyEnabled: false,
     proxyUrl: "http://127.0.0.1:7890",
+    jev: {
+      enabled: false,
+      baseUrl: "https://api.typesafe.ai",
+      model: "jev-latest",
+      apiKey: "",
+      timeoutMs: 800,
+      minConfidence: 0.6,
+      features: {
+        memoryGate: true,
+        thinkingDepth: true,
+        commandGuard: true,
+        planReviewManual: true,
+        planReviewAuto: false,
+      },
+    },
   },
   projects: [],
   sessions: [],
@@ -531,6 +559,10 @@ export const useStore = create<Store>((set, get) => ({
   showSettings: false,
   showArchive: false,
   showTokenStatsModal: false,
+  tokenStatsFromSettings: false,
+  showLogViewerModal: false,
+  logViewerFromSettings: false,
+  logViewerFilter: null,
   showGrowthModal: false,
   growthModalProjectId: null,
   growthStatus: {},
@@ -545,6 +577,7 @@ export const useStore = create<Store>((set, get) => ({
   sessionSettingsId: null,
   sessionRules: {},
   sessionTodos: {},
+  sessionPlans: {},
   dataStatus: null,
   collaborators: {},
   activeCollaboratorId: null,
@@ -943,6 +976,7 @@ export const useStore = create<Store>((set, get) => ({
       editingMessage: null,
       messages: { ...get().messages, [DRAFT_ID]: [] },
       sessionTodos: { ...get().sessionTodos, [DRAFT_ID]: [] },
+      sessionPlans: { ...get().sessionPlans, [DRAFT_ID]: [] },
       focusFloatingTaskId: null,
       activeCollaboratorId: null,
       activeSubprocessId: null,
@@ -980,6 +1014,7 @@ export const useStore = create<Store>((set, get) => ({
         editingMessage: null,
         messages: { ...get().messages, [DRAFT_ID]: [] },
         sessionTodos: { ...get().sessionTodos, [DRAFT_ID]: [] },
+        sessionPlans: { ...get().sessionPlans, [DRAFT_ID]: [] },
         focusFloatingTaskId: null,
         activeCollaboratorId: null,
         activeSubprocessId: null,
@@ -1111,6 +1146,7 @@ export const useStore = create<Store>((set, get) => ({
     void get().loadSubprocesses(id);
     void get().loadSubagents(id);
     void get().fetchActiveTask(id);
+    void get().loadPlans(id);
 
     // 5. 切换主会话时，如果分屏中的协作者/子 Agent 不属于当前会话，则关闭分屏
     const curCollabId = get().activeCollaboratorId;
@@ -1196,8 +1232,25 @@ export const useStore = create<Store>((set, get) => ({
   setShowArchive(v) {
     set({ showArchive: v });
   },
-  setShowTokenStatsModal(v) {
-    set({ showTokenStatsModal: v });
+  setShowTokenStatsModal(v, fromSettings) {
+    set({
+      showTokenStatsModal: v,
+      tokenStatsFromSettings: v ? (fromSettings ?? false) : false,
+    });
+  },
+  openLogViewer(options) {
+    set({
+      showLogViewerModal: true,
+      logViewerFromSettings: options?.fromSettings ?? false,
+      logViewerFilter: options?.filter ?? null,
+    });
+  },
+  closeLogViewer() {
+    const fromSettings = get().logViewerFromSettings;
+    set({ showLogViewerModal: false, logViewerFromSettings: false, logViewerFilter: null });
+    if (fromSettings) {
+      set({ showSettings: true });
+    }
   },
   setShowGrowthModal(v, projectId) {
     set({ showGrowthModal: v, growthModalProjectId: projectId ?? null });
@@ -1545,6 +1598,7 @@ export const useStore = create<Store>((set, get) => ({
         },
         () => {}
       );
+      void get().loadPlans(p.sessionId);
     }
   },
 
@@ -1654,6 +1708,42 @@ export const useStore = create<Store>((set, get) => ({
     set((st) => ({
       sessionTodos: { ...st.sessionTodos, [p.sessionId]: p.todos },
     }));
+  },
+
+  planRefreshTick: 0,
+  triggerPlansRefresh() {
+    set((st) => ({ planRefreshTick: st.planRefreshTick + 1 }));
+    const sid = get().currentId;
+    if (sid) void get().loadPlans(sid);
+  },
+  async loadPlans(sessionId) {
+    const id = sessionId ?? get().currentId;
+    if (!id || id === DRAFT_ID) return;
+    const sess = get().sessions.find((s) => s.id === id);
+    const workspace =
+      sess?.workspacePath ||
+      get().draft?.workspacePath ||
+      get().projects.find((p) => p.id === (sess?.projectId || get().draft?.projectId))?.path ||
+      "";
+    if (!workspace) return;
+
+    try {
+      const summaries = await ipc.listWorkspacePlans(workspace, id, true);
+      set((st) => ({
+        sessionPlans: { ...st.sessionPlans, [id]: summaries },
+      }));
+    } catch (e) {
+      console.error("加载方案清单失败:", e);
+    }
+  },
+  onSessionPlans(p) {
+    set((st) => ({ planRefreshTick: st.planRefreshTick + 1 }));
+    if (p?.sessionId) {
+      void get().loadPlans(p.sessionId);
+    } else {
+      const cur = get().currentId;
+      if (cur) void get().loadPlans(cur);
+    }
   },
 
   onRunStatus(p) {
@@ -2159,6 +2249,7 @@ export const useStore = create<Store>((set, get) => ({
 
         await st.reloadMessages(activeSessionId);
       }
+      st.triggerPlansRefresh();
       st.pushToast("已撤回本轮对话并带入编辑框");
     } catch (err: any) {
       st.pushToast(String(err) || "撤回失败", "error");
@@ -2189,6 +2280,7 @@ export const useStore = create<Store>((set, get) => ({
       if (activeSessionId) {
         await st.reloadMessages(activeSessionId);
       }
+      st.triggerPlansRefresh();
       st.pushToast("已重新应用本轮对话");
     } catch (err: any) {
       st.pushToast(String(err) || "重新应用失败", "error");
@@ -2240,6 +2332,7 @@ export const useStore = create<Store>((set, get) => ({
 
         await st.reloadMessages(activeSessionId);
       }
+      st.triggerPlansRefresh();
       st.pushToast("已撤回对话到此处并带入输入框");
     } catch (err: any) {
       st.pushToast(String(err) || "撤回失败", "error");
@@ -2270,6 +2363,7 @@ export const useStore = create<Store>((set, get) => ({
       if (activeSessionId) {
         await st.reloadMessages(activeSessionId);
       }
+      st.triggerPlansRefresh();
       st.pushToast("已重新应用对话至最新状态");
     } catch (err: any) {
       st.pushToast(String(err) || "重新应用失败", "error");
@@ -2878,14 +2972,17 @@ export function currentSession(s: Store): Session | null {
   return s.sessions.find((x) => x.id === s.currentId) ?? null;
 }
 
+const EMPTY_MESSAGES: Message[] = Object.freeze([]) as unknown as Message[];
+const EMPTY_QUEUED: QueuedItem[] = Object.freeze([]) as unknown as QueuedItem[];
+
 export function currentMessages(s: Store): Message[] {
-  if (!s.currentId) return [];
+  if (!s.currentId) return EMPTY_MESSAGES;
   const list = s.messages[s.currentId];
-  if (!list || list.length === 0) return [];
+  if (!list || list.length === 0) return EMPTY_MESSAGES;
   return sortMessages(list);
 }
 
 export function currentQueue(s: Store): QueuedItem[] {
-  if (!s.currentId) return [];
-  return s.queues[s.currentId] ?? [];
+  if (!s.currentId) return EMPTY_QUEUED;
+  return s.queues[s.currentId] ?? EMPTY_QUEUED;
 }

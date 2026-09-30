@@ -87,6 +87,11 @@ export function ModelCapabilitySelect({
             {effectiveInheritLabel}
           </option>
         )}
+        {!allowInherit && !value && (
+          <option value="" disabled className="text-inkdim bg-panel2">
+            {effectiveInheritLabel}
+          </option>
+        )}
 
         {providers.map((p) => {
           if (!p.models || p.models.length === 0) return null;

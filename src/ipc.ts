@@ -1,20 +1,43 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, DataStatus, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult } from "./types";
+import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, DataStatus, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult, JevCfg, PlanReviewReport, ToolLogFilter, ToolLogQueryResult } from "./types";
+
+/**
+ * 读请求防重入去重拦截器：
+ * 当同一命令和参数的异步查询正在进行时，后续相同的调用直接复用正在 pending 的 Promise，
+ * 避免高频重渲染时微任务队列向底层 Windows 消息泵（PostMessageW）狂轰滥炸打爆 10,000 配额。
+ */
+const inFlightQueries = new Map<string, Promise<any>>();
+
+export function deduplicatedInvoke<T>(cmd: string, args?: Record<string, any>): Promise<T> {
+  const key = `${cmd}:${JSON.stringify(args ?? {})}`;
+  const existing = inFlightQueries.get(key);
+  if (existing) {
+    return existing as Promise<T>;
+  }
+  const promise = invoke<T>(cmd, args).finally(() => {
+    inFlightQueries.delete(key);
+  });
+  inFlightQueries.set(key, promise);
+  return promise;
+}
 
 export const ipc = {
-  getSettings: () => invoke<Settings>("get_settings"),
+  getSettings: () => deduplicatedInvoke<Settings>("get_settings"),
   setSettings: (settings: Settings) => invoke<void>("set_settings", { settings }),
-  listTools: () => invoke<ToolInfo[]>("list_tools"),
+  listTools: () => deduplicatedInvoke<ToolInfo[]>("list_tools"),
   testProvider: (provider: any) => invoke<string>("test_provider", { provider }),
   testProxyConnection: (proxyUrl: string) => invoke<number>("test_proxy_connection", { proxyUrl }),
+  testJev: (jevCfg: JevCfg) => invoke<string>("test_jev", { jevCfg }),
+  evaluatePlan: (planId: string, workspace: string) =>
+    deduplicatedInvoke<PlanReviewReport>("evaluate_plan", { planId, workspace }),
 
   // 数据目录
-  getDataStatus: () => invoke<DataStatus>("get_data_status"),
+  getDataStatus: () => deduplicatedInvoke<DataStatus>("get_data_status"),
   setDataDir: (path: string) => invoke<void>("set_data_dir", { path }),
   resetDataDir: () => invoke<void>("reset_data_dir"),
   exitApp: () => invoke<void>("exit_app"),
 
-  listProjects: () => invoke<Project[]>("list_projects"),
+  listProjects: () => deduplicatedInvoke<Project[]>("list_projects"),
   createProject: (name: string, path?: string) =>
     invoke<Project>("create_project", { name, path: path ?? null }),
   removeProject: (id: string) => invoke<void>("remove_project", { id }),
@@ -34,7 +57,7 @@ export const ipc = {
     invoke<ProjectLink>("update_project_link", { id, path, description }),
   deleteProjectLink: (id: string) => invoke<void>("delete_project_link", { id }),
 
-  listSessions: () => invoke<Session[]>("list_sessions"),
+  listSessions: () => deduplicatedInvoke<Session[]>("list_sessions"),
   createSession: (input: SessionCreateInput) =>
     invoke<Session>("create_session", {
       workspacePath: input.workspacePath ?? null,
@@ -58,7 +81,7 @@ export const ipc = {
       newTitle: newTitle ?? null,
       includeTarget,
     }),
-  listArchived: () => invoke<Session[]>("list_archived"),
+  listArchived: () => deduplicatedInvoke<Session[]>("list_archived"),
   renameSession: (id: string, title: string) => invoke<void>("rename_session", { id, title }),
   deleteSession: (id: string) => invoke<void>("delete_session", { id }),
   archiveSession: (id: string) => invoke<void>("archive_session", { id }),
@@ -276,23 +299,35 @@ export const ipc = {
     invoke<void>("set_project_sop", { projectId, verifyCmd, enabled }),
   runWorkspaceSop: (workspacePath: string, cmd: string) =>
     invoke<string>("run_workspace_sop", { workspacePath, cmd }),
-  getTokenStats: (projectId?: string | null, days?: number | null) =>
-    invoke<TokenStatsReport>("get_token_stats", { projectId: projectId ?? null, days: days ?? null }),
+  getTokenStats: (
+    projectId?: string | null,
+    days?: number | null,
+    startDate?: string | null,
+    endDate?: string | null,
+  ) =>
+    invoke<TokenStatsReport>("get_token_stats", {
+      projectId: projectId ?? null,
+      days: days ?? null,
+      startDate: startDate ?? null,
+      endDate: endDate ?? null,
+    }),
+  queryToolLogs: (filter: ToolLogFilter) =>
+    invoke<ToolLogQueryResult>("query_tool_logs", { filter }),
   getSessionActiveState: (sessionId: string) =>
     invoke<SessionActiveState>("get_session_active_state", { sessionId }),
   readFileBase64: (path: string) => invoke<string>("read_file_base64", { path }),
 
   // 任务方案计划中枢 (Plans)
   getActivePlan: (sessionId: string) =>
-    invoke<ActivePlanDetail | null>("get_active_plan", { sessionId }),
+    deduplicatedInvoke<ActivePlanDetail | null>("get_active_plan", { sessionId }),
   listWorkspacePlans: (workspacePath: string, sessionId?: string | null, includeArchived?: boolean) =>
-    invoke<PlanSummary[]>("list_workspace_plans", {
+    deduplicatedInvoke<PlanSummary[]>("list_workspace_plans", {
       workspacePath,
       sessionId: sessionId ?? null,
       includeArchived: includeArchived ?? false,
     }),
   getPlanDetail: (workspacePath: string, sessionId?: string | null, planId?: string | null) =>
-    invoke<ActivePlanDetail | null>("get_plan_detail", {
+    deduplicatedInvoke<ActivePlanDetail | null>("get_plan_detail", {
       workspacePath,
       sessionId: sessionId ?? null,
       planId: planId ?? null,

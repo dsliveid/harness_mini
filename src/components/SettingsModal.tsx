@@ -23,6 +23,7 @@ import {
   Zap,
   Sparkles,
   BarChart2,
+  ScrollText,
   Sliders,
   MessageSquare,
   Palette,
@@ -36,7 +37,7 @@ const MODEL_CAP_OPTIONS = [
   { id: "vision", label: "视觉", Icon: Eye },
 ] as const;
 
-type Tab = "models" | "tools" | "network" | "sop" | "datadir";
+type Tab = "models" | "tools" | "network" | "jev" | "sop" | "datadir";
 
 const TOOL_TITLES: Record<string, string> = {
   read_file: "读取文件",
@@ -96,6 +97,7 @@ export function SettingsModal() {
   const setSettingsLocal = useStore((s) => s.setSettingsLocal);
   const pushToast = useStore((s) => s.pushToast);
   const setShowTokenStatsModal = useStore((s) => s.setShowTokenStatsModal);
+  const openLogViewer = useStore((s) => s.openLogViewer);
   const [tab, setTab] = useState<Tab>("models");
   const [local, setLocal] = useState<Settings>(storeSettings);
   const [toolList, setToolList] = useState<ToolInfo[]>([]);
@@ -113,6 +115,9 @@ export function SettingsModal() {
   } | null>(null);
   const [proxyTesting, setProxyTesting] = useState(false);
   const [proxyTestResult, setProxyTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [jevTesting, setJevTesting] = useState(false);
+  const [jevTestResult, setJevTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [visibleJevKey, setVisibleJevKey] = useState(false);
 
   useEffect(() => {
     if (show) {
@@ -126,6 +131,9 @@ export function SettingsModal() {
       setEditingContextModel(null);
       setProxyTesting(false);
       setProxyTestResult(null);
+      setJevTesting(false);
+      setJevTestResult(null);
+      setVisibleJevKey(false);
       // 打开时从后端拉取最新设置与工具列表，避免草稿基于启动时的旧缓存回写
       ipc
         .getSettings()
@@ -193,17 +201,6 @@ export function SettingsModal() {
     setExpandedIds((cur) => ({ ...cur, [p.id]: true }));
   };
 
-  // 选择默认厂商：默认使用该厂商的第一个模型
-  const selectProvider = (id: string) => {
-    const defaultModel = local.providers.find((x) => x.id === id)?.models[0] ?? null;
-    setLocal((cur) => ({
-      ...cur,
-      activeProviderId: id,
-      activeModelId: defaultModel,
-      activeModel: defaultModel,
-    }));
-  };
-
   const addModel = (providerId: string) => {
     const name = (newModel[providerId] ?? "").trim();
     if (!name) return;
@@ -218,11 +215,13 @@ export function SettingsModal() {
       const providers = cur.providers.map((item) =>
         item.id === providerId ? { ...item, models: [...item.models, name] } : item
       );
-      const isFirst = cur.activeProviderId === providerId && !(cur.activeModelId ?? cur.activeModel);
-      const activeM = isFirst ? name : (cur.activeModelId ?? cur.activeModel ?? null);
+      const hasActive = cur.activeProviderId && (cur.activeModelId ?? cur.activeModel);
+      const activeP = hasActive ? cur.activeProviderId : providerId;
+      const activeM = hasActive ? (cur.activeModelId ?? cur.activeModel ?? null) : name;
       return {
         ...cur,
         providers,
+        activeProviderId: activeP,
         activeModelId: activeM,
         activeModel: activeM,
       };
@@ -234,15 +233,32 @@ export function SettingsModal() {
     if (!p) return;
     const models = p.models.filter((m) => m !== model);
     updateProvider(providerId, { models });
-    // 删除的是激活模型时，回落到该厂商剩余的第一个模型
+    // 删除的是激活模型时，回落到该厂商剩余的第一个模型，若该厂商无模型则找其他有模型的厂商
     setLocal((cur) => {
       const activeCurrent = cur.activeModelId ?? cur.activeModel;
       const isCurrent = cur.activeProviderId === providerId && activeCurrent === model;
-      const activeM = isCurrent ? models[0] ?? null : (cur.activeModelId ?? cur.activeModel ?? null);
+      let nextPid = cur.activeProviderId;
+      let nextMid = activeCurrent ?? null;
+      if (isCurrent) {
+        if (models.length > 0) {
+          nextMid = models[0];
+        } else {
+          const other = cur.providers.find((item) => item.id !== providerId && item.models.length > 0);
+          nextPid = other?.id ?? null;
+          nextMid = other?.models[0] ?? null;
+        }
+      }
+      const imgMatch = cur.activeImageProviderId === providerId && cur.activeImageModelId === model;
+      const visMatch = cur.activeVisionProviderId === providerId && cur.activeVisionModelId === model;
       return {
         ...cur,
-        activeModelId: activeM,
-        activeModel: activeM,
+        activeProviderId: nextPid,
+        activeModelId: nextMid,
+        activeModel: nextMid,
+        activeImageProviderId: imgMatch ? null : cur.activeImageProviderId,
+        activeImageModelId: imgMatch ? null : cur.activeImageModelId,
+        activeVisionProviderId: visMatch ? null : cur.activeVisionProviderId,
+        activeVisionModelId: visMatch ? null : cur.activeVisionModelId,
       };
     });
   };
@@ -250,14 +266,26 @@ export function SettingsModal() {
   const removeProvider = (id: string) => {
     setLocal((cur) => {
       const providers = cur.providers.filter((x) => x.id !== id);
-      if (cur.activeProviderId !== id) return { ...cur, providers };
-      const defaultModel = providers[0]?.models[0] ?? null;
+      const isCurrent = cur.activeProviderId === id;
+      let nextPid = cur.activeProviderId;
+      let nextMid = cur.activeModelId ?? cur.activeModel ?? null;
+      if (isCurrent) {
+        const nextProvider = providers.find((p) => p.models.length > 0) ?? providers[0];
+        nextPid = nextProvider?.id ?? null;
+        nextMid = nextProvider?.models[0] ?? null;
+      }
+      const imgMatch = cur.activeImageProviderId === id;
+      const visMatch = cur.activeVisionProviderId === id;
       return {
         ...cur,
         providers,
-        activeProviderId: providers[0]?.id ?? null,
-        activeModelId: defaultModel,
-        activeModel: defaultModel,
+        activeProviderId: nextPid,
+        activeModelId: nextMid,
+        activeModel: nextMid,
+        activeImageProviderId: imgMatch ? null : cur.activeImageProviderId,
+        activeImageModelId: imgMatch ? null : cur.activeImageModelId,
+        activeVisionProviderId: visMatch ? null : cur.activeVisionProviderId,
+        activeVisionModelId: visMatch ? null : cur.activeVisionModelId,
       };
     });
     setExpandedIds((cur) => {
@@ -522,6 +550,12 @@ export function SettingsModal() {
                 <span>网络代理</span>
               </span>
             </button>
+            <button className={menuCls(tab === "jev")} onClick={() => setTab("jev")}>
+              <span className="flex items-center gap-2">
+                <Zap size={15} className={local.jev?.enabled ? "text-amber-400" : ""} />
+                <span>Jev 决策增强</span>
+              </span>
+            </button>
             <button className={menuCls(tab === "sop")} onClick={() => setTab("sop")}>
               <span className="flex items-center gap-2">
                 <ShieldCheck size={15} />
@@ -536,12 +570,21 @@ export function SettingsModal() {
             </button>
             <div className="border-t border-edge/40 my-1" />
             <button
-              className="w-full text-left px-3 py-2 rounded-lg text-[13px] text-inkdim hover:text-ink hover:bg-panel2"
-              onClick={() => { setShow(false); setShowTokenStatsModal(true); }}
+              className="w-full text-left px-3 py-2 rounded-lg text-[13px] text-inkdim hover:text-ink hover:bg-panel2 transition-colors cursor-pointer"
+              onClick={() => { setShow(false); setShowTokenStatsModal(true, true); }}
             >
               <span className="flex items-center gap-2">
                 <BarChart2 size={15} className="text-amber-400" />
                 <span>Token 统计</span>
+              </span>
+            </button>
+            <button
+              className="w-full text-left px-3 py-2 rounded-lg text-[13px] text-inkdim hover:text-ink hover:bg-panel2 transition-colors cursor-pointer"
+              onClick={() => { setShow(false); openLogViewer({ fromSettings: true }); }}
+            >
+              <span className="flex items-center gap-2">
+                <ScrollText size={15} className="text-cyan-400" />
+                <span>日志查询</span>
               </span>
             </button>
           </aside>
@@ -567,24 +610,11 @@ export function SettingsModal() {
                             className="p-3 flex items-center gap-2.5 cursor-pointer hover:bg-panel2/50 select-none transition-colors"
                             onClick={() => toggleExpand(p.id)}
                           >
-                            <label
-                              className="flex items-center gap-1.5 cursor-pointer shrink-0"
-                              title={local.activeProviderId === p.id ? "当前激活厂商" : "设为激活厂商"}
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              <input
-                                type="radio"
-                                name="activeProvider"
-                                checked={local.activeProviderId === p.id}
-                                onChange={() => selectProvider(p.id)}
-                              />
-                            </label>
-
                             <div className="flex items-center gap-2 min-w-0 flex-1">
                               <span className="font-medium text-ink truncate max-w-[150px]">{p.name || "未命名厂商"}</span>
                               {local.activeProviderId === p.id && (
-                                <span className="text-[11px] px-1.5 py-0.5 rounded bg-green-500/10 text-green-400 border border-green-500/20 shrink-0">
-                                  使用中
+                                <span className="text-[11px] px-1.5 py-0.5 rounded bg-green-500/10 text-green-400 border border-green-500/20 shrink-0 font-medium">
+                                  默认对话
                                 </span>
                               )}
                               {!isExpanded && (
@@ -743,22 +773,10 @@ export function SettingsModal() {
                                           <Sliders size={11} className="opacity-70" />
                                           <span>{formatTokens(limit)}</span>
                                         </button>
-                                        {isCurrent ? (
-                                          <span className="text-[11px] text-green-400 shrink-0">当前使用</span>
-                                        ) : (
-                                          <button
-                                            className="text-[12px] text-inkdim hover:text-accent shrink-0"
-                                            onClick={() =>
-                                              setLocal((cur) => ({
-                                                ...cur,
-                                                activeProviderId: p.id,
-                                                activeModelId: m,
-                                                activeModel: m,
-                                              }))
-                                            }
-                                          >
-                                            设为使用
-                                          </button>
+                                        {isCurrent && (
+                                          <span className="text-[11px] text-green-400 shrink-0 font-medium px-1.5 py-0.5 rounded bg-green-500/10 border border-green-500/20">
+                                            当前默认
+                                          </span>
                                         )}
                                         <button
                                           className="text-[12px] text-red-400 hover:underline shrink-0"
@@ -791,17 +809,9 @@ export function SettingsModal() {
                                   </button>
                                 </div>
                               </div>
-                              <div className="flex items-center gap-2 pt-1">
-                                <label className="flex items-center gap-1.5 text-inkdim text-[12px] cursor-pointer">
-                                  <input
-                                    type="radio"
-                                    checked={local.activeProviderId === p.id}
-                                    onChange={() => selectProvider(p.id)}
-                                  />
-                                  使用此厂商
-                                </label>
+                              <div className="flex items-center justify-end gap-2 pt-1">
                                 <button
-                                  className="ml-auto text-[12px] px-2.5 py-1 rounded-lg bg-panel3 hover:bg-edge text-inkdim"
+                                  className="text-[12px] px-2.5 py-1 rounded-lg bg-panel3 hover:bg-edge text-inkdim"
                                   onClick={async () => {
                                     setTesting((t) => ({ ...t, [p.id]: "测试中…" }));
                                     try {
@@ -841,13 +851,57 @@ export function SettingsModal() {
                     <div className="flex items-center gap-2">
                       <span>全局默认能力模型</span>
                       <span className="text-[11px] font-normal text-inkdim">
-                        （当未在对话或协作者中单独指定时使用；若留空则主进程默认不直接提供生图工具，引导调度协作者）
+                        （统一配置各项专项能力模型，驱动 Agent 日常对话思考、后台自主任务与专项工具调度）
                       </span>
                     </div>
                   </div>
                   <div className="bg-panel border border-edge rounded-xl p-3 flex flex-col gap-2.5">
+                    {/* 1. 主对话模型 */}
                     <div className="flex items-center gap-3">
-                      <span className="text-inkdim text-[12px] shrink-0 w-24">执行生图模型</span>
+                      <div className="flex items-center gap-1.5 text-inkdim text-[12px] shrink-0 w-24">
+                        <MessageSquare size={13} className="text-blue-400 shrink-0" />
+                        <span>主对话模型</span>
+                      </div>
+                      <div className="flex-1">
+                        <ModelCapabilitySelect
+                          capability="chat"
+                          value={
+                            local.activeProviderId && (local.activeModelId || local.activeModel)
+                              ? `${local.activeProviderId}::${local.activeModelId || local.activeModel}`
+                              : ""
+                          }
+                          onChange={(val) => {
+                            if (!val) {
+                              setLocal((cur) => ({
+                                ...cur,
+                                activeProviderId: null,
+                                activeModelId: null,
+                                activeModel: null,
+                              }));
+                            } else {
+                              const [pid, mid] = val.split("::");
+                              setLocal((cur) => ({
+                                ...cur,
+                                activeProviderId: pid,
+                                activeModelId: mid,
+                                activeModel: mid,
+                              }));
+                            }
+                          }}
+                          providers={local.providers}
+                          settings={local}
+                          allowInherit={false}
+                          inheritLabel="请选择全局主对话模型（必选）"
+                        />
+                      </div>
+                    </div>
+
+                    {/* 2. 执行生图模型 */}
+                    <div className="flex items-center gap-3">
+                      <div className="flex items-center gap-1.5 text-inkdim text-[12px] shrink-0 w-24">
+                        <Palette size={13} className="text-pink-400 shrink-0" />
+                        <span>执行生图模型</span>
+                      </div>
                       <div className="flex-1">
                         <ModelCapabilitySelect
                           capability="image_gen"
@@ -879,8 +933,13 @@ export function SettingsModal() {
                         />
                       </div>
                     </div>
+
+                    {/* 3. 视觉感知模型 */}
                     <div className="flex items-center gap-3">
-                      <span className="text-inkdim text-[12px] shrink-0 w-24">视觉感知模型</span>
+                      <div className="flex items-center gap-1.5 text-inkdim text-[12px] shrink-0 w-24">
+                        <Eye size={13} className="text-purple-400 shrink-0" />
+                        <span>视觉感知模型</span>
+                      </div>
                       <div className="flex-1">
                         <ModelCapabilitySelect
                           capability="vision"
@@ -1209,6 +1268,510 @@ export function SettingsModal() {
                       <div className="text-[12px] text-inkdim/80 leading-relaxed space-y-1 mt-1">
                         <div>• 支持协议：HTTP / HTTPS / SOCKS5（例如 <code className="font-mono text-[11px] bg-panel2 px-1 py-0.5 rounded">http://127.0.0.1:7890</code> 或 <code className="font-mono text-[11px] bg-panel2 px-1 py-0.5 rounded">socks5://127.0.0.1:7890</code>）。</div>
                         <div>• 本地回环直连：内部通信及本地模型服务（<code className="font-mono text-[11px] bg-panel2 px-1 py-0.5 rounded">localhost</code>、<code className="font-mono text-[11px] bg-panel2 px-1 py-0.5 rounded">127.0.0.1</code>）将自动直连白名单，不受代理拦截。</div>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+              </div>
+            )}
+
+            {tab === "jev" && (
+              <div className="flex flex-col gap-5">
+                <section>
+                  <div className="flex items-start justify-between gap-4 mb-4">
+                    <div className="flex-1 min-w-0">
+                      <div className="font-medium text-[14px] flex items-center gap-2">
+                        <Zap size={16} className="text-amber-400" />
+                        <span>Jev 决策网关增强 (System One 快思考)</span>
+                      </div>
+                      <div className="text-[12px] text-inkdim mt-0.5 leading-relaxed max-w-[560px]">
+                        引入 TypeSafe AI 旗舰模型 Jev，作为 Agent 内部的高频、确定性离散决策中枢（毫秒级响应、零生成幻觉、输出 Token 免费）。
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col gap-4">
+                    {/* 隐私与降级提示 */}
+                    <div className="border border-amber-500/20 bg-amber-500/5 rounded-xl p-3.5 text-[12px] text-inkdim leading-relaxed flex items-start gap-2.5">
+                      <ShieldCheck size={16} className="text-amber-400 shrink-0 mt-0.5" />
+                      <div>
+                        <span className="font-medium text-amber-300">隐私与降级契约：</span>
+                        启用 Jev 后，待评估的命令参数、记忆片段或任务摘要将发送至 Jev 端点进行结构化判断。若网络超时（默认 800ms）或服务不可用，系统将自动触发
+                        <span className="text-accent font-mono ml-1 mr-1">Abstain（弃权）</span>
+                        并无缝降级回原有逻辑，绝不卡死或中断主 Agent 运行。
+                      </div>
+                    </div>
+
+                    {/* 总开关卡片 */}
+                    <div className="border border-edge rounded-xl p-4 bg-panel flex items-start justify-between gap-4">
+                      <div>
+                        <div className="font-medium text-[13px] text-ink flex items-center gap-2">
+                          <Zap size={16} className={local.jev?.enabled ? "text-amber-400" : "text-inkdim"} />
+                          <span>启用 Jev 决策网关</span>
+                        </div>
+                        <div className="text-[12px] text-inkdim mt-1 leading-relaxed">
+                          开启后，系统的记忆落盘、任务复杂度自适应和敏感命令审批将获得 Jev 双系统赋能。
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={local.jev?.enabled ?? false}
+                        title={local.jev?.enabled ? "停用 Jev 网关" : "启用 Jev 网关"}
+                        onClick={() =>
+                          setLocal((prev) => ({
+                            ...prev,
+                            jev: {
+                              ...(prev.jev ?? {
+                                enabled: false,
+                                baseUrl: "https://api.typesafe.ai",
+                                model: "jev-latest",
+                                apiKey: "",
+                                timeoutMs: 800,
+                                minConfidence: 0.6,
+                                features: {
+                                  memoryGate: true,
+                                  thinkingDepth: true,
+                                  commandGuard: true,
+                                  planReviewManual: true,
+                                  planReviewAuto: false,
+                                },
+                              }),
+                              enabled: !(prev.jev?.enabled ?? false),
+                            },
+                          }))
+                        }
+                        className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border border-transparent transition-colors duration-200 ease-in-out focus:outline-none shrink-0 mt-0.5 ${
+                          local.jev?.enabled ? "bg-accent" : "bg-panel3 border-edge"
+                        }`}
+                      >
+                        <span
+                          className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
+                            local.jev?.enabled ? "translate-x-4" : "translate-x-0"
+                          }`}
+                        />
+                      </button>
+                    </div>
+
+                    {/* API 配置表单 */}
+                    <div
+                      className={`border border-edge rounded-xl p-4 bg-panel flex flex-col gap-3.5 transition-opacity ${
+                        local.jev?.enabled ? "opacity-100" : "opacity-60 pointer-events-none"
+                      }`}
+                    >
+                      <div className="flex flex-col gap-1.5">
+                        <label className="text-[12px] font-medium text-ink">API Key</label>
+                        <div className="flex items-center gap-2">
+                          <div className="relative flex-1">
+                            <input
+                              type={visibleJevKey ? "text" : "password"}
+                              className="w-full bg-panel2 border border-edge rounded-lg px-3 py-1.5 text-[13px] font-mono focus:outline-none focus:border-accent pr-9"
+                              placeholder="ts-...（留空则沿用已保存密钥）"
+                              value={local.jev?.apiKey ?? ""}
+                              onChange={(e) =>
+                                setLocal((prev) => ({
+                                  ...prev,
+                                  jev: {
+                                    ...(prev.jev ?? {
+                                      enabled: true,
+                                      baseUrl: "https://api.typesafe.ai",
+                                      model: "jev-latest",
+                                      apiKey: "",
+                                      timeoutMs: 800,
+                                      minConfidence: 0.6,
+                                      features: {
+                                        memoryGate: true,
+                                        thinkingDepth: true,
+                                        commandGuard: true,
+                                        planReviewManual: true,
+                                        planReviewAuto: false,
+                                      },
+                                    }),
+                                    apiKey: e.target.value,
+                                  },
+                                }))
+                              }
+                            />
+                            <button
+                              type="button"
+                              className="absolute right-2.5 top-1/2 -translate-y-1/2 text-inkdim hover:text-ink transition-colors"
+                              onClick={() => setVisibleJevKey((v) => !v)}
+                            >
+                              {visibleJevKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                            </button>
+                          </div>
+                          <button
+                            type="button"
+                            className="px-3 py-1.5 rounded-lg border border-edge bg-panel2 hover:bg-edge/40 text-[12px] font-medium text-ink shrink-0 transition-colors disabled:opacity-50"
+                            disabled={!local.jev?.enabled || jevTesting}
+                            onClick={async () => {
+                              const targetCfg = local.jev ?? {
+                                enabled: true,
+                                baseUrl: "https://api.typesafe.ai",
+                                model: "jev-latest",
+                                apiKey: "",
+                                timeoutMs: 800,
+                                minConfidence: 0.6,
+                                features: {
+                                  memoryGate: true,
+                                  thinkingDepth: true,
+                                  commandGuard: true,
+                                  planReviewManual: true,
+                                  planReviewAuto: false,
+                                },
+                              };
+                              setJevTesting(true);
+                              setJevTestResult(null);
+                              try {
+                                const msg = await ipc.testJev(targetCfg);
+                                setJevTestResult({ ok: true, msg });
+                              } catch (err: any) {
+                                setJevTestResult({ ok: false, msg: String(err) });
+                              } finally {
+                                setJevTesting(false);
+                              }
+                            }}
+                          >
+                            {jevTesting ? "测试中..." : "测试连接"}
+                          </button>
+                        </div>
+                        {jevTestResult && (
+                          <div
+                            className={`text-[12px] px-2.5 py-1.5 rounded-lg border mt-1 ${
+                              jevTestResult.ok
+                                ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                                : "bg-rose-500/10 text-rose-400 border-rose-500/20"
+                            }`}
+                          >
+                            {jevTestResult.msg}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="flex flex-col gap-1.5">
+                          <label className="text-[12px] font-medium text-ink">API 端点 (Base URL)</label>
+                          <input
+                            type="text"
+                            className="bg-panel2 border border-edge rounded-lg px-3 py-1.5 text-[13px] font-mono focus:outline-none focus:border-accent"
+                            placeholder="https://api.typesafe.ai"
+                            value={local.jev?.baseUrl ?? "https://api.typesafe.ai"}
+                            onChange={(e) =>
+                              setLocal((prev) => ({
+                                ...prev,
+                                jev: {
+                                  ...(prev.jev ?? {
+                                    enabled: true,
+                                    baseUrl: "https://api.typesafe.ai",
+                                    model: "jev-latest",
+                                    apiKey: "",
+                                    timeoutMs: 800,
+                                    minConfidence: 0.6,
+                                    features: {
+                                      memoryGate: true,
+                                      thinkingDepth: true,
+                                      commandGuard: true,
+                                      planReviewManual: true,
+                                      planReviewAuto: false,
+                                    },
+                                  }),
+                                  baseUrl: e.target.value,
+                                },
+                              }))
+                            }
+                          />
+                        </div>
+
+                        <div className="flex flex-col gap-1.5">
+                          <label className="text-[12px] font-medium text-ink">模型名称</label>
+                          <input
+                            type="text"
+                            className="bg-panel2 border border-edge rounded-lg px-3 py-1.5 text-[13px] font-mono focus:outline-none focus:border-accent"
+                            placeholder="jev-latest"
+                            value={local.jev?.model ?? "jev-latest"}
+                            onChange={(e) =>
+                              setLocal((prev) => ({
+                                ...prev,
+                                jev: {
+                                  ...(prev.jev ?? {
+                                    enabled: true,
+                                    baseUrl: "https://api.typesafe.ai",
+                                    model: "jev-latest",
+                                    apiKey: "",
+                                    timeoutMs: 800,
+                                    minConfidence: 0.6,
+                                    features: {
+                                      memoryGate: true,
+                                      thinkingDepth: true,
+                                      commandGuard: true,
+                                      planReviewManual: true,
+                                      planReviewAuto: false,
+                                    },
+                                  }),
+                                  model: e.target.value,
+                                },
+                              }))
+                            }
+                          />
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="flex flex-col gap-1.5">
+                          <label className="text-[12px] font-medium text-ink">单次超时上限 (毫秒)</label>
+                          <input
+                            type="number"
+                            min="200"
+                            max="5000"
+                            step="100"
+                            className="bg-panel2 border border-edge rounded-lg px-3 py-1.5 text-[13px] font-mono focus:outline-none focus:border-accent"
+                            value={local.jev?.timeoutMs ?? 800}
+                            onChange={(e) =>
+                              setLocal((prev) => ({
+                                ...prev,
+                                jev: {
+                                  ...(prev.jev ?? {
+                                    enabled: true,
+                                    baseUrl: "https://api.typesafe.ai",
+                                    model: "jev-latest",
+                                    apiKey: "",
+                                    timeoutMs: 800,
+                                    minConfidence: 0.6,
+                                    features: {
+                                      memoryGate: true,
+                                      thinkingDepth: true,
+                                      commandGuard: true,
+                                      planReviewManual: true,
+                                      planReviewAuto: false,
+                                    },
+                                  }),
+                                  timeoutMs: Number(e.target.value) || 800,
+                                },
+                              }))
+                            }
+                          />
+                        </div>
+
+                        <div className="flex flex-col gap-1.5">
+                          <label className="text-[12px] font-medium text-ink">置信度过滤阈值 (0.0 ~ 1.0)</label>
+                          <input
+                            type="number"
+                            min="0.1"
+                            max="1.0"
+                            step="0.05"
+                            className="bg-panel2 border border-edge rounded-lg px-3 py-1.5 text-[13px] font-mono focus:outline-none focus:border-accent"
+                            value={local.jev?.minConfidence ?? 0.6}
+                            onChange={(e) =>
+                              setLocal((prev) => ({
+                                ...prev,
+                                jev: {
+                                  ...(prev.jev ?? {
+                                    enabled: true,
+                                    baseUrl: "https://api.typesafe.ai",
+                                    model: "jev-latest",
+                                    apiKey: "",
+                                    timeoutMs: 800,
+                                    minConfidence: 0.6,
+                                    features: {
+                                      memoryGate: true,
+                                      thinkingDepth: true,
+                                      commandGuard: true,
+                                      planReviewManual: true,
+                                      planReviewAuto: false,
+                                    },
+                                  }),
+                                  minConfidence: Number(e.target.value) || 0.6,
+                                },
+                              }))
+                            }
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* 分特性细粒度开关 */}
+                    <div
+                      className={`border border-edge rounded-xl p-4 bg-panel flex flex-col gap-3 transition-opacity ${
+                        local.jev?.enabled ? "opacity-100" : "opacity-60 pointer-events-none"
+                      }`}
+                    >
+                      <div className="font-medium text-[13px] text-ink">细粒度应用特性开关</div>
+                      <div className="grid grid-cols-1 gap-2.5">
+                        <label className="flex items-center justify-between p-2 rounded-lg bg-panel2 border border-edge/60 hover:bg-panel3 transition-colors cursor-pointer">
+                          <div>
+                            <div className="text-[13px] text-ink font-medium">记忆沉淀质量门控</div>
+                            <div className="text-[11px] text-inkdim">拦截模型主观推测与脑补，仅沉淀实地验证且具备长期复用价值的关键知识</div>
+                          </div>
+                          <input
+                            type="checkbox"
+                            className="rounded border-edge text-accent focus:ring-0 w-4 h-4 ml-3"
+                            checked={local.jev?.features?.memoryGate ?? true}
+                            onChange={(e) =>
+                              setLocal((prev) => ({
+                                ...prev,
+                                jev: {
+                                  ...(prev.jev ?? {
+                                    enabled: true,
+                                    baseUrl: "https://api.typesafe.ai",
+                                    model: "jev-latest",
+                                    apiKey: "",
+                                    timeoutMs: 800,
+                                    minConfidence: 0.6,
+                                    features: {
+                                      memoryGate: true,
+                                      thinkingDepth: true,
+                                      commandGuard: true,
+                                      planReviewManual: true,
+                                      planReviewAuto: false,
+                                    },
+                                  }),
+                                  features: {
+                                    ...(prev.jev?.features ?? {
+                                      memoryGate: true,
+                                      thinkingDepth: true,
+                                      commandGuard: true,
+                                      planReviewManual: true,
+                                      planReviewAuto: false,
+                                    }),
+                                    memoryGate: e.target.checked,
+                                  },
+                                },
+                              }))
+                            }
+                          />
+                        </label>
+
+                        <label className="flex items-center justify-between p-2 rounded-lg bg-panel2 border border-edge/60 hover:bg-panel3 transition-colors cursor-pointer">
+                          <div>
+                            <div className="text-[13px] text-ink font-medium">任务复杂度与思考深度动态路由</div>
+                            <div className="text-[11px] text-inkdim">小任务下调推理耗时并快速收敛，大需求/未知领域上调档位并前置注入外部调研引导</div>
+                          </div>
+                          <input
+                            type="checkbox"
+                            className="rounded border-edge text-accent focus:ring-0 w-4 h-4 ml-3"
+                            checked={local.jev?.features?.thinkingDepth ?? true}
+                            onChange={(e) =>
+                              setLocal((prev) => ({
+                                ...prev,
+                                jev: {
+                                  ...(prev.jev ?? {
+                                    enabled: true,
+                                    baseUrl: "https://api.typesafe.ai",
+                                    model: "jev-latest",
+                                    apiKey: "",
+                                    timeoutMs: 800,
+                                    minConfidence: 0.6,
+                                    features: {
+                                      memoryGate: true,
+                                      thinkingDepth: true,
+                                      commandGuard: true,
+                                      planReviewManual: true,
+                                      planReviewAuto: false,
+                                    },
+                                  }),
+                                  features: {
+                                    ...(prev.jev?.features ?? {
+                                      memoryGate: true,
+                                      thinkingDepth: true,
+                                      commandGuard: true,
+                                      planReviewManual: true,
+                                      planReviewAuto: false,
+                                    }),
+                                    thinkingDepth: e.target.checked,
+                                  },
+                                },
+                              }))
+                            }
+                          />
+                        </label>
+
+                        <label className="flex items-center justify-between p-2 rounded-lg bg-panel2 border border-edge/60 hover:bg-panel3 transition-colors cursor-pointer">
+                          <div>
+                            <div className="text-[13px] text-ink font-medium">终端命令破坏性语义双保险</div>
+                            <div className="text-[11px] text-inkdim">突破现有 11 条硬编码正则限制，识别新型破坏性命令与外发泄露风险并上报审批</div>
+                          </div>
+                          <input
+                            type="checkbox"
+                            className="rounded border-edge text-accent focus:ring-0 w-4 h-4 ml-3"
+                            checked={local.jev?.features?.commandGuard ?? true}
+                            onChange={(e) =>
+                              setLocal((prev) => ({
+                                ...prev,
+                                jev: {
+                                  ...(prev.jev ?? {
+                                    enabled: true,
+                                    baseUrl: "https://api.typesafe.ai",
+                                    model: "jev-latest",
+                                    apiKey: "",
+                                    timeoutMs: 800,
+                                    minConfidence: 0.6,
+                                    features: {
+                                      memoryGate: true,
+                                      thinkingDepth: true,
+                                      commandGuard: true,
+                                      planReviewManual: true,
+                                      planReviewAuto: false,
+                                    },
+                                  }),
+                                  features: {
+                                    ...(prev.jev?.features ?? {
+                                      memoryGate: true,
+                                      thinkingDepth: true,
+                                      commandGuard: true,
+                                      planReviewManual: true,
+                                      planReviewAuto: false,
+                                    }),
+                                    commandGuard: e.target.checked,
+                                  },
+                                },
+                              }))
+                            }
+                          />
+                        </label>
+
+                        <label className="flex items-center justify-between p-2 rounded-lg bg-panel2 border border-edge/60 hover:bg-panel3 transition-colors cursor-pointer">
+                          <div>
+                            <div className="text-[13px] text-ink font-medium">方案可行性体检 (手动按钮)</div>
+                            <div className="text-[11px] text-inkdim">在方案卡片提供「⚡ Jev 体检」按钮，诊断目标覆盖率、步骤逻辑与技术栈契合度</div>
+                          </div>
+                          <input
+                            type="checkbox"
+                            className="rounded border-edge text-accent focus:ring-0 w-4 h-4 ml-3"
+                            checked={local.jev?.features?.planReviewManual ?? true}
+                            onChange={(e) =>
+                              setLocal((prev) => ({
+                                ...prev,
+                                jev: {
+                                  ...(prev.jev ?? {
+                                    enabled: true,
+                                    baseUrl: "https://api.typesafe.ai",
+                                    model: "jev-latest",
+                                    apiKey: "",
+                                    timeoutMs: 800,
+                                    minConfidence: 0.6,
+                                    features: {
+                                      memoryGate: true,
+                                      thinkingDepth: true,
+                                      commandGuard: true,
+                                      planReviewManual: true,
+                                      planReviewAuto: false,
+                                    },
+                                  }),
+                                  features: {
+                                    ...(prev.jev?.features ?? {
+                                      memoryGate: true,
+                                      thinkingDepth: true,
+                                      commandGuard: true,
+                                      planReviewManual: true,
+                                      planReviewAuto: false,
+                                    }),
+                                    planReviewManual: e.target.checked,
+                                  },
+                                },
+                              }))
+                            }
+                          />
+                        </label>
                       </div>
                     </div>
                   </div>

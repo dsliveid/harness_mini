@@ -10,8 +10,10 @@ import {
   FolderOpen,
   MessageSquare,
   Clock,
+  Calendar,
   Sparkles,
   ChevronRight,
+  ChevronLeft,
   ExternalLink,
   Zap,
 } from "./Icons";
@@ -26,22 +28,80 @@ function formatTokens(n?: number): string {
 export function TokenStatsModal() {
   const show = useStore((s) => s.showTokenStatsModal);
   const setShow = useStore((s) => s.setShowTokenStatsModal);
+  const tokenStatsFromSettings = useStore((s) => s.tokenStatsFromSettings);
+  const setShowSettings = useStore((s) => s.setShowSettings);
   const selectSession = useStore((s) => s.selectSession);
   const enterProject = useStore((s) => s.enterProject);
   const pushToast = useStore((s) => s.pushToast);
 
+  const handleClose = () => {
+    setShow(false);
+    if (tokenStatsFromSettings) {
+      setShowSettings(true);
+    }
+  };
+
   const [tab, setTab] = useState<"project" | "time" | "session">("project");
-  const [days, setDays] = useState<number>(30); // 7, 14, 30, 0 (0 = all)
+  const [datePreset, setDatePreset] = useState<"all" | "today" | "7d" | "30d" | "custom">("all");
+  const [startDate, setStartDate] = useState<string>("");
+  const [endDate, setEndDate] = useState<string>("");
   const [selectedProjectId, setSelectedProjectId] = useState<string>("all");
   const [data, setData] = useState<TokenStatsReport | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [hoveredBar, setHoveredBar] = useState<number | null>(null);
 
+  const handleDatePreset = (preset: "all" | "today" | "7d" | "30d") => {
+    setDatePreset(preset);
+    const now = new Date();
+    const pad = (n: number) => n.toString().padStart(2, "0");
+    const formatDate = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+
+    if (preset === "all") {
+      setStartDate("");
+      setEndDate("");
+    } else if (preset === "today") {
+      const todayStr = formatDate(now);
+      setStartDate(todayStr);
+      setEndDate(todayStr);
+    } else if (preset === "7d") {
+      const past = new Date();
+      past.setDate(past.getDate() - 6);
+      setStartDate(formatDate(past));
+      setEndDate(formatDate(now));
+    } else if (preset === "30d") {
+      const past = new Date();
+      past.setDate(past.getDate() - 29);
+      setStartDate(formatDate(past));
+      setEndDate(formatDate(now));
+    }
+  };
+
+  const handleStartDateChange = (val: string) => {
+    setStartDate(val);
+    setDatePreset("custom");
+  };
+
+  const handleEndDateChange = (val: string) => {
+    setEndDate(val);
+    setDatePreset("custom");
+  };
+
+  const handleClearDate = () => {
+    setDatePreset("all");
+    setStartDate("");
+    setEndDate("");
+  };
+
   const refresh = async () => {
     setLoading(true);
     try {
       const projId = selectedProjectId === "all" ? null : selectedProjectId;
-      const res = await ipc.getTokenStats(projId, days);
+      const res = await ipc.getTokenStats(
+        projId,
+        null,
+        startDate || null,
+        endDate || null,
+      );
       setData(res);
     } catch (e) {
       pushToast(`加载 Token 统计失败: ${e}`);
@@ -55,7 +115,7 @@ export function TokenStatsModal() {
       void refresh();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [show, days, selectedProjectId]);
+  }, [show, startDate, endDate, selectedProjectId]);
 
   if (!show) return null;
 
@@ -70,7 +130,7 @@ export function TokenStatsModal() {
   return (
     <div
       className="fixed inset-0 z-[85] bg-black/60 backdrop-blur-sm flex items-center justify-center animate-in fade-in duration-150"
-      onMouseDown={() => setShow(false)}
+      onMouseDown={handleClose}
     >
       <div
         className="bg-panel2 border border-edge rounded-2xl w-[920px] max-w-[94vw] h-[86vh] flex flex-col shadow-2xl overflow-hidden animate-in zoom-in-95 duration-150"
@@ -92,8 +152,18 @@ export function TokenStatsModal() {
           </div>
 
           <div className="flex items-center gap-2">
+            {tokenStatsFromSettings && (
+              <button
+                className="px-2.5 py-1.5 rounded-lg border border-edge hover:bg-panel3 text-inkdim hover:text-ink text-[12px] flex items-center gap-1.5 transition-colors cursor-pointer"
+                onClick={handleClose}
+                title="返回程序设置"
+              >
+                <ChevronLeft size={14} />
+                <span>返回设置</span>
+              </button>
+            )}
             <button
-              className="px-2.5 py-1.5 rounded-lg border border-edge hover:bg-panel3 text-inkdim hover:text-ink text-[12px] flex items-center gap-1.5 transition-colors"
+              className="px-2.5 py-1.5 rounded-lg border border-edge hover:bg-panel3 text-inkdim hover:text-ink text-[12px] flex items-center gap-1.5 transition-colors cursor-pointer"
               onClick={() => void refresh()}
               title="刷新统计数据"
             >
@@ -101,8 +171,9 @@ export function TokenStatsModal() {
               <span>刷新</span>
             </button>
             <button
-              className="w-8 h-8 rounded-lg hover:bg-panel3 flex items-center justify-center text-inkdim hover:text-ink transition-colors"
-              onClick={() => setShow(false)}
+              className="w-8 h-8 rounded-lg hover:bg-panel3 flex items-center justify-center text-inkdim hover:text-ink transition-colors cursor-pointer"
+              onClick={handleClose}
+              title={tokenStatsFromSettings ? "关闭并返回设置" : "关闭"}
             >
               <X size={16} />
             </button>
@@ -115,7 +186,7 @@ export function TokenStatsModal() {
             {/* 总消耗 Token */}
             <div className="bg-panel border border-edge/70 rounded-xl p-3.5 shadow-sm">
               <div className="flex items-center justify-between text-inkdim text-[11px] mb-1">
-                <span>总消耗 Token</span>
+                <span>{startDate || endDate ? "区间消耗 Token" : "总消耗 Token"}</span>
                 <Sparkles size={13} className="text-accent" />
               </div>
               <div className="text-xl font-bold text-ink tracking-tight">
@@ -129,7 +200,7 @@ export function TokenStatsModal() {
             {/* 全局缓存命中率 */}
             <div className="bg-panel border border-edge/70 rounded-xl p-3.5 shadow-sm">
               <div className="flex items-center justify-between text-inkdim text-[11px] mb-1">
-                <span>全局缓存命中率</span>
+                <span>{startDate || endDate ? "区间缓存命中率" : "全局缓存命中率"}</span>
                 <Zap size={13} className="text-cyan-400" />
               </div>
               <div className="text-xl font-bold text-cyan-400 tracking-tight">
@@ -184,63 +255,43 @@ export function TokenStatsModal() {
           </div>
         </div>
 
-        {/* 选项卡栏与筛选器 */}
-        <div className="px-6 py-2.5 border-b border-edge/40 flex items-center justify-between gap-4 shrink-0 bg-panel/50 select-none">
-          {/* Tab 切换 */}
-          <div className="flex bg-panel2 p-0.5 rounded-lg border border-edge">
-            <button
-              className={`px-3 py-1.5 rounded-md text-[12px] font-medium transition-colors flex items-center gap-1.5 ${
-                tab === "project" ? "bg-accent/15 text-accent shadow-sm" : "text-inkdim hover:text-ink"
-              }`}
-              onClick={() => setTab("project")}
-            >
-              <FolderOpen size={13} />
-              <span>按项目统计</span>
-            </button>
-            <button
-              className={`px-3 py-1.5 rounded-md text-[12px] font-medium transition-colors flex items-center gap-1.5 ${
-                tab === "time" ? "bg-accent/15 text-accent shadow-sm" : "text-inkdim hover:text-ink"
-              }`}
-              onClick={() => setTab("time")}
-            >
-              <TrendingUp size={13} />
-              <span>按时间统计</span>
-            </button>
-            <button
-              className={`px-3 py-1.5 rounded-md text-[12px] font-medium transition-colors flex items-center gap-1.5 ${
-                tab === "session" ? "bg-accent/15 text-accent shadow-sm" : "text-inkdim hover:text-ink"
-              }`}
-              onClick={() => setTab("session")}
-            >
-              <MessageSquare size={13} />
-              <span>会话消耗排行</span>
-            </button>
-          </div>
+        {/* 选项卡栏与多维筛选器 */}
+        <div className="px-6 py-2 border-b border-edge/40 bg-panel/50 shrink-0 flex flex-col gap-2 select-none">
+          {/* 第一行：Tab 切换与项目范围筛选 */}
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex bg-panel2 p-0.5 rounded-lg border border-edge">
+              <button
+                className={`px-3 py-1.5 rounded-md text-[12px] font-medium transition-colors flex items-center gap-1.5 cursor-pointer ${
+                  tab === "project" ? "bg-accent/15 text-accent shadow-sm" : "text-inkdim hover:text-ink"
+                }`}
+                onClick={() => setTab("project")}
+              >
+                <FolderOpen size={13} />
+                <span>按项目统计</span>
+              </button>
+              <button
+                className={`px-3 py-1.5 rounded-md text-[12px] font-medium transition-colors flex items-center gap-1.5 cursor-pointer ${
+                  tab === "time" ? "bg-accent/15 text-accent shadow-sm" : "text-inkdim hover:text-ink"
+                }`}
+                onClick={() => setTab("time")}
+              >
+                <TrendingUp size={13} />
+                <span>按时间统计</span>
+              </button>
+              <button
+                className={`px-3 py-1.5 rounded-md text-[12px] font-medium transition-colors flex items-center gap-1.5 cursor-pointer ${
+                  tab === "session" ? "bg-accent/15 text-accent shadow-sm" : "text-inkdim hover:text-ink"
+                }`}
+                onClick={() => setTab("session")}
+              >
+                <MessageSquare size={13} />
+                <span>会话消耗排行</span>
+              </button>
+            </div>
 
-          {/* 筛选条件（仅在按时间或会话排行时展示细化选项） */}
-          <div className="flex items-center gap-2">
-            {tab === "time" && (
-              <div className="flex bg-panel2 p-0.5 rounded-lg border border-edge text-[11px]">
-                {[
-                  { label: "近 7 天", val: 7 },
-                  { label: "近 14 天", val: 14 },
-                  { label: "近 30 天", val: 30 },
-                  { label: "全部", val: 0 },
-                ].map((item) => (
-                  <button
-                    key={item.val}
-                    className={`px-2.5 py-1 rounded-md transition-colors ${
-                      days === item.val ? "bg-panel3 text-ink font-medium shadow-sm" : "text-inkdim hover:text-ink"
-                    }`}
-                    onClick={() => setDays(item.val)}
-                  >
-                    {item.label}
-                  </button>
-                ))}
-              </div>
-            )}
-
-            {tab !== "project" && (
+            {/* 项目筛选下拉 */}
+            <div className="flex items-center gap-1.5 text-[12px] text-inkdim">
+              <span className="shrink-0">项目:</span>
               <select
                 className="bg-panel2 border border-edge rounded-lg px-2.5 py-1 text-[12px] text-ink outline-none cursor-pointer hover:border-accent/40 transition-colors"
                 value={selectedProjectId}
@@ -256,6 +307,76 @@ export function TokenStatsModal() {
                   ))}
                 <option value="unassigned">未归类 / 纯对话</option>
               </select>
+            </div>
+          </div>
+
+          {/* 第二行：时间范围与日期范围选择 */}
+          <div className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-edge/30 text-[12px]">
+            <div className="flex flex-wrap items-center gap-2.5">
+              <div className="flex items-center gap-1.5 text-inkdim">
+                <Calendar size={13} className="text-accent" />
+                <span className="shrink-0 text-[11.5px]">统计周期:</span>
+              </div>
+
+              {/* 快捷预设 */}
+              <div className="flex bg-panel2 p-0.5 rounded-lg border border-edge text-[11px]">
+                {[
+                  { label: "全部时间", val: "all" as const },
+                  { label: "今天", val: "today" as const },
+                  { label: "近 7 天", val: "7d" as const },
+                  { label: "近 30 天", val: "30d" as const },
+                ].map((item) => (
+                  <button
+                    key={item.val}
+                    className={`px-2.5 py-0.8 rounded-md transition-colors cursor-pointer ${
+                      datePreset === item.val
+                        ? "bg-panel3 text-ink font-medium shadow-sm"
+                        : "text-inkdim hover:text-ink"
+                    }`}
+                    onClick={() => handleDatePreset(item.val)}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* 自定义起止日期 */}
+              <div className="flex items-center gap-1.5 text-[11.5px] text-inkdim">
+                <span className="text-[11px]">从</span>
+                <input
+                  type="date"
+                  value={startDate}
+                  onChange={(e) => handleStartDateChange(e.target.value)}
+                  className="bg-panel2 border border-edge rounded-lg px-2 py-0.5 text-[11.5px] text-ink outline-none hover:bg-panel3 focus:border-accent cursor-pointer"
+                  title="起始日期"
+                />
+                <span className="text-[11px]">至</span>
+                <input
+                  type="date"
+                  value={endDate}
+                  onChange={(e) => handleEndDateChange(e.target.value)}
+                  className="bg-panel2 border border-edge rounded-lg px-2 py-0.5 text-[11.5px] text-ink outline-none hover:bg-panel3 focus:border-accent cursor-pointer"
+                  title="结束日期"
+                />
+                {(startDate || endDate) && (
+                  <button
+                    className="p-1 rounded-md hover:bg-panel3 text-inkdim hover:text-ink transition-colors cursor-pointer ml-0.5"
+                    onClick={handleClearDate}
+                    title="重置统计周期"
+                  >
+                    <X size={12} />
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* 提示或快速状态 */}
+            {(startDate || endDate) && (
+              <div className="text-[11px] text-accent/80 flex items-center gap-1">
+                <span>
+                  已过滤区间: {startDate || "最早"} ~ {endDate || "今天"}
+                </span>
+              </div>
             )}
           </div>
         </div>

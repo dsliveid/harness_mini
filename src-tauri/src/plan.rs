@@ -53,6 +53,10 @@ pub struct PlanSummary {
     pub total_steps: usize,
     pub completed_steps: usize,
     pub is_active: bool,
+    #[serde(default)]
+    pub steps: Vec<PlanStep>,
+    #[serde(default)]
+    pub body: String,
 }
 
 /// 计划根目录：<workspace>/.harness/plans
@@ -350,8 +354,28 @@ pub fn sync_steps_to_todos(
     }
 }
 
-/// 创建新计划
-pub fn create_plan(
+/// 计划创建影响详情（用于 CAS 影子快照与撤回恢复）
+#[derive(Debug, Clone)]
+pub struct PlanEffect {
+    pub new_plan_rel: String,
+    pub new_bytes: Vec<u8>,
+    pub suspended_plan_rel: Option<String>,
+    pub suspended_old_bytes: Option<Vec<u8>>,
+    pub suspended_new_bytes: Option<Vec<u8>>,
+    pub message: String,
+}
+
+/// 计划更新影响详情（用于 CAS 影子快照与撤回恢复）
+#[derive(Debug, Clone)]
+pub struct PlanUpdateEffect {
+    pub rel_path: String,
+    pub old_bytes: Vec<u8>,
+    pub new_bytes: Vec<u8>,
+    pub message: String,
+}
+
+/// 创建新计划并返回物理变更信息
+pub fn create_plan_with_effect(
     workspace: &Path,
     session_id: &str,
     title: &str,
@@ -361,7 +385,7 @@ pub fn create_plan(
     steps: &[String],
     verification: Option<&str>,
     conn: Option<&rusqlite::Connection>,
-) -> Result<String, String> {
+) -> Result<PlanEffect, String> {
     ensure_plans_dir(workspace)?;
     let title = title.trim();
     if title.is_empty() {
@@ -369,14 +393,24 @@ pub fn create_plan(
     }
 
     // 若当前会话已有处于 in_progress 的计划，先将其置为 suspended（挂起），实现多任务隔离
+    let mut suspended_info = None;
     if let Some((old_path, mut old_meta, old_body)) =
         find_plan_file(workspace, session_id, None, conn)
     {
         if old_meta.status == "in_progress" {
+            let old_bytes = fs::read(&old_path).ok();
             old_meta.status = "suspended".into();
             old_meta.updated_at = Utc::now().to_rfc3339();
             let updated = format_with_frontmatter(&old_meta, &old_body);
-            let _ = fs::write(&old_path, updated);
+            let new_bytes = updated.as_bytes().to_vec();
+            let _ = fs::write(&old_path, &updated);
+            if let Ok(rel) = old_path.strip_prefix(workspace) {
+                suspended_info = Some((
+                    rel.to_string_lossy().replace('\\', "/"),
+                    old_bytes,
+                    new_bytes,
+                ));
+            }
         }
     }
 
@@ -457,7 +491,8 @@ pub fn create_plan(
     );
 
     let full_content = format_with_frontmatter(&meta, &body);
-    fs::write(&file_path, full_content)
+    let new_bytes = full_content.as_bytes().to_vec();
+    fs::write(&file_path, &full_content)
         .map_err(|e| format!("写入计划文件失败 ({filename}): {e}"))?;
 
     // 绑定当前会话的 active_plan_id
@@ -467,13 +502,53 @@ pub fn create_plan(
     let parsed_steps = parse_steps_from_markdown(&body);
     sync_steps_to_todos(conn, session_id, &parsed_steps);
 
-    Ok(format!(
+    let (suspended_plan_rel, suspended_old_bytes, suspended_new_bytes) = match suspended_info {
+        Some((rel, ob, nb)) => (Some(rel), ob, Some(nb)),
+        None => (None, None, None),
+    };
+
+    let msg = format!(
         "已成功在 `.harness/plans/{filename}` 创建专属任务计划【{title}】（版本 v1）。\n- 方案文件物理路径: `.harness/plans/{filename}`\n- 活动计划ID: `{plan_id}`\n\n【⚠️ 重要阶段指令 - 方案先行门禁】: 方案文档现已物理落盘！根据规划先行原则，当前轮次严禁继续调用任何代码写入/编辑工具（write_file/edit_file）！你必须立即停止调用工具，向用户输出结构化总结回复（汇报核心目标、设计方案、影响文件清单及实施步骤），并明确请用户在对话中审阅确认方案！用户在对话中回复确认或给出调整指示后方可开始编写代码实施。"
-    ))
+    );
+
+    Ok(PlanEffect {
+        new_plan_rel: format!(".harness/plans/{}", filename),
+        new_bytes,
+        suspended_plan_rel,
+        suspended_old_bytes,
+        suspended_new_bytes,
+        message: msg,
+    })
 }
 
-/// 更新计划内容、推进步骤或调整状态
-pub fn update_plan(
+/// 创建新计划
+pub fn create_plan(
+    workspace: &Path,
+    session_id: &str,
+    title: &str,
+    goals: &str,
+    architecture: &str,
+    files: &[String],
+    steps: &[String],
+    verification: Option<&str>,
+    conn: Option<&rusqlite::Connection>,
+) -> Result<String, String> {
+    create_plan_with_effect(
+        workspace,
+        session_id,
+        title,
+        goals,
+        architecture,
+        files,
+        steps,
+        verification,
+        conn,
+    )
+    .map(|e| e.message)
+}
+
+/// 更新计划内容、推进步骤或调整状态并返回物理变更信息
+pub fn update_plan_with_effect(
     workspace: &Path,
     session_id: &str,
     plan_id: Option<&str>,
@@ -483,7 +558,7 @@ pub fn update_plan(
     modified_sections: Option<&Value>,
     revision_note: Option<&str>,
     conn: Option<&rusqlite::Connection>,
-) -> Result<String, String> {
+) -> Result<PlanUpdateEffect, String> {
     ensure_plans_dir(workspace)?;
     let Some((file_path, mut meta, mut body)) =
         find_plan_file(workspace, session_id, plan_id, conn)
@@ -491,6 +566,8 @@ pub fn update_plan(
         let hint = available_plans_hint(workspace, Some(session_id), conn);
         return Err(format!("未找到指定或当前活动的计划文档，无法更新{hint}"));
     };
+
+    let old_bytes = fs::read(&file_path).map_err(|e| format!("读取计划文件失败: {e}"))?;
 
     let time_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     meta.version += 1;
@@ -651,7 +728,8 @@ pub fn update_plan(
     }
 
     let full_content = format_with_frontmatter(&meta, &body);
-    fs::write(&file_path, full_content)
+    let new_bytes = full_content.as_bytes().to_vec();
+    fs::write(&file_path, &full_content)
         .map_err(|e| format!("更新计划文件失败: {e}"))?;
 
     // 同步更新后的步骤到 todo
@@ -665,10 +743,48 @@ pub fn update_plan(
     };
 
     let filename = file_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    Ok(format!(
+    let rel_path = file_path
+        .strip_prefix(workspace)
+        .map(|r| r.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| format!(".harness/plans/{}", filename));
+
+    let msg = format!(
         "已成功将计划【{}】更新至版本 v{}（状态：{}）。\n- 方案文件物理路径: `.harness/plans/{}`\n变更说明：{}\n步骤清单与持久化文档已实时同步更新。",
         meta.title, meta.version, status_desc, filename, rev_text
-    ))
+    );
+
+    Ok(PlanUpdateEffect {
+        rel_path,
+        old_bytes,
+        new_bytes,
+        message: msg,
+    })
+}
+
+/// 更新计划内容、推进步骤或调整状态
+pub fn update_plan(
+    workspace: &Path,
+    session_id: &str,
+    plan_id: Option<&str>,
+    reason: &str,
+    status: Option<&str>,
+    step_updates: Option<&[Value]>,
+    modified_sections: Option<&Value>,
+    revision_note: Option<&str>,
+    conn: Option<&rusqlite::Connection>,
+) -> Result<String, String> {
+    update_plan_with_effect(
+        workspace,
+        session_id,
+        plan_id,
+        reason,
+        status,
+        step_updates,
+        modified_sections,
+        revision_note,
+        conn,
+    )
+    .map(|e| e.message)
 }
 
 /// 单独更新计划某一执行步骤的状态（供前端交互勾选并持久化）
@@ -912,6 +1028,8 @@ pub fn list_plans(
                             total_steps: steps.len(),
                             completed_steps: completed_count,
                             is_active,
+                            steps,
+                            body,
                         });
                     }
                 }
@@ -1002,6 +1120,125 @@ pub fn load_active_plan_context(
             steps_text = steps_text
         ))
     }
+}
+
+/// 在会话撤回（revert_to_message / turn_revert）或重做（reapply）后，
+/// 自动校准当前会话绑定的活动方案 (active_plan_id) 与磁盘方案状态。
+pub fn sync_session_plans_after_revert(
+    conn: &rusqlite::Connection,
+    workspace: &Path,
+    session_id: &str,
+) -> Result<Option<String>, String> {
+    if workspace.as_os_str().is_empty() || session_id.is_empty() {
+        return Ok(None);
+    }
+
+    // 1. 查询会话中所有有效（reverted_at IS NULL）且按顺序降序排列的方案工具事件
+    let mut stmt = conn
+        .prepare(
+            "SELECT te.tool_name, te.params_json, te.result_text
+             FROM tool_events te
+             JOIN messages m ON te.message_id = m.id
+             WHERE m.session_id = ?1 AND m.reverted_at IS NULL
+               AND te.tool_name IN ('create_plan', 'update_plan', 'switch_plan')
+               AND te.status = 'success'
+             ORDER BY m.seq DESC, te.created_at DESC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let events: Vec<(String, String, String)> = stmt
+        .query_map(rusqlite::params![session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut candidate_plan_id: Option<String> = None;
+
+    for (name, params_str, result_text) in &events {
+        let params: Value = serde_json::from_str(params_str).unwrap_or(Value::Null);
+        if name == "switch_plan" {
+            if let Some(pid) = params.get("plan_id").and_then(|v| v.as_str()) {
+                candidate_plan_id = Some(pid.to_string());
+                break;
+            }
+        } else if name == "create_plan" {
+            // 从 result_text 中提取活动计划ID: `plan-xxx`
+            if let Some(start) = result_text.find("活动计划ID: `") {
+                let rest = &result_text[start + 16..];
+                if let Some(end) = rest.find('`') {
+                    candidate_plan_id = Some(rest[..end].to_string());
+                    break;
+                }
+            }
+            if let Some(title) = params.get("title").and_then(|v| v.as_str()) {
+                let slug = sanitize_slug(title);
+                candidate_plan_id = Some(format!("plan-{}", slug));
+                break;
+            }
+        } else if name == "update_plan" {
+            if let Some(pid) = params.get("plan_id").and_then(|v| v.as_str()) {
+                candidate_plan_id = Some(pid.to_string());
+                break;
+            }
+        }
+    }
+
+    // 2. 检查候选计划在工作区物理磁盘上是否存在
+    let pdir = plans_dir(workspace);
+    let mut resolved_active_id: Option<String> = None;
+
+    if let Some(cid) = candidate_plan_id {
+        if let Some((path, mut meta, body)) = find_plan_file(workspace, session_id, Some(&cid), Some(conn)) {
+            resolved_active_id = Some(meta.id.clone());
+            // 确保该有效方案恢复为 in_progress 状态
+            if meta.status != "in_progress" {
+                meta.status = "in_progress".into();
+                meta.updated_at = Utc::now().to_rfc3339();
+                let full = format_with_frontmatter(&meta, &body);
+                let _ = fs::write(&path, full);
+            }
+        }
+    }
+
+    // 3. 若未通过历史事件找到，但磁盘上仍有属于本 session 的方案，取最新的一个
+    if resolved_active_id.is_none() && pdir.exists() {
+        if let Ok(entries) = fs::read_dir(&pdir) {
+            let mut session_plans = Vec::new();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        let (meta, body) = parse_frontmatter(&content);
+                        if meta.session_id == session_id {
+                            session_plans.push((path, meta, body));
+                        }
+                    }
+                }
+            }
+            // 按更新时间降序
+            session_plans.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
+            if let Some((path, mut meta, body)) = session_plans.into_iter().next() {
+                resolved_active_id = Some(meta.id.clone());
+                if meta.status != "in_progress" {
+                    meta.status = "in_progress".into();
+                    meta.updated_at = Utc::now().to_rfc3339();
+                    let full = format_with_frontmatter(&meta, &body);
+                    let _ = fs::write(&path, full);
+                }
+            }
+        }
+    }
+
+    // 4. 将 resolved_active_id 写回 session_kv
+    set_active_plan_id(Some(conn), session_id, resolved_active_id.as_deref())?;
+
+    Ok(resolved_active_id)
 }
 
 #[cfg(test)]
@@ -1273,6 +1510,63 @@ mod tests {
         assert!(ctx.contains("继承自父会话"));
         assert!(ctx.contains("子任务协同约束"));
         assert!(ctx.contains("严禁擅自修改计划文档"));
+    }
+
+    #[test]
+    fn test_plan_effects_and_sync_after_revert() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        let tmp = TempDir::new();
+        let ws = tmp.path();
+        let sid = "session-test-revert";
+
+        // 1. 创建第一个方案
+        let eff1 = create_plan_with_effect(
+            ws,
+            sid,
+            "方案一",
+            "目标一",
+            "架构一",
+            &[],
+            &["步骤1".into()],
+            None,
+            Some(&conn),
+        ).unwrap();
+        assert!(eff1.new_plan_rel.starts_with(".harness/plans/"));
+        assert!(eff1.suspended_plan_rel.is_none());
+
+        let active_pid1 = get_active_plan_id(Some(&conn), sid);
+        assert!(active_pid1.is_some());
+
+        // 2. 创建第二个方案（第一个方案应被挂起）
+        let eff2 = create_plan_with_effect(
+            ws,
+            sid,
+            "方案二",
+            "目标二",
+            "架构二",
+            &[],
+            &["步骤2".into()],
+            None,
+            Some(&conn),
+        ).unwrap();
+        assert!(eff2.suspended_plan_rel.is_some());
+        assert_eq!(eff2.suspended_plan_rel.as_deref(), Some(eff1.new_plan_rel.as_str()));
+
+        let active_pid2 = get_active_plan_id(Some(&conn), sid);
+        assert!(active_pid2.is_some());
+        assert_ne!(active_pid1, active_pid2);
+
+        // 3. 模拟撤回：将方案二的物理文件删除（如同 snapshot_revert 将新建文件删除）
+        let plan2_path = ws.join(&eff2.new_plan_rel);
+        let _ = fs::remove_file(&plan2_path);
+
+        // 4. 调用 sync_session_plans_after_revert：应自动校准回方案一并置为活动方案
+        let synced_id = sync_session_plans_after_revert(&conn, ws, sid).unwrap();
+        assert_eq!(synced_id, active_pid1);
+
+        let cur_active = get_active_plan_id(Some(&conn), sid);
+        assert_eq!(cur_active, active_pid1);
     }
 }
 

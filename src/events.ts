@@ -35,6 +35,7 @@ export function useAppEvents() {
       listen<any>("settings:changed", (e) => s.onSettingsChanged(e.payload)),
       listen<any>("session:rules", (e) => s.onSessionRules(e.payload)),
       listen<any>("session:todos", (e) => s.onSessionTodos(e.payload)),
+      listen<any>("session:plans", (e) => s.onSessionPlans(e.payload)),
       listen<any>("sessions:changed", (e) => s.onSessionsChanged(e.payload)),
       listen<any>("projects:changed", () => s.onProjectsChanged()),
       listen<any>("temp:update", (e) => s.onTempUpdate(e.payload)),

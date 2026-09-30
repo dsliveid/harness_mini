@@ -437,6 +437,11 @@ pub fn get_settings_with_secrets(conn: &Connection, master: &[u8; 32]) -> Result
             }
         }
     }
+    if s.jev.api_key.is_empty() {
+        if let Ok(Some(k)) = secret_get(conn, master, crate::secrets::JEV_API_KEY_ID) {
+            s.jev.api_key = k;
+        }
+    }
     Ok(s)
 }
 
@@ -752,6 +757,155 @@ mod tests {
         let updated2 = get_project(&conn, &p.id).unwrap().unwrap();
         assert_eq!(updated2.sop_verify_cmd, None);
         assert!(!updated2.sop_enabled);
+    }
+
+    #[test]
+    fn test_query_tool_logs_filtering_and_aggregation() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        let proj = create_project(&conn, "demo_proj", Some("D:\\demo")).unwrap();
+        let sess1 = create_session(&conn, "D:\\demo", Some(&proj.id), "Session 1", "confirm").unwrap();
+        let sess2 = create_session(&conn, "D:\\demo", Some(&proj.id), "Session 2", "confirm").unwrap();
+
+        let msg1 = new_message(&conn, &sess1.id, "assistant", Some("test1".into()), false).unwrap();
+        let msg2 = new_message(&conn, &sess2.id, "assistant", Some("test2".into()), false).unwrap();
+
+        let ev1 = ToolEvent {
+            id: "ev1".into(),
+            message_id: msg1.id.clone(),
+            tool_name: "read_file".into(),
+            tool_call_id: Some("call1".into()),
+            params: serde_json::json!({ "path": "non_exist.txt" }),
+            result_text: Some("工具执行失败：读取失败: 系统找不到指定的文件。 (os error 2)".into()),
+            status: "failed".into(),
+            approval_scope: None,
+            created_at: "2026-09-30T10:00:00Z".into(),
+            subprocess_id: None,
+            reverted_at: None,
+        };
+        let ev2 = ToolEvent {
+            id: "ev2".into(),
+            message_id: msg2.id.clone(),
+            tool_name: "read_file".into(),
+            tool_call_id: Some("call2".into()),
+            params: serde_json::json!({ "path": "another_non_exist.txt" }),
+            result_text: Some("工具执行失败：读取失败: 系统找不到指定的文件。 (os error 2)".into()),
+            status: "failed".into(),
+            approval_scope: None,
+            created_at: "2026-09-30T10:01:00Z".into(),
+            subprocess_id: None,
+            reverted_at: None,
+        };
+        let ev3 = ToolEvent {
+            id: "ev3".into(),
+            message_id: msg1.id.clone(),
+            tool_name: "write_file".into(),
+            tool_call_id: Some("call3".into()),
+            params: serde_json::json!({ "path": "ok.txt", "content": "hello" }),
+            result_text: Some("写入成功".into()),
+            status: "success".into(),
+            approval_scope: None,
+            created_at: "2026-09-30T10:02:00Z".into(),
+            subprocess_id: None,
+            reverted_at: None,
+        };
+
+        insert_tool_event(&conn, &ev1).unwrap();
+        insert_tool_event(&conn, &ev2).unwrap();
+        insert_tool_event(&conn, &ev3).unwrap();
+
+        // 1. 全量查询
+        let all_res = query_tool_logs(&conn, &ToolLogFilter::default()).unwrap();
+        assert_eq!(all_res.total_count, 3);
+        assert_eq!(all_res.error_count, 2);
+        assert_eq!(all_res.items.len(), 3);
+        // 验证聚类聚合
+        assert_eq!(all_res.top_errors.len(), 1);
+        assert_eq!(all_res.top_errors[0].tool_name, "read_file");
+        assert_eq!(all_res.top_errors[0].count, 2);
+        assert_eq!(all_res.top_errors[0].session_count, 2);
+
+        // 2. 仅看异常
+        let err_res = query_tool_logs(&conn, &ToolLogFilter {
+            status: Some("error_only".into()),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(err_res.items.len(), 2);
+        assert!(err_res.items.iter().all(|it| it.status == "failed"));
+
+        // 3. 关键词过滤
+        let kw_res = query_tool_logs(&conn, &ToolLogFilter {
+            keyword: Some("another_non_exist".into()),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(kw_res.items.len(), 1);
+        assert_eq!(kw_res.items[0].id, "ev2");
+
+        // 5. 日期范围过滤
+        let date_match_res = query_tool_logs(&conn, &ToolLogFilter {
+            start_date: Some("2026-09-30".into()),
+            end_date: Some("2026-09-30".into()),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(date_match_res.items.len(), 3);
+
+        let date_miss_res = query_tool_logs(&conn, &ToolLogFilter {
+            start_date: Some("2026-10-01".into()),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(date_miss_res.items.len(), 0);
+    }
+
+    #[test]
+    fn test_get_token_stats_with_date_range() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        let proj = create_project(&conn, "token_demo_proj", None).unwrap();
+        let sess = create_session(&conn, "D:\\demo", Some(&proj.id), "Session Token", "confirm").unwrap();
+
+        // 插入不同日期的助手消息
+        let mut msg1 = new_message(&conn, &sess.id, "assistant", Some("hello 1".into()), false).unwrap();
+        msg1.created_at = "2026-09-15T12:00:00Z".into();
+        msg1.prompt_tokens = Some(100);
+        msg1.completion_tokens = Some(50);
+        msg1.total_tokens = Some(150);
+        msg1.cached_tokens = Some(20);
+        conn.execute(
+            "UPDATE messages SET created_at = ?1, prompt_tokens = ?2, completion_tokens = ?3, total_tokens = ?4, cached_tokens = ?5 WHERE id = ?6",
+            rusqlite::params![msg1.created_at, msg1.prompt_tokens, msg1.completion_tokens, msg1.total_tokens, msg1.cached_tokens, msg1.id],
+        ).unwrap();
+
+        let mut msg2 = new_message(&conn, &sess.id, "assistant", Some("hello 2".into()), false).unwrap();
+        msg2.created_at = "2026-09-20T12:00:00Z".into();
+        msg2.prompt_tokens = Some(200);
+        msg2.completion_tokens = Some(100);
+        msg2.total_tokens = Some(300);
+        msg2.cached_tokens = Some(50);
+        conn.execute(
+            "UPDATE messages SET created_at = ?1, prompt_tokens = ?2, completion_tokens = ?3, total_tokens = ?4, cached_tokens = ?5 WHERE id = ?6",
+            rusqlite::params![msg2.created_at, msg2.prompt_tokens, msg2.completion_tokens, msg2.total_tokens, msg2.cached_tokens, msg2.id],
+        ).unwrap();
+
+        // 全量查询
+        let all_stats = get_token_stats(&conn, None, None, None, None).unwrap();
+        assert_eq!(all_stats.summary.total_tokens, 450);
+        assert_eq!(all_stats.by_time.len(), 2);
+
+        // 指定日期范围：仅包含 2026-09-20
+        let filtered_stats = get_token_stats(
+            &conn,
+            None,
+            None,
+            Some("2026-09-18"),
+            Some("2026-09-22"),
+        ).unwrap();
+        assert_eq!(filtered_stats.summary.total_tokens, 300);
+        assert_eq!(filtered_stats.by_time.len(), 1);
+        assert_eq!(filtered_stats.by_time[0].date, "2026-09-20");
+        assert_eq!(filtered_stats.by_session.len(), 1);
+        assert_eq!(filtered_stats.by_session[0].total_tokens, 300);
     }
 
     #[test]
@@ -4039,6 +4193,8 @@ pub fn get_token_stats(
     conn: &Connection,
     project_id: Option<&str>,
     days: Option<u32>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
 ) -> Result<TokenStatsReport, String> {
     let now_str = now();
     let today_prefix = if now_str.len() >= 10 {
@@ -4047,42 +4203,98 @@ pub fn get_token_stats(
         ""
     };
 
-    // 1. 全局概览汇总
+    let mut date_conditions = Vec::new();
+    if let Some(sd) = start_date {
+        let trimmed = sd.trim();
+        if !trimmed.is_empty() {
+            let d = if trimmed.len() >= 10 { &trimmed[..10] } else { trimmed };
+            date_conditions.push(format!("substr(m.created_at, 1, 10) >= '{d}'"));
+        }
+    }
+    if let Some(ed) = end_date {
+        let trimmed = ed.trim();
+        if !trimmed.is_empty() {
+            let d = if trimmed.len() >= 10 { &trimmed[..10] } else { trimmed };
+            date_conditions.push(format!("substr(m.created_at, 1, 10) <= '{d}'"));
+        }
+    }
+
+    let date_filter_sql = if !date_conditions.is_empty() {
+        format!("AND {}", date_conditions.join(" AND "))
+    } else if let Some(d) = days {
+        if d > 0 {
+            let cutoff = chrono::Utc::now() - chrono::Duration::days(d as i64);
+            format!("AND m.created_at >= '{}'", cutoff.to_rfc3339())
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let proj_filter_sql = if let Some(pid) = project_id {
+        if !pid.is_empty() {
+            if pid == "unassigned" {
+                "AND (s.project_id IS NULL OR s.project_id = '')".to_string()
+            } else {
+                format!("AND s.project_id = '{pid}'")
+            }
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    // 1. 全局概览汇总 (根据日期/项目条件进行统计)
+    let summary_sql = format!(
+        "SELECT 
+            COALESCE(SUM(m.prompt_tokens), 0),
+            COALESCE(SUM(m.completion_tokens), 0),
+            COALESCE(SUM(m.total_tokens), 0),
+            COALESCE(SUM(m.cached_tokens), 0),
+            COUNT(m.id)
+         FROM messages m
+         JOIN sessions s ON s.id = m.session_id
+         WHERE m.role = 'assistant' {date_filter_sql} {proj_filter_sql}"
+    );
+
     let (tot_pt, tot_ct, tot_tt, tot_cached, tot_msgs): (i64, i64, i64, i64, i64) = conn
         .query_row(
-            "SELECT 
-                COALESCE(SUM(prompt_tokens), 0),
-                COALESCE(SUM(completion_tokens), 0),
-                COALESCE(SUM(total_tokens), 0),
-                COALESCE(SUM(cached_tokens), 0),
-                COUNT(*)
-             FROM messages
-             WHERE role = 'assistant'",
+            &summary_sql,
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .unwrap_or((0, 0, 0, 0, 0));
 
+    let today_sql = format!(
+        "SELECT 
+            COALESCE(SUM(m.prompt_tokens), 0),
+            COALESCE(SUM(m.completion_tokens), 0),
+            COALESCE(SUM(m.total_tokens), 0),
+            COALESCE(SUM(m.cached_tokens), 0)
+         FROM messages m
+         JOIN sessions s ON s.id = m.session_id
+         WHERE m.role = 'assistant' AND substr(m.created_at, 1, 10) = ?1 {proj_filter_sql}"
+    );
+
     let (today_pt, today_ct, today_tt, today_cached): (i64, i64, i64, i64) = conn
         .query_row(
-            "SELECT 
-                COALESCE(SUM(prompt_tokens), 0),
-                COALESCE(SUM(completion_tokens), 0),
-                COALESCE(SUM(total_tokens), 0),
-                COALESCE(SUM(cached_tokens), 0)
-             FROM messages
-             WHERE role = 'assistant' AND substr(created_at, 1, 10) = ?1",
+            &today_sql,
             params![today_prefix],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .unwrap_or((0, 0, 0, 0));
 
+    let sess_count_sql = format!(
+        "SELECT COUNT(DISTINCT m.session_id)
+         FROM messages m
+         JOIN sessions s ON s.id = m.session_id
+         WHERE m.total_tokens > 0 {date_filter_sql} {proj_filter_sql}"
+    );
+
     let tot_sessions: i64 = conn
-        .query_row(
-            "SELECT COUNT(DISTINCT session_id) FROM messages WHERE total_tokens > 0",
-            [],
-            |r| r.get(0),
-        )
+        .query_row(&sess_count_sql, [], |r| r.get(0))
         .unwrap_or(0);
 
     let summary = TokenStatsSummary {
@@ -4112,23 +4324,23 @@ pub fn get_token_stats(
     let all_projects = list_projects(conn)?;
     let mut by_project: Vec<ProjectTokenStats> = Vec::new();
 
-    let mut proj_stmt = conn
-        .prepare(
-            "SELECT 
-                s.project_id,
-                COALESCE(SUM(m.prompt_tokens), 0),
-                COALESCE(SUM(m.completion_tokens), 0),
-                COALESCE(SUM(m.total_tokens), 0),
-                COALESCE(SUM(m.cached_tokens), 0),
-                COUNT(DISTINCT s.id),
-                COUNT(m.id),
-                MAX(m.created_at)
-             FROM sessions s
-             JOIN messages m ON m.session_id = s.id
-             WHERE m.role = 'assistant'
-             GROUP BY s.project_id",
-        )
-        .map_err(|e| e.to_string())?;
+    let proj_sql = format!(
+        "SELECT 
+            s.project_id,
+            COALESCE(SUM(m.prompt_tokens), 0),
+            COALESCE(SUM(m.completion_tokens), 0),
+            COALESCE(SUM(m.total_tokens), 0),
+            COALESCE(SUM(m.cached_tokens), 0),
+            COUNT(DISTINCT s.id),
+            COUNT(m.id),
+            MAX(m.created_at)
+         FROM sessions s
+         JOIN messages m ON m.session_id = s.id
+         WHERE m.role = 'assistant' {date_filter_sql}
+         GROUP BY s.project_id"
+    );
+
+    let mut proj_stmt = conn.prepare(&proj_sql).map_err(|e| e.to_string())?;
 
     let proj_rows = proj_stmt
         .query_map([], |r| {
@@ -4207,31 +4419,6 @@ pub fn get_token_stats(
     by_project.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
 
     // 3. 按时间聚合（每日趋势）
-    let day_limit_sql = if let Some(d) = days {
-        if d > 0 {
-            let cutoff = chrono::Utc::now() - chrono::Duration::days(d as i64);
-            format!("AND m.created_at >= '{}'", cutoff.to_rfc3339())
-        } else {
-            String::new()
-        }
-    } else {
-        String::new()
-    };
-
-    let proj_filter_sql = if let Some(pid) = project_id {
-        if !pid.is_empty() {
-            if pid == "unassigned" {
-                "AND (s.project_id IS NULL OR s.project_id = '')".to_string()
-            } else {
-                format!("AND s.project_id = '{pid}'")
-            }
-        } else {
-            String::new()
-        }
-    } else {
-        String::new()
-    };
-
     let time_query = format!(
         "SELECT 
             substr(m.created_at, 1, 10) as day,
@@ -4242,7 +4429,7 @@ pub fn get_token_stats(
             COUNT(m.id)
          FROM messages m
          JOIN sessions s ON s.id = m.session_id
-         WHERE m.role = 'assistant' {day_limit_sql} {proj_filter_sql}
+         WHERE m.role = 'assistant' {date_filter_sql} {proj_filter_sql}
          GROUP BY day
          ORDER BY day ASC"
     );
@@ -4291,7 +4478,7 @@ pub fn get_token_stats(
          FROM sessions s
          LEFT JOIN projects p ON p.id = s.project_id
          JOIN messages m ON m.session_id = s.id
-         WHERE m.role = 'assistant' {proj_filter_sql}
+         WHERE m.role = 'assistant' {date_filter_sql} {proj_filter_sql}
          GROUP BY s.id
          HAVING tt > 0
          ORDER BY tt DESC
@@ -5174,5 +5361,254 @@ pub fn sync_session_todos_after_revert(
         params![session_id],
     );
     Ok(Some(serde_json::json!([])))
+}
+
+/// 多维度查询工具调用日志与异常审计记录，包含统计指标与高频错误聚类
+pub fn query_tool_logs(conn: &Connection, filter: &ToolLogFilter) -> Result<ToolLogQueryResult, String> {
+    let page = filter.page.unwrap_or(1).max(1);
+    let page_size = filter.page_size.unwrap_or(30).clamp(1, 200);
+    let offset = (page - 1) * page_size;
+
+    let mut where_clauses: Vec<String> = Vec::new();
+    let mut params: Vec<rusqlite::types::Value> = Vec::new();
+
+    if let Some(ref pid) = filter.project_id {
+        let trimmed = pid.trim();
+        if !trimmed.is_empty() && trimmed != "all" {
+            if trimmed == "unassigned" {
+                where_clauses.push("(s.project_id IS NULL OR s.project_id = '')".to_string());
+            } else {
+                params.push(rusqlite::types::Value::Text(trimmed.to_string()));
+                where_clauses.push(format!("s.project_id = ?{}", params.len()));
+            }
+        }
+    }
+
+    if let Some(ref sid) = filter.session_id {
+        let trimmed = sid.trim();
+        if !trimmed.is_empty() && trimmed != "all" {
+            params.push(rusqlite::types::Value::Text(trimmed.to_string()));
+            where_clauses.push(format!("m.session_id = ?{}", params.len()));
+        }
+    }
+
+    if let Some(ref status) = filter.status {
+        let trimmed = status.trim();
+        match trimmed {
+            "all" | "" => {}
+            "error_only" => {
+                where_clauses.push("te.status IN ('failed', 'denied', 'timeout')".to_string());
+            }
+            other => {
+                params.push(rusqlite::types::Value::Text(other.to_string()));
+                where_clauses.push(format!("te.status = ?{}", params.len()));
+            }
+        }
+    }
+
+    if let Some(ref tool) = filter.tool_name {
+        let trimmed = tool.trim();
+        if !trimmed.is_empty() && trimmed != "all" {
+            params.push(rusqlite::types::Value::Text(trimmed.to_string()));
+            where_clauses.push(format!("te.tool_name = ?{}", params.len()));
+        }
+    }
+
+    if let Some(ref kw) = filter.keyword {
+        let trimmed = kw.trim();
+        if !trimmed.is_empty() {
+            let pattern = format!("%{trimmed}%");
+            params.push(rusqlite::types::Value::Text(pattern.clone()));
+            let p1 = params.len();
+            params.push(rusqlite::types::Value::Text(pattern.clone()));
+            let p2 = params.len();
+            params.push(rusqlite::types::Value::Text(pattern.clone()));
+            let p3 = params.len();
+            params.push(rusqlite::types::Value::Text(pattern.clone()));
+            let p4 = params.len();
+            where_clauses.push(format!(
+                "(te.params_json LIKE ?{p1} OR te.result_text LIKE ?{p2} OR s.title LIKE ?{p3} OR te.tool_name LIKE ?{p4})"
+            ));
+        }
+    }
+
+    if let Some(ref start_date) = filter.start_date {
+        let trimmed = start_date.trim();
+        if !trimmed.is_empty() {
+            let date_part = if trimmed.len() >= 10 { &trimmed[..10] } else { trimmed };
+            params.push(rusqlite::types::Value::Text(date_part.to_string()));
+            where_clauses.push(format!("substr(te.created_at, 1, 10) >= ?{}", params.len()));
+        }
+    }
+
+    if let Some(ref end_date) = filter.end_date {
+        let trimmed = end_date.trim();
+        if !trimmed.is_empty() {
+            let date_part = if trimmed.len() >= 10 { &trimmed[..10] } else { trimmed };
+            params.push(rusqlite::types::Value::Text(date_part.to_string()));
+            where_clauses.push(format!("substr(te.created_at, 1, 10) <= ?{}", params.len()));
+        }
+    }
+
+    let where_sql = if where_clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", where_clauses.join(" AND "))
+    };
+
+    // 1. 查询当前条件下的总数与异常数
+    let count_sql = format!(
+        "SELECT COUNT(*), COUNT(CASE WHEN te.status != 'success' THEN 1 END)
+         FROM tool_events te
+         JOIN messages m ON te.message_id = m.id
+         JOIN sessions s ON m.session_id = s.id
+         {where_sql}"
+    );
+    let (total_count, error_count): (u32, u32) = {
+        let mut count_stmt = conn.prepare(&count_sql).map_err(|e| e.to_string())?;
+        count_stmt
+            .query_row(rusqlite::params_from_iter(&params), |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .map_err(|e| e.to_string())?
+    };
+
+    // 2. 查询分页列表
+    let list_sql = format!(
+        "SELECT te.id, te.message_id, te.tool_name, te.tool_call_id, te.params_json,
+                te.result_text, te.status, te.approval_scope, te.created_at, te.subprocess_id,
+                s.id as session_id, s.title as session_title, s.project_id, p.name as project_name,
+                m.reasoning
+         FROM tool_events te
+         JOIN messages m ON te.message_id = m.id
+         JOIN sessions s ON m.session_id = s.id
+         LEFT JOIN projects p ON s.project_id = p.id
+         {where_sql}
+         ORDER BY te.created_at DESC
+         LIMIT ?{} OFFSET ?{}",
+        params.len() + 1,
+        params.len() + 2
+    );
+
+    let mut list_params = params.clone();
+    list_params.push(rusqlite::types::Value::Integer(page_size as i64));
+    list_params.push(rusqlite::types::Value::Integer(offset as i64));
+
+    let mut list_stmt = conn.prepare(&list_sql).map_err(|e| e.to_string())?;
+    let items: Vec<ToolLogItem> = list_stmt
+        .query_map(rusqlite::params_from_iter(&list_params), |r| {
+            let raw_params: String = r.get(4)?;
+            let params_val = serde_json::from_str(&raw_params).unwrap_or(serde_json::Value::Null);
+            Ok(ToolLogItem {
+                id: r.get(0)?,
+                message_id: r.get(1)?,
+                tool_name: r.get(2)?,
+                tool_call_id: r.get(3)?,
+                params: params_val,
+                result_text: r.get(5)?,
+                status: r.get(6)?,
+                approval_scope: r.get(7)?,
+                created_at: r.get(8)?,
+                subprocess_id: r.get(9)?,
+                session_id: r.get(10)?,
+                session_title: r.get(11)?,
+                project_id: r.get(12)?,
+                project_name: r.get(13)?,
+                reasoning: r.get(14)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // 3. 高频同款错误聚类统计（针对当前选定的项目/会话作用域及日期范围）
+    let mut top_where: Vec<String> = vec!["te.status IN ('failed', 'denied', 'timeout')".to_string()];
+    let mut top_params: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(ref pid) = filter.project_id {
+        let trimmed = pid.trim();
+        if !trimmed.is_empty() && trimmed != "all" {
+            if trimmed == "unassigned" {
+                top_where.push("(s.project_id IS NULL OR s.project_id = '')".to_string());
+            } else {
+                top_params.push(rusqlite::types::Value::Text(trimmed.to_string()));
+                top_where.push(format!("s.project_id = ?{}", top_params.len()));
+            }
+        }
+    }
+    if let Some(ref sid) = filter.session_id {
+        let trimmed = sid.trim();
+        if !trimmed.is_empty() && trimmed != "all" {
+            top_params.push(rusqlite::types::Value::Text(trimmed.to_string()));
+            top_where.push(format!("m.session_id = ?{}", top_params.len()));
+        }
+    }
+    if let Some(ref start_date) = filter.start_date {
+        let trimmed = start_date.trim();
+        if !trimmed.is_empty() {
+            let date_part = if trimmed.len() >= 10 { &trimmed[..10] } else { trimmed };
+            top_params.push(rusqlite::types::Value::Text(date_part.to_string()));
+            top_where.push(format!("substr(te.created_at, 1, 10) >= ?{}", top_params.len()));
+        }
+    }
+    if let Some(ref end_date) = filter.end_date {
+        let trimmed = end_date.trim();
+        if !trimmed.is_empty() {
+            let date_part = if trimmed.len() >= 10 { &trimmed[..10] } else { trimmed };
+            top_params.push(rusqlite::types::Value::Text(date_part.to_string()));
+            top_where.push(format!("substr(te.created_at, 1, 10) <= ?{}", top_params.len()));
+        }
+    }
+    let top_where_sql = format!("WHERE {}", top_where.join(" AND "));
+    let top_sql = format!(
+        "SELECT te.tool_name,
+                substr(COALESCE(te.result_text, ''), 1, 140) as err_summary,
+                COUNT(*) as cnt,
+                COUNT(DISTINCT s.id) as s_cnt,
+                MAX(te.created_at) as latest_at
+         FROM tool_events te
+         JOIN messages m ON te.message_id = m.id
+         JOIN sessions s ON m.session_id = s.id
+         {top_where_sql}
+         GROUP BY te.tool_name, substr(COALESCE(te.result_text, ''), 1, 140)
+         ORDER BY cnt DESC
+         LIMIT 10"
+    );
+
+    let mut top_stmt = conn.prepare(&top_sql).map_err(|e| e.to_string())?;
+    let top_errors: Vec<TopErrorSummary> = top_stmt
+        .query_map(rusqlite::params_from_iter(&top_params), |r| {
+            let summary: String = r.get(1)?;
+            let clean_summary = if summary.trim().is_empty() {
+                "[未附带详细错误信息]".to_string()
+            } else {
+                summary
+            };
+            Ok(TopErrorSummary {
+                tool_name: r.get(0)?,
+                error_summary: clean_summary,
+                count: r.get(2)?,
+                session_count: r.get(3)?,
+                latest_at: r.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let total_pages = if total_count == 0 {
+        1
+    } else {
+        ((total_count as f64) / (page_size as f64)).ceil() as u32
+    };
+
+    Ok(ToolLogQueryResult {
+        total_count,
+        error_count,
+        items,
+        top_errors,
+        page,
+        page_size,
+        total_pages,
+    })
 }
 
