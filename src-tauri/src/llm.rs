@@ -264,6 +264,51 @@ pub async fn test_connection(cfg: &LlmCfg) -> Result<String, String> {
     }
 }
 
+/// 非流式基础对话调用
+pub async fn call_simple_completion(
+    cfg: &LlmCfg,
+    messages: &[Value],
+    temperature: Option<f32>,
+) -> Result<String, String> {
+    let url = endpoint(&cfg.base_url);
+    let mut body = json!({
+        "model": cfg.model,
+        "messages": messages,
+        "stream": false,
+    });
+    if let Some(temp) = temperature {
+        body["temperature"] = json!(temp);
+    }
+    if let Some(ref effort) = cfg.reasoning_effort {
+        let trimmed = effort.trim();
+        if !trimmed.is_empty() && trimmed != "default" {
+            body["reasoning_effort"] = json!(trimmed);
+        }
+    }
+    let resp = get_client(cfg.proxy_url.as_deref())
+        .post(&url)
+        .bearer_auth(&cfg.api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("LLM请求失败: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("LLM返回 {status}: {}", truncate(&text, 1000)));
+    }
+    let val: Value = resp.json().await.map_err(|e| format!("解析响应失败: {e}"))?;
+    let content = val.get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Ok(content)
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
         return s.to_string();

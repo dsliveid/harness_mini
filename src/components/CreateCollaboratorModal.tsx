@@ -19,6 +19,7 @@ import {
   Search,
   Layers,
   MessageSquare,
+  Zap,
 } from "./Icons";
 import { ModelCapabilitySelect } from "./ModelCapabilitySelect";
 
@@ -123,6 +124,7 @@ export function CreateCollaboratorModal() {
   const [selectedModelKey, setSelectedModelKey] = useState<string>(""); // format: "providerId::modelId" (chat)
   const [selectedImageModelKey, setSelectedImageModelKey] = useState<string>(""); // format: "providerId::modelId" (image_gen)
   const [selectedVisionModelKey, setSelectedVisionModelKey] = useState<string>(""); // format: "providerId::modelId" (vision)
+  const [selectedDecisionModelKey, setSelectedDecisionModelKey] = useState<string>(""); // format: "providerId::modelId" (decision)
 
   const providers = settings?.providers ?? [];
 
@@ -193,6 +195,16 @@ export function CreateCollaboratorModal() {
         }
       }
 
+      let decisionProviderId: string | undefined = undefined;
+      let decisionModelId: string | undefined = undefined;
+      if (selectedDecisionModelKey) {
+        const parts = selectedDecisionModelKey.split("::");
+        if (parts.length === 2) {
+          decisionProviderId = parts[0];
+          decisionModelId = parts[1];
+        }
+      }
+
       await createCollaborator({
         parentSessionId: currentId,
         role: selectedRole,
@@ -207,12 +219,15 @@ export function CreateCollaboratorModal() {
         imageModelId,
         visionProviderId,
         visionModelId,
+        decisionProviderId,
+        decisionModelId,
       });
       handleRoleSelect("frontend");
       setAutoReport(true);
       setSelectedModelKey("");
       setSelectedImageModelKey("");
       setSelectedVisionModelKey("");
+      setSelectedDecisionModelKey("");
     } finally {
       setSubmitting(false);
     }
@@ -300,7 +315,7 @@ export function CreateCollaboratorModal() {
               </span>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-2.5">
               {/* 1. 对话思考 */}
               <div className="bg-panel2/60 border border-blue-500/20 rounded-lg p-2.5 flex flex-col justify-between gap-1.5">
                 <div>
@@ -368,6 +383,30 @@ export function CreateCollaboratorModal() {
                   capability="vision"
                   value={selectedVisionModelKey}
                   onChange={setSelectedVisionModelKey}
+                  providers={providers}
+                  settings={settings}
+                  allowInherit={true}
+                />
+              </div>
+
+              {/* 4. 决策中枢 */}
+              <div className="bg-panel2/60 border border-emerald-500/20 rounded-lg p-2.5 flex flex-col justify-between gap-1.5">
+                <div>
+                  <div className="flex items-center justify-between text-[11.5px] font-medium text-emerald-400">
+                    <span className="flex items-center gap-1.5">
+                      <Zap size={13} />
+                      <span>决策中枢</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-inkdim">decision</span>
+                  </div>
+                  <div className="text-[10.5px] text-inkdim leading-tight mt-0.5 mb-1.5">
+                    执行二元判断、多选裁决与评分
+                  </div>
+                </div>
+                <ModelCapabilitySelect
+                  capability="decision"
+                  value={selectedDecisionModelKey}
+                  onChange={setSelectedDecisionModelKey}
                   providers={providers}
                   settings={settings}
                   allowInherit={true}

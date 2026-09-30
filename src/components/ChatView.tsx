@@ -8,6 +8,7 @@ import { ExecutionProcessBlock, groupTimelineItems } from "./ExecutionProcessBlo
 import { ToolRetryBanner } from "./ToolRetryBanner";
 import { CompactionBanner, CompactedHistoryCard } from "./CompactionBanner";
 import { TruncationNoticeList } from "./TruncationNoticeCard";
+import { IntentAlignmentCard } from "./IntentAlignmentCard";
 import { Bot, Plus, Sprout, ShieldCheck, AlertTriangle, Loader2, Play, RotateCcw, Zap } from "./Icons";
 
 const EMPTY_PROPOSALS: any[] = [];
@@ -342,6 +343,9 @@ export function ChatView() {
               </div>
             </div>
           )}
+
+          {/* 意图对齐门控与干预指导卡片 */}
+          <IntentAlignmentCard />
 
           {running && (msgs.length === 0 || msgs[msgs.length - 1]?.role === "user") && (
             <div className="text-inkdim text-[13px] flex items-center gap-2 py-2 px-1 animate-in fade-in duration-150">

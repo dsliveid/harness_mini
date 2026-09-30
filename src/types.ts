@@ -1,5 +1,5 @@
 import type { LucideIcon } from "lucide-react";
-import { MessageSquare, Palette, Eye } from "lucide-react";
+import { MessageSquare, Palette, Eye, Scale } from "lucide-react";
 
 export interface Provider {
   id: string;
@@ -119,6 +119,8 @@ export interface Settings {
   activeImageModelId?: string | null;
   activeVisionProviderId?: string | null;
   activeVisionModelId?: string | null;
+  activeDecisionProviderId?: string | null;
+  activeDecisionModelId?: string | null;
   lastWorkspacePath?: string | null;
   disabledTools?: string[];
   disabledSops?: string[];
@@ -197,6 +199,56 @@ export interface JevEventQueryResult {
   stats: JevStatsSummary;
 }
 
+export interface IntentAlignmentRound {
+  attempt: number;
+  understanding: string;
+  plan: string;
+  score: number;
+  scorePercent: number;
+  critique: string;
+  passed: boolean;
+}
+
+export interface IntentAlignmentEvent {
+  sessionId: string;
+  runId: string;
+  userMessage: string;
+  status: "analyzing" | "evaluating" | "retrying" | "passed" | "requires_intervention" | "skipped";
+  currentAttempt: number;
+  maxRetries: number;
+  understanding: string;
+  plan: string;
+  score: number;
+  scorePercent: number;
+  reason: string;
+  attempt?: number;
+  passed: boolean;
+  history?: IntentAlignmentRound[];
+  interventionId?: string | null;
+}
+
+export interface IntentInterventionRequest {
+  id: string;
+  sessionId: string;
+  runId: string;
+  userMessage: string;
+  understanding: string;
+  plan: string;
+  score: number;
+  critique: string;
+  retryCount: number;
+}
+
+export interface DirectDecisionResult {
+  verdict?: boolean | null;
+  choice?: string | null;
+  score?: number | null;
+  confidence: number;
+  reason: string;
+  latencyMs: number;
+  model: string;
+}
+
 export interface AgentSopInfo {
   id: string;
   name: string;
@@ -207,6 +259,14 @@ export interface AgentSopInfo {
 }
 
 export const AGENT_SOPS: AgentSopInfo[] = [
+  {
+    id: "intent_alignment_gate",
+    name: "对话意图对齐与计划前置评估规范",
+    category: "thinking",
+    categoryLabel: "思考范式",
+    description: "在主模型正式执行用户任务前，先提炼对用户意图的深度剖析与下一步行动计划；由决策模型进行严苛质检评分（达标阈值90%），未达标自动自愈迭代修正，全流程透明呈现并支持随时干预或跳过，确保理解与执行零偏差。",
+    disableEffect: "禁用后：跳过对话前置的意图剖析与决策质检打分闸门，大模型接收到用户消息后直接开始推理执行。",
+  },
   {
     id: "plan_first",
     name: "方案先行与计划中枢规范",
@@ -353,6 +413,12 @@ export interface Session {
   /** 专属视觉模型 ID */
   visionModelId?: string | null;
   vision_model_id?: string | null;
+  /** 专属决策模型厂商 ID */
+  decisionProviderId?: string | null;
+  decision_provider_id?: string | null;
+  /** 专属决策模型 ID */
+  decisionModelId?: string | null;
+  decision_model_id?: string | null;
   /** 分支来源会话 ID */
   forkedFromSessionId?: string | null;
   forked_from_session_id?: string | null;
@@ -387,6 +453,8 @@ export interface CollaboratorCreateInput {
   imageModelId?: string | null;
   visionProviderId?: string | null;
   visionModelId?: string | null;
+  decisionProviderId?: string | null;
+  decisionModelId?: string | null;
 }
 
 export interface CollaboratorUpdateInput {
@@ -404,6 +472,8 @@ export interface CollaboratorUpdateInput {
   imageModelId?: string | null;
   visionProviderId?: string | null;
   visionModelId?: string | null;
+  decisionProviderId?: string | null;
+  decisionModelId?: string | null;
 }
 
 export interface SessionModelsUpdateInput {
@@ -414,6 +484,8 @@ export interface SessionModelsUpdateInput {
   imageModelId?: string | null;
   visionProviderId?: string | null;
   visionModelId?: string | null;
+  decisionProviderId?: string | null;
+  decisionModelId?: string | null;
   reasoningEffort?: ReasoningEffort | string | null;
 }
 
@@ -430,6 +502,8 @@ export interface SessionCreateInput {
   imageModelId?: string | null;
   visionProviderId?: string | null;
   visionModelId?: string | null;
+  decisionProviderId?: string | null;
+  decisionModelId?: string | null;
   reasoningEffort?: ReasoningEffort | string | null;
 }
 
@@ -1205,6 +1279,15 @@ export function inferDefaultModelCapabilities(model: string): string[] {
   if (isVis) {
     return ["chat", "vision"];
   }
+  const isDec =
+    lower.includes("decision") ||
+    lower.includes("judge") ||
+    lower.includes("systemone") ||
+    lower.includes("noul") ||
+    lower.includes("jev");
+  if (isDec) {
+    return ["decision"];
+  }
   return ["chat"];
 }
 
@@ -1241,7 +1324,7 @@ export function hasModelCapability(
   return list.includes(cap);
 }
 
-export type ModelCapability = "chat" | "image_gen" | "vision";
+export type ModelCapability = "chat" | "image_gen" | "vision" | "decision";
 
 export interface ModelCapabilityMeta {
   id: ModelCapability;
@@ -1274,6 +1357,13 @@ export const MODEL_CAPABILITY_METAS: Record<ModelCapability, ModelCapabilityMeta
     description: "驱动图片多模态理解与视觉识别，支持分析用户截图与设计稿",
     badgeClass: "bg-purple-500/15 text-purple-400 border-purple-500/30",
   },
+  decision: {
+    id: "decision",
+    label: "决策判断",
+    Icon: Scale,
+    description: "驱动逻辑二元判断、多选决断、量化评分与对话意图对齐门控",
+    badgeClass: "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
+  },
 };
 
 /** 解析当前全局生效的生图厂商 + 模型 */
@@ -1305,6 +1395,24 @@ export function resolveActiveVisionModel(settings: Settings): { provider: Provid
   for (const p of settings.providers) {
     for (const m of p.models) {
       if (hasModelCapability(settings, p.id, m, "vision")) {
+        return { provider: p, model: m };
+      }
+    }
+  }
+  return resolveActiveModel(settings);
+}
+
+/** 解析当前全局生效的决策厂商 + 模型 */
+export function resolveActiveDecisionModel(settings: Settings): { provider: Provider; model: string } | null {
+  if (settings.activeDecisionProviderId && settings.activeDecisionModelId) {
+    const p = settings.providers.find((item) => item.id === settings.activeDecisionProviderId);
+    if (p && p.models.includes(settings.activeDecisionModelId)) {
+      return { provider: p, model: settings.activeDecisionModelId };
+    }
+  }
+  for (const p of settings.providers) {
+    for (const m of p.models) {
+      if (hasModelCapability(settings, p.id, m, "decision")) {
         return { provider: p, model: m };
       }
     }

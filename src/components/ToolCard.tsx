@@ -144,6 +144,10 @@ function ToolIcon({ name }: { name: string }) {
     case "wait_collaborators":
     case "get_collaborators":
       return <Users size={14} className="text-accent shrink-0" />;
+    case "judge_decision":
+    case "choice_decision":
+    case "score_decision":
+      return <Zap size={14} className="text-amber-400 shrink-0" />;
     default:
       return <Wrench size={14} className="text-inkdim shrink-0" />;
   }
@@ -152,6 +156,12 @@ function ToolIcon({ name }: { name: string }) {
 function paramTitle(ev: ToolEvent): string {
   const p = ev.params ?? {};
   switch (ev.toolName) {
+    case "judge_decision":
+      return `【判断】${p.statement ?? ""}`;
+    case "choice_decision":
+      return `【选择】${p.question ?? ""}`;
+    case "score_decision":
+      return `【评分】${p.target ?? ""}`;
     case "run_command":
       return String(p.command ?? "");
     case "glob":
@@ -195,6 +205,9 @@ function paramTitle(ev: ToolEvent): string {
 }
 
 const TOOL_LABELS: Record<string, string> = {
+  judge_decision: "判断决策",
+  choice_decision: "选择决策",
+  score_decision: "评分决策",
   read_file: "读取文件",
   list_dir: "列出目录",
   glob: "查找文件",
@@ -380,23 +393,6 @@ function MemoryCardView({
   const isRecord = ev.toolName === "record_memory";
   const isRead = ev.toolName === "read_memory";
 
-  const currentSessionId = useStore((s) => s.currentId);
-  const jevEvents = useStore((s) => (currentSessionId ? s.jevEvents[currentSessionId] : undefined));
-
-  const memoryGateEvent = useMemo(() => {
-    if (!jevEvents || !jevEvents.length) return null;
-    const evTime = ev.createdAt ? new Date(ev.createdAt).getTime() : 0;
-    return jevEvents.find((je) => {
-      if (je.scene !== "memory_gate") return false;
-      if (p.title && je.promptSummary && je.promptSummary.includes(String(p.title))) return true;
-      if (evTime > 0) {
-        const jeTime = new Date(je.createdAt).getTime();
-        return Math.abs(jeTime - evTime) < 30000;
-      }
-      return false;
-    });
-  }, [jevEvents, p.title, ev.createdAt]);
-
   const categoryName = useMemo(() => {
     const c = String(p.category || "").toLowerCase();
     if (c === "profile" || c === "tech_stack") return "技术大盘 profile";
@@ -430,26 +426,7 @@ function MemoryCardView({
             {categoryName}
           </span>
         )}
-        {isRecord && memoryGateEvent && (
-          <span
-            className={`text-[10px] px-1.5 py-0.5 rounded border inline-flex items-center gap-1 font-mono ${
-              memoryGateEvent.verdict === "allow"
-                ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
-                : "bg-red-500/15 text-red-300 border-red-500/30"
-            }`}
-            title={`Jev 记忆门控质检: ${memoryGateEvent.verdict === "allow" ? "放行" : "拦截"} (耗时: ${memoryGateEvent.latencyMs}ms, 置信度: ${(memoryGateEvent.confidence * 100).toFixed(0)}%)\n${memoryGateEvent.reason || ""}`}
-          >
-            <Zap size={10} className={memoryGateEvent.verdict === "allow" ? "text-emerald-400 fill-emerald-400" : "text-red-400 fill-red-400"} />
-            <span>质检: {memoryGateEvent.verdict === "allow" ? "通过" : "拦截"} · {memoryGateEvent.latencyMs}ms</span>
-          </span>
-        )}
       </div>
-
-      {isRecord && memoryGateEvent?.reason && (
-        <div className="text-[11px] text-teal-200/90 bg-teal-900/30 border border-teal-500/25 rounded-md px-2 py-1 leading-snug">
-          <span className="font-medium text-teal-300">Jev 质检评估：</span>{memoryGateEvent.reason}
-        </div>
-      )}
 
       {isRecord && p.content && (
         <div className="text-ink/90 text-[11.5px] max-h-36 overflow-y-auto bg-panel/60 p-2.5 rounded border border-edge/30 font-mono whitespace-pre-wrap select-text leading-relaxed">
@@ -507,6 +484,148 @@ function MemoryCardView({
         <Lightbulb size={12} className="text-amber-400 shrink-0" />
         <span>提示：{isRecord ? "记忆已物理落盘至工作区长期认知库（可点击上方按钮查看/修改）。新会话及后续推理将自动秒级召回。" : "已从工作区认知记忆库召回该档案（可点击上方按钮查看全文）。"}</span>
       </div>
+    </div>
+  );
+}
+
+function DecisionCardView({ ev }: { ev: ToolEvent }) {
+  const p = ev.params || {};
+  const isJudge = ev.toolName === "judge_decision";
+  const isChoice = ev.toolName === "choice_decision";
+  const isScore = ev.toolName === "score_decision";
+
+  const parsedResult = useMemo(() => {
+    if (!ev.resultText) return null;
+    try {
+      return JSON.parse(ev.resultText);
+    } catch {
+      return null;
+    }
+  }, [ev.resultText]);
+
+  return (
+    <div className="mt-2 text-[12px] bg-amber-500/5 border border-amber-500/25 rounded-xl p-3 space-y-2.5">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <div className="flex items-center gap-1.5 font-semibold text-amber-300">
+          <Zap size={14} className="text-amber-400" />
+          <span>
+            {isJudge ? "二元判断决策" : isChoice ? "多选裁决决策" : "指标评分决策"}
+          </span>
+        </div>
+        {parsedResult?.confidence != null && (
+          <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-300 border border-amber-500/20">
+            置信度: {(Number(parsedResult.confidence) * 100).toFixed(0)}%
+          </span>
+        )}
+      </div>
+
+      {isJudge && (
+        <div className="space-y-1.5">
+          <div className="text-[12px] text-inkdim">待评估陈述：</div>
+          <div className="font-mono text-ink bg-panel2/60 px-2.5 py-1.5 rounded-lg border border-edge/40">
+            {String(p.statement ?? "")}
+          </div>
+          {parsedResult?.decision && (
+            <div className="flex items-center gap-2 mt-2">
+              <span className="text-inkdim text-[12px]">裁定结论:</span>
+              <span
+                className={`text-[12px] font-bold px-2.5 py-1 rounded-lg border ${
+                  parsedResult.decision === "ALLOW"
+                    ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/30"
+                    : parsedResult.decision === "DENY"
+                    ? "bg-red-500/15 text-red-400 border-red-500/30"
+                    : "bg-zinc-500/20 text-zinc-300 border-zinc-500/30"
+                }`}
+              >
+                {parsedResult.decision === "ALLOW" ? "✓ ALLOW (放行 / 成立)" : parsedResult.decision === "DENY" ? "✗ DENY (拦截 / 否定)" : "? ABSTAIN (弃权)"}
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {isChoice && (
+        <div className="space-y-1.5">
+          <div className="text-[12px] text-inkdim">待决问题：</div>
+          <div className="font-mono text-ink bg-panel2/60 px-2.5 py-1.5 rounded-lg border border-edge/40">
+            {String(p.question ?? "")}
+          </div>
+          {Array.isArray(p.options) && (
+            <div className="flex flex-col gap-1.5 mt-2">
+              <div className="text-inkdim text-[11px]">备选选项:</div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                {p.options.map((opt: string, idx: number) => {
+                  const isSelected = parsedResult?.decision === opt;
+                  return (
+                    <div
+                      key={idx}
+                      className={`px-2.5 py-1.5 rounded-lg border text-[11.5px] font-mono flex items-center justify-between gap-2 ${
+                        isSelected
+                          ? "bg-cyan-500/15 border-cyan-500/40 text-cyan-300 font-semibold"
+                          : "bg-panel2/40 border-edge/30 text-inkdim"
+                      }`}
+                    >
+                      <span className="truncate">{opt}</span>
+                      {isSelected && <span className="text-cyan-400 text-[10px] shrink-0 font-bold">✓ 选定</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {isScore && (
+        <div className="space-y-1.5">
+          <div className="text-[12px] text-inkdim">评分对象：</div>
+          <div className="font-mono text-ink bg-panel2/60 px-2.5 py-1.5 rounded-lg border border-edge/40">
+            {String(p.target ?? "")}
+          </div>
+          {p.criteria && (
+            <div className="text-[11px] text-inkdim mt-1">
+              标准: <span className="text-ink">{String(p.criteria)}</span>
+            </div>
+          )}
+          {parsedResult?.score != null && (
+            <div className="flex items-center gap-3 mt-2">
+              <span className="text-inkdim text-[12px]">综合评分:</span>
+              <div className="flex items-center gap-2">
+                <span
+                  className={`text-[15px] font-bold font-mono px-2.5 py-0.5 rounded-lg border ${
+                    parsedResult.score >= 90
+                      ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/30"
+                      : parsedResult.score >= 70
+                      ? "bg-blue-500/15 text-blue-400 border-blue-500/30"
+                      : "bg-amber-500/15 text-amber-400 border-amber-500/30"
+                  }`}
+                >
+                  {parsedResult.score} 分
+                </span>
+                <span className="text-[11px] text-inkdim">
+                  {parsedResult.score >= 90 ? "优秀" : parsedResult.score >= 70 ? "良好" : "待改进"}
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {parsedResult?.reason && (
+        <div className="text-[11.5px] text-inkdim bg-panel border border-edge/40 rounded-lg p-2.5 mt-2 leading-relaxed">
+          <div className="font-medium text-amber-300/90 text-[11px] mb-0.5">决策归因 (Reasoning)：</div>
+          <div className="text-ink select-text whitespace-pre-wrap">{parsedResult.reason}</div>
+        </div>
+      )}
+
+      {p.context && (
+        <div className="text-[11px] text-inkdim border-t border-edge/20 pt-1.5">
+          <div className="mb-0.5">背景上下文：</div>
+          <div className="font-mono text-[10.5px] bg-panel/30 p-1.5 rounded border border-edge/20 max-h-24 overflow-y-auto select-text whitespace-pre-wrap">
+            {String(p.context)}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1554,7 +1673,14 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
         </pre>
       )}
 
-      {expanded && showResult && <CollapsibleResult text={ev.resultText!} />}
+      {/* 展开时：若是决策工具，展示专用决策卡片 */}
+      {expanded && ["judge_decision", "choice_decision", "score_decision"].includes(ev.toolName) && (
+        <DecisionCardView ev={ev} />
+      )}
+
+      {expanded && showResult && !["judge_decision", "choice_decision", "score_decision"].includes(ev.toolName) && (
+        <CollapsibleResult text={ev.resultText!} />
+      )}
     </div>
   );
 }

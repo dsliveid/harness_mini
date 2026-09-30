@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, DataStatus, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult, JevCfg, PlanReviewReport, ToolLogFilter, ToolLogQueryResult, JevDecisionEvent, JevEventFilter, JevEventQueryResult } from "./types";
+import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, DataStatus, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult, JevCfg, PlanReviewReport, ToolLogFilter, ToolLogQueryResult, DirectDecisionResult } from "./types";
 
 /**
  * 读请求防重入去重拦截器：
@@ -30,10 +30,22 @@ export const ipc = {
   testJev: (jevCfg: JevCfg) => invoke<string>("test_jev", { jevCfg }),
   evaluatePlan: (planId: string, workspace: string) =>
     deduplicatedInvoke<PlanReviewReport>("evaluate_plan", { planId, workspace }),
-  getSessionJevEvents: (sessionId: string, limit?: number) =>
-    invoke<JevDecisionEvent[]>("get_session_jev_events", { sessionId, limit: limit ?? null }),
-  queryJevEvents: (filter: JevEventFilter) =>
-    invoke<JevEventQueryResult>("query_jev_events", { filter }),
+  runDirectDecision: (input: {
+    sessionId: string;
+    kind: string;
+    prompt: string;
+    options?: string[] | null;
+    rubric?: string[] | null;
+  }) =>
+    invoke<DirectDecisionResult>("run_direct_decision", {
+      sessionId: input.sessionId,
+      kind: input.kind,
+      prompt: input.prompt,
+      options: input.options ?? null,
+      rubric: input.rubric ?? null,
+    }),
+  respondIntentIntervention: (id: string, action: string, hint?: string | null) =>
+    invoke<void>("respond_intent_intervention", { id, action, hint: hint ?? null }),
 
   // 数据目录
   getDataStatus: () => deduplicatedInvoke<DataStatus>("get_data_status"),
@@ -76,6 +88,8 @@ export const ipc = {
       imageModelId: input.imageModelId ?? null,
       visionProviderId: input.visionProviderId ?? null,
       visionModelId: input.visionModelId ?? null,
+      decisionProviderId: input.decisionProviderId ?? null,
+      decisionModelId: input.decisionModelId ?? null,
       reasoningEffort: input.reasoningEffort ?? null,
     }),
   forkSessionAtMessage: (sessionId: string, messageId: string, newTitle?: string, includeTarget: boolean = true) =>
@@ -131,6 +145,8 @@ export const ipc = {
     imageModelId?: string | null,
     visionProviderId?: string | null,
     visionModelId?: string | null,
+    decisionProviderId?: string | null,
+    decisionModelId?: string | null,
     reasoningEffort?: string | null,
   ) =>
     invoke<{ sessionId: string; messageId: string; queued: boolean; session?: Session | null }>("send_message", {
@@ -148,6 +164,8 @@ export const ipc = {
       imageModelId: imageModelId ?? null,
       visionProviderId: visionProviderId ?? null,
       visionModelId: visionModelId ?? null,
+      decisionProviderId: decisionProviderId ?? null,
+      decisionModelId: decisionModelId ?? null,
       reasoningEffort: reasoningEffort ?? null,
     }),
   setSessionReasoningEffort: (sessionId: string, reasoningEffort: string | null) =>
@@ -181,6 +199,8 @@ export const ipc = {
       imageModelId: input.imageModelId ?? null,
       visionProviderId: input.visionProviderId ?? null,
       visionModelId: input.visionModelId ?? null,
+      decisionProviderId: input.decisionProviderId ?? null,
+      decisionModelId: input.decisionModelId ?? null,
     }),
   updateCollaborator: (input: CollaboratorUpdateInput) =>
     invoke<Session>("update_collaborator", {
@@ -198,6 +218,8 @@ export const ipc = {
       imageModelId: input.imageModelId ?? null,
       visionProviderId: input.visionProviderId ?? null,
       visionModelId: input.visionModelId ?? null,
+      decisionProviderId: input.decisionProviderId ?? null,
+      decisionModelId: input.decisionModelId ?? null,
     }),
   setSessionModels: (input: SessionModelsUpdateInput) =>
     invoke<Session>("set_session_models", {
@@ -208,6 +230,9 @@ export const ipc = {
       imageModelId: input.imageModelId ?? null,
       visionProviderId: input.visionProviderId ?? null,
       visionModelId: input.visionModelId ?? null,
+      decisionProviderId: input.decisionProviderId ?? null,
+      decisionModelId: input.decisionModelId ?? null,
+      reasoningEffort: input.reasoningEffort ?? null,
     }),
   setCollaboratorAutoReport: (collaboratorId: string, autoReport: boolean) =>
     invoke<void>("set_collaborator_auto_report", { collaboratorId, autoReport }),

@@ -66,6 +66,21 @@ export function Composer() {
       label: "/task <总任务目标>",
       desc: "发起长任务（/goal 的简写别名）",
     },
+    {
+      cmd: "/jev:判断",
+      label: "/jev:判断 <判定命题或问题>",
+      desc: "调用决策模型进行二元真伪判定与置信度打分",
+    },
+    {
+      cmd: "/jev:选择",
+      label: "/jev:选择 <决策问题> 选项: A, B, C",
+      desc: "调用决策模型在多个选项中挑选最优解",
+    },
+    {
+      cmd: "/jev:评分",
+      label: "/jev:评分 <待评估内容>",
+      desc: "调用决策模型给出 0-100% 量化评分与详细依据",
+    },
   ];
 
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -142,12 +157,12 @@ export function Composer() {
     const pos = cursorPos ?? (taRef.current ? taRef.current.selectionStart : text.length);
     const safePos = Math.max(0, Math.min(pos, text.length));
     const before = text.slice(0, safePos);
-    const m = before.match(/(?:^|[^\w\/:])\/([a-zA-Z0-9_-]*)$/);
+    const m = before.match(/(?:^|[^\w\/:])\/([a-zA-Z0-9_:\u4e00-\u9fa5-]*)$/);
     if (!m) return null;
     const queryBefore = m[1];
     const slashStartIndex = before.length - queryBefore.length - 1;
     const after = text.slice(safePos);
-    const afterMatch = after.match(/^[a-zA-Z0-9_-]*/);
+    const afterMatch = after.match(/^[a-zA-Z0-9_:\u4e00-\u9fa5-]*/);
     const queryAfter = afterMatch ? afterMatch[0] : "";
     const fullQuery = (queryBefore + queryAfter).toLowerCase();
     const slashEndIndex = safePos + queryAfter.length;
@@ -403,6 +418,8 @@ export function Composer() {
         isDraftLike ? draft?.imageModelId ?? undefined : undefined,
         isDraftLike ? draft?.visionProviderId ?? undefined : undefined,
         isDraftLike ? draft?.visionModelId ?? undefined : undefined,
+        isDraftLike ? draft?.decisionProviderId ?? undefined : undefined,
+        isDraftLike ? draft?.decisionModelId ?? undefined : undefined,
         isDraftLike ? draft?.reasoningEffort ?? undefined : undefined
       );
       const st2 = useStore.getState();

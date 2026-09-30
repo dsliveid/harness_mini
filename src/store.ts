@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "./ipc";
-import { DRAFT_ID, resolveActiveModel, samePath, sortMessages, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem, type FocusFloatingTarget, type PlanSummary, type JevDecisionEvent } from "./types";
+import { DRAFT_ID, resolveActiveModel, samePath, sortMessages, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem, type FocusFloatingTarget, type PlanSummary, type IntentAlignmentEvent, type IntentInterventionRequest } from "./types";
 
 
 export interface EditingMessageTarget {
@@ -137,6 +137,9 @@ interface Store {
     /** 草稿专属视觉感知模型配置 */
     visionProviderId?: string | null;
     visionModelId?: string | null;
+    /** 草稿专属决策模型配置 */
+    decisionProviderId?: string | null;
+    decisionModelId?: string | null;
     /** 草稿专属思考程度 */
     reasoningEffort?: string | null;
   } | null;
@@ -148,6 +151,8 @@ interface Store {
     imageModelId?: string | null;
     visionProviderId?: string | null;
     visionModelId?: string | null;
+    decisionProviderId?: string | null;
+    decisionModelId?: string | null;
   }) => void;
   /** 临时空间运行时状态（临时目录是否存在 / 是否有变更 / 合并状态），按会话 id 缓存 */
   tempInfo: Record<string, TempInfo>;
@@ -158,7 +163,8 @@ interface Store {
   runStatus: Record<string, "idle" | "running">;
   lastRunOutcome: Record<string, string>;
   approvals: Record<string, ApprovalReq>;
-  jevEvents: Record<string, JevDecisionEvent[]>;
+  intentAlignments: Record<string, IntentAlignmentEvent>;
+  pendingIntentIntervention: IntentInterventionRequest | null;
   pendingCompactions: Record<string, CompactionReq>;
   sessionCompactions: Record<string, SessionCompaction[]>;
   /** 上下文硬截断提醒列表（不阻塞对话，用户可手动逐条关闭或批量关闭） */
@@ -328,8 +334,10 @@ interface Store {
   onGrowthDeleted: (id: string) => void;
   sopStatus: Record<string, { status: "checking" | "passed" | "failed" | "error"; command: string; output?: string }>;
   onSopStatus: (p: { sessionId: string; status: "checking" | "passed" | "failed" | "error"; command: string; output?: string }) => void;
-  onJevEvent: (ev: JevDecisionEvent) => void;
-  loadSessionJevEvents: (sessionId: string) => Promise<void>;
+  onIntentAlignment: (ev: IntentAlignmentEvent) => void;
+  onIntentInterventionRequired: (req: IntentInterventionRequest) => void;
+  respondIntentIntervention: (action: "hint" | "skip", hint?: string, interventionId?: string) => Promise<void>;
+  clearIntentAlignment: (sessionId: string) => void;
   toolRetryStatus: Record<string, ToolRetryStatus>;
   dismissToolRetry: (sessionId: string) => void;
   onToolRetryGuidance: (p: ToolRetryGuidanceEvent) => void;
@@ -553,7 +561,8 @@ export const useStore = create<Store>((set, get) => ({
   runStatus: {},
   lastRunOutcome: {},
   approvals: {},
-  jevEvents: {},
+  intentAlignments: {},
+  pendingIntentIntervention: null,
   pendingCompactions: {},
   sessionCompactions: {},
   truncationNotices: [],
@@ -973,6 +982,8 @@ export const useStore = create<Store>((set, get) => ({
         imageModelId: inherit ? prev?.imageModelId ?? null : null,
         visionProviderId: inherit ? prev?.visionProviderId ?? null : null,
         visionModelId: inherit ? prev?.visionModelId ?? null : null,
+        decisionProviderId: inherit ? prev?.decisionProviderId ?? null : null,
+        decisionModelId: inherit ? prev?.decisionModelId ?? null : null,
         reasoningEffort: (inherit ? prev?.reasoningEffort ?? prev?.reasoning_effort : undefined) ?? st.settings.reasoningEffort ?? null,
       },
       currentId: DRAFT_ID,
@@ -1011,6 +1022,8 @@ export const useStore = create<Store>((set, get) => ({
           imageModelId: prev?.imageModelId ?? null,
           visionProviderId: prev?.visionProviderId ?? null,
           visionModelId: prev?.visionModelId ?? null,
+          decisionProviderId: prev?.decisionProviderId ?? null,
+          decisionModelId: prev?.decisionModelId ?? null,
           reasoningEffort: prev?.reasoningEffort ?? prev?.reasoning_effort ?? st.settings.reasoningEffort ?? null,
         },
         currentId: DRAFT_ID,
@@ -1070,6 +1083,8 @@ export const useStore = create<Store>((set, get) => ({
         imageModelId: input.imageModelId !== undefined ? input.imageModelId : d.imageModelId,
         visionProviderId: input.visionProviderId !== undefined ? input.visionProviderId : d.visionProviderId,
         visionModelId: input.visionModelId !== undefined ? input.visionModelId : d.visionModelId,
+        decisionProviderId: input.decisionProviderId !== undefined ? input.decisionProviderId : d.decisionProviderId,
+        decisionModelId: input.decisionModelId !== undefined ? input.decisionModelId : d.decisionModelId,
       },
     });
   },
@@ -1151,7 +1166,6 @@ export const useStore = create<Store>((set, get) => ({
     void get().loadSubagents(id);
     void get().fetchActiveTask(id);
     void get().loadPlans(id);
-    void get().loadSessionJevEvents(id);
 
     // 5. 切换主会话时，如果分屏中的协作者/子 Agent 不属于当前会话，则关闭分屏
     const curCollabId = get().activeCollaboratorId;
@@ -2444,6 +2458,8 @@ export const useStore = create<Store>((set, get) => ({
           imageModelId: draft?.imageModelId || undefined,
           visionProviderId: draft?.visionProviderId || undefined,
           visionModelId: draft?.visionModelId || undefined,
+          decisionProviderId: draft?.decisionProviderId || undefined,
+          decisionModelId: draft?.decisionModelId || undefined,
           reasoningEffort: draft?.reasoningEffort || undefined,
         });
         st.onSessionUpdate(newSession);
@@ -2967,32 +2983,38 @@ export const useStore = create<Store>((set, get) => ({
     });
   },
 
-  onJevEvent(ev: JevDecisionEvent) {
+  onIntentAlignment(ev: IntentAlignmentEvent) {
     if (!ev || !ev.sessionId) return;
-    set((st) => {
-      const list = st.jevEvents[ev.sessionId] ?? [];
-      const exists = list.some((e) => e.id === ev.id);
-      return {
-        jevEvents: {
-          ...st.jevEvents,
-          [ev.sessionId]: exists ? list.map((e) => (e.id === ev.id ? ev : e)) : [...list, ev],
-        },
-      };
-    });
+    set((st) => ({
+      intentAlignments: {
+        ...st.intentAlignments,
+        [ev.sessionId]: ev,
+      },
+    }));
   },
 
-  async loadSessionJevEvents(sessionId: string) {
+  onIntentInterventionRequired(req: IntentInterventionRequest) {
+    set({ pendingIntentIntervention: req });
+  },
+
+  async respondIntentIntervention(action: "hint" | "skip", hint?: string, interventionId?: string) {
+    const cur = get().pendingIntentIntervention;
+    const targetId = interventionId || cur?.id;
+    if (!targetId) return;
     try {
-      const events = await ipc.getSessionJevEvents(sessionId);
-      set((st) => ({
-        jevEvents: {
-          ...st.jevEvents,
-          [sessionId]: events,
-        },
-      }));
+      await ipc.respondIntentIntervention(targetId, action, hint);
+      set({ pendingIntentIntervention: null });
     } catch (e) {
-      console.warn("loadSessionJevEvents failed:", e);
+      get().pushToast(`回应干预请求失败: ${e}`);
     }
+  },
+
+  clearIntentAlignment(sessionId: string) {
+    set((st) => {
+      const copy = { ...st.intentAlignments };
+      delete copy[sessionId];
+      return { intentAlignments: copy };
+    });
   },
 
   onError(p) {

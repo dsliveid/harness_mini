@@ -678,54 +678,7 @@ pub fn trigger_auto_distillation(
             let cleaned = clean_json_text(&res.content);
             if let Ok(parsed) = serde_json::from_str::<AutoDistillOutput>(cleaned) {
                 if parsed.should_record && !parsed.title.trim().is_empty() && !parsed.content.trim().is_empty() {
-                    // --- Jev 决策网关：痛点 1 自动提炼门控 ---
-                    if settings.jev.enabled && settings.jev.features.memory_gate {
-                        if let Some(client) = crate::jev::JevClient::from_cfg(&settings.jev, settings.effective_proxy_url()) {
-                            let start = std::time::Instant::now();
-                            let gate = client.judge_memory_quality(&parsed.content, &session.workspace_path, settings.jev.min_confidence).await;
-                            let latency_ms = start.elapsed().as_millis() as u64;
 
-                            let (verdict_str, reason_opt) = match &gate {
-                                crate::jev::Gate::Allow => ("allow".to_string(), Some("自动提炼内容经质检通过".to_string())),
-                                crate::jev::Gate::Deny(r) => ("deny".to_string(), Some(r.clone())),
-                                crate::jev::Gate::Abstain => ("abstain".to_string(), Some("质检降级".to_string())),
-                            };
-
-                            let prompt_summary = if parsed.content.chars().count() > 120 {
-                                format!("{}...", parsed.content.chars().take(120).collect::<String>())
-                            } else {
-                                parsed.content.clone()
-                            };
-
-                            let jev_ev = crate::models::JevDecisionEvent {
-                                id: format!("jev_{}", uuid::Uuid::new_v4().simple()),
-                                session_id: session_id.clone(),
-                                run_id: Some(run_id.clone()),
-                                scene: "auto_distill".to_string(),
-                                verdict: verdict_str,
-                                decision_value: Some(parsed.title.clone()),
-                                confidence: settings.jev.min_confidence,
-                                latency_ms,
-                                reason: reason_opt,
-                                adapted_effort: None,
-                                needs_research: None,
-                                prompt_summary: Some(prompt_summary),
-                                created_at: chrono::Local::now().to_rfc3339(),
-                            };
-
-                            let state = app.state::<crate::AppState>();
-                            {
-                                let db = state.db.lock().unwrap();
-                                let _ = crate::store::insert_jev_event(&db, &jev_ev);
-                            }
-                            let _ = app.emit("jev:event", &jev_ev);
-
-                            if let crate::jev::Gate::Deny(_) = gate {
-                                // Jev 判定疑似推测脑补或无长期价值，丢弃提炼候选，不予落盘
-                                return;
-                            }
-                        }
-                    }
 
                     let last_assistant_msg_id = messages
                         .iter()

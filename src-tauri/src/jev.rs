@@ -641,6 +641,202 @@ fn parse_systemone_response(val: serde_json::Value) -> Result<HashMap<String, Je
     Err(format!("无法识别的 Jev 响应格式: {val}"))
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DecisionExecutionResult {
+    #[serde(default)]
+    pub verdict: Option<bool>,
+    #[serde(default)]
+    pub choice: Option<String>,
+    #[serde(default)]
+    pub score: Option<f32>,
+    pub confidence: f32,
+    pub reason: String,
+    pub latency_ms: u64,
+    pub model: String,
+}
+
+/// 统一决策模型执行器：若 Base URL 为 TypeSafe / SystemOne 则走极速原生协议，否则走标准 OpenAI 兼容结构化决策 Prompt
+pub async fn execute_decision(
+    provider: &crate::models::ProviderCfg,
+    model: &str,
+    kind: &str, // "judge" | "choice" | "score"
+    state: &str,
+    instruction: &str,
+    options: Option<Vec<String>>,
+    rubric: Option<Vec<String>>,
+    proxy_url: Option<String>,
+) -> Result<DecisionExecutionResult, String> {
+    let is_typesafe = provider.base_url.contains("typesafe") || provider.base_url.contains("systemone");
+
+    if is_typesafe {
+        let client = JevClient::new(
+            provider.base_url.clone(),
+            provider.api_key.clone(),
+            model.to_string(),
+            15000,
+            proxy_url,
+        );
+        let t0 = std::time::Instant::now();
+        match kind {
+            "judge" => {
+                let (prob, gate) = client.decide_noul(state, instruction, 0.0).await;
+                let lat = t0.elapsed().as_millis() as u64;
+                let v = prob.map(|p| p >= 0.5);
+                let reason = match gate {
+                    Gate::Allow => "判断为真（符合准则）".to_string(),
+                    Gate::Deny(r) => r,
+                    Gate::Abstain => "模型置信度偏低或弃权".to_string(),
+                };
+                Ok(DecisionExecutionResult {
+                    verdict: v,
+                    choice: None,
+                    score: prob,
+                    confidence: prob.unwrap_or(0.8),
+                    reason,
+                    latency_ms: lat,
+                    model: model.to_string(),
+                })
+            }
+            "choice" => {
+                let opts = options.unwrap_or_default();
+                let res = client.decide_choice(state, instruction, opts.clone(), 0.0).await;
+                let lat = t0.elapsed().as_millis() as u64;
+                let (c, conf) = res.unwrap_or_else(|| (opts.first().cloned().unwrap_or_default(), 0.5));
+                Ok(DecisionExecutionResult {
+                    verdict: None,
+                    choice: Some(c.clone()),
+                    score: None,
+                    confidence: conf,
+                    reason: format!("在备选项中选定「{c}」"),
+                    latency_ms: lat,
+                    model: model.to_string(),
+                })
+            }
+            "score" | _ => {
+                let rub = rubric.unwrap_or_else(|| vec![
+                    "1: 严重缺陷或完全不符合".into(),
+                    "2: 基本可用或部分符合".into(),
+                    "3: 深度契合或极佳".into(),
+                ]);
+                let mut questions = HashMap::new();
+                questions.insert("q_score".into(), JevQuestion::Score { instructions: instruction.to_string(), rubric: rub });
+                let map = client.systemone(state, questions).await.map_err(|e| format!("Jev 评分失败: {e}"))?;
+                let lat = t0.elapsed().as_millis() as u64;
+                let ans = map.get("q_score");
+                let score_val = ans.and_then(|a| a.score).unwrap_or(0.5);
+                let conf = ans.and_then(|a| a.confidence).unwrap_or(0.8);
+                Ok(DecisionExecutionResult {
+                    verdict: None,
+                    choice: None,
+                    score: Some(score_val),
+                    confidence: conf,
+                    reason: format!("综合评估打分: {:.1}%", score_val * 100.0),
+                    latency_ms: lat,
+                    model: model.to_string(),
+                })
+            }
+        }
+    } else {
+        // Standard OpenAI-compatible Chat Completions
+        let t0 = std::time::Instant::now();
+        let b = provider.base_url.trim().trim_end_matches('/');
+        let b = b.strip_suffix("/chat/completions").unwrap_or(b);
+        let url = format!("{b}/chat/completions");
+
+        let system_prompt = match kind {
+            "judge" => "你是一个高精度二元判断决策专家。请根据提供的上下文(state)与判断准则(instruction)，做出二元判定。\n必须且仅返回如下格式的纯 JSON 对象，不要添加任何其他前缀或 Markdown 标记：\n{\"verdict\": true, \"confidence\": 0.95, \"reason\": \"判定依据简述\"}",
+            "choice" => "你是一个高精度多选决策专家。请根据提供的上下文(state)、选择准则(instruction)以及给定可选项列表(options)，从选项中严格挑选最匹配的一个。\n必须且仅返回如下格式的纯 JSON 对象，不要添加任何其他前缀或 Markdown 标记：\n{\"choice\": \"选中的选项文本\", \"confidence\": 0.95, \"reason\": \"选择理由简述\"}",
+            "score" | _ => "你是一个高精度量化评分决策专家。请根据提供的上下文(state)、评分目标(instruction)以及评分量表(rubric)，给出 0 到 100 的评分（以 0.0 到 1.0 的浮点数表示，例如 0.92 代表 92%）。\n必须且仅返回如下格式的纯 JSON 对象，不要添加任何其他前缀或 Markdown 标记：\n{\"score\": 0.92, \"confidence\": 0.95, \"reason\": \"详细评分依据\"}",
+        };
+
+        let user_prompt = match kind {
+            "judge" => format!("【上下文背景】:\n{}\n\n【判断准则】:\n{}", state, instruction),
+            "choice" => {
+                let opts = options.unwrap_or_default();
+                format!("【上下文背景】:\n{}\n\n【选择目标】:\n{}\n\n【备选列表】:\n{}", state, instruction, opts.join("\n- "))
+            }
+            "score" | _ => {
+                let rub = rubric.unwrap_or_default();
+                format!("【待评估内容】:\n{}\n\n【评估要求】:\n{}\n\n【评分量表】:\n{}", state, instruction, rub.join("\n- "))
+            }
+        };
+
+        let body = serde_json::json!({
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": 0.1
+        });
+
+        let mut http_builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
+        if let Some(ref p) = proxy_url {
+            if !p.trim().is_empty() {
+                if let Ok(proxy) = reqwest::Proxy::all(p) {
+                    http_builder = http_builder.proxy(proxy);
+                }
+            }
+        }
+        let http = http_builder.build().map_err(|e| format!("构建 HTTP 客户端失败: {e}"))?;
+
+        let mut req = http.post(&url).header("Content-Type", "application/json");
+        if !provider.api_key.trim().is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", provider.api_key.trim()));
+        }
+
+        let resp = req.json(&body).send().await.map_err(|e| format!("决策模型请求失败: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_txt = resp.text().await.unwrap_or_default();
+            return Err(format!("决策模型返回错误 HTTP {status}: {err_txt}"));
+        }
+
+        let val: serde_json::Value = resp.json().await.map_err(|e| format!("解析决策模型响应失败: {e}"))?;
+        let content = val.get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+
+        let lat = t0.elapsed().as_millis() as u64;
+
+        // 提取 JSON
+        let json_str = if let Some(start) = content.find('{') {
+            if let Some(end) = content.rfind('}') {
+                &content[start..=end]
+            } else {
+                content
+            }
+        } else {
+            content
+        };
+
+        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap_or_else(|_| serde_json::json!({
+            "reason": content
+        }));
+
+        let verdict = parsed.get("verdict").and_then(|v| v.as_bool());
+        let choice = parsed.get("choice").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let raw_score = parsed.get("score").and_then(|v| v.as_f64()).map(|s| s as f32);
+        let score = raw_score.map(|s| if s > 1.0 { (s / 100.0).clamp(0.0, 1.0) } else { s.clamp(0.0, 1.0) });
+        let confidence = parsed.get("confidence").and_then(|v| v.as_f64()).map(|s| s as f32).unwrap_or(0.9);
+        let reason = parsed.get("reason").and_then(|v| v.as_str()).unwrap_or(content).to_string();
+
+        Ok(DecisionExecutionResult {
+            verdict,
+            choice,
+            score,
+            confidence,
+            reason,
+            latency_ms: lat,
+            model: model.to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

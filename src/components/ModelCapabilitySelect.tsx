@@ -5,6 +5,7 @@ import {
   MODEL_CAPABILITY_METAS,
   resolveActiveImageModel,
   resolveActiveVisionModel,
+  resolveActiveDecisionModel,
   resolveActiveModel,
 } from "../types";
 import { AlertTriangle, Settings as SettingsIcon } from "./Icons";
@@ -47,6 +48,11 @@ export function ModelCapabilitySelect({
       : "跟随全局 (未配置)";
   } else if (capability === "vision") {
     const act = resolveActiveVisionModel(settings);
+    defaultInherit = act
+      ? `跟随全局 (${act.model} · ${act.provider.name})`
+      : "跟随全局 (回落主对话模型)";
+  } else if (capability === "decision") {
+    const act = resolveActiveDecisionModel(settings);
     defaultInherit = act
       ? `跟随全局 (${act.model} · ${act.provider.name})`
       : "跟随全局 (回落主对话模型)";

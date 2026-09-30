@@ -12,14 +12,7 @@ import {
   Zap,
 } from "./Icons";
 
-function formatComplexity(val?: string | null): string {
-  if (!val) return "快思考";
-  const v = val.toLowerCase();
-  if (v.includes("simple") || v.includes("低") || v.includes("简")) return "简单任务";
-  if (v.includes("medium") || v.includes("中")) return "中等任务";
-  if (v.includes("complex") || v.includes("高") || v.includes("繁")) return "复杂任务";
-  return val;
-}
+
 
 export type GroupedTimelineItem =
   | { type: "compaction"; compaction: SessionCompaction }
@@ -278,35 +271,7 @@ export function ExecutionProcessBlock({
   }, [isRunning]);
 
   const stepCount = steps.length;
-  const sessionId = steps[0]?.sessionId;
-  const jevEvents = useStore((s) => (sessionId ? s.jevEvents[sessionId] : undefined));
 
-  const complexityEvent = useMemo(() => {
-    if (!jevEvents || jevEvents.length === 0) return null;
-    const runId = steps[0]?.runId;
-    if (runId) {
-      const match = jevEvents.find((e) => e.scene === "task_complexity" && e.runId === runId);
-      if (match) return match;
-    }
-    const firstStepTime = steps[0]?.createdAt ? new Date(steps[0].createdAt).getTime() : 0;
-    const lastStepTime = steps[steps.length - 1]?.createdAt ? new Date(steps[steps.length - 1].createdAt).getTime() : firstStepTime;
-    const complexityEvents = jevEvents.filter((e) => e.scene === "task_complexity");
-    if (complexityEvents.length === 0) return null;
-
-    if (isRunning) {
-      return complexityEvents[complexityEvents.length - 1];
-    }
-
-    if (firstStepTime > 0) {
-      for (let i = complexityEvents.length - 1; i >= 0; i--) {
-        const evTime = new Date(complexityEvents[i].createdAt).getTime();
-        if (evTime <= lastStepTime + 10000 && evTime >= firstStepTime - 120000) {
-          return complexityEvents[i];
-        }
-      }
-    }
-    return null;
-  }, [jevEvents, steps, isRunning]);
 
   const toolCount = useMemo(() => {
     return steps.reduce((sum, s) => {
@@ -423,17 +388,6 @@ export function ExecutionProcessBlock({
               改动 {turnModifiedFilesCount} 个文件
             </span>
           )}
-          {complexityEvent && (
-            <span
-              className="text-[11px] px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30 shrink-0 font-medium inline-flex items-center gap-1 font-mono"
-              title={`Jev 快思考决策: ${complexityEvent.decisionValue} (耗时: ${complexityEvent.latencyMs}ms, 置信度: ${(complexityEvent.confidence * 100).toFixed(0)}%)\n推理深度: ${complexityEvent.adaptedEffort || "-"}\n${complexityEvent.reason || ""}`}
-            >
-              <Zap size={11} className="text-amber-400 fill-amber-400 shrink-0" />
-              <span>Jev: {formatComplexity(complexityEvent.decisionValue)}</span>
-              <span className="text-amber-400/50">·</span>
-              <span className="text-amber-300/80">{complexityEvent.latencyMs}ms</span>
-            </span>
-          )}
           {isRunning && (
             <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-400 border border-blue-500/30 animate-pulse shrink-0 font-medium">
               运行中
@@ -472,42 +426,6 @@ export function ExecutionProcessBlock({
       {/* 展开的执行步骤明细 */}
       {isOpen && (
         <div className="border-t border-edge/40 px-3.5 pb-3.5 pt-2.5 flex flex-col gap-3.5 bg-panel/30">
-          {complexityEvent && (
-            <div className="rounded-xl border border-amber-500/25 bg-amber-950/20 p-2.5 flex items-start gap-2.5 text-xs select-text animate-in fade-in duration-150">
-              <div className="p-1 rounded-lg bg-amber-500/10 text-amber-400 shrink-0 mt-0.5">
-                <Zap size={13} className="fill-amber-400" />
-              </div>
-              <div className="flex-1 min-w-0 space-y-1">
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className="font-semibold text-amber-300">⚡ Jev 快思考决策</span>
-                  <span className="px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 font-mono text-[10.5px]">
-                    {formatComplexity(complexityEvent.decisionValue)}
-                  </span>
-                  <span className="text-inkdim text-[11px] font-mono">
-                    响应: <span className="text-amber-300 font-medium">{complexityEvent.latencyMs}ms</span>
-                  </span>
-                  <span className="text-inkdim text-[11px] font-mono">
-                    置信度: <span className="text-ink font-medium">{(complexityEvent.confidence * 100).toFixed(0)}%</span>
-                  </span>
-                  {complexityEvent.adaptedEffort && (
-                    <span className="px-1.5 py-0.2 rounded bg-blue-500/15 text-blue-300 border border-blue-500/25 font-mono text-[10.5px]">
-                      自适应深度: {complexityEvent.adaptedEffort}
-                    </span>
-                  )}
-                  {complexityEvent.needsResearch && (
-                    <span className="px-1.5 py-0.2 rounded bg-purple-500/15 text-purple-300 border border-purple-500/25 font-mono text-[10.5px]">
-                      需前置探索
-                    </span>
-                  )}
-                </div>
-                {complexityEvent.reason && (
-                  <div className="text-inkdim text-[11.5px] leading-relaxed">
-                    <span className="text-inkdim/70">判定依据：</span>{complexityEvent.reason}
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
           {steps.map((step, idx) => (
             <div
               key={step.id}

@@ -9,6 +9,7 @@ import {
   formatTokens,
   resolveActiveImageModel,
   resolveActiveVisionModel,
+  resolveActiveDecisionModel,
   resolveModelContextLimit,
 } from "../types";
 
@@ -48,6 +49,7 @@ export function ModelMatrixModal() {
 
   const [imageKey, setImageKey] = useState("");
   const [visionKey, setVisionKey] = useState("");
+  const [decisionKey, setDecisionKey] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
   // 解析全局实际生效的能力模型，供跟随全局时展示具体模型名称
@@ -58,6 +60,10 @@ export function ModelMatrixModal() {
   const activeVision = resolveActiveVisionModel(settings);
   const activeVisionDesc = activeVision
     ? `${activeVision.model} (${activeVision.provider.name})`
+    : "回落主对话模型";
+  const activeDecision = resolveActiveDecisionModel(settings);
+  const activeDecisionDesc = activeDecision
+    ? `${activeDecision.model} (${activeDecision.provider.name})`
     : "回落主对话模型";
 
   // 当前主对话模型显示名
@@ -92,6 +98,10 @@ export function ModelMatrixModal() {
       const vp = draft.visionProviderId || "";
       const vm = draft.visionModelId || "";
       setVisionKey(vp && vm ? `${vp}::${vm}` : "");
+
+      const dp = draft.decisionProviderId || "";
+      const dm = draft.decisionModelId || "";
+      setDecisionKey(dp && dm ? `${dp}::${dm}` : "");
     } else if (isConfiguringSession && targetSession) {
       const ip = targetSession.imageProviderId || targetSession.image_provider_id || "";
       const im = targetSession.imageModelId || targetSession.image_model_id || "";
@@ -100,6 +110,10 @@ export function ModelMatrixModal() {
       const vp = targetSession.visionProviderId || targetSession.vision_provider_id || "";
       const vm = targetSession.visionModelId || targetSession.vision_model_id || "";
       setVisionKey(vp && vm ? `${vp}::${vm}` : "");
+
+      const dp = targetSession.decisionProviderId || targetSession.decision_provider_id || "";
+      const dm = targetSession.decisionModelId || targetSession.decision_model_id || "";
+      setDecisionKey(dp && dm ? `${dp}::${dm}` : "");
     } else {
       // 全局配置模式
       const ip = settings.activeImageProviderId || "";
@@ -109,6 +123,10 @@ export function ModelMatrixModal() {
       const vp = settings.activeVisionProviderId || "";
       const vm = settings.activeVisionModelId || "";
       setVisionKey(vp && vm ? `${vp}::${vm}` : "");
+
+      const dp = settings.activeDecisionProviderId || "";
+      const dm = settings.activeDecisionModelId || "";
+      setDecisionKey(dp && dm ? `${dp}::${dm}` : "");
     }
   }, [show, targetSessionId, isDraft, draft, isConfiguringSession, targetSession, settings]);
 
@@ -129,6 +147,7 @@ export function ModelMatrixModal() {
     try {
       const [imagePid, imageMid] = parseKey(imageKey);
       const [visionPid, visionMid] = parseKey(visionKey);
+      const [decisionPid, decisionMid] = parseKey(decisionKey);
 
       if (isDraft) {
         // 当前为未落库的新对话草稿：将能力模型保存到草稿中，首发消息创建会话时随之落库
@@ -137,6 +156,8 @@ export function ModelMatrixModal() {
           imageModelId: imageMid,
           visionProviderId: visionPid,
           visionModelId: visionMid,
+          decisionProviderId: decisionPid,
+          decisionModelId: decisionMid,
         });
         pushToast("当前对话能力模型配置已保存");
         close();
@@ -156,6 +177,8 @@ export function ModelMatrixModal() {
           imageModelId: imageMid,
           visionProviderId: visionPid,
           visionModelId: visionMid,
+          decisionProviderId: decisionPid,
+          decisionModelId: decisionMid,
         });
         if (!success) {
           setSubmitting(false);
@@ -169,10 +192,12 @@ export function ModelMatrixModal() {
           activeImageModelId: imageMid,
           activeVisionProviderId: visionPid,
           activeVisionModelId: visionMid,
+          activeDecisionProviderId: decisionPid,
+          activeDecisionModelId: decisionMid,
         };
         setSettingsLocal(nextSettings);
         await ipc.setSettings(nextSettings);
-        pushToast("全局默认生图与视觉模型已更新");
+        pushToast("全局默认生图、视觉与决策模型已更新");
       }
 
       close();
@@ -200,7 +225,7 @@ export function ModelMatrixModal() {
             </div>
             <div>
               <div className="text-[14px] font-semibold text-ink flex items-center gap-2">
-                <span>能力模型设置 (生图与视觉)</span>
+                <span>能力模型设置 (生图、视觉与决策)</span>
                 {isConfiguringSession ? (
                   <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-accent/10 border border-accent/20 text-accent truncate max-w-[200px]">
                     当前会话: {isDraft ? "新对话" : targetSession?.title}
@@ -212,7 +237,7 @@ export function ModelMatrixModal() {
                 )}
               </div>
               <div className="text-[11.5px] text-inkdim mt-0.5">
-                针对生图与视觉感知独立绑定专业模型，避免与主对话模型冲突
+                针对生图、视觉感知与逻辑决策独立绑定专业模型，避免与主对话模型冲突
               </div>
             </div>
           </div>
@@ -303,6 +328,36 @@ export function ModelMatrixModal() {
               settings={settings}
               allowInherit={true}
               inheritLabel={`跟随全局 (${activeVisionDesc})`}
+            />
+          </div>
+
+          {/* 3. 决策判断槽位 */}
+          <div className="p-3.5 rounded-xl border border-emerald-500/20 bg-emerald-500/5 space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <MODEL_CAPABILITY_METAS.decision.Icon size={16} className="text-emerald-400 shrink-0" />
+                <span className="text-[12.5px] font-medium text-ink">
+                  {MODEL_CAPABILITY_METAS.decision.label}
+                </span>
+                <span className="text-[10.5px] px-1.5 py-0.5 rounded border border-emerald-500/30 text-emerald-400 font-mono">
+                  decision
+                </span>
+              </div>
+              <span className="text-[11px] text-emerald-400/80">
+                {decisionKey ? "已指定专属模型" : `跟随全局: ${activeDecisionDesc}`}
+              </span>
+            </div>
+            <p className="text-[11px] text-inkdim leading-relaxed">
+              {MODEL_CAPABILITY_METAS.decision.description}。支持 TypeSafe AI 或标准 LLM，驱动判断、选择与评分决策工具、意图对齐门控及 /jev: 决策指令。
+            </p>
+            <ModelCapabilitySelect
+              capability="decision"
+              value={decisionKey}
+              onChange={setDecisionKey}
+              providers={settings.providers}
+              settings={settings}
+              allowInherit={true}
+              inheritLabel={`跟随全局 (${activeDecisionDesc})`}
             />
           </div>
         </div>

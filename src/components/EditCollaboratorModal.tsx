@@ -23,6 +23,7 @@ import {
   Search,
   Layers,
   MessageSquare,
+  Zap,
 } from "./Icons";
 import { ModelCapabilitySelect } from "./ModelCapabilitySelect";
 
@@ -132,6 +133,7 @@ export function EditCollaboratorModal() {
   const [selectedModelKey, setSelectedModelKey] = useState<string>(""); // "providerId::modelId" (chat)
   const [selectedImageModelKey, setSelectedImageModelKey] = useState<string>(""); // "providerId::modelId" (image_gen)
   const [selectedVisionModelKey, setSelectedVisionModelKey] = useState<string>(""); // "providerId::modelId" (vision)
+  const [selectedDecisionModelKey, setSelectedDecisionModelKey] = useState<string>(""); // "providerId::modelId" (decision)
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const providers = settings?.providers ?? [];
@@ -201,6 +203,14 @@ export function EditCollaboratorModal() {
         setSelectedVisionModelKey(`${visPid}::${visMid}`);
       } else {
         setSelectedVisionModelKey("");
+      }
+
+      const decPid = s.decisionProviderId || s.decision_provider_id;
+      const decMid = s.decisionModelId || s.decision_model_id;
+      if (decPid && decMid) {
+        setSelectedDecisionModelKey(`${decPid}::${decMid}`);
+      } else {
+        setSelectedDecisionModelKey("");
       }
     };
 
@@ -294,6 +304,16 @@ export function EditCollaboratorModal() {
         }
       }
 
+      let decisionProviderId: string | null = null;
+      let decisionModelId: string | null = null;
+      if (selectedDecisionModelKey) {
+        const parts = selectedDecisionModelKey.split("::");
+        if (parts.length === 2) {
+          decisionProviderId = parts[0];
+          decisionModelId = parts[1];
+        }
+      }
+
       await updateCollaborator({
         collaboratorId: editingId,
         role: selectedRole,
@@ -309,6 +329,8 @@ export function EditCollaboratorModal() {
         imageModelId,
         visionProviderId,
         visionModelId,
+        decisionProviderId,
+        decisionModelId,
       });
 
       pushToast("协作者配置已更新并同步落库");
@@ -411,7 +433,7 @@ export function EditCollaboratorModal() {
                 </span>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-2.5">
                 {/* 1. 对话思考 */}
                 <div className="bg-panel2/60 border border-blue-500/20 rounded-lg p-2.5 flex flex-col justify-between gap-1.5">
                   <div>
@@ -479,6 +501,30 @@ export function EditCollaboratorModal() {
                     capability="vision"
                     value={selectedVisionModelKey}
                     onChange={setSelectedVisionModelKey}
+                    providers={providers}
+                    settings={settings}
+                    allowInherit={true}
+                  />
+                </div>
+
+                {/* 4. 决策中枢 */}
+                <div className="bg-panel2/60 border border-emerald-500/20 rounded-lg p-2.5 flex flex-col justify-between gap-1.5">
+                  <div>
+                    <div className="flex items-center justify-between text-[11.5px] font-medium text-emerald-400">
+                      <span className="flex items-center gap-1.5">
+                        <Zap size={13} />
+                        <span>决策中枢</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-inkdim">decision</span>
+                    </div>
+                    <div className="text-[10.5px] text-inkdim leading-tight mt-0.5 mb-1.5">
+                      执行二元判断、多选裁决与评分
+                    </div>
+                  </div>
+                  <ModelCapabilitySelect
+                    capability="decision"
+                    value={selectedDecisionModelKey}
+                    onChange={setSelectedDecisionModelKey}
                     providers={providers}
                     settings={settings}
                     allowInherit={true}

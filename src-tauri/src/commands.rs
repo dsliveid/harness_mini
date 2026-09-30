@@ -203,24 +203,6 @@ pub async fn evaluate_plan(
     client.evaluate_plan_feasibility(&plan_content, &tech_stack, settings.jev.min_confidence).await
 }
 
-#[tauri::command]
-pub async fn get_session_jev_events(
-    state: State<'_, crate::AppState>,
-    session_id: String,
-    limit: Option<usize>,
-) -> Result<Vec<crate::models::JevDecisionEvent>, String> {
-    let db = state.db.lock().unwrap();
-    store::get_session_jev_events(&db, &session_id, limit)
-}
-
-#[tauri::command]
-pub async fn query_jev_events(
-    state: State<'_, crate::AppState>,
-    filter: crate::models::JevEventFilter,
-) -> Result<crate::models::JevEventQueryResult, String> {
-    let db = state.db.lock().unwrap();
-    store::query_jev_events(&db, &filter)
-}
 
 #[tauri::command]
 pub async fn test_proxy_connection(proxy_url: String) -> Result<u64, String> {
@@ -630,6 +612,8 @@ pub fn create_session(
     image_model_id: Option<String>,
     vision_provider_id: Option<String>,
     vision_model_id: Option<String>,
+    decision_provider_id: Option<String>,
+    decision_model_id: Option<String>,
     reasoning_effort: Option<String>,
 ) -> Result<Session, String> {
     let access_mode = crate::models::normalize_access_mode(access_mode.as_deref().unwrap_or("confirm"));
@@ -667,6 +651,8 @@ pub fn create_session(
             image_model_id.as_deref(),
             vision_provider_id.as_deref(),
             vision_model_id.as_deref(),
+            decision_provider_id.as_deref(),
+            decision_model_id.as_deref(),
             reasoning_effort.as_deref(),
         )?;
         if let Some(lim) = context_token_limit {
@@ -708,6 +694,8 @@ pub fn create_session(
         image_model_id.as_deref(),
         vision_provider_id.as_deref(),
         vision_model_id.as_deref(),
+        decision_provider_id.as_deref(),
+        decision_model_id.as_deref(),
         reasoning_effort.as_deref(),
     )?;
     if let Some(lim) = context_token_limit {
@@ -749,6 +737,8 @@ pub fn send_message(
     image_model_id: Option<String>,
     vision_provider_id: Option<String>,
     vision_model_id: Option<String>,
+    decision_provider_id: Option<String>,
+    decision_model_id: Option<String>,
     reasoning_effort: Option<String>,
 ) -> Result<SendResult, String> {
     let text = text.trim().to_string();
@@ -801,6 +791,8 @@ pub fn send_message(
                     image_model_id.as_deref(),
                     vision_provider_id.as_deref(),
                     vision_model_id.as_deref(),
+                    decision_provider_id.as_deref(),
+                    decision_model_id.as_deref(),
                     reasoning_effort.as_deref(),
                 )?;
                 if let Some(lim) = context_token_limit {
@@ -850,6 +842,8 @@ pub fn send_message(
                     image_model_id.as_deref(),
                     vision_provider_id.as_deref(),
                     vision_model_id.as_deref(),
+                    decision_provider_id.as_deref(),
+                    decision_model_id.as_deref(),
                     reasoning_effort.as_deref(),
                 )?;
                 if let Some(lim) = context_token_limit {
@@ -1173,6 +1167,8 @@ pub fn create_collaborator(
     image_model_id: Option<String>,
     vision_provider_id: Option<String>,
     vision_model_id: Option<String>,
+    decision_provider_id: Option<String>,
+    decision_model_id: Option<String>,
 ) -> Result<Session, String> {
     let parent = {
         let db = state.db.lock().unwrap();
@@ -1235,6 +1231,8 @@ pub fn create_collaborator(
             image_model_id.as_deref(),
             vision_provider_id.as_deref(),
             vision_model_id.as_deref(),
+            decision_provider_id.as_deref(),
+            decision_model_id.as_deref(),
         )?
     };
 
@@ -1274,6 +1272,8 @@ pub fn update_collaborator(
     image_model_id: Option<String>,
     vision_provider_id: Option<String>,
     vision_model_id: Option<String>,
+    decision_provider_id: Option<String>,
+    decision_model_id: Option<String>,
 ) -> Result<Session, String> {
     let parent_id = {
         let db = state.db.lock().unwrap();
@@ -1330,6 +1330,8 @@ pub fn update_collaborator(
             image_model_id.as_deref(),
             vision_provider_id.as_deref(),
             vision_model_id.as_deref(),
+            decision_provider_id.as_deref(),
+            decision_model_id.as_deref(),
         )?
     };
 
@@ -1359,6 +1361,8 @@ pub fn set_session_models(
     image_model_id: Option<String>,
     vision_provider_id: Option<String>,
     vision_model_id: Option<String>,
+    decision_provider_id: Option<String>,
+    decision_model_id: Option<String>,
 ) -> Result<Session, String> {
     let db = state.db.lock().unwrap();
     let updated = store::update_session_models(
@@ -1370,6 +1374,8 @@ pub fn set_session_models(
         image_model_id.as_deref(),
         vision_provider_id.as_deref(),
         vision_model_id.as_deref(),
+        decision_provider_id.as_deref(),
+        decision_model_id.as_deref(),
     )?;
     drop(db);
 
@@ -1493,6 +1499,8 @@ pub fn do_report_collaborator_increment(
         app.clone(),
         Some(parent_id.clone()),
         report_prompt,
+        None,
+        None,
         None,
         None,
         None,
@@ -1699,6 +1707,81 @@ pub fn respond_compaction(
     } else {
         Err("压缩请求不存在或已处理".into())
     }
+}
+
+#[tauri::command]
+pub fn respond_intent_intervention(
+    state: State<'_, crate::AppState>,
+    id: String,
+    action: String,
+    hint: Option<String>,
+) -> Result<(), String> {
+    let pending = state.intent_interventions.lock().unwrap().remove(&id);
+    if let Some(p) = pending {
+        let _ = p.tx.send(crate::models::IntentInterventionDecision { action, hint });
+        Ok(())
+    } else {
+        Err("意图对齐干预请求不存在或已处理".into())
+    }
+}
+
+#[tauri::command]
+pub async fn run_direct_decision(
+    state: State<'_, crate::AppState>,
+    session_id: String,
+    kind: String,
+    prompt: String,
+    options: Option<Vec<String>>,
+    rubric: Option<Vec<String>>,
+) -> Result<crate::jev::DecisionExecutionResult, String> {
+    let session = {
+        let db = state.db.lock().unwrap();
+        crate::store::get_session(&db, &session_id)?
+            .ok_or_else(|| format!("会话不存在: {session_id}"))?
+    };
+
+    let settings = {
+        let db = state.db.lock().unwrap();
+        let master = state.master_key.lock().unwrap();
+        crate::store::get_settings_with_secrets(&db, &master)?
+    };
+
+    let resolved = if let (Some(pid), Some(mid)) = (&session.decision_provider_id, &session.decision_model_id) {
+        settings.providers.iter().find(|p| &p.id == pid).map(|p| (p.clone(), mid.clone()))
+    } else if let (Some(pid), Some(mid)) = (&session.provider_id, &session.model_id) {
+        if settings.has_capability(Some(pid), mid, "decision") {
+            settings.providers.iter().find(|p| &p.id == pid).map(|p| (p.clone(), mid.clone()))
+        } else if let Some(p) = settings.providers.iter().find(|p| &p.id == pid) {
+            p.models.iter().find(|m| settings.has_capability(Some(pid), m, "decision"))
+                .map(|m| (p.clone(), m.clone()))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+    .or_else(|| {
+        crate::models::resolve_active_decision_model(&settings)
+            .map(|(p, m)| (p.clone(), m.to_string()))
+    })
+    .or_else(|| {
+        crate::models::resolve_active_model(&settings)
+            .map(|(p, m)| (p.clone(), m.to_string()))
+    });
+
+    let (provider, model) = resolved.ok_or_else(|| "未找到可用的决策模型，请在设置中配置模型厂商与模型".to_string())?;
+
+    crate::jev::execute_decision(
+        &provider,
+        &model,
+        &kind,
+        &prompt,
+        &prompt,
+        options,
+        rubric,
+        settings.effective_proxy_url(),
+    )
+    .await
 }
 
 #[tauri::command]

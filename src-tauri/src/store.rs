@@ -214,24 +214,6 @@ fn init(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_snapshots_event ON tool_file_snapshots(tool_event_id);
         CREATE INDEX IF NOT EXISTS idx_snapshots_message ON tool_file_snapshots(message_id);
         CREATE INDEX IF NOT EXISTS idx_snapshots_session ON tool_file_snapshots(session_id, created_at);
-
-        CREATE TABLE IF NOT EXISTS jev_decision_events (
-          id TEXT PRIMARY KEY,
-          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-          run_id TEXT,
-          scene TEXT NOT NULL,
-          verdict TEXT NOT NULL,
-          decision_value TEXT,
-          confidence REAL NOT NULL DEFAULT 0.0,
-          latency_ms INTEGER NOT NULL DEFAULT 0,
-          reason TEXT,
-          adapted_effort TEXT,
-          needs_research INTEGER,
-          prompt_summary TEXT,
-          created_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_jev_events_session ON jev_decision_events(session_id, created_at);
-        CREATE INDEX IF NOT EXISTS idx_jev_events_scene ON jev_decision_events(scene, created_at);
         "#,
     )
     .map_err(|e| e.to_string())?;
@@ -305,6 +287,8 @@ fn init(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "sessions", "image_model_id", "image_model_id TEXT")?;
     ensure_column(conn, "sessions", "vision_provider_id", "vision_provider_id TEXT")?;
     ensure_column(conn, "sessions", "vision_model_id", "vision_model_id TEXT")?;
+    ensure_column(conn, "sessions", "decision_provider_id", "decision_provider_id TEXT")?;
+    ensure_column(conn, "sessions", "decision_model_id", "decision_model_id TEXT")?;
     ensure_column(conn, "sessions", "forked_from_session_id", "forked_from_session_id TEXT")?;
     ensure_column(conn, "sessions", "forked_from_message_id", "forked_from_message_id TEXT")?;
     ensure_column(conn, "sessions", "reasoning_effort", "reasoning_effort TEXT")?;
@@ -1077,7 +1061,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let p = create_session(&conn, "D:\\ws", None, "parent_session", "confirm").unwrap();
-        let c = create_collaborator_session(&conn, &p.id, "designer", "图像生成", "生图", None, "D:\\ws", None, None, true, None, None, None, None, None, None).unwrap();
+        let c = create_collaborator_session(&conn, &p.id, "designer", "图像生成", "生图", None, "D:\\ws", None, None, true, None, None, None, None, None, None, None, None).unwrap();
 
         // 1. 初始状态未被主进程委派
         let is_dispatched = get_kv(&conn, &c.id, "dispatched_by_parent").unwrap().map(|v| v == "true").unwrap_or(false);
@@ -1591,6 +1575,8 @@ mod tests {
             Some("doubao-seedream-5.0-lite"),
             Some("openai"),
             Some("gpt-4o"),
+            Some("typesafe"),
+            Some("jev-latest"),
             None,
         )
         .unwrap();
@@ -1601,6 +1587,8 @@ mod tests {
         assert_eq!(s.image_model_id.as_deref(), Some("doubao-seedream-5.0-lite"));
         assert_eq!(s.vision_provider_id.as_deref(), Some("openai"));
         assert_eq!(s.vision_model_id.as_deref(), Some("gpt-4o"));
+        assert_eq!(s.decision_provider_id.as_deref(), Some("typesafe"));
+        assert_eq!(s.decision_model_id.as_deref(), Some("jev-latest"));
 
         // 从数据库重新读取验证
         let loaded = get_session(&conn, &s.id).unwrap().unwrap();
@@ -1610,6 +1598,8 @@ mod tests {
         assert_eq!(loaded.image_model_id.as_deref(), Some("doubao-seedream-5.0-lite"));
         assert_eq!(loaded.vision_provider_id.as_deref(), Some("openai"));
         assert_eq!(loaded.vision_model_id.as_deref(), Some("gpt-4o"));
+        assert_eq!(loaded.decision_provider_id.as_deref(), Some("typesafe"));
+        assert_eq!(loaded.decision_model_id.as_deref(), Some("jev-latest"));
     }
 
     #[test]
@@ -1783,73 +1773,6 @@ mod tests {
         assert_eq!(snaps_after_u_active.len(), 2);
         assert_eq!(snaps_after_u_active[0].file_path, "src/b.rs"); // 后生成的排在前面 (LIFO)
         assert_eq!(snaps_after_u_active[1].file_path, "src/a.rs");
-    }
-
-    #[test]
-    fn test_jev_decision_events_insert_and_query() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-
-        let s = create_session(&conn, "D:\\workspace", None, "jev test", "confirm").unwrap();
-        let ev1 = JevDecisionEvent {
-            id: "jev-1".to_string(),
-            session_id: s.id.clone(),
-            run_id: Some("run-1".to_string()),
-            scene: "task_complexity".to_string(),
-            verdict: "allow".to_string(),
-            decision_value: Some("medium".to_string()),
-            confidence: 0.95,
-            latency_ms: 68,
-            reason: Some("Task involves multi-file refactoring".to_string()),
-            adapted_effort: Some("medium".to_string()),
-            needs_research: Some(false),
-            prompt_summary: Some("User asked to update tests".to_string()),
-            created_at: "2026-09-30T10:00:00Z".to_string(),
-        };
-
-        let ev2 = JevDecisionEvent {
-            id: "jev-2".to_string(),
-            session_id: s.id.clone(),
-            run_id: Some("run-1".to_string()),
-            scene: "command_guard".to_string(),
-            verdict: "deny".to_string(),
-            decision_value: None,
-            confidence: 0.99,
-            latency_ms: 45,
-            reason: Some("Destructive rm -rf detected".to_string()),
-            adapted_effort: None,
-            needs_research: None,
-            prompt_summary: Some("rm -rf /".to_string()),
-            created_at: "2026-09-30T10:01:00Z".to_string(),
-        };
-
-        insert_jev_event(&conn, &ev1).unwrap();
-        insert_jev_event(&conn, &ev2).unwrap();
-
-        // 1. 测试按会话拉取
-        let session_events = get_session_jev_events(&conn, &s.id, None).unwrap();
-        assert_eq!(session_events.len(), 2);
-        assert_eq!(session_events[0].id, "jev-1");
-        assert_eq!(session_events[1].id, "jev-2");
-
-        // 2. 测试全局带筛选分页查询 (scene = command_guard)
-        let filter_guard = JevEventFilter {
-            session_id: None,
-            scene: Some("command_guard".to_string()),
-            verdict: None,
-            limit: Some(10),
-            offset: Some(0),
-        };
-        let query_res = query_jev_events(&conn, &filter_guard).unwrap();
-        assert_eq!(query_res.total, 1);
-        assert_eq!(query_res.items.len(), 1);
-        assert_eq!(query_res.items[0].id, "jev-2");
-        assert_eq!(query_res.items[0].verdict, "deny");
-
-        // 3. 测试统计概览
-        assert_eq!(query_res.stats.total_count, 2);
-        assert_eq!(query_res.stats.allow_count, 1);
-        assert_eq!(query_res.stats.deny_count, 1);
     }
 }
 
@@ -2026,9 +1949,11 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         image_model_id: r.get(27)?,
         vision_provider_id: r.get(28)?,
         vision_model_id: r.get(29)?,
-        forked_from_session_id: r.get(30)?,
-        forked_from_message_id: r.get(31)?,
-        reasoning_effort: r.get(32)?,
+        decision_provider_id: r.get(30)?,
+        decision_model_id: r.get(31)?,
+        forked_from_session_id: r.get(32)?,
+        forked_from_message_id: r.get(33)?,
+        reasoning_effort: r.get(34)?,
         last_run_status: None,
     })
 }
@@ -2039,6 +1964,7 @@ const SESSION_COLS: &str =
      parent_session_id, session_type, subagent_role, subagent_task, context_token_limit, \
      last_reported_msg_id, auto_report, trigger_tool_event_id, provider_id, model_id, \
      dispatch_rule, image_provider_id, image_model_id, vision_provider_id, vision_model_id, \
+     decision_provider_id, decision_model_id, \
      forked_from_session_id, forked_from_message_id, reasoning_effort";
 
 fn attach_session_tokens(conn: &Connection, sessions: &mut [Session]) -> Result<(), String> {
@@ -2293,6 +2219,8 @@ pub fn create_session(
         None,
         None,
         None,
+        None,
+        None,
     )
 }
 
@@ -2308,6 +2236,8 @@ pub fn create_session_with_models(
     image_model_id: Option<&str>,
     vision_provider_id: Option<&str>,
     vision_model_id: Option<&str>,
+    decision_provider_id: Option<&str>,
+    decision_model_id: Option<&str>,
     reasoning_effort: Option<&str>,
 ) -> Result<Session, String> {
     let t = now();
@@ -2348,6 +2278,8 @@ pub fn create_session_with_models(
         image_model_id: image_model_id.map(|s| s.to_string()),
         vision_provider_id: vision_provider_id.map(|s| s.to_string()),
         vision_model_id: vision_model_id.map(|s| s.to_string()),
+        decision_provider_id: decision_provider_id.map(|s| s.to_string()),
+        decision_model_id: decision_model_id.map(|s| s.to_string()),
         forked_from_session_id: None,
         forked_from_message_id: None,
         reasoning_effort: reasoning_effort.map(|s| s.to_string()),
@@ -2361,8 +2293,9 @@ pub fn create_session_with_models(
             last_reported_msg_id, auto_report,
             provider_id, model_id,
             image_provider_id, image_model_id, vision_provider_id, vision_model_id,
+            decision_provider_id, decision_model_id,
             reasoning_effort
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,'main',NULL,NULL,NULL,NULL,?10,?11,?12,?13,?14,?15,?16)",
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,'main',NULL,NULL,NULL,NULL,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
         params![
             s.id,
             s.title,
@@ -2379,6 +2312,8 @@ pub fn create_session_with_models(
             s.image_model_id,
             s.vision_provider_id,
             s.vision_model_id,
+            s.decision_provider_id,
+            s.decision_model_id,
             s.reasoning_effort,
         ],
     )
@@ -2403,6 +2338,8 @@ pub fn create_collaborator_session(
     image_model_id: Option<&str>,
     vision_provider_id: Option<&str>,
     vision_model_id: Option<&str>,
+    decision_provider_id: Option<&str>,
+    decision_model_id: Option<&str>,
 ) -> Result<Session, String> {
     let t = now();
     let norm_mode = access_mode.map(normalize_access_mode).unwrap_or_else(|| "confirm".into());
@@ -2442,6 +2379,8 @@ pub fn create_collaborator_session(
         image_model_id: image_model_id.map(|s| s.to_string()),
         vision_provider_id: vision_provider_id.map(|s| s.to_string()),
         vision_model_id: vision_model_id.map(|s| s.to_string()),
+        decision_provider_id: decision_provider_id.map(|s| s.to_string()),
+        decision_model_id: decision_model_id.map(|s| s.to_string()),
         forked_from_session_id: None,
         forked_from_message_id: None,
         reasoning_effort: None,
@@ -2454,8 +2393,9 @@ pub fn create_collaborator_session(
             parent_session_id, session_type, subagent_role, subagent_task,
             last_reported_msg_id, auto_report, provider_id, model_id,
             dispatch_rule, image_provider_id, image_model_id,
-            vision_provider_id, vision_model_id
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'collaborator',?11,?12,NULL,?13,?14,?15,?16,?17,?18,?19,?20)",
+            vision_provider_id, vision_model_id,
+            decision_provider_id, decision_model_id
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'collaborator',?11,?12,NULL,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
         params![
             s.id,
             s.title,
@@ -2477,6 +2417,8 @@ pub fn create_collaborator_session(
             s.image_model_id,
             s.vision_provider_id,
             s.vision_model_id,
+            s.decision_provider_id,
+            s.decision_model_id,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -2498,6 +2440,8 @@ pub fn update_collaborator_session(
     image_model_id: Option<&str>,
     vision_provider_id: Option<&str>,
     vision_model_id: Option<&str>,
+    decision_provider_id: Option<&str>,
+    decision_model_id: Option<&str>,
 ) -> Result<Session, String> {
     let t = now();
     conn.execute(
@@ -2514,8 +2458,10 @@ pub fn update_collaborator_session(
             image_model_id = ?10,
             vision_provider_id = ?11,
             vision_model_id = ?12,
-            updated_at = ?13
-         WHERE id = ?14 AND session_type = 'collaborator'",
+            decision_provider_id = ?13,
+            decision_model_id = ?14,
+            updated_at = ?15
+         WHERE id = ?16 AND session_type = 'collaborator'",
         params![
             title,
             role,
@@ -2529,6 +2475,8 @@ pub fn update_collaborator_session(
             image_model_id,
             vision_provider_id,
             vision_model_id,
+            decision_provider_id,
+            decision_model_id,
             t,
             collaborator_id,
         ],
@@ -2547,6 +2495,8 @@ pub fn update_session_models(
     image_model_id: Option<&str>,
     vision_provider_id: Option<&str>,
     vision_model_id: Option<&str>,
+    decision_provider_id: Option<&str>,
+    decision_model_id: Option<&str>,
 ) -> Result<Session, String> {
     let t = now();
     conn.execute(
@@ -2557,8 +2507,10 @@ pub fn update_session_models(
             image_model_id = ?4,
             vision_provider_id = ?5,
             vision_model_id = ?6,
-            updated_at = ?7
-         WHERE id = ?8",
+            decision_provider_id = ?7,
+            decision_model_id = ?8,
+            updated_at = ?9
+         WHERE id = ?10",
         params![
             provider_id,
             model_id,
@@ -2566,6 +2518,8 @@ pub fn update_session_models(
             image_model_id,
             vision_provider_id,
             vision_model_id,
+            decision_provider_id,
+            decision_model_id,
             t,
             session_id,
         ],
@@ -2639,6 +2593,8 @@ pub fn create_subprocess_session(
         image_model_id: None,
         vision_provider_id: None,
         vision_model_id: None,
+        decision_provider_id: None,
+        decision_model_id: None,
         forked_from_session_id: None,
         forked_from_message_id: None,
         reasoning_effort: None,
@@ -2766,6 +2722,7 @@ pub fn fork_session_at_message(
             context_token_limit, last_reported_msg_id, auto_report,
             trigger_tool_event_id, provider_id, model_id, dispatch_rule,
             image_provider_id, image_model_id, vision_provider_id, vision_model_id,
+            decision_provider_id, decision_model_id,
             forked_from_session_id, forked_from_message_id, reasoning_effort
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, 'active',
@@ -2775,7 +2732,8 @@ pub fn fork_session_at_message(
             ?7, NULL, 1,
             NULL, ?8, ?9, NULL,
             ?10, ?11, ?12, ?13,
-            ?14, ?15, ?16
+            ?14, ?15,
+            ?16, ?17, ?18
         )",
         params![
             new_session_id,
@@ -2791,6 +2749,8 @@ pub fn fork_session_at_message(
             source_session.image_model_id,
             source_session.vision_provider_id,
             source_session.vision_model_id,
+            source_session.decision_provider_id,
+            source_session.decision_model_id,
             source_session_id,
             target_message_id,
             source_session.reasoning_effort,
@@ -5694,202 +5654,6 @@ pub fn query_tool_logs(conn: &Connection, filter: &ToolLogFilter) -> Result<Tool
         page,
         page_size,
         total_pages,
-    })
-}
-
-/// 持久化一条 Jev 决策网关运行轨迹记录
-pub fn insert_jev_event(conn: &Connection, ev: &JevDecisionEvent) -> Result<(), String> {
-    let needs_research_int = ev.needs_research.map(|b| if b { 1 } else { 0 });
-    conn.execute(
-        "INSERT INTO jev_decision_events(id, session_id, run_id, scene, verdict, decision_value, confidence, latency_ms, reason, adapted_effort, needs_research, prompt_summary, created_at)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-        params![
-            ev.id,
-            ev.session_id,
-            ev.run_id,
-            ev.scene,
-            ev.verdict,
-            ev.decision_value,
-            ev.confidence,
-            ev.latency_ms,
-            ev.reason,
-            ev.adapted_effort,
-            needs_research_int,
-            ev.prompt_summary,
-            ev.created_at,
-        ],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// 查询指定会话下的全部 Jev 决策记录（按时间正序，便于界面挂载时间线）
-pub fn get_session_jev_events(
-    conn: &Connection,
-    session_id: &str,
-    limit: Option<usize>,
-) -> Result<Vec<JevDecisionEvent>, String> {
-    let lim = limit.unwrap_or(200).min(500);
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, session_id, run_id, scene, verdict, decision_value, confidence, latency_ms, reason, adapted_effort, needs_research, prompt_summary, created_at
-             FROM jev_decision_events
-             WHERE session_id = ?1
-             ORDER BY created_at ASC, id ASC
-             LIMIT ?2",
-        )
-        .map_err(|e| e.to_string())?;
-
-    let rows = stmt
-        .query_map(params![session_id, lim], |r| {
-            let nr_int: Option<i64> = r.get(10)?;
-            Ok(JevDecisionEvent {
-                id: r.get(0)?,
-                session_id: r.get(1)?,
-                run_id: r.get(2)?,
-                scene: r.get(3)?,
-                verdict: r.get(4)?,
-                decision_value: r.get(5)?,
-                confidence: r.get(6)?,
-                latency_ms: r.get(7)?,
-                reason: r.get(8)?,
-                adapted_effort: r.get(9)?,
-                needs_research: nr_int.map(|v| v != 0),
-                prompt_summary: r.get(11)?,
-                created_at: r.get(12)?,
-            })
-        })
-        .map_err(|e| e.to_string())?;
-
-    let mut events = Vec::new();
-    for row in rows {
-        if let Ok(ev) = row {
-            events.push(ev);
-        }
-    }
-    Ok(events)
-}
-
-/// 多维度全量查询 Jev 决策网关日志与性能统计指标
-pub fn query_jev_events(
-    conn: &Connection,
-    filter: &JevEventFilter,
-) -> Result<JevEventQueryResult, String> {
-    let limit = filter.limit.unwrap_or(50).clamp(1, 200);
-    let offset = filter.offset.unwrap_or(0);
-
-    let mut where_clauses = Vec::new();
-    let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
-
-    if let Some(ref sid) = filter.session_id {
-        let trimmed = sid.trim();
-        if !trimmed.is_empty() && trimmed != "all" {
-            params_vec.push(rusqlite::types::Value::Text(trimmed.to_string()));
-            where_clauses.push(format!("session_id = ?{}", params_vec.len()));
-        }
-    }
-
-    if let Some(ref sc) = filter.scene {
-        let trimmed = sc.trim();
-        if !trimmed.is_empty() && trimmed != "all" {
-            params_vec.push(rusqlite::types::Value::Text(trimmed.to_string()));
-            where_clauses.push(format!("scene = ?{}", params_vec.len()));
-        }
-    }
-
-    if let Some(ref verd) = filter.verdict {
-        let trimmed = verd.trim();
-        if !trimmed.is_empty() && trimmed != "all" {
-            params_vec.push(rusqlite::types::Value::Text(trimmed.to_string()));
-            where_clauses.push(format!("verdict = ?{}", params_vec.len()));
-        }
-    }
-
-    let where_sql = if where_clauses.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", where_clauses.join(" AND "))
-    };
-
-    // 统计总数
-    let count_sql = format!("SELECT COUNT(*) FROM jev_decision_events {where_sql}");
-    let total: usize = conn
-        .query_row(&count_sql, rusqlite::params_from_iter(&params_vec), |r| r.get(0))
-        .unwrap_or(0);
-
-    // 统计概览指标
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let stats_sql = "SELECT 
-        COUNT(*),
-        COALESCE(AVG(latency_ms), 0),
-        COALESCE(SUM(CASE WHEN verdict = 'allow' THEN 1 ELSE 0 END), 0),
-        COALESCE(SUM(CASE WHEN verdict = 'deny' THEN 1 ELSE 0 END), 0),
-        COALESCE(SUM(CASE WHEN verdict = 'abstain' THEN 1 ELSE 0 END), 0),
-        COALESCE(SUM(CASE WHEN substr(created_at, 1, 10) = ?1 THEN 1 ELSE 0 END), 0)
-        FROM jev_decision_events";
-
-    let stats: JevStatsSummary = conn
-        .query_row(stats_sql, params![today], |r| {
-            let avg_lat: f64 = r.get(1)?;
-            Ok(JevStatsSummary {
-                total_count: r.get(0)?,
-                avg_latency_ms: avg_lat.round() as u64,
-                allow_count: r.get(2)?,
-                deny_count: r.get(3)?,
-                abstain_count: r.get(4)?,
-                today_count: r.get(5)?,
-            })
-        })
-        .unwrap_or_default();
-
-    // 查分页列表
-    let list_sql = format!(
-        "SELECT id, session_id, run_id, scene, verdict, decision_value, confidence, latency_ms, reason, adapted_effort, needs_research, prompt_summary, created_at
-         FROM jev_decision_events
-         {where_sql}
-         ORDER BY created_at DESC, id DESC
-         LIMIT ?{} OFFSET ?{}",
-        params_vec.len() + 1,
-        params_vec.len() + 2
-    );
-
-    let mut list_params = params_vec;
-    list_params.push(rusqlite::types::Value::Integer(limit as i64));
-    list_params.push(rusqlite::types::Value::Integer(offset as i64));
-
-    let mut stmt = conn.prepare(&list_sql).map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(&list_params), |r| {
-            let nr_int: Option<i64> = r.get(10)?;
-            Ok(JevDecisionEvent {
-                id: r.get(0)?,
-                session_id: r.get(1)?,
-                run_id: r.get(2)?,
-                scene: r.get(3)?,
-                verdict: r.get(4)?,
-                decision_value: r.get(5)?,
-                confidence: r.get(6)?,
-                latency_ms: r.get(7)?,
-                reason: r.get(8)?,
-                adapted_effort: r.get(9)?,
-                needs_research: nr_int.map(|v| v != 0),
-                prompt_summary: r.get(11)?,
-                created_at: r.get(12)?,
-            })
-        })
-        .map_err(|e| e.to_string())?;
-
-    let mut items = Vec::new();
-    for row in rows {
-        if let Ok(ev) = row {
-            items.push(ev);
-        }
-    }
-
-    Ok(JevEventQueryResult {
-        items,
-        total,
-        stats,
     })
 }
 

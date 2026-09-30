@@ -125,72 +125,7 @@ impl Default for JevFeatures {
     }
 }
 
-/// Jev 决策网关的单次运行轨迹事件
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct JevDecisionEvent {
-    pub id: String,
-    pub session_id: String,
-    #[serde(default)]
-    pub run_id: Option<String>,
-    /// 触发场景：task_complexity | memory_gate | command_guard | plan_review | auto_distill
-    pub scene: String,
-    /// 决策结果状态：allow | deny | abstain | choice | score
-    pub verdict: String,
-    /// 具体决策值（如 "small", "true", "0.92"）
-    #[serde(default)]
-    pub decision_value: Option<String>,
-    /// 模型置信度 (0.0 ~ 1.0)
-    pub confidence: f32,
-    /// 决策耗时（毫秒）
-    pub latency_ms: u64,
-    /// 判定理由或触发说明
-    #[serde(default)]
-    pub reason: Option<String>,
-    /// 自适应调节的思考深度（如 "low", "high"）
-    #[serde(default)]
-    pub adapted_effort: Option<String>,
-    /// 是否需要外部调研
-    #[serde(default)]
-    pub needs_research: Option<bool>,
-    /// 判定所依据的输入摘要
-    #[serde(default)]
-    pub prompt_summary: Option<String>,
-    /// ISO 8601 时间戳
-    pub created_at: String,
-}
 
-/// Jev 决策日志查询过滤参数
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct JevEventFilter {
-    pub session_id: Option<String>,
-    pub scene: Option<String>,
-    pub verdict: Option<String>,
-    pub limit: Option<usize>,
-    pub offset: Option<usize>,
-}
-
-/// Jev 决策日志统计摘要
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct JevStatsSummary {
-    pub total_count: u64,
-    pub avg_latency_ms: u64,
-    pub allow_count: u64,
-    pub deny_count: u64,
-    pub abstain_count: u64,
-    pub today_count: u64,
-}
-
-/// Jev 决策日志查询结果集
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct JevEventQueryResult {
-    pub items: Vec<JevDecisionEvent>,
-    pub total: usize,
-    pub stats: JevStatsSummary,
-}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -239,6 +174,11 @@ pub struct SettingsData {
     pub active_vision_provider_id: Option<String>,
     #[serde(default)]
     pub active_vision_model_id: Option<String>,
+    /// 全局默认判断决策模型配置
+    #[serde(default)]
+    pub active_decision_provider_id: Option<String>,
+    #[serde(default)]
+    pub active_decision_model_id: Option<String>,
     #[serde(default)]
     pub last_workspace_path: Option<String>,
     #[serde(default)]
@@ -254,7 +194,7 @@ pub struct SettingsData {
     /// 自定义代理地址（例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:7890）
     #[serde(default = "default_proxy_url")]
     pub proxy_url: Option<String>,
-    /// Jev 决策网关配置
+    /// Jev 兼容配置（已废弃独立网关模式，保留兼容反序列化）
     #[serde(default)]
     pub jev: JevCfg,
 }
@@ -277,6 +217,8 @@ impl Default for SettingsData {
             active_image_model_id: None,
             active_vision_provider_id: None,
             active_vision_model_id: None,
+            active_decision_provider_id: None,
+            active_decision_model_id: None,
             last_workspace_path: None,
             disabled_tools: vec![],
             disabled_sops: vec![],
@@ -457,6 +399,13 @@ pub fn infer_default_capabilities(model: &str) -> Vec<String> {
     if is_img {
         return vec!["image_gen".to_string()];
     }
+    let is_decision = lower.contains("jev")
+        || lower.contains("judge")
+        || lower.contains("eval")
+        || lower.contains("systemone");
+    if is_decision {
+        return vec!["decision".to_string()];
+    }
     let is_vis = lower.contains("vl")
         || lower.contains("vision")
         || lower.contains("4v")
@@ -465,9 +414,9 @@ pub fn infer_default_capabilities(model: &str) -> Vec<String> {
         || lower.contains("claude-3")
         || lower.contains("gemini");
     if is_vis {
-        return vec!["chat".to_string(), "vision".to_string()];
+        return vec!["chat".to_string(), "vision".to_string(), "decision".to_string()];
     }
-    vec!["chat".to_string()]
+    vec!["chat".to_string(), "decision".to_string()]
 }
 
 /// 预设角色的默认调度触发规则（主进程 System Prompt 注入使用）
@@ -520,6 +469,24 @@ pub fn resolve_active_vision_model(settings: &SettingsData) -> Option<(&Provider
         }
     }
     None
+}
+
+/// 解析全局生效的 (决策厂商, 决策模型)：优先全局激活项，若无则寻找具备 decision 能力的模型，再次回落到主对话模型
+pub fn resolve_active_decision_model(settings: &SettingsData) -> Option<(&ProviderCfg, &str)> {
+    if let (Some(pid), Some(mid)) = (&settings.active_decision_provider_id, &settings.active_decision_model_id) {
+        if let Some(p) = settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid)) {
+            return Some((p, mid.as_str()));
+        }
+    }
+    // 回落：查找任意配置了 decision 能力的模型
+    for p in &settings.providers {
+        for m in &p.models {
+            if settings.has_capability(Some(&p.id), m, "decision") {
+                return Some((p, m.as_str()));
+            }
+        }
+    }
+    resolve_active_model(settings)
 }
 
 
@@ -823,6 +790,12 @@ pub struct Session {
     /// 会话专属视觉感知模型标识（为空则跟随全局）
     #[serde(default)]
     pub vision_model_id: Option<String>,
+    /// 会话专属判断决策模型厂商 ID（为空则跟随全局）
+    #[serde(default)]
+    pub decision_provider_id: Option<String>,
+    /// 会话专属判断决策模型标识（为空则跟随全局）
+    #[serde(default)]
+    pub decision_model_id: Option<String>,
     /// 分支来源会话 ID（若从某个会话节点分叉出来）
     #[serde(default)]
     pub forked_from_session_id: Option<String>,
@@ -883,6 +856,8 @@ impl Default for Session {
             image_model_id: None,
             vision_provider_id: None,
             vision_model_id: None,
+            decision_provider_id: None,
+            decision_model_id: None,
             forked_from_session_id: None,
             forked_from_message_id: None,
             reasoning_effort: None,
@@ -1211,6 +1186,74 @@ pub struct ApprovalRequest {
     pub risk_source: Option<String>,
     #[serde(default)]
     pub jev_reason: Option<String>,
+}
+
+/// 意图对齐单轮历史记录
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct IntentAlignmentRound {
+    pub attempt: usize,
+    pub understanding: String,
+    pub plan: String,
+    pub score: f32,
+    pub score_percent: u32,
+    pub critique: String,
+    pub passed: bool,
+}
+
+/// 日常对话意图对齐评估事件（全生命周期流式透明呈现）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct IntentAlignmentEvent {
+    pub session_id: String,
+    pub run_id: String,
+    pub user_message: String,
+    /// 状态："analyzing" | "evaluating" | "retrying" | "passed" | "requires_intervention" | "skipped"
+    pub status: String,
+    pub current_attempt: usize,
+    pub max_retries: usize,
+    #[serde(default)]
+    pub understanding: String,
+    #[serde(default)]
+    pub plan: String,
+    #[serde(default)]
+    pub score: f32,
+    #[serde(default)]
+    pub score_percent: u32,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub attempt: usize,
+    #[serde(default)]
+    pub passed: bool,
+    #[serde(default)]
+    pub history: Vec<IntentAlignmentRound>,
+    #[serde(default)]
+    pub intervention_id: Option<String>,
+}
+
+/// 意图对齐未达标人工干预请求
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct IntentInterventionRequest {
+    pub id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub user_message: String,
+    pub understanding: String,
+    pub plan: String,
+    pub score: f32,
+    pub critique: String,
+    pub retry_count: usize,
+}
+
+/// 意图对齐人工干预决策（补充提示或跳过）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct IntentInterventionDecision {
+    /// "hint" | "skip"
+    pub action: String,
+    pub hint: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

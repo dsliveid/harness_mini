@@ -659,6 +659,85 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "required": ["prompt"]
             }),
         },
+        ToolSpec {
+            name: "judge_decision",
+            description: "调用决策模型进行高精度二元判断。适用于评估条件是否满足、方案是否可行、代码是否合规、是否存在风险等对/错或真/假判断场景。",
+            risk: Risk::ReadOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "state": {
+                        "type": "string",
+                        "description": "进行决策所依据的上下文事实、背景信息或代码内容"
+                    },
+                    "instruction": {
+                        "type": "string",
+                        "description": "二元判断的核心命题或准则（例如：当前修改是否破坏了向后兼容性？）"
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "可选：指定决策模型。缺省时自动使用会话或全局绑定的决策模型"
+                    }
+                },
+                "required": ["state", "instruction"]
+            }),
+        },
+        ToolSpec {
+            name: "choice_decision",
+            description: "调用决策模型在多个备选项中做出最优选择与分类。适用于方案多选一、分类归因、路由分发等离散选择场景。",
+            risk: Risk::ReadOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "state": {
+                        "type": "string",
+                        "description": "进行选择所依据的上下文背景、需求目标或当前环境信息"
+                    },
+                    "instruction": {
+                        "type": "string",
+                        "description": "选择与分类的目标或准则"
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "可供选择的离散选项文本列表"
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "可选：指定决策模型。缺省时自动使用会话或全局绑定的决策模型"
+                    }
+                },
+                "required": ["state", "instruction", "options"]
+            }),
+        },
+        ToolSpec {
+            name: "score_decision",
+            description: "调用决策模型对目标内容进行量化百分制评分与多维度评估。适用于方案可行性打分、代码质量评分、意图对齐评估等场景。",
+            risk: Risk::ReadOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "state": {
+                        "type": "string",
+                        "description": "待评估的内容、方案、代码或分析上下文"
+                    },
+                    "instruction": {
+                        "type": "string",
+                        "description": "评分目标与评价维度说明"
+                    },
+                    "rubric": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "可选：量化评分量表或打分标准参考项"
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "可选：指定决策模型。缺省时自动使用会话或全局绑定的决策模型"
+                    }
+                },
+                "required": ["state", "instruction"]
+            }),
+        },
         // ---------- 临时空间专用（普通会话不下发，见 agent.rs run_once 的 specs 过滤） ----------
         ToolSpec {
             name: "temp_status",
@@ -963,6 +1042,9 @@ pub async fn execute(
         "wait_collaborators" => wait_collaborators_tool(args, ctx).await,
         "get_collaborators" => get_collaborators_tool(ctx).await,
         "generate_image" => generate_image_tool(args, ctx).await,
+        "judge_decision" => judge_decision_tool(args, ctx).await,
+        "choice_decision" => choice_decision_tool(args, ctx).await,
+        "score_decision" => score_decision_tool(args, ctx).await,
         "temp_status" => temp_status(ctx).await,
         "temp_changes" => temp_changes(args, ctx).await,
         "temp_diff" => temp_diff(args, ctx).await,
@@ -2155,76 +2237,6 @@ async fn record_memory_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Strin
     let title = args.get("title").and_then(|v| v.as_str()).ok_or("缺少 title 参数")?;
     let content = args.get("content").and_then(|v| v.as_str()).ok_or("缺少 content 参数")?;
 
-    // --- Jev 决策网关：痛点 1 记忆沉淀真实性与必要性门控 ---
-    if let Some(host) = &ctx.host {
-        let state = host.app.state::<crate::AppState>();
-        let (jev_client_opt, min_conf) = {
-            let db = state.db.lock().unwrap();
-            let master = state.master_key.lock().unwrap();
-            if let Ok(settings) = crate::store::get_settings_with_secrets(&db, &master) {
-                if settings.jev.enabled && settings.jev.features.memory_gate {
-                    (
-                        crate::jev::JevClient::from_cfg(&settings.jev, settings.effective_proxy_url()),
-                        settings.jev.min_confidence,
-                    )
-                } else {
-                    (None, 0.6)
-                }
-            } else {
-                (None, 0.6)
-            }
-        };
-
-        if let Some(client) = jev_client_opt {
-            let ws_str = ctx.workspace.to_string_lossy();
-            let start = std::time::Instant::now();
-            let gate = client.judge_memory_quality(content, &ws_str, min_conf).await;
-            let latency_ms = start.elapsed().as_millis() as u64;
-
-            let (verdict_str, reason_opt) = match &gate {
-                crate::jev::Gate::Allow => ("allow".to_string(), Some("确定性经验，放行落盘".to_string())),
-                crate::jev::Gate::Deny(r) => ("deny".to_string(), Some(r.clone())),
-                crate::jev::Gate::Abstain => ("abstain".to_string(), Some("置信度不足或决策弃权".to_string())),
-            };
-
-            let prompt_summary = if content.chars().count() > 120 {
-                format!("{}...", content.chars().take(120).collect::<String>())
-            } else {
-                content.to_string()
-            };
-
-            let jev_ev = crate::models::JevDecisionEvent {
-                id: format!("jev_{}", uuid::Uuid::new_v4().simple()),
-                session_id: host.session_id.clone(),
-                run_id: None,
-                scene: "memory_gate".to_string(),
-                verdict: verdict_str,
-                decision_value: Some(title.to_string()),
-                confidence: min_conf,
-                latency_ms,
-                reason: reason_opt,
-                adapted_effort: None,
-                needs_research: None,
-                prompt_summary: Some(prompt_summary),
-                created_at: chrono::Local::now().to_rfc3339(),
-            };
-
-            {
-                let db = state.db.lock().unwrap();
-                let _ = crate::store::insert_jev_event(&db, &jev_ev);
-            }
-            let _ = host.app.emit("jev:event", &jev_ev);
-
-            match gate {
-                crate::jev::Gate::Deny(reason) => {
-                    return Ok(format!("【⚠️ Jev 决策网关拦截】该知识/经验未予入库：{reason}。请仅在对代码实地验证后且具备长期复用价值时沉淀知识。"));
-                }
-                crate::jev::Gate::Allow | crate::jev::Gate::Abstain => {
-                    // 放行或降级回原逻辑
-                }
-            }
-        }
-    }
 
     let effect = crate::memory::record_memory_with_effect(&ctx.workspace, category, title, content)?;
     record_file_snapshot(ctx, &effect.rel_path, effect.old_bytes.as_deref(), &effect.new_bytes).await;
@@ -3306,6 +3318,126 @@ async fn generate_image_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
     Ok(format!(
         "🎨 图片生成成功！\n- 保存路径: `{target_str}`\n- 使用模型: `{model_name}`\n- 提示词: {prompt}\n- 分辨率: {size_display}\n- 大小: {kb} KB\n\n![{prompt}]({target_str})"
     ))
+}
+
+fn resolve_decision_model_for_tool(
+    args: &Value,
+    ctx: &ToolCtx,
+) -> Result<(crate::models::ProviderCfg, String), String> {
+    let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
+    let state = host.app.state::<crate::AppState>();
+    let session_id = &host.session_id;
+
+    let session = {
+        let db = state.db.lock().unwrap();
+        crate::store::get_session(&db, session_id)?
+            .ok_or_else(|| format!("会话不存在: {session_id}"))?
+    };
+
+    let settings = {
+        let db = state.db.lock().unwrap();
+        let master = state.master_key.lock().unwrap();
+        crate::store::get_settings_with_secrets(&db, &master)?
+    };
+
+    let requested_model = args.get("model").and_then(|v| v.as_str()).map(|s| s.trim()).filter(|s| !s.is_empty());
+
+    let resolved = if let Some(req_m) = requested_model {
+        settings.providers.iter().find(|p| p.models.iter().any(|m| m == req_m))
+            .map(|p| (p.clone(), req_m.to_string()))
+            .or_else(|| crate::models::resolve_active_model(&settings).map(|(p, _)| (p.clone(), req_m.to_string())))
+    } else if let (Some(pid), Some(mid)) = (&session.decision_provider_id, &session.decision_model_id) {
+        settings.providers.iter().find(|p| &p.id == pid)
+            .map(|p| (p.clone(), mid.clone()))
+    } else if let (Some(pid), Some(mid)) = (&session.provider_id, &session.model_id) {
+        if settings.has_capability(Some(pid), mid, "decision") {
+            settings.providers.iter().find(|p| &p.id == pid).map(|p| (p.clone(), mid.clone()))
+        } else if let Some(p) = settings.providers.iter().find(|p| &p.id == pid) {
+            p.models.iter().find(|m| settings.has_capability(Some(pid), m, "decision"))
+                .map(|m| (p.clone(), m.clone()))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+    .or_else(|| {
+        crate::models::resolve_active_decision_model(&settings)
+            .map(|(p, m)| (p.clone(), m.to_string()))
+    })
+    .or_else(|| {
+        crate::models::resolve_active_model(&settings)
+            .map(|(p, m)| (p.clone(), m.to_string()))
+    });
+
+    resolved.ok_or_else(|| "未找到可用的决策模型，请在设置中配置模型厂商与模型".to_string())
+}
+
+async fn judge_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let (provider, model) = resolve_decision_model_for_tool(args, ctx)?;
+    let state = args.get("state").and_then(|v| v.as_str()).ok_or("缺少 state 参数")?;
+    let instruction = args.get("instruction").and_then(|v| v.as_str()).ok_or("缺少 instruction 参数")?;
+
+    let res = crate::jev::execute_decision(
+        &provider,
+        &model,
+        "judge",
+        state,
+        instruction,
+        None,
+        None,
+        ctx.proxy_url.clone(),
+    )
+    .await?;
+
+    Ok(serde_json::to_string_pretty(&res).unwrap_or_else(|_| "{}".to_string()))
+}
+
+async fn choice_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let (provider, model) = resolve_decision_model_for_tool(args, ctx)?;
+    let state = args.get("state").and_then(|v| v.as_str()).ok_or("缺少 state 参数")?;
+    let instruction = args.get("instruction").and_then(|v| v.as_str()).ok_or("缺少 instruction 参数")?;
+    let options = args.get("options")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
+        .ok_or("缺少 options 参数或选项格式不正确")?;
+
+    let res = crate::jev::execute_decision(
+        &provider,
+        &model,
+        "choice",
+        state,
+        instruction,
+        Some(options),
+        None,
+        ctx.proxy_url.clone(),
+    )
+    .await?;
+
+    Ok(serde_json::to_string_pretty(&res).unwrap_or_else(|_| "{}".to_string()))
+}
+
+async fn score_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let (provider, model) = resolve_decision_model_for_tool(args, ctx)?;
+    let state = args.get("state").and_then(|v| v.as_str()).ok_or("缺少 state 参数")?;
+    let instruction = args.get("instruction").and_then(|v| v.as_str()).ok_or("缺少 instruction 参数")?;
+    let rubric = args.get("rubric")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect::<Vec<_>>());
+
+    let res = crate::jev::execute_decision(
+        &provider,
+        &model,
+        "score",
+        state,
+        instruction,
+        None,
+        rubric,
+        ctx.proxy_url.clone(),
+    )
+    .await?;
+
+    Ok(serde_json::to_string_pretty(&res).unwrap_or_else(|_| "{}".to_string()))
 }
 
 #[cfg(test)]
