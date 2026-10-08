@@ -369,6 +369,7 @@ pub fn run() {
             commands::set_settings,
             commands::list_tools,
             commands::test_provider,
+            commands::list_provider_models,
             commands::test_jev,
             commands::evaluate_plan,
             commands::test_proxy_connection,

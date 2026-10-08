@@ -233,6 +233,136 @@ pub async fn test_connection(cfg: &LlmCfg) -> Result<String, String> {
     }
 }
 
+pub fn extract_model_ids(val: &Value) -> Vec<String> {
+    let mut raw_ids = Vec::new();
+
+    fn collect_from_array(arr: &[Value], out: &mut Vec<String>) {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                out.push(s.to_string());
+            } else if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                out.push(id.to_string());
+            } else if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                let clean = name.strip_prefix("models/").unwrap_or(name);
+                out.push(clean.to_string());
+            } else if let Some(model) = item.get("model").and_then(|v| v.as_str()) {
+                out.push(model.to_string());
+            }
+        }
+    }
+
+    if let Some(arr) = val.as_array() {
+        collect_from_array(arr, &mut raw_ids);
+    } else if let Some(obj) = val.as_object() {
+        if let Some(Value::Array(arr)) = obj.get("data") {
+            collect_from_array(arr, &mut raw_ids);
+        } else if let Some(Value::Array(arr)) = obj.get("models") {
+            collect_from_array(arr, &mut raw_ids);
+        } else if let Some(Value::Array(arr)) = obj.get("items") {
+            collect_from_array(arr, &mut raw_ids);
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for id in raw_ids {
+        let trimmed = id.trim().to_string();
+        if !trimmed.is_empty() && seen.insert(trimmed.clone()) {
+            result.push(trimmed);
+        }
+    }
+    result
+}
+
+/// 获取指定厂商的模型列表
+pub async fn list_models(
+    provider: &crate::models::ProviderCfg,
+    api_key: &str,
+    proxy_url: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let raw_base = provider.base_url.trim();
+    if raw_base.is_empty() {
+        return Err("Base URL 不能为空".into());
+    }
+
+    let clean_base = raw_base.trim_end_matches('/');
+    let clean_base = clean_base.strip_suffix("/chat/completions").unwrap_or(clean_base);
+    let clean_base = clean_base.strip_suffix("/messages").unwrap_or(clean_base);
+    let clean_base = clean_base.strip_suffix("/responses").unwrap_or(clean_base);
+    let clean_base = clean_base.trim_end_matches('/');
+
+    let mut candidate_urls = Vec::new();
+    if clean_base.ends_with("/models") {
+        candidate_urls.push(clean_base.to_string());
+    } else {
+        candidate_urls.push(format!("{clean_base}/models"));
+        if !clean_base.ends_with("/v1") && !clean_base.contains("/v1/") && !clean_base.contains("/v4") {
+            candidate_urls.push(format!("{clean_base}/v1/models"));
+        }
+        candidate_urls.push(format!("{clean_base}/api/tags"));
+    }
+
+    let client = get_client(proxy_url);
+    let is_anthropic = clean_base.to_lowercase().contains("anthropic");
+    let mut last_error = String::new();
+
+    for url in &candidate_urls {
+        let mut req = client.get(url);
+        let key = api_key.trim();
+        if !key.is_empty() {
+            req = req.bearer_auth(key);
+            if is_anthropic || matches!(provider.model_protocols.values().next(), Some(crate::models::RequestProtocol::Messages)) {
+                req = req.header("x-api-key", key).header("anthropic-version", "2023-06-01");
+            }
+        } else if is_anthropic {
+            req = req.header("anthropic-version", "2023-06-01");
+        }
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_error = format!("网络请求失败: {e}");
+                continue;
+            }
+        };
+
+        let status = resp.status();
+        if status.is_success() {
+            let val: Value = match resp.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    last_error = format!("解析 JSON 响应失败: {e}");
+                    continue;
+                }
+            };
+
+            let models = extract_model_ids(&val);
+            if !models.is_empty() {
+                return Ok(models);
+            } else {
+                last_error = "响应成功但未找到模型数据".to_string();
+            }
+        } else if status.as_u16() == 401 {
+            return Err("鉴权失败 (HTTP 401)：请检查 API Key 是否正确".into());
+        } else if status.as_u16() == 403 {
+            return Err("访问被拒绝 (HTTP 403)：请检查 API Key 权限".into());
+        } else if status.as_u16() == 404 {
+            let text = resp.text().await.unwrap_or_default();
+            last_error = format!("端点 404 ({url}): {}", truncate(&text, 200));
+            continue;
+        } else {
+            let text = resp.text().await.unwrap_or_default();
+            last_error = format!("服务端返回 {status}: {}", truncate(&text, 200));
+        }
+    }
+
+    if last_error.is_empty() {
+        Err("未能获取到模型列表，请检查网络或厂商接口配置".into())
+    } else {
+        Err(format!("获取模型列表失败: {last_error}"))
+    }
+}
+
 /// 非流式基础对话调用
 pub async fn call_simple_completion(
     cfg: &LlmCfg,
@@ -407,6 +537,40 @@ mod tests {
         assert_eq!(normalize_proxy_url("socks5://127.0.0.1:1080"), "socks5://127.0.0.1:1080");
         assert_eq!(normalize_proxy_url(""), "");
         assert_eq!(normalize_proxy_url("   "), "");
+    }
+
+    #[test]
+    fn test_extract_model_ids_openai() {
+        let data = json!({
+            "object": "list",
+            "data": [
+                {"id": "gpt-4o", "object": "model"},
+                {"id": "gpt-4o-mini", "object": "model"}
+            ]
+        });
+        assert_eq!(extract_model_ids(&data), vec!["gpt-4o", "gpt-4o-mini"]);
+    }
+
+    #[test]
+    fn test_extract_model_ids_ollama() {
+        let data = json!({
+            "models": [
+                {"name": "llama3:latest", "model": "llama3:latest"},
+                {"name": "qwen2.5:latest"}
+            ]
+        });
+        assert_eq!(extract_model_ids(&data), vec!["llama3:latest", "qwen2.5:latest"]);
+    }
+
+    #[test]
+    fn test_extract_model_ids_gemini() {
+        let data = json!({
+            "models": [
+                {"name": "models/gemini-1.5-pro"},
+                {"name": "models/gemini-1.5-flash"}
+            ]
+        });
+        assert_eq!(extract_model_ids(&data), vec!["gemini-1.5-pro", "gemini-1.5-flash"]);
     }
 }
 

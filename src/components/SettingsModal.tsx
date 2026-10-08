@@ -194,6 +194,10 @@ export function SettingsModal() {
       activeModelId: cur.activeProviderId ? cur.activeModelId : (p.models[0] ?? null),
     }));
     setExpandedIds((cur) => ({ ...cur, [p.id]: true }));
+    setTimeout(() => {
+      const el = document.getElementById(`provider-card-${p.id}`);
+      el?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }, 60);
   };
 
   const addModel = (providerId: string) => {
@@ -591,18 +595,16 @@ export function SettingsModal() {
               <div className="flex flex-col gap-6">
                 {/* 模型厂商 */}
                 <section>
-                  <div className="flex items-center mb-2">
-                    <div className="font-medium">模型厂商（OpenAI 兼容）</div>
-                    <button className="ml-auto text-accent hover:underline flex items-center gap-1 text-[12px]" onClick={addProvider}>
-                      <Plus size={13} />
-                      <span>添加厂商</span>
-                    </button>
-                  </div>
+                  <div className="font-medium mb-2">模型厂商（OpenAI 兼容）</div>
                   <div className="flex flex-col gap-2.5">
                     {local.providers.map((p) => {
                       const isExpanded = !!expandedIds[p.id];
                       return (
-                        <div key={p.id} className="border border-edge rounded-xl bg-panel overflow-hidden transition-colors">
+                        <div
+                          key={p.id}
+                          id={`provider-card-${p.id}`}
+                          className="border border-edge rounded-xl bg-panel overflow-hidden transition-colors"
+                        >
                           {/* 厂商条目头部（默认折叠，紧凑展示） */}
                           <div
                             className="p-3 flex items-center gap-2.5 cursor-pointer hover:bg-panel2/50 select-none transition-colors"
@@ -759,12 +761,12 @@ export function SettingsModal() {
                                             updateProvider(p.id, { modelProtocols: nextProtocols });
                                           }}
                                           className="text-[10.5px] bg-panel3/80 hover:bg-panel3 border border-edge/80 rounded px-1.5 py-0.5 text-ink focus:outline-none focus:border-accent cursor-pointer shrink-0"
-                                          title="配置此模型使用的请求协议格式"
+                                          title="配置此模型使用的请求协议格式。通用大模型用作决策时请选 OpenAI Chat/Claude/Response；SystemOne 仅适用于 TypeSafe AI 原生端点"
                                         >
                                           <option value="chat_completions">OpenAI Chat</option>
                                           <option value="messages">Claude Messages</option>
                                           <option value="response">OpenAI Response</option>
-                                          <option value="systemone">SystemOne (决策)</option>
+                                          <option value="systemone">SystemOne (TypeSafe 原生专用)</option>
                                         </select>
 
                                         <button
@@ -850,6 +852,14 @@ export function SettingsModal() {
                       );
                     })}
                     {local.providers.length === 0 && <div className="text-inkdim">尚未添加厂商。支持任意 OpenAI 兼容接口。</div>}
+                    <button
+                      type="button"
+                      className="w-full py-2.5 border border-dashed border-edge/80 hover:border-accent/60 hover:bg-accent/5 rounded-xl text-inkdim hover:text-accent flex items-center justify-center gap-1.5 text-[12px] font-medium transition-all cursor-pointer"
+                      onClick={addProvider}
+                    >
+                      <Plus size={13} />
+                      <span>添加厂商</span>
+                    </button>
                   </div>
                 </section>
 

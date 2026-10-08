@@ -26,6 +26,7 @@ export const ipc = {
   setSettings: (settings: Settings) => invoke<void>("set_settings", { settings }),
   listTools: () => deduplicatedInvoke<ToolInfo[]>("list_tools"),
   testProvider: (provider: any) => invoke<string>("test_provider", { provider }),
+  listProviderModels: (provider: any) => invoke<string[]>("list_provider_models", { provider }),
   testProxyConnection: (proxyUrl: string) => invoke<number>("test_proxy_connection", { proxyUrl }),
   testJev: (jevCfg: JevCfg) => invoke<string>("test_jev", { jevCfg }),
   evaluatePlan: (planId: string, workspace: string) =>

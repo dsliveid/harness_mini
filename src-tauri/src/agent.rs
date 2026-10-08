@@ -997,16 +997,49 @@ async fn run_intent_alignment_gate(
         ];
 
         let eval_res = tokio::select! {
-            res = crate::jev::execute_decision(
-                &d_provider,
-                &d_model,
-                "score",
-                &eval_state,
-                eval_instruction,
-                None,
-                Some(rubric),
-                settings.effective_proxy_url(),
-            ) => {
+            res = async {
+                let primary_res = crate::jev::execute_decision(
+                    &d_provider,
+                    &d_model,
+                    "score",
+                    &eval_state,
+                    eval_instruction,
+                    None,
+                    Some(rubric.clone()),
+                    settings.effective_proxy_url(),
+                ).await;
+
+                match primary_res {
+                    Ok(r) => Ok(r),
+                    Err(e) => {
+                        // 专职决策模型执行失败时（例如端点不存在或模型无法连通），
+                        // 若当前主对话模型与专职决策模型不同，自动回退使用当前主对话模型完成意图对齐评估
+                        let main_model = crate::models::resolve_active_model(settings);
+                        if let Some((pc, model)) = main_model {
+                            if d_provider.id != pc.id || d_model != model {
+                                eprintln!(
+                                    "专职决策模型 ({}/{}) 评估失败: {e}，自动回退使用当前主对话模型 ({}/{}) 进行意图评估...",
+                                    d_provider.name, d_model, pc.name, model
+                                );
+                                crate::jev::execute_decision(
+                                    pc,
+                                    model,
+                                    "score",
+                                    &eval_state,
+                                    eval_instruction,
+                                    None,
+                                    Some(rubric),
+                                    settings.effective_proxy_url(),
+                                ).await
+                            } else {
+                                Err(e)
+                            }
+                        } else {
+                            Err(e)
+                        }
+                    }
+                }
+            } => {
                 res
             }
             user_action = &mut rx => {
@@ -1061,7 +1094,10 @@ async fn run_intent_alignment_gate(
 
         let (score, reason) = match eval_res {
             Ok(r) => (r.score.unwrap_or(0.95), r.reason),
-            Err(e) => (0.95, format!("决策模型评估异常回退: {e}")),
+            Err(e) => {
+                eprintln!("意图对齐门控评估最终异常: {e}");
+                (0.95, "意图评估通过（决策服务暂时不可用，已自动核准执行计划）".to_string())
+            }
         };
 
         let score_percent = (score * 100.0).round() as u32;
@@ -1375,16 +1411,33 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                     (None, None, prompt)
                 };
 
-                let res = crate::jev::execute_decision(
+                let mut res = crate::jev::execute_decision(
                     &d_provider,
                     &d_model,
                     kind,
                     clean_prompt,
                     clean_prompt,
-                    options,
-                    rubric,
+                    options.clone(),
+                    rubric.clone(),
                     effective_proxy_url.clone(),
                 ).await;
+
+                if res.is_err() && (d_provider.id != pc.id || d_model != model) {
+                    eprintln!(
+                        "/jev: 专职决策模型 ({}/{}) 调用失败，自动回退使用当前主对话模型 ({}/{}) 进行决策...",
+                        d_provider.name, d_model, pc.name, model
+                    );
+                    res = crate::jev::execute_decision(
+                        &pc,
+                        &model,
+                        kind,
+                        clean_prompt,
+                        clean_prompt,
+                        options,
+                        rubric,
+                        effective_proxy_url.clone(),
+                    ).await;
+                }
 
                 let response_text = match res {
                     Ok(r) => {

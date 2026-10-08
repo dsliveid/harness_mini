@@ -86,6 +86,16 @@ function orderedEvents(msg: Message): ToolEvent[] {
   return ordered;
 }
 
+export function cleanReasoningText(text?: string | null): string {
+  if (!text) return "";
+  return text
+    .replace(
+      /^【意图剖析与规划闸门（质检通过）】\s*(?:•|\*|-)?\s*意图理解:\s*[\s\S]*?(?:•|\*|-)?\s*拟定方案:\s*[\s\S]*?(?:\n\n|\n|$)/,
+      ""
+    )
+    .trim();
+}
+
 /** 思考过程折叠卡片：流式期间默认展开，便于实时可见；完成后默认折叠 */
 function ReasoningBlock({ text, streaming }: { text: string; streaming: boolean }) {
   const [open, setOpen] = useState(streaming);
@@ -379,7 +389,8 @@ export function MessageItem({
   if (msg.role === "assistant") {
     const events = useMemo(() => orderedEvents(msg), [msg.toolEvents, msg.toolCalls]);
     const hasContent = !!msg.content;
-    const hasReasoning = !!msg.reasoning;
+    const cleanedReasoning = useMemo(() => cleanReasoningText(msg.reasoning), [msg.reasoning]);
+    const hasReasoning = Boolean(cleanedReasoning && cleanedReasoning.length > 0);
 
     const isRunningTurn = !!turnMetrics?.isCurrentRunningTurn;
     const isTurnEnd = turnMetrics?.isTurnEnd ?? true;
@@ -437,7 +448,7 @@ export function MessageItem({
             <span>已撤回本轮修改 (Soft Undo - 模型已自动忽略此轮上下文)</span>
           </div>
         )}
-        {hasReasoning && <ReasoningBlock text={msg.reasoning!} streaming={!!streaming} />}
+        {hasReasoning && <ReasoningBlock text={cleanedReasoning} streaming={!!streaming} />}
         {hasContent && (
           <div
             className={`group relative ${

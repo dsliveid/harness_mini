@@ -222,6 +222,14 @@ pub async fn dispatch_rpc(
             let msg = commands::test_provider(st, provider).await?;
             Ok(json!(msg))
         }
+        "list_provider_models" => {
+            let provider: ProviderCfg = serde_json::from_value(
+                params.get("provider").cloned().unwrap_or(Value::Null),
+            )
+            .map_err(|e| format!("参数解析错误: {e}"))?;
+            let models = commands::list_provider_models(st, provider).await?;
+            Ok(json!(models))
+        }
 
         // ---- 项目 ----
         "list_projects" => {

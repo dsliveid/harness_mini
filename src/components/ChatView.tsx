@@ -8,7 +8,6 @@ import { ExecutionProcessBlock, groupTimelineItems } from "./ExecutionProcessBlo
 import { ToolRetryBanner } from "./ToolRetryBanner";
 import { CompactionBanner, CompactedHistoryCard } from "./CompactionBanner";
 import { TruncationNoticeList } from "./TruncationNoticeCard";
-import { IntentAlignmentCard } from "./IntentAlignmentCard";
 import { Bot, Plus, Sprout, ShieldCheck, AlertTriangle, Loader2, Play, RotateCcw, Zap } from "./Icons";
 
 const EMPTY_PROPOSALS: any[] = [];
@@ -34,6 +33,8 @@ export function ChatView() {
   const lastRunOutcome = useStore((s) => (s.currentId ? s.lastRunOutcome[s.currentId] : undefined));
   const retryTurn = useStore((s) => s.retryTurn);
   const continueTurn = useStore((s) => s.continueTurn);
+  const currentIntentAlignment = useStore((s) => (s.currentId ? s.intentAlignments[s.currentId] : undefined));
+  const intentAlignments = useStore((s) => s.intentAlignments);
   // 临时空间对话：合并点（含）之前的消息永久不可编辑重发
   const mergedBoundary = session?.mergedSeq ?? null;
 
@@ -135,8 +136,15 @@ export function ChatView() {
 
   // 按轮次将连续多步 assistant 工具执行过程聚合成折叠抽屉卡片，突出最终交付答复
   const groupedItems = useMemo(() => {
-    return groupTimelineItems(timelineItems, turnMetricsMap, running);
-  }, [timelineItems, turnMetricsMap, running]);
+    return groupTimelineItems(
+      timelineItems,
+      turnMetricsMap,
+      running,
+      intentAlignments,
+      currentIntentAlignment,
+      currentId
+    );
+  }, [timelineItems, turnMetricsMap, running, intentAlignments, currentIntentAlignment, currentId]);
 
   useEffect(() => {
     const el = boxRef.current;
@@ -257,6 +265,7 @@ export function ChatView() {
                   turnMetrics={item.turnMetrics}
                   readOnly={readOnly}
                   turnMetricsMap={turnMetricsMap}
+                  intentAlignment={item.intentAlignment}
                 />
               );
             }
@@ -344,15 +353,7 @@ export function ChatView() {
             </div>
           )}
 
-          {/* 意图对齐门控与干预指导卡片 */}
-          <IntentAlignmentCard />
 
-          {running && (msgs.length === 0 || msgs[msgs.length - 1]?.role === "user") && (
-            <div className="text-inkdim text-[13px] flex items-center gap-2 py-2 px-1 animate-in fade-in duration-150">
-              <Loader2 size={15} className="animate-spin text-accent" />
-              <span>Agent 正在思考并制定执行计划…</span>
-            </div>
-          )}
         </div>
       </div>
     </div>

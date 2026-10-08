@@ -372,6 +372,23 @@ impl SettingsData {
         let m = self.active_model_id.clone().or_else(|| self.active_model.clone());
         self.active_model_id = m.clone();
         self.active_model = m;
+        // 若厂商 Base URL 不是 TypeSafe/SystemOne 专属服务，但模型协议被误设为 SystemOne，自动纠正为该厂商推断协议
+        for p in &mut self.providers {
+            let is_real_typesafe = p.base_url.contains("typesafe") || p.base_url.contains("systemone");
+            if !is_real_typesafe {
+                for (model_name, proto) in p.model_protocols.iter_mut() {
+                    if *proto == RequestProtocol::SystemOne {
+                        *proto = if p.base_url.contains("anthropic") || model_name.to_lowercase().starts_with("claude") {
+                            RequestProtocol::Messages
+                        } else if p.base_url.contains("responses") || p.base_url.ends_with("/responses") {
+                            RequestProtocol::Response
+                        } else {
+                            RequestProtocol::ChatCompletions
+                        };
+                    }
+                }
+            }
+        }
     }
 
     /// 获取当前生效的代理地址（若未启用代理或地址为空则返回 None）

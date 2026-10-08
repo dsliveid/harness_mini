@@ -135,6 +135,25 @@ pub async fn test_provider(
 }
 
 #[tauri::command]
+pub async fn list_provider_models(
+    state: State<'_, crate::AppState>,
+    provider: ProviderCfg,
+) -> Result<Vec<String>, String> {
+    let (key, proxy_url) = {
+        let db = state.db.lock().unwrap();
+        let master = state.master_key.lock().unwrap();
+        let k = if provider.api_key.is_empty() {
+            store::secret_get(&db, &master, &provider.id).ok().flatten().unwrap_or_default()
+        } else {
+            provider.api_key.clone()
+        };
+        let p = store::get_settings(&db).ok().and_then(|s| s.effective_proxy_url());
+        (k, p)
+    };
+    llm::list_models(&provider, &key, proxy_url.as_deref()).await
+}
+
+#[tauri::command]
 pub async fn test_jev(
     state: State<'_, crate::AppState>,
     jev_cfg: JevCfg,

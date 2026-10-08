@@ -2989,6 +2989,7 @@ export const useStore = create<Store>((set, get) => ({
       intentAlignments: {
         ...st.intentAlignments,
         [ev.sessionId]: ev,
+        ...(ev.runId ? { [ev.runId]: ev } : {}),
       },
     }));
   },
