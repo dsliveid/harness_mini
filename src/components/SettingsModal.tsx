@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import { ipc } from "../ipc";
 import { useStore } from "../store";
-import type { Provider, Settings, ToolInfo, AgentSopInfo } from "../types";
-import { formatTokens, resolveModelContextLimit, resolveModelCapabilities, hasModelCapability, AGENT_SOPS } from "../types";
+import type { Provider, Settings, ToolInfo, AgentSopInfo, RequestProtocol } from "../types";
+import { formatTokens, resolveModelContextLimit, resolveModelCapabilities, hasModelCapability, AGENT_SOPS, getModelProtocol, inferRequestProtocol } from "../types";
 import { DataDirSection } from "./DataDirSection";
 import { ModalActions, ModalClose } from "./ModalActions";
 import { ModelContextModal } from "./ModelContextModal";
@@ -206,9 +206,16 @@ export function SettingsModal() {
       return;
     }
     setNewModel((m) => ({ ...m, [providerId]: "" }));
+    const inferredProto = inferRequestProtocol(p.baseUrl, name);
     setLocal((cur) => {
       const providers = cur.providers.map((item) =>
-        item.id === providerId ? { ...item, models: [...item.models, name] } : item
+        item.id === providerId
+          ? {
+              ...item,
+              models: [...item.models, name],
+              modelProtocols: { ...(item.modelProtocols || {}), [name]: inferredProto },
+            }
+          : item
       );
       const hasActive = cur.activeProviderId && (cur.activeModelId ?? cur.activeModel);
       const activeP = hasActive ? cur.activeProviderId : providerId;
@@ -227,7 +234,9 @@ export function SettingsModal() {
     const p = local.providers.find((x) => x.id === providerId);
     if (!p) return;
     const models = p.models.filter((m) => m !== model);
-    updateProvider(providerId, { models });
+    const nextProtocols = { ...(p.modelProtocols || {}) };
+    delete nextProtocols[model];
+    updateProvider(providerId, { models, modelProtocols: nextProtocols });
     // 删除的是激活模型时，回落到该厂商剩余的第一个模型，若该厂商无模型则找其他有模型的厂商
     setLocal((cur) => {
       const activeCurrent = cur.activeModelId ?? cur.activeModel;
@@ -740,6 +749,23 @@ export function SettingsModal() {
                                             );
                                           })}
                                         </div>
+
+                                        {/* 请求协议选择器 */}
+                                        <select
+                                          value={getModelProtocol(p, m)}
+                                          onChange={(e) => {
+                                            const proto = e.target.value as RequestProtocol;
+                                            const nextProtocols = { ...(p.modelProtocols || {}), [m]: proto };
+                                            updateProvider(p.id, { modelProtocols: nextProtocols });
+                                          }}
+                                          className="text-[10.5px] bg-panel3/80 hover:bg-panel3 border border-edge/80 rounded px-1.5 py-0.5 text-ink focus:outline-none focus:border-accent cursor-pointer shrink-0"
+                                          title="配置此模型使用的请求协议格式"
+                                        >
+                                          <option value="chat_completions">OpenAI Chat</option>
+                                          <option value="messages">Claude Messages</option>
+                                          <option value="response">OpenAI Response</option>
+                                          <option value="systemone">SystemOne (决策)</option>
+                                        </select>
 
                                         <button
                                           type="button"

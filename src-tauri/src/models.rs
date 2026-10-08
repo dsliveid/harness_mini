@@ -1,4 +1,48 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// 模型请求协议定义
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestProtocol {
+    #[default]
+    ChatCompletions, // OpenAI 兼容标准接口 (/chat/completions)
+    Messages,        // Anthropic Claude 接口 (/v1/messages)
+    Response,        // OpenAI 新一代 Responses 接口 (/v1/responses)
+    #[serde(rename = "systemone", alias = "system_one")]
+    SystemOne,       // Jev / TypeSafe 决策专用接口 (/v1/systemone)
+}
+
+impl RequestProtocol {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat_completions",
+            Self::Messages => "messages",
+            Self::Response => "response",
+            Self::SystemOne => "systemone",
+        }
+    }
+
+    /// 判断该协议是否具备作为 Agent 主会话多轮对话的能力
+    pub fn is_chat_capable(&self) -> bool {
+        matches!(self, Self::ChatCompletions | Self::Messages | Self::Response)
+    }
+
+    /// 启发式智能推断默认协议（用于老配置自动迁移与用户未指定时）
+    pub fn infer(base_url: &str, model_id: &str) -> Self {
+        let b = base_url.to_lowercase();
+        let m = model_id.to_lowercase();
+        if b.contains("systemone") || b.contains("typesafe") || m.contains("systemone") {
+            Self::SystemOne
+        } else if b.contains("anthropic") || m.starts_with("claude") {
+            Self::Messages
+        } else if b.contains("responses") || b.ends_with("/responses") {
+            Self::Response
+        } else {
+            Self::ChatCompletions
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -14,6 +58,18 @@ pub struct ProviderCfg {
     pub model: String,
     #[serde(default)]
     pub api_key: String,
+    /// 每个模型绑定的请求协议 (chat_completions, messages, response, systemone)
+    #[serde(default)]
+    pub model_protocols: HashMap<String, RequestProtocol>,
+}
+
+impl ProviderCfg {
+    pub fn get_model_protocol(&self, model: &str) -> RequestProtocol {
+        self.model_protocols
+            .get(model)
+            .copied()
+            .unwrap_or_else(|| RequestProtocol::infer(&self.base_url, model))
+    }
 }
 
 fn default_access_mode() -> String {
@@ -370,6 +426,19 @@ impl SettingsData {
 
     /// 检查指定模型是否具备某项能力（如 "chat", "image_gen", "vision"）
     pub fn has_capability(&self, provider_id: Option<&str>, model: &str, cap: &str) -> bool {
+        if cap == "chat" {
+            if let Some(pid) = provider_id {
+                if let Some(p) = self.providers.iter().find(|x| x.id == pid) {
+                    if !p.get_model_protocol(model).is_chat_capable() {
+                        return false;
+                    }
+                }
+            } else if let Some(p) = self.providers.iter().find(|x| x.models.iter().any(|m| m == model)) {
+                if !p.get_model_protocol(model).is_chat_capable() {
+                    return false;
+                }
+            }
+        }
         let caps = self.resolve_model_capabilities(provider_id, model);
         caps.iter().any(|c| c == cap)
     }
@@ -519,6 +588,7 @@ mod tests {
             models: models.iter().map(|m| m.to_string()).collect(),
             model: String::new(),
             api_key: String::new(),
+            model_protocols: HashMap::new(),
         }
     }
 
@@ -532,6 +602,7 @@ mod tests {
             models: vec![],
             model: "glm-4.6".into(),
             api_key: String::new(),
+            model_protocols: HashMap::new(),
         }];
         s.migrate_legacy_model();
         assert_eq!(s.providers[0].models, vec!["glm-4.6".to_string()]);

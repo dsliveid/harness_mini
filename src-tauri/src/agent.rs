@@ -1315,8 +1315,10 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         base_url: pc.base_url.clone(),
         api_key: pc.api_key.clone(),
         model: model.clone(),
+        protocol: pc.get_model_protocol(&model),
         reasoning_effort: effective_reasoning_effort,
         proxy_url: effective_proxy_url.clone(),
+        session_id: Some(session_id.to_string()),
     };
 
     // /jev: 极速决策指令拦截（判断 / 选择 / 评分）

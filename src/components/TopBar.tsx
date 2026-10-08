@@ -2,7 +2,7 @@ import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ipc } from "../ipc";
 import { currentSession, useStore } from "../store";
-import { DRAFT_ID, formatTokens, modelKey, parseModelKey, resolveActiveModel, resolveSessionActiveModel, resolveModelContextLimit, samePath, type Project, type ReasoningEffort } from "../types";
+import { DRAFT_ID, formatTokens, modelKey, parseModelKey, resolveActiveModel, resolveSessionActiveModel, resolveModelContextLimit, samePath, getModelProtocol, isChatCapableProtocol, type Project, type ReasoningEffort } from "../types";
 import { askConfirm } from "./PromptModal";
 import { ModelContextModal } from "./ModelContextModal";
 
@@ -58,8 +58,13 @@ export function TopBar() {
   const workspacePath = session?.workspacePath ?? draft?.workspacePath ?? "";
   // 临时空间对话（含未落库草稿）：工作区为临时副本，固定不可切换
   const isTempConv = !!session?.isTemp || (currentId === DRAFT_ID && !!draft?.temp);
-  // 顶栏模型选择：按厂商分组（optgroup）；优先解析当前会话/草稿专属模型，未配置时回落至全局配置
-  const groups = settings.providers.filter((p) => (p.models ?? []).length > 0);
+  // 顶栏模型选择：按厂商分组；过滤掉仅供决策用的 systemone 协议模型
+  const groups = settings.providers
+    .map((p) => ({
+      ...p,
+      models: (p.models ?? []).filter((m) => isChatCapableProtocol(getModelProtocol(p, m))),
+    }))
+    .filter((p) => p.models.length > 0);
   const active = resolveSessionActiveModel(settings, session, currentId === DRAFT_ID ? draft : null);
 
   // 上下文上限三级解析：会话专属设置 -> 模型独立配置/推断 -> 全局保底值
@@ -569,6 +574,8 @@ export function TopBar() {
                         {p.models.map((m) => {
                           const isSelected = active?.provider.id === p.id && active?.model === m;
                           const mLimit = resolveModelContextLimit(settings, p.id, m);
+                          const proto = getModelProtocol(p, m);
+                          const protoLabel = proto === "messages" ? "Claude" : proto === "response" ? "Response" : "Chat";
                           return (
                             <button
                               key={m}
@@ -578,13 +585,16 @@ export function TopBar() {
                                   : "hover:bg-panel3 text-ink/90 hover:text-ink"
                               }`}
                               onClick={() => void handleSelectModel(p.id, m)}
-                              title={`${p.name} · ${m}\n上下文上限: ${mLimit.toLocaleString()} tokens`}
+                              title={`${p.name} · ${m}\n协议: ${protoLabel}\n上下文上限: ${mLimit.toLocaleString()} tokens`}
                             >
                               <div className="flex items-center gap-1.5 truncate min-w-0 flex-1">
                                 <Cpu size={12} className={isSelected ? "text-accent" : "text-inkdim"} />
                                 <span className="truncate">{m}</span>
                               </div>
                               <div className="flex items-center gap-1 shrink-0">
+                                <span className="text-[9px] text-inkdim/80 bg-panel3/70 px-1 py-0.2 rounded border border-edge/40">
+                                  {protoLabel}
+                                </span>
                                 <span className="text-[9.5px] font-mono text-inkdim bg-panel3 px-1 py-0.2 rounded border border-edge/60">
                                   {formatTokens(mLimit)}
                                 </span>

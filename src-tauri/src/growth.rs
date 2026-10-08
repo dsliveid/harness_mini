@@ -47,12 +47,15 @@ pub fn trigger_reflection_on_denial(
         };
         let Some(session) = session else { return };
         let Some((pc, model)) = crate::models::resolve_active_model(&settings) else { return };
+        let protocol = pc.get_model_protocol(model);
         let cfg = LlmCfg {
             base_url: pc.base_url.clone(),
             api_key: pc.api_key.clone(),
             model: model.to_string(),
+            protocol,
             reasoning_effort: None,
             proxy_url: settings.effective_proxy_url(),
+            session_id: Some(session_id.clone()),
         };
 
         let _ = app.emit(
@@ -175,12 +178,15 @@ pub fn trigger_manual_reflection(
         };
         let Some(session) = session else { return };
         let Some((pc, model)) = crate::models::resolve_active_model(&settings) else { return };
+        let protocol = pc.get_model_protocol(model);
         let cfg = LlmCfg {
             base_url: pc.base_url.clone(),
             api_key: pc.api_key.clone(),
             model: model.to_string(),
+            protocol,
             reasoning_effort: None,
             proxy_url: settings.effective_proxy_url(),
+            session_id: Some(session_id.clone()),
         };
 
         let _ = app.emit(

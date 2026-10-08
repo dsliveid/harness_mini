@@ -3273,12 +3273,15 @@ async fn generate_image_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
     let size = args.get("size").and_then(|v| v.as_str());
     let filename_arg = args.get("filename").and_then(|v| v.as_str());
 
+    let protocol = provider.get_model_protocol(&model_name);
     let cfg = crate::llm::LlmCfg {
         base_url: provider.base_url.clone(),
         api_key: provider.api_key.clone(),
         model: model_name.clone(),
+        protocol,
         reasoning_effort: None,
         proxy_url: ctx.proxy_url.clone(),
+        session_id: None,
     };
 
     let img_bytes = crate::llm::generate_image_api(&cfg, prompt, size).await?;

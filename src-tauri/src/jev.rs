@@ -175,6 +175,7 @@ impl JevClient {
     /// 构建 reqwest 客户端（包含超时与代理）
     fn build_http_client(&self) -> Result<reqwest::Client, String> {
         let mut builder = reqwest::Client::builder()
+            .user_agent("harness-mini/0.1.0")
             .timeout(Duration::from_millis(self.timeout_ms));
 
         if let Some(ref p) = self.proxy_url {
@@ -212,10 +213,13 @@ impl JevClient {
             questions,
         };
 
+        let sess_id = format!("jev-{}", uuid::Uuid::new_v4().simple());
         let resp = http
             .post(&endpoint)
             .header("Authorization", format!("Bearer {}", self.api_key.trim()))
             .header("Content-Type", "application/json")
+            .header("x-opencode-session", &sess_id)
+            .header("x-session-id", &sess_id)
             .json(&body)
             .send()
             .await
@@ -667,7 +671,10 @@ pub async fn execute_decision(
     rubric: Option<Vec<String>>,
     proxy_url: Option<String>,
 ) -> Result<DecisionExecutionResult, String> {
-    let is_typesafe = provider.base_url.contains("typesafe") || provider.base_url.contains("systemone");
+    let protocol = provider.get_model_protocol(model);
+    let is_typesafe = protocol == crate::models::RequestProtocol::SystemOne
+        || provider.base_url.contains("typesafe")
+        || provider.base_url.contains("systemone");
 
     if is_typesafe {
         let client = JevClient::new(
@@ -771,7 +778,9 @@ pub async fn execute_decision(
             "temperature": 0.1
         });
 
-        let mut http_builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
+        let mut http_builder = reqwest::Client::builder()
+            .user_agent("harness-mini/0.1.0")
+            .timeout(std::time::Duration::from_secs(30));
         if let Some(ref p) = proxy_url {
             if !p.trim().is_empty() {
                 if let Ok(proxy) = reqwest::Proxy::all(p) {
@@ -781,7 +790,11 @@ pub async fn execute_decision(
         }
         let http = http_builder.build().map_err(|e| format!("构建 HTTP 客户端失败: {e}"))?;
 
-        let mut req = http.post(&url).header("Content-Type", "application/json");
+        let sess_id = format!("jev-{}", uuid::Uuid::new_v4().simple());
+        let mut req = http.post(&url)
+            .header("Content-Type", "application/json")
+            .header("x-opencode-session", &sess_id)
+            .header("x-session-id", &sess_id);
         if !provider.api_key.trim().is_empty() {
             req = req.header("Authorization", format!("Bearer {}", provider.api_key.trim()));
         }

@@ -1094,8 +1094,10 @@ pub async fn merge_space(
         base_url: pc.base_url.clone(),
         api_key: pc.api_key.clone(),
         model: m.to_string(),
+        protocol: pc.get_model_protocol(m),
         reasoning_effort: None,
         proxy_url: settings.effective_proxy_url(),
+        session_id: Some(session_id.to_string()),
     });
 
     let summary = apply_merge(&manifest, llm_cfg.as_ref()).await;
@@ -1402,8 +1404,10 @@ pub async fn merge_from_agent(
         base_url: pc.base_url.clone(),
         api_key: pc.api_key.clone(),
         model: m.to_string(),
+        protocol: pc.get_model_protocol(m),
         reasoning_effort: None,
         proxy_url: settings.effective_proxy_url(),
+        session_id: Some(session_id.to_string()),
     });
 
     let summary = apply_merge(&manifest, llm_cfg.as_ref()).await;

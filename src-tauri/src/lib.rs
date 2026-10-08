@@ -9,6 +9,7 @@ pub mod memory;
 mod models;
 mod paths;
 pub mod plan;
+pub mod protocol;
 mod secrets;
 pub mod server;
 pub mod single_instance;

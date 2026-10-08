@@ -550,12 +550,15 @@ pub fn trigger_auto_distillation(
         }
 
         let Some((pc, model)) = crate::models::resolve_active_model(&settings) else { return };
+        let protocol = pc.get_model_protocol(model);
         let cfg = LlmCfg {
             base_url: pc.base_url.clone(),
             api_key: pc.api_key.clone(),
             model: model.to_string(),
+            protocol,
             reasoning_effort: None,
             proxy_url: settings.effective_proxy_url(),
+            session_id: Some(session_id.clone()),
         };
 
         let all_msgs = {

@@ -1,12 +1,41 @@
 import type { LucideIcon } from "lucide-react";
 import { MessageSquare, Palette, Eye, Scale } from "lucide-react";
 
+export type RequestProtocol = "chat_completions" | "messages" | "response" | "systemone";
+
 export interface Provider {
   id: string;
   name: string; // 厂商名称
   baseUrl: string;
   models: string[]; // 该厂商下配置的模型列表
   apiKey: string;
+  modelProtocols?: Record<string, RequestProtocol>;
+}
+
+export function inferRequestProtocol(baseUrl: string, modelId: string): RequestProtocol {
+  const b = (baseUrl || "").toLowerCase();
+  const m = (modelId || "").toLowerCase();
+  if (b.includes("systemone") || b.includes("typesafe") || m.includes("systemone")) {
+    return "systemone";
+  }
+  if (b.includes("anthropic") || m.startsWith("claude")) {
+    return "messages";
+  }
+  if (b.includes("responses") || b.endsWith("/responses")) {
+    return "response";
+  }
+  return "chat_completions";
+}
+
+export function getModelProtocol(provider: Provider, model: string): RequestProtocol {
+  if (provider.modelProtocols?.[model]) {
+    return provider.modelProtocols[model];
+  }
+  return inferRequestProtocol(provider.baseUrl, model);
+}
+
+export function isChatCapableProtocol(protocol: RequestProtocol): boolean {
+  return protocol !== "systemone";
 }
 
 export interface ApprovalRule {

@@ -6,8 +6,22 @@ pub struct LlmCfg {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub protocol: crate::models::RequestProtocol,
     pub reasoning_effort: Option<String>,
     pub proxy_url: Option<String>,
+    pub session_id: Option<String>,
+}
+
+impl LlmCfg {
+    /// 获取当前会话 ID；若无则自动生成具有唯一性的会话 ID，保证 OpenCode / 缓存路由层的一致性与命中率
+    pub fn effective_session_id(&self) -> String {
+        self.session_id
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("sess-{}", uuid::Uuid::new_v4().simple()))
+    }
 }
 
 /// 规整 endpoint：容忍用户把完整路径 /chat/completions 填进 Base URL
@@ -53,6 +67,7 @@ pub fn normalize_proxy_url(raw: &str) -> String {
 /// 若 proxy_url 为 Some 且非空，则配置全局代理并排除本地回环（localhost, 127.0.0.1, ::1）。
 pub fn build_client(proxy_url: Option<&str>) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
+        .user_agent("harness-mini/0.1.0")
         .connect_timeout(std::time::Duration::from_secs(25))
         .tcp_keepalive(std::time::Duration::from_secs(15))
         .pool_idle_timeout(std::time::Duration::from_secs(60));
@@ -97,141 +112,18 @@ pub fn get_client(proxy_url: Option<&str>) -> reqwest::Client {
     new_client
 }
 
-/// 调用 OpenAI 兼容 /chat/completions（流式）。
-/// `on_text` 在每个内容增量到达时被调用（用于向 UI 推送）。
+/// 调用大模型（流式），内部根据 cfg.protocol 自动路由至对应协议适配器
 pub async fn chat_stream(
     cfg: &LlmCfg,
     messages: &[Value],
     tools: &[Value],
-    mut on_text: impl FnMut(&str) + Send,
-    mut on_reasoning: impl FnMut(&str) + Send,
+    on_text: impl FnMut(&str) + Send,
+    on_reasoning: impl FnMut(&str) + Send,
 ) -> Result<LlmResult, String> {
-    let url = endpoint(&cfg.base_url);
-    let mut body = json!({
-        "model": cfg.model,
-        "messages": messages,
-        "stream": true,
-        "stream_options": { "include_usage": true },
-    });
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(tools.to_vec());
-    }
-    // 思考程度处理：仅当明确指定且非 "default" 时才传入 reasoning_effort（支持模型默认不传，防止非推理模型报错 400）
-    if let Some(ref effort) = cfg.reasoning_effort {
-        let trimmed = effort.trim();
-        if !trimmed.is_empty() && trimmed != "default" {
-            body["reasoning_effort"] = json!(trimmed);
-        }
-    }
-
-    let resp = get_client(cfg.proxy_url.as_deref())
-        .post(&url)
-        .bearer_auth(&cfg.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("请求失败: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("LLM 返回 {status}: {}", truncate(&text, 2000)));
-    }
-
-    let mut stream = resp.bytes_stream();
-    let mut buffer: Vec<u8> = Vec::new();
-    let mut result = LlmResult::default();
-    let mut calls: Vec<Option<ToolCallAcc>> = Vec::new();
-
-    use futures::StreamExt;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("流读取失败: {e}"))?;
-        buffer.extend_from_slice(&chunk);
-        // SSE 事件以空行分隔，但按行解析 "data:" 更简单可靠
-        while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = buffer.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line);
-            let line = line.trim_end();
-            let Some(data) = line.strip_prefix("data:") else { continue };
-            let data = data.trim();
-            if data == "[DONE]" {
-                return Ok(finish(result, &mut calls));
-            }
-            if data.is_empty() {
-                continue;
-            }
-            let v: Value = match serde_json::from_str(data) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if let Some(u) = v.get("usage") {
-                if u.is_object() {
-                    result.usage = Some(u.clone());
-                }
-            }
-            let Some(choices) = v.get("choices").and_then(|c| c.as_array()) else { continue };
-            let Some(delta) = choices.get(0).and_then(|c| c.get("delta")) else { continue };
-            if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
-                if !text.is_empty() {
-                    result.content.push_str(text);
-                    on_text(text);
-                }
-            }
-            // 推理型模型（DeepSeek R1、GLM-Reasoning 等）的思考过程：
-            // OpenAI 兼容端点常见字段为 reasoning_content，部分实现用 reasoning
-            if let Some(text) = delta
-                .get("reasoning_content")
-                .or_else(|| delta.get("reasoning"))
-                .and_then(|c| c.as_str())
-            {
-                if !text.is_empty() {
-                    result.reasoning.push_str(text);
-                    on_reasoning(text);
-                }
-            }
-            if let Some(tcs) = delta.get("tool_calls").and_then(|c| c.as_array()) {
-                for tc in tcs {
-                    let idx = tc
-                        .get("index")
-                        .and_then(|i| i.as_u64())
-                        .unwrap_or(calls.len() as u64) as usize;
-                    while calls.len() <= idx {
-                        calls.push(None);
-                    }
-                    let slot = &mut calls[idx];
-                    if slot.is_none() {
-                        *slot = Some(ToolCallAcc {
-                            id: String::new(),
-                            name: String::new(),
-                            args: String::new(),
-                        });
-                    }
-                    let slot = slot.as_mut().unwrap();
-                    if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
-                        slot.id.push_str(id);
-                    }
-                    if let Some(name) = tc
-                        .get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|n| n.as_str())
-                    {
-                        slot.name.push_str(name);
-                    }
-                    if let Some(args) = tc
-                        .get("function")
-                        .and_then(|f| f.get("arguments"))
-                        .and_then(|a| a.as_str())
-                    {
-                        slot.args.push_str(args);
-                    }
-                }
-            }
-        }
-    }
-    Ok(finish(result, &mut calls))
+    crate::protocol::dispatch_chat_stream(cfg, messages, tools, on_text, on_reasoning).await
 }
 
-fn finish(mut result: LlmResult, calls: &mut Vec<Option<ToolCallAcc>>) -> LlmResult {
+pub fn finish(mut result: LlmResult, calls: &mut Vec<Option<ToolCallAcc>>) -> LlmResult {
     for c in calls.iter_mut() {
         if let Some(c) = c.take() {
             result.tool_calls.push(c);
@@ -240,27 +132,104 @@ fn finish(mut result: LlmResult, calls: &mut Vec<Option<ToolCallAcc>>) -> LlmRes
     result
 }
 
-/// 非流式连接测试
+/// 非流式连接测试，根据协议自动适配
 pub async fn test_connection(cfg: &LlmCfg) -> Result<String, String> {
-    let url = endpoint(&cfg.base_url);
-    let body = json!({
-        "model": cfg.model,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 1,
-    });
-    let resp = get_client(cfg.proxy_url.as_deref())
-        .post(&url)
-        .bearer_auth(&cfg.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("连接失败: {e}"))?;
-    let status = resp.status();
-    if status.is_success() {
-        Ok(format!("连接成功（{status}）"))
-    } else {
-        let text = resp.text().await.unwrap_or_default();
-        Err(format!("服务端返回 {status}: {}", truncate(&text, 500)))
+    let session_id = cfg.effective_session_id();
+    match cfg.protocol {
+        crate::models::RequestProtocol::Messages => {
+            let url = crate::protocol::anthropic::endpoint(&cfg.base_url);
+            let body = json!({
+                "model": cfg.model,
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "ping"}]}],
+                "max_tokens": 5,
+            });
+            let resp = get_client(cfg.proxy_url.as_deref())
+                .post(&url)
+                .header("x-api-key", &cfg.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .header("x-opencode-session", &session_id)
+                .header("x-session-id", &session_id)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("连接失败: {e}"))?;
+            let status = resp.status();
+            if status.is_success() {
+                Ok(format!("Claude Messages 连接成功（{status}）"))
+            } else {
+                let text = resp.text().await.unwrap_or_default();
+                Err(format!("服务端返回 {status}: {}", truncate(&text, 500)))
+            }
+        }
+        crate::models::RequestProtocol::Response => {
+            let url = crate::protocol::openai_responses::endpoint(&cfg.base_url);
+            let body = json!({
+                "model": cfg.model,
+                "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ping"}]}],
+            });
+            let resp = get_client(cfg.proxy_url.as_deref())
+                .post(&url)
+                .bearer_auth(&cfg.api_key)
+                .header("content-type", "application/json")
+                .header("x-opencode-session", &session_id)
+                .header("x-session-id", &session_id)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("连接失败: {e}"))?;
+            let status = resp.status();
+            if status.is_success() {
+                Ok(format!("OpenAI Responses 连接成功（{status}）"))
+            } else {
+                let text = resp.text().await.unwrap_or_default();
+                Err(format!("服务端返回 {status}: {}", truncate(&text, 500)))
+            }
+        }
+        crate::models::RequestProtocol::SystemOne => {
+            let client = crate::jev::JevClient::new(
+                cfg.base_url.clone(),
+                cfg.api_key.clone(),
+                cfg.model.clone(),
+                5000,
+                cfg.proxy_url.clone(),
+            );
+            let mut q = std::collections::HashMap::new();
+            q.insert(
+                "ping".to_string(),
+                crate::jev::JevQuestion::Noul {
+                    instructions: "ping test".to_string(),
+                },
+            );
+            match client.systemone("test connectivity", q).await {
+                Ok(_) => Ok("SystemOne 决策端点连通成功".into()),
+                Err(e) => Err(format!("SystemOne 连通失败: {e}")),
+            }
+        }
+        crate::models::RequestProtocol::ChatCompletions => {
+            let url = endpoint(&cfg.base_url);
+            let body = json!({
+                "model": cfg.model,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+            });
+            let resp = get_client(cfg.proxy_url.as_deref())
+                .post(&url)
+                .bearer_auth(&cfg.api_key)
+                .header("x-opencode-session", &session_id)
+                .header("x-session-id", &session_id)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("连接失败: {e}"))?;
+            let status = resp.status();
+            if status.is_success() {
+                Ok(format!("OpenAI Chat 连接成功（{status}）"))
+            } else {
+                let text = resp.text().await.unwrap_or_default();
+                Err(format!("服务端返回 {status}: {}", truncate(&text, 500)))
+            }
+        }
     }
 }
 
@@ -270,6 +239,7 @@ pub async fn call_simple_completion(
     messages: &[Value],
     temperature: Option<f32>,
 ) -> Result<String, String> {
+    let session_id = cfg.effective_session_id();
     let url = endpoint(&cfg.base_url);
     let mut body = json!({
         "model": cfg.model,
@@ -288,6 +258,8 @@ pub async fn call_simple_completion(
     let resp = get_client(cfg.proxy_url.as_deref())
         .post(&url)
         .bearer_auth(&cfg.api_key)
+        .header("x-opencode-session", &session_id)
+        .header("x-session-id", &session_id)
         .json(&body)
         .send()
         .await
@@ -309,7 +281,7 @@ pub async fn call_simple_completion(
     Ok(content)
 }
 
-fn truncate(s: &str, n: usize) -> String {
+pub fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
         return s.to_string();
     }
@@ -344,9 +316,12 @@ pub async fn generate_image_api(
         body["size"] = json!(s);
     }
 
+    let session_id = cfg.effective_session_id();
     let resp = get_client(cfg.proxy_url.as_deref())
         .post(&url)
         .bearer_auth(cfg.api_key.trim())
+        .header("x-opencode-session", &session_id)
+        .header("x-session-id", &session_id)
         .json(&body)
         .send()
         .await
