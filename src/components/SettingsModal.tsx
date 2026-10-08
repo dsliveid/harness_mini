@@ -844,7 +844,7 @@ export function SettingsModal() {
                                             const nextProtocols = { ...(p.modelProtocols || {}), [m]: proto };
                                             updateProvider(p.id, { modelProtocols: nextProtocols });
                                           }}
-                                          className="text-[10.5px] bg-panel3/80 hover:bg-panel3 border border-edge/80 rounded px-1.5 py-0.5 text-ink focus:outline-none focus:border-accent cursor-pointer shrink-0"
+                                          className="w-[110px] text-[10.5px] bg-panel3/80 hover:bg-panel3 border border-edge/80 rounded px-1.5 py-0.5 text-ink focus:outline-none focus:border-accent cursor-pointer shrink-0"
                                           title="配置此模型使用的请求协议格式（OpenAI Chat、Claude Messages、OpenAI Response 或 SystemOne 决策协议）"
                                         >
                                           <option value="chat_completions">OpenAI Chat</option>
@@ -853,9 +853,10 @@ export function SettingsModal() {
                                           <option value="systemone">SystemOne</option>
                                         </select>
 
+                                        {/* 上下文长度配置标签（固定宽度对齐） */}
                                         <button
                                           type="button"
-                                          className={`text-[11px] font-mono px-2 py-0.5 rounded-md border flex items-center gap-1 transition-all shrink-0 ${
+                                          className={`w-[68px] justify-center text-[11px] font-mono px-1.5 py-0.5 rounded-md border flex items-center gap-1 transition-all shrink-0 ${
                                             isCustom
                                               ? "bg-accent/15 border-accent/40 text-accent hover:bg-accent/25"
                                               : "bg-panel3/80 border-edge/80 text-inkdim hover:text-ink hover:border-accent/40 hover:bg-panel3"
@@ -870,11 +871,11 @@ export function SettingsModal() {
                                           }
                                           title={`点击配置 ${m} 的上下文上限（当前: ${limit.toLocaleString()} tokens）`}
                                         >
-                                          <Sliders size={11} className="opacity-70" />
-                                          <span>{formatTokens(limit)}</span>
+                                          <Sliders size={11} className="opacity-70 shrink-0" />
+                                          <span className="truncate">{formatTokens(limit)}</span>
                                         </button>
                                         <button
-                                          className="text-[12px] text-red-400 hover:underline shrink-0"
+                                          className="text-[12px] text-red-400 hover:underline shrink-0 cursor-pointer"
                                           onClick={() => removeModel(p.id, m)}
                                         >
                                           删除
