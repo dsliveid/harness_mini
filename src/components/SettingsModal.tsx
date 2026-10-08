@@ -845,12 +845,12 @@ export function SettingsModal() {
                                             updateProvider(p.id, { modelProtocols: nextProtocols });
                                           }}
                                           className="text-[10.5px] bg-panel3/80 hover:bg-panel3 border border-edge/80 rounded px-1.5 py-0.5 text-ink focus:outline-none focus:border-accent cursor-pointer shrink-0"
-                                          title="配置此模型使用的请求协议格式。支持 OpenCode Zen (jev-1.13) 及 TypeSafe AI 原生决策端点；通用模型用作决策时请选用 OpenAI Chat/Claude/Response"
+                                          title="配置此模型使用的请求协议格式（OpenAI Chat、Claude Messages、OpenAI Response 或 SystemOne 决策协议）"
                                         >
                                           <option value="chat_completions">OpenAI Chat</option>
                                           <option value="messages">Claude Messages</option>
                                           <option value="response">OpenAI Response</option>
-                                          <option value="systemone">SystemOne (Jev 专属决策)</option>
+                                          <option value="systemone">SystemOne</option>
                                         </select>
 
                                         <button
