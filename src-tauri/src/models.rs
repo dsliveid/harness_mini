@@ -32,7 +32,12 @@ impl RequestProtocol {
     pub fn infer(base_url: &str, model_id: &str) -> Self {
         let b = base_url.to_lowercase();
         let m = model_id.to_lowercase();
-        if b.contains("systemone") || b.contains("typesafe") || m.contains("systemone") {
+        if b.contains("systemone")
+            || b.contains("typesafe")
+            || m.contains("systemone")
+            || m.starts_with("jev")
+            || (b.contains("opencode.ai/zen") && m.contains("jev"))
+        {
             Self::SystemOne
         } else if b.contains("anthropic") || m.starts_with("claude") {
             Self::Messages
@@ -372,12 +377,14 @@ impl SettingsData {
         let m = self.active_model_id.clone().or_else(|| self.active_model.clone());
         self.active_model_id = m.clone();
         self.active_model = m;
-        // 若厂商 Base URL 不是 TypeSafe/SystemOne 专属服务，但模型协议被误设为 SystemOne，自动纠正为该厂商推断协议
+        // 若厂商明确属于通用对话网关且不是 SystemOne/Jev 兼容节点，但模型被误设为 SystemOne，进行纠偏
         for p in &mut self.providers {
-            let is_real_typesafe = p.base_url.contains("typesafe") || p.base_url.contains("systemone");
-            if !is_real_typesafe {
+            let is_systemone_capable = p.base_url.contains("typesafe")
+                || p.base_url.contains("systemone")
+                || p.base_url.contains("opencode.ai/zen");
+            if !is_systemone_capable {
                 for (model_name, proto) in p.model_protocols.iter_mut() {
-                    if *proto == RequestProtocol::SystemOne {
+                    if *proto == RequestProtocol::SystemOne && !model_name.to_lowercase().starts_with("jev") {
                         *proto = if p.base_url.contains("anthropic") || model_name.to_lowercase().starts_with("claude") {
                             RequestProtocol::Messages
                         } else if p.base_url.contains("responses") || p.base_url.ends_with("/responses") {

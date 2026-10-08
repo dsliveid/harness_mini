@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { ipc } from "../ipc";
 import { useStore } from "../store";
 import type { Provider, Settings, ToolInfo, AgentSopInfo, RequestProtocol } from "../types";
@@ -29,6 +29,11 @@ import {
   Palette,
   Sprout,
   Globe,
+  List,
+  Loader2,
+  RefreshCw,
+  Search,
+  X,
 } from "./Icons";
 
 const MODEL_CAP_OPTIONS = [
@@ -107,6 +112,12 @@ export function SettingsModal() {
   const [visibleKeys, setVisibleKeys] = useState<Record<string, boolean>>({});
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [newModel, setNewModel] = useState<Record<string, string>>({});
+  const [fetchingModels, setFetchingModels] = useState<Record<string, boolean>>({});
+  const [fetchedModels, setFetchedModels] = useState<Record<string, string[]>>({});
+  const [openModelMenu, setOpenModelMenu] = useState<Record<string, boolean>>({});
+  const [modelFilter, setModelFilter] = useState<Record<string, string>>({});
+  const menuContainers = useRef<Record<string, HTMLDivElement | null>>({});
+  const inputRefs = useRef<Record<string, HTMLInputElement | null>>({});
   const [expandedIds, setExpandedIds] = useState<Record<string, boolean>>({});
   const [editingContextModel, setEditingContextModel] = useState<{
     providerId: string;
@@ -125,6 +136,9 @@ export function SettingsModal() {
       setVisibleKeys({});
       setCopiedId(null);
       setNewModel({});
+      setFetchingModels({});
+      setOpenModelMenu({});
+      setModelFilter({});
       setExpandedIds({});
       setEditingContextModel(null);
       setProxyTesting(false);
@@ -145,6 +159,30 @@ export function SettingsModal() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [show]);
+
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      for (const [pid, isOpen] of Object.entries(openModelMenu)) {
+        if (isOpen) {
+          const container = menuContainers.current[pid];
+          if (container && !container.contains(e.target as Node)) {
+            setOpenModelMenu((prev) => ({ ...prev, [pid]: false }));
+          }
+        }
+      }
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setOpenModelMenu({});
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [openModelMenu]);
 
   if (!show) return null;
 
@@ -198,6 +236,50 @@ export function SettingsModal() {
       const el = document.getElementById(`provider-card-${p.id}`);
       el?.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }, 60);
+  };
+
+  const handleFetchModels = async (provider: Provider) => {
+    if (!provider.baseUrl.trim()) {
+      pushToast("请先填写该厂商的 Base URL");
+      return;
+    }
+    setFetchingModels((f) => ({ ...f, [provider.id]: true }));
+    try {
+      const list = await ipc.listProviderModels(provider);
+      if (!list || list.length === 0) {
+        pushToast("未获取到可用模型，请检查厂商配置或网络连接");
+        return;
+      }
+      setFetchedModels((m) => ({ ...m, [provider.id]: list }));
+      setOpenModelMenu((o) => ({ ...o, [provider.id]: true }));
+      pushToast(`成功获取 ${list.length} 个模型`);
+    } catch (err: any) {
+      const msg = typeof err === "string" ? err : err?.message || String(err);
+      pushToast(`获取模型列表失败: ${msg}`);
+    } finally {
+      setFetchingModels((f) => ({ ...f, [provider.id]: false }));
+    }
+  };
+
+  const handleFetchOrToggleModels = (provider: Provider) => {
+    if (openModelMenu[provider.id]) {
+      setOpenModelMenu((o) => ({ ...o, [provider.id]: false }));
+      return;
+    }
+    if (fetchedModels[provider.id] && fetchedModels[provider.id].length > 0) {
+      setOpenModelMenu((o) => ({ ...o, [provider.id]: true }));
+    } else {
+      handleFetchModels(provider);
+    }
+  };
+
+  const handleSelectModel = (providerId: string, modelName: string) => {
+    setNewModel((m) => ({ ...m, [providerId]: modelName }));
+    setOpenModelMenu((o) => ({ ...o, [providerId]: false }));
+    pushToast(`已填入模型「${modelName}」`);
+    setTimeout(() => {
+      inputRefs.current[providerId]?.focus();
+    }, 50);
   };
 
   const addModel = (providerId: string) => {
@@ -603,7 +685,9 @@ export function SettingsModal() {
                         <div
                           key={p.id}
                           id={`provider-card-${p.id}`}
-                          className="border border-edge rounded-xl bg-panel overflow-hidden transition-colors"
+                          className={`border border-edge rounded-xl bg-panel transition-colors ${
+                            isExpanded ? "overflow-visible" : "overflow-hidden"
+                          }`}
                         >
                           {/* 厂商条目头部（默认折叠，紧凑展示） */}
                           <div
@@ -761,12 +845,12 @@ export function SettingsModal() {
                                             updateProvider(p.id, { modelProtocols: nextProtocols });
                                           }}
                                           className="text-[10.5px] bg-panel3/80 hover:bg-panel3 border border-edge/80 rounded px-1.5 py-0.5 text-ink focus:outline-none focus:border-accent cursor-pointer shrink-0"
-                                          title="配置此模型使用的请求协议格式。通用大模型用作决策时请选 OpenAI Chat/Claude/Response；SystemOne 仅适用于 TypeSafe AI 原生端点"
+                                          title="配置此模型使用的请求协议格式。支持 OpenCode Zen (jev-1.13) 及 TypeSafe AI 原生决策端点；通用模型用作决策时请选用 OpenAI Chat/Claude/Response"
                                         >
                                           <option value="chat_completions">OpenAI Chat</option>
                                           <option value="messages">Claude Messages</option>
                                           <option value="response">OpenAI Response</option>
-                                          <option value="systemone">SystemOne (TypeSafe 原生专用)</option>
+                                          <option value="systemone">SystemOne (Jev 专属决策)</option>
                                         </select>
 
                                         <button
@@ -800,8 +884,11 @@ export function SettingsModal() {
                                   })}
                                   {p.models.length === 0 && <div className="text-[12px] text-amber-400">请至少添加一个模型</div>}
                                 </div>
-                                <div className="flex gap-2">
+                                <div className="flex gap-2 relative">
                                   <input
+                                    ref={(el) => {
+                                      inputRefs.current[p.id] = el;
+                                    }}
                                     className={inputCls}
                                     placeholder="输入模型名，如 deepseek-chat"
                                     value={newModel[p.id] ?? ""}
@@ -810,8 +897,124 @@ export function SettingsModal() {
                                       if (e.key === "Enter") addModel(p.id);
                                     }}
                                   />
+                                  <div
+                                    className="relative shrink-0"
+                                    ref={(el) => {
+                                      menuContainers.current[p.id] = el;
+                                    }}
+                                  >
+                                    <button
+                                      type="button"
+                                      className="shrink-0 text-[12px] px-3 h-full rounded-lg bg-panel3 hover:bg-edge text-inkdim hover:text-ink flex items-center gap-1.5 transition-colors disabled:opacity-60 cursor-pointer"
+                                      onClick={() => handleFetchOrToggleModels(p)}
+                                      disabled={fetchingModels[p.id]}
+                                      title="从厂商接口获取可用模型列表"
+                                    >
+                                      {fetchingModels[p.id] ? (
+                                        <Loader2 size={13} className="animate-spin text-accent" />
+                                      ) : (
+                                        <List size={13} />
+                                      )}
+                                      <span>{fetchingModels[p.id] ? "获取中…" : "获取模型列表"}</span>
+                                    </button>
+
+                                    {openModelMenu[p.id] && (
+                                      <div className="absolute right-0 top-full mt-1.5 w-80 max-w-[calc(100vw-4rem)] bg-panel border border-edge rounded-xl shadow-2xl p-2 z-50 flex flex-col gap-1.5 animate-in fade-in zoom-in-95 duration-100">
+                                        <div className="flex items-center justify-between px-1.5 py-1 border-b border-edge/60 text-[11px] text-inkdim">
+                                          <span className="font-medium text-ink">
+                                            可用模型 (
+                                            {
+                                              (fetchedModels[p.id] || []).filter((m) =>
+                                                m.toLowerCase().includes((modelFilter[p.id] ?? "").toLowerCase())
+                                              ).length
+                                            }
+                                            {
+                                              (fetchedModels[p.id] || []).filter((m) =>
+                                                m.toLowerCase().includes((modelFilter[p.id] ?? "").toLowerCase())
+                                              ).length !== (fetchedModels[p.id] || []).length
+                                                ? ` / ${(fetchedModels[p.id] || []).length}`
+                                                : ""
+                                            }
+                                            )
+                                          </span>
+                                          <div className="flex items-center gap-1">
+                                            <button
+                                              type="button"
+                                              onClick={() => handleFetchModels(p)}
+                                              disabled={fetchingModels[p.id]}
+                                              className="hover:text-ink hover:bg-panel3 px-1.5 py-0.5 rounded transition-colors flex items-center gap-1 text-[11px] cursor-pointer"
+                                              title="重新获取"
+                                            >
+                                              <RefreshCw size={11} className={fetchingModels[p.id] ? "animate-spin" : ""} />
+                                              <span>刷新</span>
+                                            </button>
+                                            <button
+                                              type="button"
+                                              onClick={() => setOpenModelMenu((prev) => ({ ...prev, [p.id]: false }))}
+                                              className="hover:text-ink hover:bg-panel3 p-1 rounded transition-colors text-[11px] cursor-pointer"
+                                              title="关闭"
+                                            >
+                                              <X size={11} />
+                                            </button>
+                                          </div>
+                                        </div>
+
+                                        <div className="relative">
+                                          <Search size={12} className="absolute left-2.5 top-2 text-inkdim pointer-events-none" />
+                                          <input
+                                            type="text"
+                                            className="w-full pl-7 pr-2 py-1 text-[11px] bg-panel2/80 border border-edge/60 rounded-md text-ink placeholder:text-inkdim/60 focus:outline-none focus:border-accent/60"
+                                            placeholder="搜索模型名称…"
+                                            value={modelFilter[p.id] ?? ""}
+                                            onChange={(e) => setModelFilter((f) => ({ ...f, [p.id]: e.target.value }))}
+                                            autoFocus
+                                          />
+                                        </div>
+
+                                        <div className="max-h-56 overflow-y-auto space-y-0.5 custom-scrollbar pr-0.5">
+                                          {(() => {
+                                            const filterText = (modelFilter[p.id] ?? "").toLowerCase();
+                                            const list = (fetchedModels[p.id] || []).filter((m) =>
+                                              m.toLowerCase().includes(filterText)
+                                            );
+                                            if (list.length === 0) {
+                                              return (
+                                                <div className="text-[12px] text-inkdim text-center py-3">
+                                                  {(fetchedModels[p.id] || []).length === 0 ? "未获取到模型" : "无匹配模型"}
+                                                </div>
+                                              );
+                                            }
+                                            return list.map((m) => {
+                                              const isAdded = p.models.includes(m);
+                                              const isCurrentInput = newModel[p.id] === m;
+                                              return (
+                                                <button
+                                                  key={m}
+                                                  type="button"
+                                                  className={`w-full text-left px-2.5 py-1.5 rounded-lg text-[12px] flex items-center justify-between gap-2 transition-colors cursor-pointer ${
+                                                    isCurrentInput
+                                                      ? "bg-accent/15 text-accent font-medium"
+                                                      : "hover:bg-panel3 text-ink/90 hover:text-ink"
+                                                  }`}
+                                                  onClick={() => handleSelectModel(p.id, m)}
+                                                  title={`点击选择并将「${m}」填入输入框`}
+                                                >
+                                                  <span className="truncate font-mono text-[11.5px]">{m}</span>
+                                                  {isAdded && (
+                                                    <span className="text-[10px] px-1.5 py-0.2 rounded bg-panel3 text-inkdim shrink-0">
+                                                      已添加
+                                                    </span>
+                                                  )}
+                                                </button>
+                                              );
+                                            });
+                                          })()}
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
                                   <button
-                                    className="shrink-0 text-[12px] px-3 rounded-lg bg-panel3 hover:bg-edge text-inkdim hover:text-ink flex items-center gap-1.5 transition-colors"
+                                    className="shrink-0 text-[12px] px-3 rounded-lg bg-panel3 hover:bg-edge text-inkdim hover:text-ink flex items-center gap-1.5 transition-colors cursor-pointer"
                                     onClick={() => addModel(p.id)}
                                   >
                                     <Plus size={13} />

@@ -8,16 +8,92 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
-/// Jev 问题的三种基础原语
+fn serialize_choice_options<S>(options: &[String], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    let mut map = serializer.serialize_map(Some(options.len()))?;
+    for opt in options {
+        if let Some((k, v)) = opt.split_once(':').or_else(|| opt.split_once('：')) {
+            let k_trim = k.trim();
+            let v_trim = v.trim();
+            if !k_trim.is_empty() {
+                map.serialize_entry(k_trim, if v_trim.is_empty() { k_trim } else { v_trim })?;
+                continue;
+            }
+        }
+        map.serialize_entry(opt.as_str(), opt.as_str())?;
+    }
+    map.end()
+}
+
+fn deserialize_choice_options<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ChoiceOptionsVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for ChoiceOptionsVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a map of option keys to descriptions, or a sequence of options")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut list = Vec::new();
+            while let Some(elem) = seq.next_element::<String>()? {
+                list.push(elem);
+            }
+            Ok(list)
+        }
+
+        fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+        where
+            M: serde::de::MapAccess<'de>,
+        {
+            let mut list = Vec::new();
+            while let Some((k, v)) = access.next_entry::<String, String>()? {
+                if k == v {
+                    list.push(k);
+                } else {
+                    list.push(format!("{k}: {v}"));
+                }
+            }
+            Ok(list)
+        }
+    }
+
+    deserializer.deserialize_any(ChoiceOptionsVisitor)
+}
+
+/// Jev 问题的三种基础原语（完全遵从 SystemOne 规范，choice/score 均映射为 criteria）
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum JevQuestion {
     /// 二元命题判定，返回概率 0.0 ~ 1.0
     Noul { instructions: String },
-    /// 离散选项分类
-    Choice { instructions: String, options: Vec<String> },
-    /// 标准分级评估
-    Score { instructions: String, rubric: Vec<String> },
+    /// 离散选项分类（按官方规范序列化为 criteria 字典）
+    Choice {
+        instructions: String,
+        #[serde(
+            rename = "criteria",
+            alias = "options",
+            serialize_with = "serialize_choice_options",
+            deserialize_with = "deserialize_choice_options"
+        )]
+        options: Vec<String>,
+    },
+    /// 标准分级评估（按官方规范序列化为 criteria 列表）
+    Score {
+        instructions: String,
+        #[serde(rename = "criteria", alias = "rubric")]
+        rubric: Vec<String>,
+    },
 }
 
 /// 发送给 Jev /v1/systemone 的请求体
@@ -725,22 +801,96 @@ async fn execute_decision_with_systemone(
                 "3: 深度契合或极佳".into(),
             ]);
             let mut questions = HashMap::new();
-            questions.insert("q_score".into(), JevQuestion::Score { instructions: instruction.to_string(), rubric: rub });
-            let map = client.systemone(state, questions).await.map_err(|e| format!("Jev 评分失败: {e}"))?;
+            questions.insert(
+                "q_score".into(),
+                JevQuestion::Score {
+                    instructions: instruction.to_string(),
+                    rubric: rub.clone(),
+                },
+            );
+            let map = client
+                .systemone(state, questions)
+                .await
+                .map_err(|e| format!("Jev 评分失败: {e}"))?;
             let lat = t0.elapsed().as_millis() as u64;
             let ans = map.get("q_score");
-            let score_val = ans.and_then(|a| a.score).ok_or_else(|| "SystemOne 评分未返回有效数值".to_string())?;
             let conf = ans.and_then(|a| a.confidence).unwrap_or(0.8);
+
+            // Jev 评分归一化处理：优先根据各分级量表概率加权计算期望得分
+            let score_val = if let Some(probs) = ans.and_then(|a| a.probabilities.as_ref()) {
+                let mut weighted = 0.0f32;
+                let mut total_p = 0.0f32;
+                for (k, &p) in probs {
+                    if let Ok(idx) = k.parse::<usize>() {
+                        let level_val = extract_rubric_level_score(&rub, idx);
+                        weighted += level_val * p;
+                        total_p += p;
+                    }
+                }
+                if total_p > 0.0 {
+                    (weighted / total_p).clamp(0.0, 1.0)
+                } else {
+                    ans.and_then(|a| a.score)
+                        .map(|s| normalize_raw_score(s, rub.len()))
+                        .unwrap_or(0.8)
+                }
+            } else if let Some(raw) = ans.and_then(|a| a.score) {
+                normalize_raw_score(raw, rub.len())
+            } else {
+                return Err("SystemOne 评分未返回有效数值".to_string());
+            };
+
             Ok(DecisionExecutionResult {
                 verdict: None,
                 choice: None,
                 score: Some(score_val),
                 confidence: conf,
-                reason: format!("综合评估打分: {:.1}%", score_val * 100.0),
+                reason: format!("Jev 决策量化评估打分: {:.1}%", score_val * 100.0),
                 latency_ms: lat,
                 model: model.to_string(),
             })
         }
+    }
+}
+
+fn extract_rubric_level_score(rub: &[String], idx: usize) -> f32 {
+    if idx >= rub.len() {
+        return 0.5;
+    }
+    let text = &rub[idx];
+    if let Some((min, max)) = parse_range_in_text(text) {
+        return (min + max) / 200.0;
+    }
+    let first_text = rub.first().map(|s| s.as_str()).unwrap_or("");
+    if first_text.contains("90") || first_text.contains('优') || first_text.contains('好') || first_text.contains('高') {
+        if rub.len() <= 1 { 1.0 } else { 1.0 - (idx as f32 / (rub.len() - 1) as f32) }
+    } else {
+        if rub.len() <= 1 { 1.0 } else { (idx + 1) as f32 / rub.len() as f32 }
+    }
+}
+
+fn parse_range_in_text(text: &str) -> Option<(f32, f32)> {
+    for part in text.split(|c: char| c.is_whitespace() || c == ':' || c == '：' || c == ',' || c == '，') {
+        if let Some((low, high)) = part.split_once('-') {
+            if let (Ok(l), Ok(h)) = (low.trim().parse::<f32>(), high.trim().parse::<f32>()) {
+                if l >= 0.0 && h <= 100.0 && l <= h {
+                    return Some((l, h));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn normalize_raw_score(raw: f32, rub_len: usize) -> f32 {
+    if raw <= 1.0 {
+        raw.clamp(0.0, 1.0)
+    } else if raw <= 10.0 && rub_len > 1 {
+        (raw / rub_len as f32).clamp(0.0, 1.0)
+    } else if raw <= 100.0 {
+        (raw / 100.0).clamp(0.0, 1.0)
+    } else {
+        1.0
     }
 }
 
@@ -858,7 +1008,9 @@ pub async fn execute_decision(
     let protocol = provider.get_model_protocol(model);
     let is_typesafe = protocol == crate::models::RequestProtocol::SystemOne
         || provider.base_url.contains("typesafe")
-        || provider.base_url.contains("systemone");
+        || provider.base_url.contains("systemone")
+        || provider.base_url.contains("opencode.ai/zen")
+        || model.to_lowercase().starts_with("jev");
 
     if is_typesafe {
         match execute_decision_with_systemone(
@@ -1013,9 +1165,10 @@ mod tests {
         let json_val = serde_json::to_value(&req).unwrap();
         assert_eq!(json_val["model"], "jev-latest");
         assert_eq!(json_val["state"], "test state context");
-        assert_eq!(json_val["questions"]["q_noul"]["type"], "noul");
-        assert_eq!(json_val["questions"]["q_choice"]["type"], "choice");
-        assert_eq!(json_val["questions"]["q_score"]["type"], "score");
+        assert_eq!(json_val["questions"]["q_choice"]["criteria"]["a"], "a");
+        assert_eq!(json_val["questions"]["q_choice"]["criteria"]["b"], "b");
+        assert_eq!(json_val["questions"]["q_score"]["criteria"][0], "1: bad");
+        assert_eq!(json_val["questions"]["q_score"]["criteria"][1], "2: good");
     }
 
     #[test]

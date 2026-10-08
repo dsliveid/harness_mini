@@ -15,7 +15,13 @@ export interface Provider {
 export function inferRequestProtocol(baseUrl: string, modelId: string): RequestProtocol {
   const b = (baseUrl || "").toLowerCase();
   const m = (modelId || "").toLowerCase();
-  if (b.includes("systemone") || b.includes("typesafe") || m.includes("systemone")) {
+  if (
+    b.includes("systemone") ||
+    b.includes("typesafe") ||
+    m.includes("systemone") ||
+    m.startsWith("jev") ||
+    (b.includes("opencode.ai/zen") && m.includes("jev"))
+  ) {
     return "systemone";
   }
   if (b.includes("anthropic") || m.startsWith("claude")) {
