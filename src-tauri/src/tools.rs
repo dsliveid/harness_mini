@@ -712,18 +712,26 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "score_decision",
-            description: "调用决策模型对目标内容进行量化百分制评分与多维度评估。适用于方案可行性打分、代码质量评分、意图对齐评估等场景。",
+            description: "调用决策模型对目标方案或意图理解进行量化百分制评分与多维度质检评估。用于复杂需求、多步骤任务落地的方案准入审查。",
             risk: Risk::ReadOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
+                    "understanding": {
+                        "type": "string",
+                        "description": "大模型对用户核心意图、诉求细节与关键约束边界的深度剖析"
+                    },
+                    "plan": {
+                        "type": "string",
+                        "description": "拟定下一步要执行的分步行动方案与工具调用路径"
+                    },
                     "state": {
                         "type": "string",
-                        "description": "待评估的内容、方案、代码或分析上下文"
+                        "description": "可选：待评估的内容、方案、代码或补充上下文"
                     },
                     "instruction": {
                         "type": "string",
-                        "description": "评分目标与评价维度说明"
+                        "description": "可选：评分目标与评价维度说明（缺省时自动使用方案质量与可行性审查准则）"
                     },
                     "rubric": {
                         "type": "array",
@@ -734,8 +742,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                         "type": "string",
                         "description": "可选：指定决策模型。缺省时自动使用会话或全局绑定的决策模型"
                     }
-                },
-                "required": ["state", "instruction"]
+                }
             }),
         },
         // ---------- 临时空间专用（普通会话不下发，见 agent.rs run_once 的 specs 过滤） ----------
@@ -3393,13 +3400,19 @@ async fn judge_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
     )
     .await?;
 
-    Ok(serde_json::to_string_pretty(&res).unwrap_or_else(|_| "{}".to_string()))
+    let mut val = serde_json::to_value(&res).map_err(|e| e.to_string())?;
+    if let Value::Object(ref mut map) = val {
+        map.insert("state".into(), Value::String(state.to_string()));
+        map.insert("instruction".into(), Value::String(instruction.to_string()));
+    }
+
+    Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| "{}".to_string()))
 }
 
 async fn choice_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let (provider, model) = resolve_decision_model_for_tool(args, ctx)?;
-    let state = args.get("state").and_then(|v| v.as_str()).ok_or("缺少 state 参数")?;
-    let instruction = args.get("instruction").and_then(|v| v.as_str()).ok_or("缺少 instruction 参数")?;
+    let state = args.get("state").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let instruction = args.get("instruction").and_then(|v| v.as_str()).unwrap_or("请根据上下文与候选选项，裁决选定最符合要求的目标分支。").trim();
     let options = args.get("options")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
@@ -3411,19 +3424,55 @@ async fn choice_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Str
         "choice",
         state,
         instruction,
-        Some(options),
+        Some(options.clone()),
         None,
         ctx.proxy_url.clone(),
     )
     .await?;
 
-    Ok(serde_json::to_string_pretty(&res).unwrap_or_else(|_| "{}".to_string()))
+    let mut val = serde_json::to_value(&res).map_err(|e| e.to_string())?;
+    if let Value::Object(ref mut map) = val {
+        map.insert("options".into(), serde_json::json!(options));
+        map.insert("state".into(), Value::String(state.to_string()));
+        map.insert("instruction".into(), Value::String(instruction.to_string()));
+    }
+
+    Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| "{}".to_string()))
 }
 
 async fn score_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let (provider, model) = resolve_decision_model_for_tool(args, ctx)?;
-    let state = args.get("state").and_then(|v| v.as_str()).ok_or("缺少 state 参数")?;
-    let instruction = args.get("instruction").and_then(|v| v.as_str()).ok_or("缺少 instruction 参数")?;
+    
+    let understanding = args.get("understanding").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let plan = args.get("plan").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let state_raw = args.get("state").and_then(|v| v.as_str()).unwrap_or("").trim();
+
+    let combined_state = if !understanding.is_empty() || !plan.is_empty() {
+        let mut s = String::new();
+        if !understanding.is_empty() {
+            s.push_str(&format!("【意图理解】\n{}\n\n", understanding));
+        }
+        if !plan.is_empty() {
+            s.push_str(&format!("【行动方案】\n{}\n\n", plan));
+        }
+        if !state_raw.is_empty() {
+            s.push_str(&format!("【补充背景】\n{}", state_raw));
+        }
+        s
+    } else if !state_raw.is_empty() {
+        state_raw.to_string()
+    } else {
+        return Err("缺少 understanding/plan 或 state 参数".into());
+    };
+
+    let instruction_raw = args.get("instruction").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let default_instruction = "请对该意图剖析的精准性与行动方案的可行性进行严格百分制评分。若意图理解透彻且方案切实可行无高危越界，给出90分以上；若信息严重不足、存在臆测或方案缺陷，请给出合理扣分与修改建议。";
+    let instruction = if !instruction_raw.is_empty() {
+        instruction_raw
+    } else {
+        default_instruction
+    };
+
     let rubric = args.get("rubric")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect::<Vec<_>>());
@@ -3432,7 +3481,7 @@ async fn score_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
         &provider,
         &model,
         "score",
-        state,
+        &combined_state,
         instruction,
         None,
         rubric,
@@ -3440,7 +3489,22 @@ async fn score_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
     )
     .await?;
 
-    Ok(serde_json::to_string_pretty(&res).unwrap_or_else(|_| "{}".to_string()))
+    let score_val = res.score.unwrap_or(0.0);
+    let score_pct = (score_val * 100.0).round() as u32;
+
+    let mut val = serde_json::to_value(&res).map_err(|e| e.to_string())?;
+    if let Value::Object(ref mut map) = val {
+        if !understanding.is_empty() {
+            map.insert("understanding".into(), Value::String(understanding.to_string()));
+        }
+        if !plan.is_empty() {
+            map.insert("plan".into(), Value::String(plan.to_string()));
+        }
+        map.insert("scorePercent".into(), serde_json::json!(score_pct));
+        map.insert("instruction".into(), Value::String(instruction.to_string()));
+    }
+
+    Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| "{}".to_string()))
 }
 
 #[cfg(test)]

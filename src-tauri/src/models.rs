@@ -1144,7 +1144,7 @@ pub struct Attachment {
     pub is_image: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
     pub id: String,
@@ -1294,6 +1294,12 @@ pub struct IntentAlignmentRound {
     pub score_percent: u32,
     pub critique: String,
     pub passed: bool,
+    #[serde(default)]
+    pub decision_type: Option<String>,
+    #[serde(default)]
+    pub verdict: Option<bool>,
+    #[serde(default)]
+    pub selected_choice: Option<String>,
 }
 
 /// 日常对话意图对齐评估事件（全生命周期流式透明呈现）
@@ -1325,6 +1331,12 @@ pub struct IntentAlignmentEvent {
     pub history: Vec<IntentAlignmentRound>,
     #[serde(default)]
     pub intervention_id: Option<String>,
+    #[serde(default)]
+    pub decision_type: Option<String>,
+    #[serde(default)]
+    pub verdict: Option<bool>,
+    #[serde(default)]
+    pub selected_choice: Option<String>,
 }
 
 /// 意图对齐未达标人工干预请求
@@ -1340,13 +1352,22 @@ pub struct IntentInterventionRequest {
     pub score: f32,
     pub critique: String,
     pub retry_count: usize,
+    /// 候选多轮方案（例如第 1 轮方案与第 2 轮方案），用于人工对比与选择采纳
+    #[serde(default)]
+    pub rounds: Vec<IntentAlignmentRound>,
+    /// 第 1 轮方案（快捷引用）
+    #[serde(default)]
+    pub plan1: Option<String>,
+    /// 第 2 轮方案（快捷引用）
+    #[serde(default)]
+    pub plan2: Option<String>,
 }
 
-/// 意图对齐人工干预决策（补充提示或跳过）
+/// 意图对齐人工干预决策（adopt_plan_1 / adopt_plan_2 / hint / skip）
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct IntentInterventionDecision {
-    /// "hint" | "skip"
+    /// "adopt_plan_1" | "adopt_plan_2" | "hint" | "skip"
     pub action: String,
     pub hint: Option<String>,
 }

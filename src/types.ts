@@ -242,6 +242,9 @@ export interface IntentAlignmentRound {
   scorePercent: number;
   critique: string;
   passed: boolean;
+  decisionType?: "score" | "judge" | "choice";
+  verdict?: boolean | null;
+  selectedChoice?: string | null;
 }
 
 export interface IntentAlignmentEvent {
@@ -260,6 +263,9 @@ export interface IntentAlignmentEvent {
   passed: boolean;
   history?: IntentAlignmentRound[];
   interventionId?: string | null;
+  decisionType?: "score" | "judge" | "choice";
+  verdict?: boolean | null;
+  selectedChoice?: string | null;
 }
 
 export interface IntentInterventionRequest {
@@ -272,6 +278,9 @@ export interface IntentInterventionRequest {
   score: number;
   critique: string;
   retryCount: number;
+  rounds?: IntentAlignmentRound[];
+  plan1?: string | null;
+  plan2?: string | null;
 }
 
 export interface DirectDecisionResult {

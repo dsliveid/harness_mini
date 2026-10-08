@@ -184,6 +184,24 @@ export function IntentAlignmentCard(props?: IntentAlignmentCardProps) {
     }
   };
 
+  const handleAdoptPlan1 = async () => {
+    setIsSubmitting(true);
+    try {
+      await respondIntentIntervention("adopt_plan_1", undefined, activeInterventionId);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleAdoptPlan2 = async () => {
+    setIsSubmitting(true);
+    try {
+      await respondIntentIntervention("adopt_plan_2", undefined, activeInterventionId);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
   const handleSendHint = async () => {
     if (!hintText.trim()) return;
     setIsSubmitting(true);
@@ -300,9 +318,9 @@ export function IntentAlignmentCard(props?: IntentAlignmentCardProps) {
 
         {/* 卡片标签与前置门控标识 */}
         <div className="flex items-center gap-1.5 shrink-0">
-          <span className="text-[12px] text-ink font-medium">意图对齐与规划质检</span>
-          <span className="text-[10px] px-1.5 py-[0.5px] rounded bg-purple-500/10 text-purple-400 border border-purple-500/20 shrink-0">
-            前置门控
+          <span className="text-[12px] text-ink font-medium">意图对齐与决策准入</span>
+          <span className="text-[10px] px-1.5 py-[0.5px] rounded bg-purple-500/10 text-purple-400 border border-purple-500/20 shrink-0 font-medium">
+            SOP 准入
           </span>
         </div>
 
@@ -327,7 +345,22 @@ export function IntentAlignmentCard(props?: IntentAlignmentCardProps) {
             </button>
           )}
 
-          {scorePct > 0 && !isAnalyzing && (
+          {/* 决策形态支持：judge / choice / score */}
+          {activeRound?.decisionType === "judge" || alignment?.decisionType === "judge" ? (
+            <span
+              className={`text-[10px] font-mono px-1.5 py-0.5 rounded-full border font-bold ${
+                isPassed || alignment?.verdict === true || activeRound?.verdict === true
+                  ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                  : "bg-rose-500/20 text-rose-200 border-rose-500/35"
+              }`}
+            >
+              {isPassed || alignment?.verdict === true || activeRound?.verdict === true ? "二元判定: 符合" : "二元判定: 不符"}
+            </span>
+          ) : activeRound?.decisionType === "choice" || alignment?.decisionType === "choice" ? (
+            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full border font-bold bg-purple-500/15 text-purple-300 border-purple-500/30">
+              分支选定: {activeRound?.selectedChoice || alignment?.selectedChoice || "已选定"}
+            </span>
+          ) : scorePct > 0 && !isAnalyzing ? (
             <span
               className={`text-[10px] font-mono px-1.5 py-0.5 rounded-full border font-bold ${
                 isPassed
@@ -337,7 +370,7 @@ export function IntentAlignmentCard(props?: IntentAlignmentCardProps) {
             >
               契合度 {scorePct}%
             </span>
-          )}
+          ) : null}
           {alignmentStatusBadge(alignment?.status || "", isPassed, isRequiresIntervention, inProgress)}
         </div>
       </div>
@@ -396,7 +429,13 @@ export function IntentAlignmentCard(props?: IntentAlignmentCardProps) {
               <div className="flex items-center justify-between font-medium text-inkdim mb-1">
                 <div className="flex items-center gap-1.5">
                   <Lightbulb size={13} className="text-amber-400 shrink-0" />
-                  <span>大模型核心意图剖析与约束边界：</span>
+                  <span>
+                    {(activeRound?.decisionType || alignment?.decisionType) === "choice"
+                      ? "大模型候选分支与背景剖析："
+                      : (activeRound?.decisionType || alignment?.decisionType) === "judge"
+                      ? "二元审查命题与上下文："
+                      : "大模型核心意图剖析与约束边界："}
+                  </span>
                 </div>
                 {understandingContent && (
                   <button
@@ -421,7 +460,13 @@ export function IntentAlignmentCard(props?: IntentAlignmentCardProps) {
               <div className="flex items-center justify-between font-medium text-inkdim mb-1">
                 <div className="flex items-center gap-1.5">
                   <ListTodo size={13} className="text-cyan-400 shrink-0" />
-                  <span>拟定下一步分步行动计划：</span>
+                  <span>
+                    {(activeRound?.decisionType || alignment?.decisionType) === "choice"
+                      ? "🎯 裁决选定目标分支与执行路径："
+                      : (activeRound?.decisionType || alignment?.decisionType) === "judge"
+                      ? "⚖️ 判定结论与裁决依据："
+                      : "拟定下一步分步行动计划："}
+                  </span>
                 </div>
                 {planContent && (
                   <button
@@ -507,6 +552,56 @@ export function IntentAlignmentCard(props?: IntentAlignmentCardProps) {
                     >
                       {isSubmitting ? <Loader2 size={13} className="animate-spin" /> : <Send size={13} />}
                       <span>提交纠偏提示并重新评估</span>
+                    </button>
+                  </div>
+                </div>
+              ) : isRequiresIntervention ? (
+                <div className="space-y-2 pt-1 border-t border-amber-500/25">
+                  <div className="flex items-center justify-between text-[11.5px] text-amber-300 font-medium">
+                    <span className="flex items-center gap-1.5">
+                      <AlertTriangle size={13} className="text-amber-400 shrink-0" />
+                      <span>连续 2 轮方案评分未达 90 分，请人工审批后续执行方式：</span>
+                    </span>
+                    <button
+                      type="button"
+                      className="text-[11px] text-inkdim hover:text-ink underline cursor-pointer"
+                      onClick={handleSkip}
+                      disabled={isSubmitting}
+                      title="跳过并强制解锁生产工具"
+                    >
+                      跳过并直接执行
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                    <button
+                      type="button"
+                      className="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-[12px] flex items-center gap-1.5 cursor-pointer transition-colors shadow-sm disabled:opacity-50"
+                      onClick={handleAdoptPlan1}
+                      disabled={isSubmitting}
+                      title="采纳第 1 轮方案并立即解锁生产工具推进执行"
+                    >
+                      <CheckCircle2 size={13} />
+                      <span>采用决策 (1)</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-[12px] flex items-center gap-1.5 cursor-pointer transition-colors shadow-sm disabled:opacity-50"
+                      onClick={handleAdoptPlan2}
+                      disabled={isSubmitting}
+                      title="采纳第 2 轮方案并立即解锁生产工具推进执行"
+                    >
+                      <CheckCircle2 size={13} />
+                      <span>采用决策 (2)</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="px-3.5 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-zinc-950 font-medium text-[12px] flex items-center gap-1.5 cursor-pointer transition-colors shadow-sm disabled:opacity-50"
+                      onClick={() => setShowHintInput(true)}
+                      disabled={isSubmitting}
+                      title="输入提示词重新指导大模型"
+                    >
+                      <Lightbulb size={13} />
+                      <span>输入提示</span>
                     </button>
                   </div>
                 </div>

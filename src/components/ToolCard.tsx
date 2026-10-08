@@ -521,23 +521,23 @@ function DecisionCardView({ ev }: { ev: ToolEvent }) {
 
       {isJudge && (
         <div className="space-y-1.5">
-          <div className="text-[12px] text-inkdim">待评估陈述：</div>
+          <div className="text-[12px] text-inkdim">待评估命题：</div>
           <div className="font-mono text-ink bg-panel2/60 px-2.5 py-1.5 rounded-lg border border-edge/40">
-            {String(p.statement ?? "")}
+            {String(p.state ?? p.statement ?? "")}
           </div>
-          {parsedResult?.decision && (
+          {(parsedResult?.verdict != null || parsedResult?.decision) && (
             <div className="flex items-center gap-2 mt-2">
               <span className="text-inkdim text-[12px]">裁定结论:</span>
               <span
                 className={`text-[12px] font-bold px-2.5 py-1 rounded-lg border ${
-                  parsedResult.decision === "ALLOW"
+                  parsedResult.verdict === true || parsedResult.decision === "ALLOW"
                     ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/30"
-                    : parsedResult.decision === "DENY"
-                    ? "bg-red-500/15 text-red-400 border-red-500/30"
-                    : "bg-zinc-500/20 text-zinc-300 border-zinc-500/30"
+                    : "bg-red-500/15 text-red-400 border-red-500/30"
                 }`}
               >
-                {parsedResult.decision === "ALLOW" ? "✓ ALLOW (放行 / 成立)" : parsedResult.decision === "DENY" ? "✗ DENY (拦截 / 否定)" : "? ABSTAIN (弃权)"}
+                {parsedResult.verdict === true || parsedResult.decision === "ALLOW"
+                  ? "✓ 符合 / 放行 (ALLOW)"
+                  : "✗ 不符合 / 拦截 (DENY)"}
               </span>
             </div>
           )}
@@ -546,16 +546,17 @@ function DecisionCardView({ ev }: { ev: ToolEvent }) {
 
       {isChoice && (
         <div className="space-y-1.5">
-          <div className="text-[12px] text-inkdim">待决问题：</div>
+          <div className="text-[12px] text-inkdim">待决问题与准则：</div>
           <div className="font-mono text-ink bg-panel2/60 px-2.5 py-1.5 rounded-lg border border-edge/40">
-            {String(p.question ?? "")}
+            {String(p.instruction ?? p.state ?? p.question ?? "")}
           </div>
-          {Array.isArray(p.options) && (
+          {Array.isArray(p.options || parsedResult?.options) && (
             <div className="flex flex-col gap-1.5 mt-2">
-              <div className="text-inkdim text-[11px]">备选选项:</div>
+              <div className="text-inkdim text-[11px]">备选分支列表:</div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
-                {p.options.map((opt: string, idx: number) => {
-                  const isSelected = parsedResult?.decision === opt;
+                {(p.options || parsedResult?.options || []).map((opt: string, idx: number) => {
+                  const chosen = parsedResult?.choice || parsedResult?.decision;
+                  const isSelected = chosen === opt;
                   return (
                     <div
                       key={idx}
@@ -566,7 +567,7 @@ function DecisionCardView({ ev }: { ev: ToolEvent }) {
                       }`}
                     >
                       <span className="truncate">{opt}</span>
-                      {isSelected && <span className="text-cyan-400 text-[10px] shrink-0 font-bold">✓ 选定</span>}
+                      {isSelected && <span className="text-cyan-400 text-[10px] shrink-0 font-bold">✓ 已选定</span>}
                     </div>
                   );
                 })}
@@ -577,34 +578,58 @@ function DecisionCardView({ ev }: { ev: ToolEvent }) {
       )}
 
       {isScore && (
-        <div className="space-y-1.5">
-          <div className="text-[12px] text-inkdim">评分对象：</div>
-          <div className="font-mono text-ink bg-panel2/60 px-2.5 py-1.5 rounded-lg border border-edge/40">
-            {String(p.target ?? "")}
-          </div>
-          {p.criteria && (
-            <div className="text-[11px] text-inkdim mt-1">
-              标准: <span className="text-ink">{String(p.criteria)}</span>
+        <div className="space-y-2">
+          {(p.understanding || parsedResult?.understanding) && (
+            <div>
+              <div className="text-[11.5px] text-amber-300 font-medium mb-1">💡 意图剖析与约束边界：</div>
+              <div className="font-mono text-ink bg-panel2/60 px-2.5 py-1.5 rounded-lg border border-edge/40 text-[11.5px] whitespace-pre-wrap">
+                {String(p.understanding || parsedResult?.understanding || "")}
+              </div>
             </div>
           )}
-          {parsedResult?.score != null && (
+          {(p.plan || parsedResult?.plan) && (
+            <div>
+              <div className="text-[11.5px] text-cyan-300 font-medium mb-1">📋 拟定分步行动计划：</div>
+              <div className="font-mono text-ink bg-panel2/60 px-2.5 py-1.5 rounded-lg border border-edge/40 text-[11.5px] whitespace-pre-wrap">
+                {String(p.plan || parsedResult?.plan || "")}
+              </div>
+            </div>
+          )}
+          {!p.understanding && !parsedResult?.understanding && (p.state || p.target) && (
+            <div>
+              <div className="text-[11.5px] text-inkdim mb-1">评估对象：</div>
+              <div className="font-mono text-ink bg-panel2/60 px-2.5 py-1.5 rounded-lg border border-edge/40 text-[11.5px] whitespace-pre-wrap">
+                {String(p.state || p.target || "")}
+              </div>
+            </div>
+          )}
+          {(parsedResult?.scorePercent != null || parsedResult?.score != null) && (
             <div className="flex items-center gap-3 mt-2">
-              <span className="text-inkdim text-[12px]">综合评分:</span>
+              <span className="text-inkdim text-[12px]">质检评分:</span>
               <div className="flex items-center gap-2">
-                <span
-                  className={`text-[15px] font-bold font-mono px-2.5 py-0.5 rounded-lg border ${
-                    parsedResult.score >= 90
-                      ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/30"
-                      : parsedResult.score >= 70
-                      ? "bg-blue-500/15 text-blue-400 border-blue-500/30"
-                      : "bg-amber-500/15 text-amber-400 border-amber-500/30"
-                  }`}
-                >
-                  {parsedResult.score} 分
-                </span>
-                <span className="text-[11px] text-inkdim">
-                  {parsedResult.score >= 90 ? "优秀" : parsedResult.score >= 70 ? "良好" : "待改进"}
-                </span>
+                {(() => {
+                  const scoreVal =
+                    parsedResult.scorePercent ??
+                    (parsedResult.score > 1 ? parsedResult.score : Math.round(parsedResult.score * 100));
+                  return (
+                    <>
+                      <span
+                        className={`text-[15px] font-bold font-mono px-2.5 py-0.5 rounded-lg border ${
+                          scoreVal >= 90
+                            ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/30"
+                            : scoreVal >= 70
+                            ? "bg-blue-500/15 text-blue-400 border-blue-500/30"
+                            : "bg-amber-500/15 text-amber-400 border-amber-500/30"
+                        }`}
+                      >
+                        {scoreVal} 分
+                      </span>
+                      <span className="text-[11px] text-inkdim">
+                        {scoreVal >= 90 ? "及格准入 (≥90%)" : "未达及格线 (<90%)"}
+                      </span>
+                    </>
+                  );
+                })()}
               </div>
             </div>
           )}
