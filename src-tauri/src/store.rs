@@ -1603,6 +1603,69 @@ mod tests {
     }
 
     #[test]
+    fn test_create_subprocess_session_inherits_parent_models_and_capabilities() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let parent = create_session_with_models(
+            &conn,
+            "D:\\workspace",
+            None,
+            "父会话",
+            "confirm",
+            Some("opencode"),
+            Some("deepseek-v4.1-flash"),
+            Some("volcengine"),
+            Some("doubao-seedream-5.0-lite"),
+            Some("opencode"),
+            Some("glm-5.3-flash"),
+            Some("typesafe"),
+            Some("jev-latest"),
+            None,
+        )
+        .unwrap();
+
+        let _ = set_session_reasoning_effort(&conn, &parent.id, Some("high"));
+
+        let sub = create_subprocess_session(
+            &conn,
+            &parent.id,
+            "探针",
+            "子进程探针",
+            "执行独立子任务",
+            "D:\\workspace",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // 验证内存返回的 Session 对象
+        assert_eq!(sub.parent_session_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(sub.provider_id.as_deref(), Some("opencode"));
+        assert_eq!(sub.model_id.as_deref(), Some("deepseek-v4.1-flash"));
+        assert_eq!(sub.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(sub.image_provider_id.as_deref(), Some("volcengine"));
+        assert_eq!(sub.image_model_id.as_deref(), Some("doubao-seedream-5.0-lite"));
+        assert_eq!(sub.vision_provider_id.as_deref(), Some("opencode"));
+        assert_eq!(sub.vision_model_id.as_deref(), Some("glm-5.3-flash"));
+        assert_eq!(sub.decision_provider_id.as_deref(), Some("typesafe"));
+        assert_eq!(sub.decision_model_id.as_deref(), Some("jev-latest"));
+
+        // 从 SQLite 重新加载验证持久化落库结果
+        let loaded = get_session(&conn, &sub.id).unwrap().unwrap();
+        assert_eq!(loaded.parent_session_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(loaded.provider_id.as_deref(), Some("opencode"));
+        assert_eq!(loaded.model_id.as_deref(), Some("deepseek-v4.1-flash"));
+        assert_eq!(loaded.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(loaded.image_provider_id.as_deref(), Some("volcengine"));
+        assert_eq!(loaded.image_model_id.as_deref(), Some("doubao-seedream-5.0-lite"));
+        assert_eq!(loaded.vision_provider_id.as_deref(), Some("opencode"));
+        assert_eq!(loaded.vision_model_id.as_deref(), Some("glm-5.3-flash"));
+        assert_eq!(loaded.decision_provider_id.as_deref(), Some("typesafe"));
+        assert_eq!(loaded.decision_model_id.as_deref(), Some("jev-latest"));
+    }
+
+    #[test]
     fn test_tool_file_snapshots_crud() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
