@@ -788,16 +788,27 @@ fn queued_payload(state: &crate::AppState, session_id: &str) -> Vec<Value> {
         .collect()
 }
 
-/// 解析会话或全局生效的决策模型 (Jev)
+/// 解析会话或全局生效的决策模型 (Jev)，支持子会话动态继承父会话
 fn resolve_decision_model_for_session(
     session: &crate::models::Session,
+    parent_session: Option<&crate::models::Session>,
     settings: &crate::models::SettingsData,
 ) -> Option<(crate::models::ProviderCfg, String)> {
-    if let (Some(pid), Some(mid)) = (&session.decision_provider_id, &session.decision_model_id) {
-        settings.providers.iter().find(|p| &p.id == pid).map(|p| (p.clone(), mid.clone()))
-    } else if let (Some(pid), Some(mid)) = (&session.provider_id, &session.model_id) {
+    let dec_pid = session.decision_provider_id.as_deref()
+        .or_else(|| parent_session.and_then(|p| p.decision_provider_id.as_deref()));
+    let dec_mid = session.decision_model_id.as_deref()
+        .or_else(|| parent_session.and_then(|p| p.decision_model_id.as_deref()));
+
+    let main_pid = session.provider_id.as_deref()
+        .or_else(|| parent_session.and_then(|p| p.provider_id.as_deref()));
+    let main_mid = session.model_id.as_deref()
+        .or_else(|| parent_session.and_then(|p| p.model_id.as_deref()));
+
+    if let (Some(pid), Some(mid)) = (dec_pid, dec_mid) {
+        settings.providers.iter().find(|p| &p.id == pid).map(|p| (p.clone(), mid.to_string()))
+    } else if let (Some(pid), Some(mid)) = (main_pid, main_mid) {
         if settings.has_capability(Some(pid), mid, "decision") {
-            settings.providers.iter().find(|p| &p.id == pid).map(|p| (p.clone(), mid.clone()))
+            settings.providers.iter().find(|p| &p.id == pid).map(|p| (p.clone(), mid.to_string()))
         } else if let Some(p) = settings.providers.iter().find(|p| &p.id == pid) {
             p.models.iter().find(|m| settings.has_capability(Some(pid), m, "decision"))
                 .map(|m| (p.clone(), m.clone()))
@@ -888,6 +899,7 @@ async fn run_intent_alignment_gate(
     app: &AppHandle,
     state: &crate::AppState,
     session: &crate::models::Session,
+    parent_session: Option<&crate::models::Session>,
     settings: &crate::models::SettingsData,
     cfg: &LlmCfg,
     session_id: &str,
@@ -895,7 +907,7 @@ async fn run_intent_alignment_gate(
     user_message: &str,
     recent_context: &str,
 ) -> Option<(String, String)> {
-    let resolved_decision = resolve_decision_model_for_session(session, settings);
+    let resolved_decision = resolve_decision_model_for_session(session, parent_session, settings);
     let Some((d_provider, d_model)) = resolved_decision else {
         return None;
     };
@@ -1287,14 +1299,20 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
     let mut last_assistant_id: Option<String> = None;
     let mut run_tokens = RunTokenMetrics::default();
     let state = app.state::<crate::AppState>();
-    let (session, settings, trigger_msg) = {
+    let (session, settings, trigger_msg, parent_session) = {
         let db = state.db.lock().unwrap();
         let master = state.master_key.lock().unwrap();
+        let s = store::get_session(&db, session_id).ok().flatten();
+        let p = s
+            .as_ref()
+            .and_then(|sess| sess.parent_session_id.as_deref())
+            .and_then(|pid| store::get_session(&db, pid).ok().flatten());
         (
-            store::get_session(&db, session_id).ok().flatten(),
+            s,
             // 必须注入加密 secrets 表中的 API Key，否则以空 Key 请求导致 401
             store::get_settings_with_secrets(&db, &master).unwrap_or_default(),
             store::get_message(&db, trigger_id).ok().flatten(),
+            p,
         )
     };
     let Some(session) = session else { return (RunOutcome::Failed, None, run_tokens); };
@@ -1329,14 +1347,30 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         })
     };
 
+    // 动态向上继承模型配置（若当前会话未显式指定，且存在父会话，则继承父会话配置）
+    let effective_provider_id = session.provider_id.as_deref()
+        .or_else(|| parent_session.as_ref().and_then(|p| p.provider_id.as_deref()));
+    let effective_model_id = session.model_id.as_deref()
+        .or_else(|| parent_session.as_ref().and_then(|p| p.model_id.as_deref()));
+
+    let effective_vision_provider_id = session.vision_provider_id.as_deref()
+        .or_else(|| parent_session.as_ref().and_then(|p| p.vision_provider_id.as_deref()));
+    let effective_vision_model_id = session.vision_model_id.as_deref()
+        .or_else(|| parent_session.as_ref().and_then(|p| p.vision_model_id.as_deref()));
+
+    let _effective_image_provider_id = session.image_provider_id.as_deref()
+        .or_else(|| parent_session.as_ref().and_then(|p| p.image_provider_id.as_deref()));
+    let effective_image_model_id = session.image_model_id.as_deref()
+        .or_else(|| parent_session.as_ref().and_then(|p| p.image_model_id.as_deref()));
+
     // 解析模型配置：
     // 1. 若当前会话包含图片附件且配置了专属视觉模型（或全局视觉模型），优先使用视觉模型
     // 2. 否则优先使用会话专属绑定的厂商 + 模型（若已指定），未指定或失效时回退到全局激活模型
     // 注意：对话引擎必须具备 chat 能力；若用户绑定的模型只具备 image_gen，自动回退到厂商内具备 chat 能力的模型或全局激活模型
     let resolved_vision_model = if has_images {
-        if let (Some(v_pid), Some(v_mid)) = (&session.vision_provider_id, &session.vision_model_id) {
+        if let (Some(v_pid), Some(v_mid)) = (effective_vision_provider_id, effective_vision_model_id) {
             settings.providers.iter().find(|p| &p.id == v_pid && p.models.iter().any(|m| m == v_mid))
-                .map(|p| (p.clone(), v_mid.clone()))
+                .map(|p| (p.clone(), v_mid.to_string()))
         } else {
             crate::models::resolve_active_vision_model(&settings)
                 .map(|(p, m)| (p.clone(), m.to_string()))
@@ -1347,10 +1381,10 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
 
     let resolved_model = if let Some(vm) = resolved_vision_model {
         Some(vm)
-    } else if let (Some(pid), Some(mid)) = (&session.provider_id, &session.model_id) {
+    } else if let (Some(pid), Some(mid)) = (effective_provider_id, effective_model_id) {
         if let Some(p) = settings.providers.iter().find(|p| &p.id == pid) {
-            if p.models.contains(mid) && settings.has_capability(Some(pid), mid, "chat") {
-                Some((p.clone(), mid.clone()))
+            if p.models.iter().any(|m| m == mid) && settings.has_capability(Some(pid), mid, "chat") {
+                Some((p.clone(), mid.to_string()))
             } else if let Some(chat_m) = p.models.iter().find(|m| settings.has_capability(Some(pid), m, "chat")) {
                 Some((p.clone(), chat_m.clone()))
             } else {
@@ -1376,6 +1410,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         .reasoning_effort
         .as_deref()
         .filter(|s| !s.is_empty())
+        .or_else(|| parent_session.as_ref().and_then(|p| p.reasoning_effort.as_deref()).filter(|s| !s.is_empty()))
         .or(settings.reasoning_effort.as_deref())
         .filter(|s| !s.is_empty() && *s != "default")
         .map(|s| s.to_string());
@@ -1416,7 +1451,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 ("judge", remainder)
             };
 
-            if let Some((d_provider, d_model)) = resolve_decision_model_for_session(&session, &settings) {
+            if let Some((d_provider, d_model)) = resolve_decision_model_for_session(&session, parent_session.as_ref(), &settings) {
                 let (options, rubric, clean_prompt) = if kind == "choice" {
                     if let Some(pos) = prompt.find("选项:").or_else(|| prompt.find("选项：")).or_else(|| prompt.find("options:")) {
                         let prefix = prompt[..pos].trim();
@@ -1613,11 +1648,11 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
 
     let session_has_image_gen = if session.session_type == "collaborator" && session.subagent_role.as_deref() == Some("image_gen") {
         true
-    } else if session.image_model_id.is_some() {
+    } else if effective_image_model_id.is_some() {
         true
     } else if !has_collab_image_gen {
         settings.active_image_model_id.is_some()
-            || session.model_id.as_deref().map(|m| settings.has_capability(session.provider_id.as_deref(), m, "image_gen")).unwrap_or(false)
+            || effective_model_id.map(|m| settings.has_capability(effective_provider_id, m, "image_gen")).unwrap_or(false)
             || resolve_active_model(&settings).map(|(p, m)| settings.has_capability(Some(&p.id), m, "image_gen")).unwrap_or(false)
     } else {
         false
@@ -1891,6 +1926,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 app,
                 &state,
                 &session,
+                parent_session.as_ref(),
                 &settings,
                 &cfg,
                 session_id,

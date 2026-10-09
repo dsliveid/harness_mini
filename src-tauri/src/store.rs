@@ -2557,6 +2557,18 @@ pub fn create_subprocess_session(
 ) -> Result<Session, String> {
     let t = now();
     let norm_mode = access_mode.map(normalize_access_mode).unwrap_or_else(|| "confirm".into());
+    let parent_session = get_session(conn, parent_session_id).ok().flatten();
+    let provider_id = parent_session.as_ref().and_then(|p| p.provider_id.clone());
+    let model_id = parent_session.as_ref().and_then(|p| p.model_id.clone());
+    let reasoning_effort = parent_session.as_ref().and_then(|p| p.reasoning_effort.clone());
+    let image_provider_id = parent_session.as_ref().and_then(|p| p.image_provider_id.clone());
+    let image_model_id = parent_session.as_ref().and_then(|p| p.image_model_id.clone());
+    let vision_provider_id = parent_session.as_ref().and_then(|p| p.vision_provider_id.clone());
+    let vision_model_id = parent_session.as_ref().and_then(|p| p.vision_model_id.clone());
+    let decision_provider_id = parent_session.as_ref().and_then(|p| p.decision_provider_id.clone());
+    let decision_model_id = parent_session.as_ref().and_then(|p| p.decision_model_id.clone());
+    let context_token_limit = parent_session.as_ref().and_then(|p| p.context_token_limit);
+
     let s = Session {
         id: uuid::Uuid::new_v4().to_string(),
         title: title.to_string(),
@@ -2582,22 +2594,22 @@ pub fn create_subprocess_session(
         session_type: "subprocess".into(),
         subagent_role: Some(role.to_string()),
         subagent_task: Some(task.to_string()),
-        context_token_limit: None,
+        context_token_limit,
         last_reported_msg_id: None,
         auto_report: Some(false),
         trigger_tool_event_id: trigger_tool_event_id.map(|s| s.to_string()),
-        provider_id: None,
-        model_id: None,
+        provider_id,
+        model_id,
         dispatch_rule: None,
-        image_provider_id: None,
-        image_model_id: None,
-        vision_provider_id: None,
-        vision_model_id: None,
-        decision_provider_id: None,
-        decision_model_id: None,
+        image_provider_id,
+        image_model_id,
+        vision_provider_id,
+        vision_model_id,
+        decision_provider_id,
+        decision_model_id,
         forked_from_session_id: None,
         forked_from_message_id: None,
-        reasoning_effort: None,
+        reasoning_effort,
         last_run_status: None,
     };
     conn.execute(
@@ -2605,8 +2617,13 @@ pub fn create_subprocess_session(
             id, title, workspace_path, access_mode, project_id, status, 
             last_message_at, created_at, updated_at, 
             parent_session_id, session_type, subagent_role, subagent_task,
-            last_reported_msg_id, auto_report, trigger_tool_event_id
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'subprocess',?11,?12,NULL,0,?13)",
+            last_reported_msg_id, auto_report, trigger_tool_event_id,
+            provider_id, model_id, reasoning_effort,
+            image_provider_id, image_model_id,
+            vision_provider_id, vision_model_id,
+            decision_provider_id, decision_model_id,
+            context_token_limit
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'subprocess',?11,?12,NULL,0,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
         params![
             s.id,
             s.title,
@@ -2621,6 +2638,16 @@ pub fn create_subprocess_session(
             s.subagent_role,
             s.subagent_task,
             s.trigger_tool_event_id,
+            s.provider_id,
+            s.model_id,
+            s.reasoning_effort,
+            s.image_provider_id,
+            s.image_model_id,
+            s.vision_provider_id,
+            s.vision_model_id,
+            s.decision_provider_id,
+            s.decision_model_id,
+            s.context_token_limit,
         ],
     )
     .map_err(|e| e.to_string())?;

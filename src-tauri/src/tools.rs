@@ -3227,10 +3227,13 @@ async fn generate_image_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
     let state = host.app.state::<crate::AppState>();
     let session_id = &host.session_id;
 
-    let session = {
+    let (session, parent_session) = {
         let db = state.db.lock().unwrap();
-        crate::store::get_session(&db, session_id)?
-            .ok_or_else(|| format!("会话不存在: {session_id}"))?
+        let s = crate::store::get_session(&db, session_id)?
+            .ok_or_else(|| format!("会话不存在: {session_id}"))?;
+        let p = s.parent_session_id.as_deref()
+            .and_then(|pid| crate::store::get_session(&db, pid).ok().flatten());
+        (s, p)
     };
 
     let settings = {
@@ -3241,10 +3244,19 @@ async fn generate_image_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
 
     let requested_model = args.get("model").and_then(|v| v.as_str()).map(|s| s.trim()).filter(|s| !s.is_empty());
 
+    let effective_image_provider_id = session.image_provider_id.as_deref()
+        .or_else(|| parent_session.as_ref().and_then(|p| p.image_provider_id.as_deref()));
+    let effective_image_model_id = session.image_model_id.as_deref()
+        .or_else(|| parent_session.as_ref().and_then(|p| p.image_model_id.as_deref()));
+    let effective_provider_id = session.provider_id.as_deref()
+        .or_else(|| parent_session.as_ref().and_then(|p| p.provider_id.as_deref()));
+    let effective_model_id = session.model_id.as_deref()
+        .or_else(|| parent_session.as_ref().and_then(|p| p.model_id.as_deref()));
+
     // 解析生图模型 (Provider, ModelName)：
     // 1. 若工具参数显式指定了 model，优先在所有厂商中匹配
-    // 2. 检查会话专属生图模型 image_provider_id / image_model_id
-    // 3. 检查会话专属模型 provider_id / model_id 是否具备 image_gen 能力
+    // 2. 检查会话专属（或继承父会话）生图模型 image_provider_id / image_model_id
+    // 3. 检查会话专属（或继承父会话）主模型 provider_id / model_id 是否具备 image_gen 能力
     // 4. 检查会话所属 provider 是否有其他模型具备 image_gen 能力
     // 5. 检查全局 active_image_provider_id / active_image_model_id
     // 6. 查找全局任意厂商中具备 image_gen 能力的模型
@@ -3252,12 +3264,12 @@ async fn generate_image_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
         settings.providers.iter().find(|p| p.models.iter().any(|m| m == req_m))
             .map(|p| (p.clone(), req_m.to_string()))
             .or_else(|| crate::models::resolve_active_model(&settings).map(|(p, _)| (p.clone(), req_m.to_string())))
-    } else if let (Some(pid), Some(mid)) = (&session.image_provider_id, &session.image_model_id) {
+    } else if let (Some(pid), Some(mid)) = (effective_image_provider_id, effective_image_model_id) {
         settings.providers.iter().find(|p| &p.id == pid)
-            .map(|p| (p.clone(), mid.clone()))
-    } else if let (Some(pid), Some(mid)) = (&session.provider_id, &session.model_id) {
+            .map(|p| (p.clone(), mid.to_string()))
+    } else if let (Some(pid), Some(mid)) = (effective_provider_id, effective_model_id) {
         if settings.has_capability(Some(pid), mid, "image_gen") {
-            settings.providers.iter().find(|p| &p.id == pid).map(|p| (p.clone(), mid.clone()))
+            settings.providers.iter().find(|p| &p.id == pid).map(|p| (p.clone(), mid.to_string()))
         } else if let Some(p) = settings.providers.iter().find(|p| &p.id == pid) {
             p.models.iter().find(|m| settings.has_capability(Some(pid), m, "image_gen"))
                 .map(|m| (p.clone(), m.clone()))
