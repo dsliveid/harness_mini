@@ -336,7 +336,7 @@ interface Store {
   onSopStatus: (p: { sessionId: string; status: "checking" | "passed" | "failed" | "error"; command: string; output?: string }) => void;
   onIntentAlignment: (ev: IntentAlignmentEvent) => void;
   onIntentInterventionRequired: (req: IntentInterventionRequest) => void;
-  respondIntentIntervention: (action: "adopt_plan_1" | "adopt_plan_2" | "hint" | "skip", hint?: string, interventionId?: string) => Promise<void>;
+  respondIntentIntervention: (action: "adopt" | "adopt_plan_1" | "adopt_plan_2" | "hint" | "skip", hint?: string, interventionId?: string) => Promise<void>;
   clearIntentAlignment: (sessionId: string) => void;
   toolRetryStatus: Record<string, ToolRetryStatus>;
   dismissToolRetry: (sessionId: string) => void;
@@ -2998,7 +2998,7 @@ export const useStore = create<Store>((set, get) => ({
     set({ pendingIntentIntervention: req });
   },
 
-  async respondIntentIntervention(action: "adopt_plan_1" | "adopt_plan_2" | "hint" | "skip", hint?: string, interventionId?: string) {
+  async respondIntentIntervention(action: "adopt" | "adopt_plan_1" | "adopt_plan_2" | "hint" | "skip", hint?: string, interventionId?: string) {
     const cur = get().pendingIntentIntervention;
     const targetId = interventionId || cur?.id;
     if (!targetId) return;

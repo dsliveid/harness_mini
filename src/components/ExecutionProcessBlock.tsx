@@ -385,9 +385,19 @@ export function ExecutionProcessBlock({
     return null;
   }, [propIntervention, isRunning, storePendingIntervention, currentSessionId]);
 
-  // 用户手动切换过展开/收起时，优先使用用户意图；否则运行中默认展开，完成后默认折叠
+  const isRequiresIntervention = Boolean(
+    resolvedIntervention || resolvedAlignment?.status === "requires_intervention"
+  );
+
+  // 用户手动切换过展开/收起时，优先使用用户意图；否则运行中或等待干预时默认展开，完成后默认折叠
   const [userToggled, setUserToggled] = useState<boolean | null>(null);
-  const isOpen = userToggled !== null ? userToggled : isRunning;
+  const isOpen = userToggled !== null ? userToggled : (isRunning || isRequiresIntervention);
+
+  useEffect(() => {
+    if (isRequiresIntervention) {
+      setUserToggled(true);
+    }
+  }, [isRequiresIntervention]);
 
   // 当运行状态从 running 变为 false 时，重置用户手动干预状态，确保自动优雅折叠
   const wasRunningRef = useRef(isRunning);

@@ -842,7 +842,7 @@ fn parse_understanding_and_plan(raw: &str) -> (String, String) {
 }
 
 /// 提取最近几轮人机对话的关键摘要，用于意图对齐门控进行代词消解与上下文关联
-#[allow(dead_code)]
+/// 提取最近几轮人机对话的完整上下文，用于意图对齐门控进行代词消解与选项解析（不截断选项与末尾内容）
 fn format_recent_context_for_gate(msgs: &[crate::models::Message], trigger_msg_id: Option<&str>) -> String {
     let mut relevant = Vec::new();
     let mut count = 0;
@@ -855,14 +855,8 @@ fn format_recent_context_for_gate(msgs: &[crate::models::Message], trigger_msg_i
         if m.role == "user" || m.role == "assistant" {
             let content = m.content.as_deref().unwrap_or("").trim();
             if !content.is_empty() {
-                let truncated = if content.chars().count() > 400 {
-                    let prefix: String = content.chars().take(400).collect();
-                    format!("{}...", prefix)
-                } else {
-                    content.to_string()
-                };
                 let role_label = if m.role == "user" { "用户" } else { "助手" };
-                relevant.push(format!("- {}: {}", role_label, truncated));
+                relevant.push(format!("- {}: {}", role_label, content));
                 count += 1;
                 if count >= 3 {
                     break;
@@ -874,7 +868,7 @@ fn format_recent_context_for_gate(msgs: &[crate::models::Message], trigger_msg_i
         return String::new();
     }
     relevant.reverse();
-    relevant.join("\n")
+    relevant.join("\n\n")
 }
 
 #[allow(dead_code)]
@@ -889,8 +883,7 @@ fn is_clarification_intent_plan(plan: &str) -> bool {
         || p.contains("信息严重不足")
 }
 
-/// 日常对话意图对齐门控（已由对话内原生决策闭环替代，保留作为备用降级）
-#[allow(dead_code)]
+/// 日常对话前置意图对齐门控（仅对用户输入做单轮决策，内容极简，<90分由用户采用或输入提示，决不隐藏工具）
 async fn run_intent_alignment_gate(
     app: &AppHandle,
     state: &crate::AppState,
@@ -901,439 +894,390 @@ async fn run_intent_alignment_gate(
     run_id: &str,
     user_message: &str,
     recent_context: &str,
-) -> Option<(String, String, bool)> {
+) -> Option<(String, String)> {
     let resolved_decision = resolve_decision_model_for_session(session, settings);
     let Some((d_provider, d_model)) = resolved_decision else {
         return None;
     };
 
-    let mut user_hint: Option<String> = None;
-    let mut retry_count = 0usize;
-    let mut prev_critique: Option<(f32, String)> = None;
-    let mut rounds: Vec<crate::models::IntentAlignmentRound> = Vec::new();
+    let intervention_id = format!("intent-{}-{}", session_id, uuid::Uuid::new_v4());
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    {
+        let mut pending = state.intent_interventions.lock().unwrap();
+        pending.retain(|_, v| v.session_id != session_id);
+        pending.insert(intervention_id.clone(), crate::PendingIntentIntervention {
+            session_id: session_id.to_string(),
+            tx,
+        });
+    }
 
-    loop {
-        // 注册当前轮次的干预/跳过通道，以便用户在生成或评估的任意时刻点击立即跳过或补充提示
-        let intervention_id = format!("intent-{}-{}", session_id, uuid::Uuid::new_v4());
-        let (tx, mut rx) = tokio::sync::oneshot::channel();
-        {
+    // 阶段 1：通知前端正在提炼意图
+    let analyzing_event = crate::models::IntentAlignmentEvent {
+        session_id: session_id.to_string(),
+        run_id: run_id.to_string(),
+        user_message: user_message.to_string(),
+        status: "analyzing".into(),
+        current_attempt: 1,
+        max_retries: 1,
+        understanding: String::new(),
+        plan: String::new(),
+        score: 0.0,
+        score_percent: 0,
+        reason: String::new(),
+        attempt: 1,
+        passed: false,
+        history: Vec::new(),
+        intervention_id: Some(intervention_id.clone()),
+        decision_type: Some("score".into()),
+        verdict: None,
+        selected_choice: None,
+    };
+    let _ = app.emit("intent:alignment", &analyzing_event);
+
+    // 1. LLM 极简提炼对用户意图的理解以及关键行动（严格限制字数，简洁明了）
+    let context_block = if recent_context.trim().is_empty() {
+        String::new()
+    } else {
+        format!("【前序对话上下文参考（用于代词消解与选项解析）】:\n{}\n\n", recent_context.trim())
+    };
+    let gen_prompt = format!(
+        "你是一个高智能任务规划分析器。请仔细阅读用户最新发送的消息（参考前序对话上下文以准确解析代词、选项与编号），以极简明确的格式输出两部分内容：\n\
+        1. understanding: 1句话定性概括用户真实核心诉求（严格控制在40字以内）；\n\
+        2. plan: 列出 2~3 点核心关键动作清单（每点不超过25字，严禁冗长流水账）。\n\n\
+        必须且仅以如下 JSON 格式输出，不要输出任何 Markdown 标记或多余说明：\n\
+        {{\"understanding\": \"一句话意图\", \"plan\": \"1. 关键动作一\\n2. 关键动作二\"}}\n\n\
+        {}\
+        【用户消息】：\n{}",
+        context_block,
+        user_message
+    );
+
+    let gen_messages = vec![
+        json!({"role": "system", "content": "你是一个严谨客观的意图理解与任务规划分析器，只输出纯 JSON。"}),
+        json!({"role": "user", "content": gen_prompt}),
+    ];
+
+    let gen_resp = tokio::select! {
+        res = crate::llm::call_simple_completion(cfg, &gen_messages, Some(0.1)) => {
+            res.unwrap_or_default()
+        }
+        user_action = &mut rx => {
             let mut pending = state.intent_interventions.lock().unwrap();
-            pending.retain(|_, v| v.session_id != session_id);
-            pending.insert(intervention_id.clone(), crate::PendingIntentIntervention {
-                session_id: session_id.to_string(),
-                tx,
-            });
-        }
-
-        // 阶段 1：通知前端大模型正在进行深度意图剖析与规划
-        let analyzing_event = crate::models::IntentAlignmentEvent {
-            session_id: session_id.to_string(),
-            run_id: run_id.to_string(),
-            user_message: user_message.to_string(),
-            status: "analyzing".into(),
-            current_attempt: retry_count + 1,
-            max_retries: 2,
-            understanding: String::new(),
-            plan: String::new(),
-            score: 0.0,
-            score_percent: 0,
-            reason: String::new(),
-            attempt: retry_count + 1,
-            passed: false,
-            history: rounds.clone(),
-            intervention_id: Some(intervention_id.clone()),
-            decision_type: Some("score".into()),
-            verdict: None,
-            selected_choice: None,
-        };
-        let _ = app.emit("intent:alignment", &analyzing_event);
-
-        // 1. LLM 生成对用户意图的理解以及接下来该做什么
-        let context_block = if recent_context.trim().is_empty() {
+            pending.remove(&intervention_id);
+            drop(pending);
+            if let Ok(_decision) = user_action {
+                let skip_event = crate::models::IntentAlignmentEvent {
+                    session_id: session_id.to_string(),
+                    run_id: run_id.to_string(),
+                    user_message: user_message.to_string(),
+                    status: "skipped".into(),
+                    current_attempt: 1,
+                    max_retries: 1,
+                    understanding: user_message.to_string(),
+                    plan: "用户手动跳过前置评估，直接执行。".into(),
+                    score: 1.0,
+                    score_percent: 100,
+                    reason: "用户手动跳过意图对齐".into(),
+                    attempt: 1,
+                    passed: true,
+                    history: Vec::new(),
+                    intervention_id: None,
+                    decision_type: Some("score".into()),
+                    verdict: None,
+                    selected_choice: None,
+                };
+                let _ = app.emit("intent:alignment", &skip_event);
+                return Some((user_message.to_string(), "根据用户指令跳过前置评估，直接执行。".into()));
+            }
             String::new()
-        } else {
-            format!("【前序对话上下文参考（用于指代消解与选项解析）】:\n{}\n\n", recent_context.trim())
-        };
-        let mut gen_prompt = format!(
-            "你是一个高智能任务规划分析器。请仔细阅读用户最新发送的消息（参考前序对话上下文以准确解析代词、选项与编号），清晰输出两部分内容：\n\
-            1. 意图理解：深刻剖析用户真实核心诉求、关键意图与约束边界。\n\
-            2. 行动计划：明确接下来准备采取什么具体行动（包含拟调用的工具或关键步骤）。\n\n\
-            必须且仅以如下 JSON 格式输出，不要输出任何其他 Markdown 标记或多余文本：\n\
-            {{\"understanding\": \"对用户意图的深刻理解\", \"plan\": \"接下来具体分步行动计划\"}}\n\n\
-            {}\
-            【用户消息】：\n{}",
-            context_block,
-            user_message
-        );
-        if let Some(ref h) = user_hint {
-            gen_prompt.push_str(&format!("\n\n【用户给出的补充提示/重点强调】:\n{}\n请在理解与行动计划中充分融入用户的补充提示！", h));
         }
-        if retry_count > 0 {
-            if let Some((prev_s, ref prev_r)) = prev_critique {
-                gen_prompt.push_str(&format!(
-                    "\n\n【前一轮审查反馈（得分仅 {:.0}%，未达 90% 达标线）】:\n{}\n请深刻反思并修正上述不足，给出更精准周全的意图理解与行动计划！",
-                    prev_s * 100.0, prev_r
-                ));
-            }
-        }
+    };
 
-        let gen_messages = vec![
-            json!({"role": "system", "content": "你是一个严谨客观的意图理解与任务规划分析器，只输出纯 JSON。"}),
-            json!({"role": "user", "content": gen_prompt}),
-        ];
+    let (extracted_understanding, extracted_plan) = parse_understanding_and_plan(&gen_resp);
 
-        let gen_resp = tokio::select! {
-            res = crate::llm::call_simple_completion(cfg, &gen_messages, Some(0.1)) => {
-                res.unwrap_or_default()
-            }
-            user_action = &mut rx => {
-                let mut pending = state.intent_interventions.lock().unwrap();
-                pending.remove(&intervention_id);
-                drop(pending);
-                if let Ok(decision) = user_action {
-                    if decision.action == "hint" && decision.hint.as_ref().map(|h| !h.trim().is_empty()).unwrap_or(false) {
-                        user_hint = decision.hint;
-                        retry_count = 0;
-                        prev_critique = None;
-                        continue;
-                    } else {
-                        // 用户主动跳过对齐门控
-                        let skip_event = crate::models::IntentAlignmentEvent {
-                            session_id: session_id.to_string(),
-                            run_id: run_id.to_string(),
-                            user_message: user_message.to_string(),
-                            status: "skipped".into(),
-                            current_attempt: retry_count + 1,
-                            max_retries: 2,
-                            understanding: user_message.to_string(),
-                            plan: "用户手动跳过前置评估，直接执行。".into(),
-                            score: 1.0,
-                            score_percent: 100,
-                            reason: "用户手动跳过意图对齐闸门".into(),
-                            attempt: retry_count + 1,
-                            passed: true,
-                            history: rounds.clone(),
-                            intervention_id: None,
-                            decision_type: Some("score".into()),
-                            verdict: None,
-                            selected_choice: None,
-                        };
-                        let _ = app.emit("intent:alignment", &skip_event);
-                        return Some((user_message.to_string(), "根据用户指令跳过前置评估，直接执行。".into(), false));
-                    }
-                }
-                String::new()
-            }
-        };
+    // 阶段 2：通知前端意图已提取，决策模型进行单轮打分
+    let evaluating_event = crate::models::IntentAlignmentEvent {
+        session_id: session_id.to_string(),
+        run_id: run_id.to_string(),
+        user_message: user_message.to_string(),
+        status: "evaluating".into(),
+        current_attempt: 1,
+        max_retries: 1,
+        understanding: extracted_understanding.clone(),
+        plan: extracted_plan.clone(),
+        score: 0.0,
+        score_percent: 0,
+        reason: String::new(),
+        attempt: 1,
+        passed: false,
+        history: Vec::new(),
+        intervention_id: Some(intervention_id.clone()),
+        decision_type: Some("score".into()),
+        verdict: None,
+        selected_choice: None,
+    };
+    let _ = app.emit("intent:alignment", &evaluating_event);
 
-        let (extracted_understanding, extracted_plan) = parse_understanding_and_plan(&gen_resp);
+    // 2. 决策模型单轮评估打分
+    let eval_state = format!(
+        "{}\
+        【用户消息】: {}\n\
+        【核心意图】: {}\n\
+        【核心动作】:\n{}",
+        context_block,
+        user_message, extracted_understanding, extracted_plan
+    );
+    let eval_instruction = "请简要评估上述提取的核心意图与动作是否精准契合用户需求。打分区间 0 到 100（以 0.0 到 1.0 表示）。若存在偏差或不明确，请在 reason 中用 1 句话指出具体原因。";
+    let rubric = vec![
+        "90-100: 准确契合用户意图，动作方向明确可行".into(),
+        "0-89: 存在歧义、理解偏差或关键动作遗漏".into(),
+    ];
 
-        // 阶段 2：通知前端意图理解与方案已提炼出炉，决策模型开始质检打分
-        let evaluating_event = crate::models::IntentAlignmentEvent {
-            session_id: session_id.to_string(),
-            run_id: run_id.to_string(),
-            user_message: user_message.to_string(),
-            status: "evaluating".into(),
-            current_attempt: retry_count + 1,
-            max_retries: 2,
-            understanding: extracted_understanding.clone(),
-            plan: extracted_plan.clone(),
-            score: 0.0,
-            score_percent: 0,
-            reason: String::new(),
-            attempt: retry_count + 1,
-            passed: false,
-            history: rounds.clone(),
-            intervention_id: Some(intervention_id.clone()),
-            decision_type: Some("score".into()),
-            verdict: None,
-            selected_choice: None,
-        };
-        let _ = app.emit("intent:alignment", &evaluating_event);
+    let eval_res = tokio::select! {
+        res = async {
+            let primary_res = crate::jev::execute_decision(
+                &d_provider,
+                &d_model,
+                "score",
+                &eval_state,
+                eval_instruction,
+                None,
+                Some(rubric.clone()),
+                settings.effective_proxy_url(),
+            ).await;
 
-        // 2. 让 Jev 决策模型评估 LLM 对用户意图的理解程度
-        let eval_state = format!(
-            "{}\
-            【用户原始消息】:\n{}\n\n【LLM 提取的意图理解】:\n{}\n\n【LLM 规划的后续行动】:\n{}",
-            context_block,
-            user_message, extracted_understanding, extracted_plan
-        );
-        let eval_instruction = "请全面评估 LLM 对用户意图的理解是否精准到位、行动方案是否完全契合用户需求且周全可行。打分区间 0 到 100（以 0.0 到 1.0 表示）。若理解有偏差、关键诉求有遗漏或行动方案答非所问，必须扣分并在 reason 中给出具体中肯的修改建议。";
-        let rubric = vec![
-            "90-100: 准确且深刻理解用户核心需求，行动方案周全精准，完全符合用户真实意图".into(),
-            "70-89: 基本理解用户意图，但存在部分遗漏、关键细节欠缺或行动方案不够聚焦".into(),
-            "0-69: 存在明显误解、答非所问、方案偏离核心需求或遗漏关键前提".into(),
-        ];
-
-        let eval_res = tokio::select! {
-            res = async {
-                let primary_res = crate::jev::execute_decision(
-                    &d_provider,
-                    &d_model,
-                    "score",
-                    &eval_state,
-                    eval_instruction,
-                    None,
-                    Some(rubric.clone()),
-                    settings.effective_proxy_url(),
-                ).await;
-
-                match primary_res {
-                    Ok(r) => Ok(r),
-                    Err(e) => {
-                        // 专职决策模型执行失败时（例如端点不存在或模型无法连通），
-                        // 若当前主对话模型与专职决策模型不同，自动回退使用当前主对话模型完成意图对齐评估
-                        let main_model = crate::models::resolve_active_model(settings);
-                        if let Some((pc, model)) = main_model {
-                            if d_provider.id != pc.id || d_model != model {
-                                eprintln!(
-                                    "专职决策模型 ({}/{}) 评估失败: {e}，自动回退使用当前主对话模型 ({}/{}) 进行意图评估...",
-                                    d_provider.name, d_model, pc.name, model
-                                );
-                                crate::jev::execute_decision(
-                                    pc,
-                                    model,
-                                    "score",
-                                    &eval_state,
-                                    eval_instruction,
-                                    None,
-                                    Some(rubric),
-                                    settings.effective_proxy_url(),
-                                ).await
-                            } else {
-                                Err(e)
-                            }
+            match primary_res {
+                Ok(r) => Ok(r),
+                Err(e) => {
+                    let main_model = crate::models::resolve_active_model(settings);
+                    if let Some((pc, model)) = main_model {
+                        if d_provider.id != pc.id || d_model != model {
+                            crate::jev::execute_decision(
+                                pc,
+                                model,
+                                "score",
+                                &eval_state,
+                                eval_instruction,
+                                None,
+                                Some(rubric),
+                                settings.effective_proxy_url(),
+                            ).await
                         } else {
                             Err(e)
                         }
-                    }
-                }
-            } => {
-                res
-            }
-            user_action = &mut rx => {
-                let mut pending = state.intent_interventions.lock().unwrap();
-                pending.remove(&intervention_id);
-                drop(pending);
-                if let Ok(decision) = user_action {
-                    if decision.action == "hint" && decision.hint.as_ref().map(|h| !h.trim().is_empty()).unwrap_or(false) {
-                        user_hint = decision.hint;
-                        retry_count = 0;
-                        prev_critique = None;
-                        continue;
                     } else {
-                        let skip_event = crate::models::IntentAlignmentEvent {
-                            session_id: session_id.to_string(),
-                            run_id: run_id.to_string(),
-                            user_message: user_message.to_string(),
-                            status: "skipped".into(),
-                            current_attempt: retry_count + 1,
-                            max_retries: 2,
-                            understanding: extracted_understanding.clone(),
-                            plan: extracted_plan.clone(),
-                            score: 1.0,
-                            score_percent: 100,
-                            reason: "用户手动跳过意图对齐闸门".into(),
-                            attempt: retry_count + 1,
-                            passed: true,
-                            history: rounds.clone(),
-                            intervention_id: None,
-                            decision_type: Some("score".into()),
-                            verdict: None,
-                            selected_choice: None,
-                        };
-                        let _ = app.emit("intent:alignment", &skip_event);
-                        return Some((extracted_understanding, extracted_plan, false));
+                        Err(e)
                     }
                 }
-                Ok(crate::jev::DecisionExecutionResult {
-                    verdict: None,
-                    choice: None,
-                    score: Some(0.95),
-                    confidence: 0.9,
-                    reason: "跳过评估".into(),
-                    latency_ms: 0,
-                    model: d_model.clone(),
-                })
             }
-        };
-
-        // 移除当前轮临时注册的通道
-        {
+        } => {
+            res
+        }
+        user_action = &mut rx => {
             let mut pending = state.intent_interventions.lock().unwrap();
             pending.remove(&intervention_id);
-        }
-
-        let (score, reason) = match eval_res {
-            Ok(r) => (r.score.unwrap_or(0.95), r.reason),
-            Err(e) => {
-                eprintln!("意图对齐门控评估最终异常: {e}");
-                (0.95, "意图评估通过（决策服务暂时不可用，已自动核准执行计划）".to_string())
+            drop(pending);
+            if let Ok(_decision) = user_action {
+                let skip_event = crate::models::IntentAlignmentEvent {
+                    session_id: session_id.to_string(),
+                    run_id: run_id.to_string(),
+                    user_message: user_message.to_string(),
+                    status: "skipped".into(),
+                    current_attempt: 1,
+                    max_retries: 1,
+                    understanding: extracted_understanding.clone(),
+                    plan: extracted_plan.clone(),
+                    score: 1.0,
+                    score_percent: 100,
+                    reason: "用户手动跳过意图对齐闸门".into(),
+                    attempt: 1,
+                    passed: true,
+                    history: Vec::new(),
+                    intervention_id: None,
+                    decision_type: Some("score".into()),
+                    verdict: None,
+                    selected_choice: None,
+                };
+                let _ = app.emit("intent:alignment", &skip_event);
+                return Some((extracted_understanding, extracted_plan));
             }
-        };
-
-        let score_percent = (score * 100.0).round() as u32;
-        let passed = score_percent >= 90;
-
-        // 记录本轮评估详情入历史
-        let round_record = crate::models::IntentAlignmentRound {
-            attempt: retry_count + 1,
-            understanding: extracted_understanding.clone(),
-            plan: extracted_plan.clone(),
-            score,
-            score_percent,
-            critique: reason.clone(),
-            passed,
-            decision_type: Some("score".into()),
-            verdict: None,
-            selected_choice: None,
-        };
-        rounds.push(round_record);
-
-        if passed {
-            let is_clar = is_clarification_intent_plan(&extracted_plan);
-            let pass_event = crate::models::IntentAlignmentEvent {
-                session_id: session_id.to_string(),
-                run_id: run_id.to_string(),
-                user_message: user_message.to_string(),
-                status: "passed".into(),
-                current_attempt: retry_count + 1,
-                max_retries: 2,
-                understanding: extracted_understanding.clone(),
-                plan: extracted_plan.clone(),
-                score,
-                score_percent,
-                reason: reason.clone(),
-                attempt: retry_count + 1,
-                passed: true,
-                history: rounds.clone(),
-                intervention_id: None,
-                decision_type: Some("score".into()),
+            Ok(crate::jev::DecisionExecutionResult {
                 verdict: None,
-                selected_choice: None,
-            };
-            let _ = app.emit("intent:alignment", &pass_event);
-            return Some((extracted_understanding, extracted_plan, is_clar));
+                choice: None,
+                score: Some(0.95),
+                confidence: 0.9,
+                reason: "跳过评估".into(),
+                latency_ms: 0,
+                model: d_model.clone(),
+            })
         }
+    };
 
-        // 未达标 (score < 90%)
-        if retry_count < 2 {
-            // 自动重试最多 2 次
-            retry_count += 1;
-            prev_critique = Some((score, reason.clone()));
+    // 移除已处理的通道
+    {
+        let mut pending = state.intent_interventions.lock().unwrap();
+        pending.remove(&intervention_id);
+    }
 
-            let retry_event = crate::models::IntentAlignmentEvent {
-                session_id: session_id.to_string(),
-                run_id: run_id.to_string(),
-                user_message: user_message.to_string(),
-                status: "retrying".into(),
-                current_attempt: retry_count,
-                max_retries: 2,
-                understanding: extracted_understanding.clone(),
-                plan: extracted_plan.clone(),
-                score,
-                score_percent,
-                reason: reason.clone(),
-                attempt: retry_count,
-                passed: false,
-                history: rounds.clone(),
-                intervention_id: None,
-                decision_type: Some("score".into()),
-                verdict: None,
-                selected_choice: None,
-            };
-            let _ = app.emit("intent:alignment", &retry_event);
-
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            continue;
+    let (score, reason) = match eval_res {
+        Ok(r) => (r.score.unwrap_or(0.95), r.reason),
+        Err(e) => {
+            eprintln!("意图对齐门控评估异常: {e}");
+            (0.95, "意图评估通过（决策服务暂时不可用，已自动核准执行计划）".to_string())
         }
+    };
 
-        // 重试 2 次后仍未达标，挂起等待用户决定给予提示或者跳过
-        let final_intervention_id = format!("intent-{}-{}", session_id, uuid::Uuid::new_v4());
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        {
-            let mut pending = state.intent_interventions.lock().unwrap();
-            pending.retain(|_, v| v.session_id != session_id);
-            pending.insert(final_intervention_id.clone(), crate::PendingIntentIntervention {
-                session_id: session_id.to_string(),
-                tx,
-            });
-        }
+    let score_percent = (score * 100.0).round() as u32;
+    let passed = score_percent >= 90;
 
-        let intervention_event = crate::models::IntentAlignmentEvent {
+    let round_record = crate::models::IntentAlignmentRound {
+        attempt: 1,
+        understanding: extracted_understanding.clone(),
+        plan: extracted_plan.clone(),
+        score,
+        score_percent,
+        critique: reason.clone(),
+        passed,
+        decision_type: Some("score".into()),
+        verdict: None,
+        selected_choice: None,
+    };
+    let rounds = vec![round_record];
+
+    if passed {
+        let pass_event = crate::models::IntentAlignmentEvent {
             session_id: session_id.to_string(),
             run_id: run_id.to_string(),
             user_message: user_message.to_string(),
-            status: "requires_intervention".into(),
-            current_attempt: retry_count + 1,
-            max_retries: 2,
+            status: "passed".into(),
+            current_attempt: 1,
+            max_retries: 1,
             understanding: extracted_understanding.clone(),
             plan: extracted_plan.clone(),
             score,
             score_percent,
             reason: reason.clone(),
-            attempt: retry_count + 1,
-            passed: false,
-            history: rounds.clone(),
-            intervention_id: Some(final_intervention_id.clone()),
+            attempt: 1,
+            passed: true,
+            history: rounds,
+            intervention_id: None,
             decision_type: Some("score".into()),
             verdict: None,
             selected_choice: None,
         };
-        let _ = app.emit("intent:alignment", &intervention_event);
+        let _ = app.emit("intent:alignment", &pass_event);
+        return Some((extracted_understanding, extracted_plan));
+    }
 
-        let intervention_req = crate::models::IntentInterventionRequest {
-            id: final_intervention_id.clone(),
+    // 单轮评分未达标 (<90分)：直接挂起等待用户二选一（采用该决策 / 输入提示调整方向）
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    {
+        let mut pending = state.intent_interventions.lock().unwrap();
+        pending.retain(|_, v| v.session_id != session_id);
+        pending.insert(intervention_id.clone(), crate::PendingIntentIntervention {
             session_id: session_id.to_string(),
-            run_id: run_id.to_string(),
-            user_message: user_message.to_string(),
-            understanding: extracted_understanding.clone(),
-            plan: extracted_plan.clone(),
-            score,
-            critique: reason.clone(),
-            retry_count,
-            rounds: rounds.clone(),
-            plan1: rounds.get(0).map(|r| r.plan.clone()),
-            plan2: rounds.get(1).map(|r| r.plan.clone()),
-        };
-        let _ = app.emit("intent:intervention_required", &intervention_req);
+            tx,
+        });
+    }
 
-        match rx.await {
-            Ok(decision) => {
-                if decision.action == "hint" && decision.hint.as_ref().map(|h| !h.trim().is_empty()).unwrap_or(false) {
-                    user_hint = decision.hint;
-                    retry_count = 0;
-                    prev_critique = None;
-                    continue;
+    let intervention_event = crate::models::IntentAlignmentEvent {
+        session_id: session_id.to_string(),
+        run_id: run_id.to_string(),
+        user_message: user_message.to_string(),
+        status: "requires_intervention".into(),
+        current_attempt: 1,
+        max_retries: 1,
+        understanding: extracted_understanding.clone(),
+        plan: extracted_plan.clone(),
+        score,
+        score_percent,
+        reason: reason.clone(),
+        attempt: 1,
+        passed: false,
+        history: rounds.clone(),
+        intervention_id: Some(intervention_id.clone()),
+        decision_type: Some("score".into()),
+        verdict: None,
+        selected_choice: None,
+    };
+    let _ = app.emit("intent:alignment", &intervention_event);
+
+    let intervention_req = crate::models::IntentInterventionRequest {
+        id: intervention_id.clone(),
+        session_id: session_id.to_string(),
+        run_id: run_id.to_string(),
+        user_message: user_message.to_string(),
+        understanding: extracted_understanding.clone(),
+        plan: extracted_plan.clone(),
+        score,
+        critique: reason.clone(),
+        retry_count: 1,
+        rounds: rounds.clone(),
+        plan1: Some(extracted_plan.clone()),
+        plan2: None,
+    };
+    let _ = app.emit("intent:intervention_required", &intervention_req);
+
+    match rx.await {
+        Ok(decision) => {
+            let action = decision.action.as_str();
+            if action == "hint" {
+                let hint = decision.hint.unwrap_or_default();
+                let adjusted_understanding = if !hint.trim().is_empty() {
+                    format!("{}（用户纠偏：{}）", extracted_understanding, hint.trim())
                 } else {
-                    let skip_event = crate::models::IntentAlignmentEvent {
-                        session_id: session_id.to_string(),
-                        run_id: run_id.to_string(),
-                        user_message: user_message.to_string(),
-                        status: "skipped".into(),
-                        current_attempt: retry_count + 1,
-                        max_retries: 2,
-                        understanding: extracted_understanding.clone(),
-                        plan: extracted_plan.clone(),
-                        score,
-                        score_percent,
-                        reason: "用户手动跳过对齐".into(),
-                        attempt: retry_count + 1,
-                        passed: true,
-                        history: rounds.clone(),
-                        intervention_id: None,
-                        decision_type: Some("score".into()),
-                        verdict: None,
-                        selected_choice: None,
-                    };
-                    let _ = app.emit("intent:alignment", &skip_event);
-                    return Some((extracted_understanding, extracted_plan, false));
-                }
+                    extracted_understanding
+                };
+                let pass_event = crate::models::IntentAlignmentEvent {
+                    session_id: session_id.to_string(),
+                    run_id: run_id.to_string(),
+                    user_message: user_message.to_string(),
+                    status: "passed".into(),
+                    current_attempt: 1,
+                    max_retries: 1,
+                    understanding: adjusted_understanding.clone(),
+                    plan: extracted_plan.clone(),
+                    score: 1.0,
+                    score_percent: 100,
+                    reason: format!("根据用户输入提示调整方向: {}", hint.trim()),
+                    attempt: 1,
+                    passed: true,
+                    history: rounds,
+                    intervention_id: None,
+                    decision_type: Some("score".into()),
+                    verdict: None,
+                    selected_choice: None,
+                };
+                let _ = app.emit("intent:alignment", &pass_event);
+                Some((adjusted_understanding, extracted_plan))
+            } else {
+                // "adopt", "adopt_plan_1", "adopt_plan_2", "skip"
+                let pass_event = crate::models::IntentAlignmentEvent {
+                    session_id: session_id.to_string(),
+                    run_id: run_id.to_string(),
+                    user_message: user_message.to_string(),
+                    status: "passed".into(),
+                    current_attempt: 1,
+                    max_retries: 1,
+                    understanding: extracted_understanding.clone(),
+                    plan: extracted_plan.clone(),
+                    score: 1.0,
+                    score_percent: 100,
+                    reason: "用户人工审批确认采用该决策".into(),
+                    attempt: 1,
+                    passed: true,
+                    history: rounds,
+                    intervention_id: None,
+                    decision_type: Some("score".into()),
+                    verdict: None,
+                    selected_choice: None,
+                };
+                let _ = app.emit("intent:alignment", &pass_event);
+                Some((extracted_understanding, extracted_plan))
             }
-            Err(_) => {
-                let is_clar = is_clarification_intent_plan(&extracted_plan);
-                return Some((extracted_understanding, extracted_plan, is_clar));
-            }
+        }
+        Err(_) => {
+            Some((extracted_understanding, extracted_plan))
         }
     }
 }
@@ -1905,14 +1849,14 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         };
         (sec, effective_plan_mode, neg_intent)
     };
-    let sys = system_prompt(
+    let mut sys = system_prompt(
         &session,
         project_section.as_deref(),
         &settings.disabled_sops,
         &project_plan_mode,
     );
 
-    // ---- 意图对齐门控（日常对话规则：LLM生成意图理解与行动计划，Jev评分，低于90%重试2次后人工干预） ----
+    // ---- 前置意图对齐门控（仅对用户输入做单轮决策，内容极简，<90分由用户采用或输入提示，决不隐藏工具） ----
     let should_run_intent_alignment = {
         let is_main_session = session.session_type == "main" || session.session_type.is_empty();
         let is_sop_enabled = !settings.disabled_sops.iter().any(|s| s == "intent_alignment_gate");
@@ -1935,11 +1879,35 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         }
     };
 
+    if should_run_intent_alignment {
+        if let Some(ref m) = trigger_msg {
+            let u_msg = m.content.as_deref().unwrap_or("").trim();
+            let recent_context = {
+                let db = state.db.lock().unwrap();
+                let all_m = store::all_messages(&db, session_id).unwrap_or_default();
+                format_recent_context_for_gate(&all_m, Some(&m.id))
+            };
+            if let Some((understanding, plan)) = run_intent_alignment_gate(
+                app,
+                &state,
+                &session,
+                &settings,
+                &cfg,
+                session_id,
+                run_id,
+                u_msg,
+                &recent_context,
+            ).await {
+                sys.push_str(&format!(
+                    "\n\n## 经过确认的当前核心意图与行动计划\n- **意图理解**: {}\n- **核心行动**: {}\n请严格围绕上述对齐的目标与行动推进，使用合适的工具完成任务。\n",
+                    understanding, plan
+                ));
+            }
+        }
+    }
+
     let verified_intent_prefix: Option<String> = None;
-    let mut clarification_locked = false;
-    let mut sop_verified = !should_run_intent_alignment;
-    // 跟踪本轮对话内大模型主动调用的 score_decision 质检轮次
-    let mut score_decision_rounds: Vec<crate::models::IntentAlignmentRound> = Vec::new();
+    let mut sop_verified = false;
     let mut files_modified = false;
     let mut code_modified = false;
     let mut sop_retry_count = 0usize;
@@ -2054,24 +2022,8 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             let sid_reason = sid2.clone();
             let mid_reason = mid2.clone();
 
-            // 动态双阶段受控工具集：若处于意图澄清锁定中，或尚未对齐且启用了门控，仅下发只读与决策工具，物理屏蔽修改类生产工具
-            let step_schemas: Vec<Value> = if clarification_locked || (!sop_verified && should_run_intent_alignment) {
-                specs.iter()
-                    .filter(|s| s.risk == Risk::ReadOnly || s.name == "judge_decision" || s.name == "choice_decision" || s.name == "score_decision")
-                    .map(|s| {
-                        json!({
-                            "type": "function",
-                            "function": {
-                                "name": s.name,
-                                "description": s.description,
-                                "parameters": s.schema
-                            }
-                        })
-                    })
-                    .collect()
-            } else {
-                schemas.clone()
-            };
+            // 生产工具始终 100% 全量暴露给大模型，决不动态过滤或隐藏工具列表，消除工具锁死隐患
+            let step_schemas = schemas.clone();
 
             let call = llm::chat_stream(
                 &cfg,
@@ -2388,10 +2340,8 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 || tc.name == "run_command"
                 || tc.name == "delete_file"
                 || tc.name == "apply_diff";
-            let guard_denied = if is_modifying {
-                if clarification_locked {
-                    Some("【SOP意图门控拦截】: 当前对齐方案已明确要求先向用户澄清询问，严禁在澄清前执行代码修改或命令。请停止调用修改类工具，直接向用户输出澄清询问。".to_string())
-                } else if project_plan_mode == "always_plan" && created_plan_in_this_turn {
+            let guard_denied: Option<String> = if is_modifying {
+                if project_plan_mode == "always_plan" && created_plan_in_this_turn {
                     Some("【模式守卫拦截】: 当前项目启用了「Always Plan 模式」，执行方案刚刚生成，严禁在同一轮次中未经用户确认直接修改代码。请停止调用写入工具，向用户汇报当前计划核心并请求确认。".to_string())
                 } else if project_plan_mode == "always_proceed" && negative_code_intent {
                     Some("【模式守卫拦截】: 用户在当前任务中明确说明了先不改动代码（仅出方案/评估）。你已完成计划制定，严格禁止在当前轮次修改代码。请向用户输出方案说明并等待用户指示。".to_string())
@@ -2492,308 +2442,31 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                     );
                 }
 
-                // 联动决策工具结果：大模型在会话中主动调用决策原语，根据裁决结论与自愈状态机解锁生产工具权限
                 if tc.name == "score_decision" {
                     if let Ok(val) = serde_json::from_str::<Value>(&result_text) {
                         let score_val = val.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
                         let score_pct = val.get("scorePercent").and_then(|v| v.as_u64()).map(|n| n as u32).unwrap_or((score_val * 100.0).round() as u32);
                         let critique = val.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let cur_understanding = val.get("understanding").and_then(|v| v.as_str())
-                            .or_else(|| args.get("understanding").and_then(|v| v.as_str()))
-                            .unwrap_or("模型对用户意图与边界的剖析")
-                            .to_string();
-                        let cur_plan = val.get("plan").and_then(|v| v.as_str())
-                            .or_else(|| args.get("plan").and_then(|v| v.as_str()))
-                            .unwrap_or("模型拟定的分步行动计划")
-                            .to_string();
-
-                        let passed = score_pct >= 90;
-                        let round_num = score_decision_rounds.len() + 1;
-                        let round_snapshot = crate::models::IntentAlignmentRound {
-                            attempt: round_num,
-                            understanding: cur_understanding.clone(),
-                            plan: cur_plan.clone(),
-                            score: score_val,
-                            score_percent: score_pct,
-                            critique: critique.clone(),
-                            passed,
-                            decision_type: Some("score".into()),
-                            verdict: None,
-                            selected_choice: None,
-                        };
-                        score_decision_rounds.push(round_snapshot);
-
-                        let u_msg_content = trigger_msg.as_ref().and_then(|m| m.content.clone()).unwrap_or_default();
-
-                        if passed {
-                            sop_verified = true;
-                            clarification_locked = false;
-                            let evt = crate::models::IntentAlignmentEvent {
-                                session_id: session_id.to_string(),
-                                run_id: run_id.to_string(),
-                                user_message: u_msg_content,
-                                status: "passed".into(),
-                                current_attempt: round_num,
-                                max_retries: 2,
-                                understanding: cur_understanding.clone(),
-                                plan: cur_plan.clone(),
-                                score: score_val,
-                                score_percent: score_pct,
-                                reason: critique.clone(),
-                                attempt: round_num,
-                                passed: true,
-                                history: score_decision_rounds.clone(),
-                                intervention_id: None,
-                                decision_type: Some("score".into()),
-                                verdict: None,
-                                selected_choice: None,
-                            };
-                            let _ = app.emit("intent:alignment", &evt);
-                            result_text = format!(
-                                "{}\n\n✅【方案质检通过】评分 {}%（≥90%及格线），生产工具已解锁授权。请严格按照上述计划推进执行。",
-                                result_text, score_pct
-                            );
-                        } else if round_num == 1 {
-                            // 首轮未达标（<90分）：触发模型在对话内原地自愈反思重试
-                            sop_verified = false;
-                            let evt = crate::models::IntentAlignmentEvent {
-                                session_id: session_id.to_string(),
-                                run_id: run_id.to_string(),
-                                user_message: u_msg_content,
-                                status: "retrying".into(),
-                                current_attempt: 1,
-                                max_retries: 2,
-                                understanding: cur_understanding.clone(),
-                                plan: cur_plan.clone(),
-                                score: score_val,
-                                score_percent: score_pct,
-                                reason: critique.clone(),
-                                attempt: 1,
-                                passed: false,
-                                history: score_decision_rounds.clone(),
-                                intervention_id: None,
-                                decision_type: Some("score".into()),
-                                verdict: None,
-                                selected_choice: None,
-                            };
-                            let _ = app.emit("intent:alignment", &evt);
-                            result_text = format!(
-                                "{}\n\n⚠️【方案质检未达标】当前评分: {}%（低于90%及格线）。\n质检评估意见: {}\n\n请在思考区（<think>）深入反思上述扣分意见，完善你的意图理解与行动计划，并再次调用 `score_decision` 发起第 2 轮审查。",
-                                result_text, score_pct, critique
-                            );
-                        } else {
-                            // 连续 2 轮未达标（<90分）：挂起当前执行线程，等待用户审批（采用决策1 / 采用决策2 / 输入提示）
-                            sop_verified = false;
-                            let (tx, rx) = tokio::sync::oneshot::channel::<crate::models::IntentInterventionDecision>();
-                            let intervention_id = format!("intervention-{}-{}", session_id, uuid::Uuid::new_v4());
-                            {
-                                let mut map = state.intent_interventions.lock().unwrap();
-                                map.retain(|_, v| v.session_id != session_id);
-                                map.insert(intervention_id.clone(), crate::PendingIntentIntervention {
-                                    session_id: session_id.to_string(),
-                                    tx,
-                                });
-                            }
-
-                            let plan1_str = score_decision_rounds.get(0).map(|r| r.plan.clone());
-                            let plan2_str = score_decision_rounds.get(1).map(|r| r.plan.clone());
-
-                            let evt = crate::models::IntentAlignmentEvent {
-                                session_id: session_id.to_string(),
-                                run_id: run_id.to_string(),
-                                user_message: u_msg_content.clone(),
-                                status: "requires_intervention".into(),
-                                current_attempt: round_num,
-                                max_retries: 2,
-                                understanding: cur_understanding.clone(),
-                                plan: cur_plan.clone(),
-                                score: score_val,
-                                score_percent: score_pct,
-                                reason: critique.clone(),
-                                attempt: round_num,
-                                passed: false,
-                                history: score_decision_rounds.clone(),
-                                intervention_id: Some(intervention_id.clone()),
-                                decision_type: Some("score".into()),
-                                verdict: None,
-                                selected_choice: None,
-                            };
-                            let _ = app.emit("intent:alignment", &evt);
-
-                            let intervention_req = crate::models::IntentInterventionRequest {
-                                id: intervention_id.clone(),
-                                session_id: session_id.to_string(),
-                                run_id: run_id.to_string(),
-                                user_message: u_msg_content,
-                                understanding: cur_understanding.clone(),
-                                plan: cur_plan.clone(),
-                                score: score_val,
-                                critique: critique.clone(),
-                                retry_count: score_decision_rounds.len(),
-                                rounds: score_decision_rounds.clone(),
-                                plan1: plan1_str.clone(),
-                                plan2: plan2_str.clone(),
-                            };
-                            let _ = app.emit("intent:intervention_required", &intervention_req);
-
-                            // 挂起线程，等待前端用户三选一决策
-                            match rx.await {
-                                Ok(decision) => {
-                                    match decision.action.as_str() {
-                                        "adopt_plan_1" => {
-                                            sop_verified = true;
-                                            clarification_locked = false;
-                                            let chosen_p = plan1_str.unwrap_or_else(|| cur_plan.clone());
-                                            let _ = app.emit("intent:alignment", &crate::models::IntentAlignmentEvent {
-                                                session_id: session_id.to_string(),
-                                                run_id: run_id.to_string(),
-                                                user_message: String::new(),
-                                                status: "passed".into(),
-                                                current_attempt: 2,
-                                                max_retries: 2,
-                                                understanding: score_decision_rounds.get(0).map(|r| r.understanding.clone()).unwrap_or_default(),
-                                                plan: chosen_p.clone(),
-                                                score: 1.0,
-                                                score_percent: 100,
-                                                reason: "用户人工审批：采纳第 1 轮方案并授权执行".into(),
-                                                attempt: 2,
-                                                passed: true,
-                                                history: score_decision_rounds.clone(),
-                                                intervention_id: None,
-                                                decision_type: Some("score".into()),
-                                                verdict: None,
-                                                selected_choice: None,
-                                            });
-                                            result_text = format!(
-                                                "{}\n\n✅【用户人工审批】用户已批准采纳【第 1 轮方案】，生产工具已解锁：\n- 采纳方案: {}\n请严格按照该方案执行落地！",
-                                                result_text, chosen_p
-                                            );
-                                        }
-                                        "adopt_plan_2" => {
-                                            sop_verified = true;
-                                            clarification_locked = false;
-                                            let chosen_p = plan2_str.unwrap_or_else(|| cur_plan.clone());
-                                            let _ = app.emit("intent:alignment", &crate::models::IntentAlignmentEvent {
-                                                session_id: session_id.to_string(),
-                                                run_id: run_id.to_string(),
-                                                user_message: String::new(),
-                                                status: "passed".into(),
-                                                current_attempt: 2,
-                                                max_retries: 2,
-                                                understanding: score_decision_rounds.get(1).map(|r| r.understanding.clone()).unwrap_or_default(),
-                                                plan: chosen_p.clone(),
-                                                score: 1.0,
-                                                score_percent: 100,
-                                                reason: "用户人工审批：采纳第 2 轮方案并授权执行".into(),
-                                                attempt: 2,
-                                                passed: true,
-                                                history: score_decision_rounds.clone(),
-                                                intervention_id: None,
-                                                decision_type: Some("score".into()),
-                                                verdict: None,
-                                                selected_choice: None,
-                                            });
-                                            result_text = format!(
-                                                "{}\n\n✅【用户人工审批】用户已批准采纳【第 2 轮方案】，生产工具已解锁：\n- 采纳方案: {}\n请严格按照该方案执行落地！",
-                                                result_text, chosen_p
-                                            );
-                                        }
-                                        "hint" => {
-                                            let hint = decision.hint.unwrap_or_default();
-                                            score_decision_rounds.clear();
-                                            result_text = format!(
-                                                "{}\n\n💡【用户人工纠偏指导】: {}\n请根据用户的最新提示指导，在思考区重新分析意图并制定切实可行的方案，再次调用 `score_decision` 进行质检审查。",
-                                                result_text, hint
-                                            );
-                                        }
-                                        _ => {
-                                            sop_verified = true;
-                                            clarification_locked = false;
-                                            result_text = format!("{}\n\n⚡ 用户已选择直接跳过对齐，生产工具已授权放行，请继续执行。", result_text);
-                                        }
-                                    }
-                                }
-                                Err(_) => {
-                                    // 通道异常中断，降级放行
-                                    sop_verified = true;
-                                    clarification_locked = false;
-                                }
-                            }
-                        }
+                        result_text = format!(
+                            "{}\n\n【方案打分结果】评分: {}%，评估意见: {}",
+                            result_text, score_pct, critique
+                        );
                     }
                 } else if tc.name == "judge_decision" {
                     if let Ok(val) = serde_json::from_str::<Value>(&result_text) {
                         let v = val.get("verdict").and_then(|v| v.as_bool()).unwrap_or(false);
                         let reason = val.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let state_str = val.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        if v {
-                            sop_verified = true;
-                            clarification_locked = false;
-                        } else {
-                            clarification_locked = true;
-                        }
-                        let evt = crate::models::IntentAlignmentEvent {
-                            session_id: session_id.to_string(),
-                            run_id: run_id.to_string(),
-                            user_message: trigger_msg.as_ref().and_then(|m| m.content.clone()).unwrap_or_default(),
-                            status: if v { "passed".into() } else { "requires_intervention".into() },
-                            current_attempt: 1,
-                            max_retries: 2,
-                            understanding: format!("二元审查命题: {}", state_str),
-                            plan: format!("判定结论: {}（{}）", if v { "符合准入规范" } else { "不符合/存在风险" }, reason),
-                            score: if v { 1.0 } else { 0.0 },
-                            score_percent: if v { 100 } else { 0 },
-                            reason: reason.clone(),
-                            attempt: 1,
-                            passed: v,
-                            history: Vec::new(),
-                            intervention_id: None,
-                            decision_type: Some("judge".into()),
-                            verdict: Some(v),
-                            selected_choice: None,
-                        };
-                        let _ = app.emit("intent:alignment", &evt);
-                        if v {
-                            result_text = format!(
-                                "{}\n\n✅【二元判定通过】结论为真（符合准入要求），生产工具已解锁授权。请继续执行。",
-                                result_text
-                            );
-                        } else {
-                            result_text = format!(
-                                "{}\n\n❌【二元判定不符合】理由: {}\n由于判定不符合规范，生产工具已被锁定，请向用户汇报说明并澄清。",
-                                result_text, reason
-                            );
-                        }
+                        result_text = format!(
+                            "{}\n\n【二元判定结果】判定结论: {}，依据说明: {}",
+                            result_text, if v { "符合" } else { "不符合" }, reason
+                        );
                     }
                 } else if tc.name == "choice_decision" {
                     if let Ok(val) = serde_json::from_str::<Value>(&result_text) {
                         let choice_str = val.get("choice").and_then(|v| v.as_str()).unwrap_or("").to_string();
                         let reason = val.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        sop_verified = true;
-                        clarification_locked = false;
-                        let evt = crate::models::IntentAlignmentEvent {
-                            session_id: session_id.to_string(),
-                            run_id: run_id.to_string(),
-                            user_message: trigger_msg.as_ref().and_then(|m| m.content.clone()).unwrap_or_default(),
-                            status: "passed".into(),
-                            current_attempt: 1,
-                            max_retries: 2,
-                            understanding: "模型主动发起分支抉择定夺审查".into(),
-                            plan: format!("裁决选定方案: {choice_str}（依据: {reason}）"),
-                            score: 1.0,
-                            score_percent: 100,
-                            reason: reason.clone(),
-                            attempt: 1,
-                            passed: true,
-                            history: Vec::new(),
-                            intervention_id: None,
-                            decision_type: Some("choice".into()),
-                            verdict: None,
-                            selected_choice: Some(choice_str.clone()),
-                        };
-                        let _ = app.emit("intent:alignment", &evt);
                         result_text = format!(
-                            "{}\n\n🎯【分支抉择完成】已裁决选定目标分支: `{}`\n依据: {}\n生产工具已解锁授权，请以此分支继续执行。",
+                            "{}\n\n【分支选定结果】选定目标: `{}`，理由: {}",
                             result_text, choice_str, reason
                         );
                     }
@@ -4341,12 +4014,9 @@ fn system_prompt(
 
         if is_sop_enabled("intent_alignment_gate") {
             rules.push(format!(
-                "{rule_num}. 【对话意图对齐与决策工具自主调度 SOP（原生思考与准入闭环）】：\n   \
-                 - 准则一（原生透明思考）：在每次决策或执行前，必须在思考区（<think>）进行深入、透明的推理剖析，明确用户真实需求与上下文指代。\n   \
-                 - 准则二（决策准入与生产工具安全锁定）：在获得决策审查准入前，写入文件、编辑代码、运行命令等生产工具已被系统安全锁定。你必须根据实际问题自主挑选并调用适宜的决策工具获得准入：\n     \
-                   • `choice_decision`（选项/分支抉择）：当用户回复指代性选项编号（如“1”、“A1”）、或面对多个可行路线需要明确选定时调用。必须传入 `options`（候选列表）与 `instruction`。选定后系统直接放行解锁生产工具。\n     \
-                   • `judge_decision`（二元是非判定）：当面对破坏性命令、高危操作审查、或需判断“当前信息是否充足可立即执行”等是非命题时调用。判定符合直接放行解锁；不符合将锁定并要求向用户发起澄清询问。\n     \
-                   • `score_decision`（方案质量打分）：当面对复杂需求实现、多步骤规划、重构等任务时调用。必须传入 `understanding`（意图剖析）与 `plan`（分步计划）。及格线为 ≥90 分（通过直接解锁）；若 <90 分，请在思考区深入反思扣分意见后第 2 轮调用；若连续 2 轮仍 <90 分，系统将挂起并转交用户人工审批（采用方案1/采用方案2/补充指导）。"
+                "{rule_num}. 【对话意图对齐与行动准入 SOP】：\n   \
+                 - 系统已在前置阶段针对用户输入完成了意图理解与行动规划确认。请严格围绕确认的目标与分步计划推进执行；\n   \
+                 - 所有工具均已全量就绪可用，请严格按规范开展代码阅读、编辑与自检。"
             ));
             rule_num += 1;
         }
@@ -4739,7 +4409,7 @@ mod tests {
         assert!(all_enabled.contains("修改文件前必须先用 read_file 读取相关内容"));
         assert!(all_enabled.contains("精益代码研读与克制探索 SOP"));
         assert!(all_enabled.contains("todo 工具列出计划"));
-        assert!(all_enabled.contains("对话意图对齐与决策工具自主调度 SOP"));
+        assert!(all_enabled.contains("对话意图对齐与行动准入 SOP"));
 
         let disabled = vec![
             "plan_first".to_string(),
@@ -4755,7 +4425,7 @@ mod tests {
         assert!(!filtered.contains("todo 工具列出计划"));
         assert!(!filtered.contains("修改文件前必须先用 read_file 读取相关内容"));
         assert!(!filtered.contains("精益代码研读与克制探索 SOP"));
-        assert!(!filtered.contains("对话意图对齐与决策工具自主调度 SOP"));
+        assert!(!filtered.contains("对话意图对齐与行动准入 SOP"));
         assert!(filtered.contains("团队协作者优先委派原则"));
     }
 
