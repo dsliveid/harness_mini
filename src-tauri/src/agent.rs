@@ -3580,6 +3580,12 @@ fn build_context(
             "assistant" => {
                 let mut obj = json!({"role": "assistant"});
                 let content = m.content.clone().unwrap_or_default();
+                if let Some(ref r) = m.reasoning {
+                    if !r.trim().is_empty() {
+                        obj["reasoning_content"] = Value::String(r.clone());
+                        est += estimate_tokens(r);
+                    }
+                }
                 match &m.tool_calls {
                     Some(tcs) if !tcs.is_null() && tcs.as_array().map(|a| !a.is_empty()).unwrap_or(false) => {
                         if !content.is_empty() {
@@ -3604,7 +3610,7 @@ fn build_context(
                         }
                     }
                     _ => {
-                        if !content.is_empty() {
+                        if !content.is_empty() || obj.get("reasoning_content").is_some() {
                             obj["content"] = Value::String(content.clone());
                             est += estimate_tokens(&content);
                             out.push(obj);
@@ -4359,6 +4365,30 @@ mod tests {
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[3]["role"], "tool");
         assert_eq!(msgs[3]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn test_build_context_preserves_reasoning_content() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        store::init_schema(&conn).unwrap();
+        let s = store::create_session(&conn, ".", None, "t", "confirm").unwrap();
+        let _u = store::new_message(&conn, &s.id, "user", Some("hi".into()), false).unwrap();
+        let a = store::new_message(&conn, &s.id, "assistant", Some("content".into()), false).unwrap();
+        store::update_message_reasoning(&conn, &a.id, "I am thinking deeply...").unwrap();
+        store::update_message_tool_calls(
+            &conn,
+            &a.id,
+            &json!([{"id": "call_1", "type": "function", "function": {"name": "judge_decision", "arguments": "{}"}}]),
+            "content",
+            None,
+        )
+        .unwrap();
+
+        let (msgs, _, _) = build_context(&conn, &s.id, "sys", 28000);
+        let msgs = msgs.unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["reasoning_content"], "I am thinking deeply...");
     }
 
     #[test]
