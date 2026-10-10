@@ -660,6 +660,29 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "recognize_image",
+            description: "多模态视觉识别与图像理解工具。当需要查看、识别或分析本地图片文件（如 generated_images 目录中的生成图、项目图片资源、设计图、截图、相片等）的内容时调用。严禁使用 read_file 读取图片文件。系统将调用配置的视觉模型并返回深入的视觉理解分析结果。",
+            risk: Risk::ReadOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "本地图片文件的路径（支持工作区相对路径或绝对路径，如 generated_images/happy-new-year.png 或 F:/.../image.png）"
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "可选：对图片的识别分析提示词或具体问题（例如：“请提取图片中的所有文字”、“画面中有哪些主体元素？”等）。缺省时系统将全面描述并深入分析图片内容。"
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "可选：指定用于识别的视觉模型名称。缺省时自动使用会话或全局配置的生效视觉模型。"
+                    }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolSpec {
             name: "judge_decision",
             description: "调用决策模型进行高精度二元判断。适用于评估条件是否满足、方案是否可行、代码是否合规、是否存在风险等对/错或真/假判断场景。",
             risk: Risk::ReadOnly,
@@ -1049,6 +1072,7 @@ pub async fn execute(
         "wait_collaborators" => wait_collaborators_tool(args, ctx).await,
         "get_collaborators" => get_collaborators_tool(ctx).await,
         "generate_image" => generate_image_tool(args, ctx).await,
+        "recognize_image" => recognize_image_tool(args, ctx).await,
         "judge_decision" => judge_decision_tool(args, ctx).await,
         "choice_decision" => choice_decision_tool(args, ctx).await,
         "score_decision" => score_decision_tool(args, ctx).await,
@@ -1067,7 +1091,7 @@ async fn read_file(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let path = resolve(ctx, rel);
     let bytes = tokio::fs::read(&path).await.map_err(|e| format!("读取失败: {e}"))?;
     if is_binary(&bytes) {
-        return Err("疑似二进制文件，无法以文本读取".into());
+        return Err("疑似二进制文件，无法以文本读取。若该文件为图片，请直接调用 recognize_image 工具进行视觉多模态识别与分析。".into());
     }
     let text = String::from_utf8_lossy(&bytes);
     let offset = get_u64_arg(args, "offset_line", 1).max(1) as usize;
@@ -3348,6 +3372,192 @@ async fn generate_image_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
     Ok(format!(
         "🎨 图片生成成功！\n- 保存路径: `{target_str}`\n- 厂商: `{}`\n- 使用模型: `{model_name}`\n- 提示词: {prompt}\n- 分辨率: {size_display}\n- 大小: {kb} KB\n\n![{prompt}]({target_str})",
         provider.name
+    ))
+}
+
+fn resolve_vision_model_for_tool(
+    args: &Value,
+    ctx: &ToolCtx,
+) -> Result<(crate::models::ProviderCfg, String), String> {
+    let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
+    let state = host.app.state::<crate::AppState>();
+    let session_id = &host.session_id;
+
+    let session = {
+        let db = state.db.lock().unwrap();
+        crate::store::get_session(&db, session_id)?
+            .ok_or_else(|| format!("会话不存在: {session_id}"))?
+    };
+
+    let settings = {
+        let db = state.db.lock().unwrap();
+        let master = state.master_key.lock().unwrap();
+        crate::store::get_settings_with_secrets(&db, &master)?
+    };
+
+    let requested_model = args.get("model").and_then(|v| v.as_str()).map(|s| s.trim()).filter(|s| !s.is_empty());
+
+    let resolved = if let Some(req_m) = requested_model {
+        settings.providers.iter().find(|p| p.models.iter().any(|m| m == req_m))
+            .map(|p| (p.clone(), req_m.to_string()))
+            .or_else(|| crate::models::resolve_active_model(&settings).map(|(p, _)| (p.clone(), req_m.to_string())))
+    } else if let (Some(pid), Some(mid)) = (&session.vision_provider_id, &session.vision_model_id) {
+        settings.providers.iter().find(|p| &p.id == pid)
+            .map(|p| (p.clone(), mid.clone()))
+    } else if let (Some(pid), Some(mid)) = (&settings.active_vision_provider_id, &settings.active_vision_model_id) {
+        settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid))
+            .map(|p| (p.clone(), mid.clone()))
+    } else if let (Some(pid), Some(mid)) = (&session.provider_id, &session.model_id) {
+        if settings.has_capability(Some(pid), mid, "vision") {
+            settings.providers.iter().find(|p| &p.id == pid).map(|p| (p.clone(), mid.clone()))
+        } else if let Some(p) = settings.providers.iter().find(|p| &p.id == pid) {
+            p.models.iter().find(|m| settings.has_capability(Some(pid), m, "vision"))
+                .map(|m| (p.clone(), m.clone()))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+    .or_else(|| {
+        crate::models::resolve_active_vision_model(&settings)
+            .map(|(p, m)| (p.clone(), m.to_string()))
+    })
+    .or_else(|| {
+        crate::models::resolve_active_model(&settings)
+            .filter(|(p, m)| settings.has_capability(Some(&p.id), m, "vision"))
+            .map(|(p, m)| (p.clone(), m.to_string()))
+    });
+
+    resolved.ok_or_else(|| {
+        "识图失败：当前未配置具备【视觉感知 (vision)】能力的可行模型。\n\n请在【设置 -> 厂商配置】中为对应厂商模型勾选「视觉」能力，或在会话设置中配置视觉专属模型。".to_string()
+    })
+}
+
+async fn recognize_image_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
+    let state = host.app.state::<crate::AppState>();
+    let session_id = &host.session_id;
+
+    let raw_path = args.get("path").and_then(|v| v.as_str()).map(|s| s.trim()).filter(|s| !s.is_empty())
+        .ok_or("缺少 path 参数：请提供要识别的本地图片路径")?;
+    let prompt_arg = args.get("prompt").and_then(|v| v.as_str()).map(|s| s.trim()).filter(|s| !s.is_empty());
+    let prompt = prompt_arg.unwrap_or("请详细描述并分析这张图片的内容，包括画面主体、文字内容、艺术风格、色彩与关键细节特征。");
+
+    // 1. 寻找图片文件的真实物理路径（支持绝对路径、工作区相对路径、generated_images 相对路径）
+    let file_path = Path::new(raw_path);
+    let target_path = if file_path.is_absolute() && file_path.exists() {
+        file_path.to_path_buf()
+    } else {
+        let in_workspace = if !ctx.workspace.as_os_str().is_empty() {
+            let p = ctx.workspace.join(file_path);
+            if p.exists() { Some(p) } else { None }
+        } else {
+            None
+        };
+
+        if let Some(p) = in_workspace {
+            p
+        } else {
+            let data_dir = state.data_dir.lock().unwrap().clone().unwrap_or_else(|| state.default_data_dir.clone());
+            let in_session_gen = data_dir.join("generated_images").join(session_id).join(file_path);
+            let in_gen_root = data_dir.join(file_path);
+            if in_session_gen.exists() {
+                in_session_gen
+            } else if in_gen_root.exists() {
+                in_gen_root
+            } else if file_path.exists() {
+                file_path.to_path_buf()
+            } else {
+                return Err(format!("图片文件不存在: `{raw_path}`。请检查路径是否正确（支持绝对路径或工作区相对路径）。"));
+            }
+        }
+    };
+
+    // 2. 检查文件大小（限制 20MB）
+    let meta = tokio::fs::metadata(&target_path).await
+        .map_err(|e| format!("获取图片信息失败: {e}"))?;
+    if meta.len() > 20 * 1024 * 1024 {
+        return Err("图片文件体积超过 20MB 上限，暂不支持处理过大文件".to_string());
+    }
+
+    let bytes = tokio::fs::read(&target_path).await
+        .map_err(|e| format!("读取图片文件失败: {e}"))?;
+    if bytes.is_empty() {
+        return Err("图片文件内容为空 (0 字节)".to_string());
+    }
+
+    // 3. 智能推断 MIME 类型
+    let ext = target_path.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()).unwrap_or_default();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        _ => {
+            if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+                "image/png"
+            } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+                "image/jpeg"
+            } else if bytes.starts_with(b"GIF8") {
+                "image/gif"
+            } else if bytes.starts_with(b"RIFF") && bytes.len() > 12 && &bytes[8..12] == b"WEBP" {
+                "image/webp"
+            } else {
+                "image/png"
+            }
+        }
+    };
+
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let data_url = format!("data:{mime};base64,{b64}");
+
+    // 4. 解析生效视觉模型
+    let (provider, model_name) = resolve_vision_model_for_tool(args, ctx)?;
+
+    // 5. 构建多模态请求并调用 LLM
+    let protocol = provider.get_model_protocol(&model_name);
+    let cfg = crate::llm::LlmCfg {
+        base_url: provider.base_url.clone(),
+        api_key: provider.api_key.clone(),
+        model: model_name.clone(),
+        protocol,
+        reasoning_effort: None,
+        proxy_url: ctx.proxy_url.clone(),
+        session_id: Some(session_id.to_string()),
+    };
+
+    let messages = vec![
+        json!({
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": prompt
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": data_url
+                    }
+                }
+            ]
+        })
+    ];
+
+    let res = crate::llm::chat_stream(&cfg, &messages, &[], |_| {}, |_| {}).await
+        .map_err(|e| format!("识图调用失败 [厂商: {} / 模型: {}]: {e}", provider.name, model_name))?;
+
+    let target_display_path = target_path.to_string_lossy().replace('\\', "/");
+    let kb = bytes.len() / 1024;
+
+    Ok(format!(
+        "👁️ 图像识别完成！\n- 目标图片: `{target_display_path}`\n- 厂商: `{}`\n- 使用模型: `{model_name}`\n- 大小: {kb} KB\n- 分析要求: {prompt}\n\n### 识别与分析结果：\n{}",
+        provider.name,
+        res.content.trim()
     ))
 }
 

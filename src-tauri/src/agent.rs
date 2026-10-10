@@ -1661,6 +1661,28 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         false
     };
 
+    let has_collab_vision = if !is_subagent {
+        let db = state.db.lock().unwrap();
+        store::list_collaborators(&db, session_id)
+            .map(|list| list.iter().any(|c| c.subagent_role.as_deref() == Some("vision") || c.vision_model_id.is_some()))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    let session_has_vision = if session.session_type == "collaborator" && session.subagent_role.as_deref() == Some("vision") {
+        true
+    } else if effective_vision_model_id.is_some() {
+        true
+    } else if !has_collab_vision {
+        settings.active_vision_model_id.is_some()
+            || effective_model_id.map(|m| settings.has_capability(effective_provider_id, m, "vision")).unwrap_or(false)
+            || crate::models::resolve_active_vision_model(&settings).is_some()
+            || resolve_active_model(&settings).map(|(p, m)| settings.has_capability(Some(&p.id), m, "vision")).unwrap_or(false)
+    } else {
+        false
+    };
+
     let specs: Vec<ToolSpec> = tools::tool_specs()
         .into_iter()
         // 临时空间专用工具仅对临时空间会话下发
@@ -1669,6 +1691,8 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         .filter(|s| !is_subagent || !tools::SUBAGENT_TOOL_NAMES.contains(&s.name))
         // 工具能力准入：只有具备生图能力的会话才下发 generate_image
         .filter(|s| s.name != "generate_image" || session_has_image_gen)
+        // 工具能力准入：只有具备视觉能力的会话才下发 recognize_image
+        .filter(|s| s.name != "recognize_image" || session_has_vision)
         // 过滤设置中被禁用的工具
         .filter(|s| !settings.disabled_tools.contains(&s.name.to_string()))
         .collect();
@@ -2636,8 +2660,8 @@ async fn handle_tool_call(
     };
     let risk = spec.risk;
 
-    // 未绑定工作区的会话为纯对话模式：文件/命令工具不可用（todo、generate_image 除外）
-    if ctx.workspace.as_os_str().is_empty() && tool_name != "todo" && tool_name != "generate_image" {
+    // 未绑定工作区的会话为纯对话模式：文件/命令工具不可用（todo、generate_image、recognize_image 除外）
+    if ctx.workspace.as_os_str().is_empty() && tool_name != "todo" && tool_name != "generate_image" && tool_name != "recognize_image" {
         let text = "当前会话未绑定工作区，文件与命令工具不可用。请直接以文字回答用户，并提示：如需读写文件或执行命令，可在顶栏选择工作区目录后重试。".to_string();
         ev.status = "failed".into();
         ev.result_text = Some(text.clone());
@@ -3101,6 +3125,11 @@ fn build_preview(tool_name: &str, args: &Value) -> String {
             let size = args.get("size").and_then(|s| s.as_str()).unwrap_or("1024x1024");
             let filename = args.get("filename").and_then(|f| f.as_str()).unwrap_or("自动生成路径");
             format!("根据提示词生成图片：\n提示词: {prompt}\n分辨率: {size}\n目标文件: {filename}")
+        }
+        "recognize_image" => {
+            let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            let prompt = args.get("prompt").and_then(|p| p.as_str()).unwrap_or("全面分析图片内容");
+            format!("图像识别与分析：\n目标图片: {path}\n分析要求: {prompt}")
         }
         "create_plan" => {
             let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("未命名计划");
@@ -3842,6 +3871,11 @@ fn system_prompt(
             rule_num += 1;
         }
 
+        if session.subagent_role.as_deref() == Some("vision") {
+            rules.push(format!("{rule_num}. 【视觉感知与图像识别核心职责】：根据用户或主进程指派的目标，调用 `recognize_image` 工具深入识别、提取与分析目标图片（支持文字提取、设计稿分析、界面元素审查等），并在回复中给出详尽专业的视觉分析报告。"));
+            rule_num += 1;
+        }
+
         if is_sop_enabled("plan_first") {
             rules.push(format!("{rule_num}. 【方案先行与克制改动】：开始实际修改前，优先梳理实现思路。如果包含代码修改，必须先阅读原文并做最小化精确修改。"));
             rule_num += 1;
@@ -4032,6 +4066,13 @@ fn system_prompt(
         rule_num += 1;
 
         rules.push(format!("{rule_num}. 不要执行破坏性命令（如递归删除、格式化磁盘等），它们会被强制要求用户确认。"));
+        rule_num += 1;
+
+        rules.push(format!(
+            "{rule_num}. 【多模态图像感知与识图准则】：\n   \
+             - 当需要查看、识别或分析本地图片文件（如 generated_images 目录中的生成图、项目图片资源、设计图、截图、相片等）的内容时，**必须直接调用 `recognize_image(path, prompt)` 工具**；\n   \
+             - 严禁调用 `read_file` 读取图片或二进制文件（会报错拦截），严禁编写脚本安装外部 OCR 库；直接使用内置的 `recognize_image` 即可自动调用视觉模型获得深入专业的识别与分析结果。"
+        ));
         rule_num += 1;
 
         if is_sop_enabled("todo_lifecycle") {

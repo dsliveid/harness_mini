@@ -2,7 +2,7 @@ import { useState, useMemo, useEffect } from "react";
 import { ipc } from "../ipc";
 import { useStore } from "../store";
 import type { ToolEvent, Settings, Session } from "../types";
-import { resolveActiveImageModel, resolveActiveDecisionModel, hasModelCapability } from "../types";
+import { resolveActiveModel, resolveActiveImageModel, resolveActiveVisionModel, resolveActiveDecisionModel, hasModelCapability } from "../types";
 import { Markdown } from "./Markdown";
 import { SubprocessBranchTree } from "./SubprocessBranchTree";
 import { SafeImage } from "./SafeImage";
@@ -33,6 +33,7 @@ import {
   BookOpen,
   Lightbulb,
   Server,
+  Eye,
 } from "./Icons";
 
 function statusBadge(status: string, revertedAt?: string | null) {
@@ -69,6 +70,13 @@ function toolCategoryBadge(name: string) {
     return (
       <span className="text-[10px] px-1.5 py-[0.5px] rounded bg-pink-500/10 text-pink-400 border border-pink-500/20 shrink-0">
         多模态生图
+      </span>
+    );
+  }
+  if (name === "recognize_image") {
+    return (
+      <span className="text-[10px] px-1.5 py-[0.5px] rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 shrink-0">
+        多模态视觉
       </span>
     );
   }
@@ -127,6 +135,8 @@ function ToolIcon({ name }: { name: string }) {
       return <BookOpen size={14} className="text-teal-400 shrink-0" />;
     case "generate_image":
       return <Image size={14} className="text-pink-400 shrink-0" />;
+    case "recognize_image":
+      return <Eye size={14} className="text-cyan-400 shrink-0" />;
     case "list_skills":
     case "save_skill":
     case "run_skill":
@@ -173,6 +183,8 @@ function paramTitle(ev: ToolEvent): string {
       return "任务清单";
     case "generate_image":
       return String(p.prompt ?? "");
+    case "recognize_image":
+      return `${p.path ?? ""}${p.prompt ? `（${p.prompt}）` : ""}`;
     case "run_skill":
     case "save_skill":
       return String(p.name ?? "");
@@ -226,6 +238,7 @@ const TOOL_LABELS: Record<string, string> = {
   record_memory: "沉淀记忆",
   read_memory: "查阅记忆",
   generate_image: "生成图片",
+  recognize_image: "识别图片",
   list_skills: "查询技能库",
   save_skill: "固化项目技能",
   run_skill: "执行项目技能",
@@ -247,7 +260,7 @@ const TOOL_LABELS: Record<string, string> = {
 };
 
 /**
- * 提取生图与决策工具实际调用的模型与厂商信息
+ * 提取生图、识图与决策工具实际调用的模型与厂商信息
  * 1. 优先从工具执行结果 (resultText / JSON) 中提取实际调用厂商与模型
  * 2. 失败时从后端注入的错误前缀 [厂商: xxx / 模型: yyy] 提取
  * 3. 正在执行中或未产生产物时，回退到当前会话专属配置或全局生效配置进行精准推算
@@ -258,12 +271,13 @@ export function extractToolModelInfo(
   session?: Session | null
 ): { provider?: string; model?: string } | null {
   const isImageTool = ev.toolName === "generate_image";
+  const isVisionTool = ev.toolName === "recognize_image";
   const isDecisionTool = ["judge_decision", "choice_decision", "score_decision"].includes(ev.toolName);
-  if (!isImageTool && !isDecisionTool) return null;
+  if (!isImageTool && !isVisionTool && !isDecisionTool) return null;
 
   // 1. 优先尝试从 ev.resultText 中提取实际执行返回的厂商与模型（最准确）
   if (ev.resultText) {
-    if (isImageTool) {
+    if (isImageTool || isVisionTool) {
       const providerMatch = ev.resultText.match(/厂商:\s*`?([^`\n]+)`?/);
       const modelMatch = ev.resultText.match(/使用模型:\s*`?([^`\n]+)`?/);
       const errMatch = ev.resultText.match(/\[厂商:\s*([^/\]]+?)\s*\/\s*模型:\s*([^/\]]+?)\s*\]/);
@@ -318,6 +332,32 @@ export function extractToolModelInfo(
     if (mainPid && mainMid && hasModelCapability(settings, mainPid, mainMid, "image_gen")) {
       const p = settings.providers?.find((item) => item.id === mainPid);
       return { provider: p?.name || mainPid, model: mainMid };
+    }
+  } else if (isVisionTool) {
+    if (ev.params?.model) {
+      const reqM = String(ev.params.model).trim();
+      const p = settings.providers?.find((item) => item.models?.includes(reqM));
+      return { provider: p?.name || p?.id, model: reqM };
+    }
+    const sessPid = session?.visionProviderId || session?.vision_provider_id;
+    const sessMid = session?.visionModelId || session?.vision_model_id;
+    if (sessPid && sessMid) {
+      const p = settings.providers?.find((item) => item.id === sessPid);
+      return { provider: p?.name || sessPid, model: sessMid };
+    }
+    const activeVis = resolveActiveVisionModel(settings);
+    if (activeVis) {
+      return { provider: activeVis.provider.name || activeVis.provider.id, model: activeVis.model };
+    }
+    const mainPid = session?.providerId || session?.provider_id;
+    const mainMid = session?.modelId || session?.model_id;
+    if (mainPid && mainMid && hasModelCapability(settings, mainPid, mainMid, "vision")) {
+      const p = settings.providers?.find((item) => item.id === mainPid);
+      return { provider: p?.name || mainPid, model: mainMid };
+    }
+    const activeMain = resolveActiveModel(settings);
+    if (activeMain && hasModelCapability(settings, activeMain.provider.id, activeMain.model, "vision")) {
+      return { provider: activeMain.provider.name || activeMain.provider.id, model: activeMain.model };
     }
   } else if (isDecisionTool) {
     if (ev.params?.model) {
@@ -1269,6 +1309,178 @@ function ImageToolView({
   );
 }
 
+function VisionRecognizeView({
+  ev,
+  modelInfo,
+}: {
+  ev: ToolEvent;
+  modelInfo?: { provider?: string; model?: string } | null;
+}) {
+  const p = ev.params || {};
+  const setLightboxImage = useStore((s) => s.setLightboxImage);
+  const pushToast = useStore((s) => s.pushToast);
+  const [copiedResult, setCopiedResult] = useState(false);
+
+  const rawPath = String(p.path || "");
+  const prompt = String(p.prompt || "请详细描述并分析这张图片的内容");
+
+  // 从结果中解析出实际目标物理路径与分析正文
+  const pathMatch = ev.resultText?.match(/目标图片:\s*`?([^`\n]+)`?/);
+  const displayImagePath = pathMatch ? pathMatch[1].trim() : rawPath;
+
+  const contentText = useMemo(() => {
+    if (!ev.resultText) return "";
+    const prefix = "### 识别与分析结果：";
+    const idx = ev.resultText.indexOf(prefix);
+    if (idx !== -1) {
+      return ev.resultText.substring(idx + prefix.length).trim();
+    }
+    return ev.resultText;
+  }, [ev.resultText]);
+
+  const handleCopyResult = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!contentText) return;
+    navigator.clipboard.writeText(contentText).then(
+      () => {
+        setCopiedResult(true);
+        setTimeout(() => setCopiedResult(false), 1500);
+        pushToast("分析结果已复制到剪贴板");
+      },
+      () => pushToast("复制失败")
+    );
+  };
+
+  // 1. 执行中状态：骨架加载与动画
+  if (ev.status === "running") {
+    return (
+      <div className="mt-2.5 rounded-xl border border-cyan-500/20 bg-cyan-500/5 p-6 flex flex-col items-center justify-center gap-2.5 text-inkdim select-none">
+        <div className="relative flex items-center justify-center">
+          <Loader2 size={26} className="animate-spin text-cyan-400" />
+          <Eye size={13} className="absolute text-cyan-300 animate-pulse" />
+        </div>
+        <div className="text-[13px] font-medium text-ink">视觉模型正在理解分析图像，请稍候…</div>
+        {modelInfo && (modelInfo.provider || modelInfo.model) && (
+          <div className="inline-flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-0.5 rounded-md bg-cyan-500/10 text-cyan-300 border border-cyan-500/20">
+            <Server size={11} className="text-cyan-400" />
+            {modelInfo.provider && <span className="font-medium">{modelInfo.provider}</span>}
+            {modelInfo.provider && modelInfo.model && <span className="opacity-40">/</span>}
+            {modelInfo.model && <span>{modelInfo.model}</span>}
+          </div>
+        )}
+        {displayImagePath && (
+          <div className="text-[11.5px] font-mono text-inkdim/80 text-center max-w-md truncate px-2">
+            目标图片: {displayImagePath}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // 2. 失败状态
+  if (ev.status === "failed" || ev.status === "denied" || ev.status === "timeout") {
+    return (
+      <div className="mt-2.5 rounded-xl border border-red-500/30 bg-red-500/10 p-3.5 text-red-300 space-y-2">
+        <div className="font-medium text-[12.5px] flex items-center justify-between gap-1.5 text-red-400 flex-wrap">
+          <div className="flex items-center gap-1.5">
+            <ShieldAlert size={15} />
+            <span>图像识别未完成 ({ev.status})</span>
+          </div>
+          {modelInfo && (modelInfo.provider || modelInfo.model) && (
+            <span className="inline-flex items-center gap-1 text-[11px] font-mono px-2 py-0.5 rounded bg-red-950/50 border border-red-500/30 text-red-300">
+              <Server size={11} />
+              {modelInfo.provider && <span>{modelInfo.provider}</span>}
+              {modelInfo.provider && modelInfo.model && <span>/</span>}
+              {modelInfo.model && <span>{modelInfo.model}</span>}
+            </span>
+          )}
+        </div>
+        <div className="text-[12px] font-mono whitespace-pre-wrap text-red-300/90 max-h-40 overflow-y-auto selection:bg-red-500/30">
+          {ev.resultText || "未能获取到视觉分析结果"}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-2.5 rounded-xl overflow-hidden border border-cyan-500/30 bg-panel2/70 shadow-sm space-y-0">
+      {/* 顶部标题与元数据栏 */}
+      <div className="p-3 border-b border-edge/60 bg-panel3/30 flex items-center justify-between gap-2 flex-wrap">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="inline-flex items-center gap-1 text-[11px] font-medium text-cyan-400 bg-cyan-500/10 border border-cyan-500/20 px-2 py-0.5 rounded-md">
+            <Eye size={12} />
+            <span>视觉感知解析</span>
+          </span>
+          {modelInfo && (modelInfo.provider || modelInfo.model) && (
+            <span className="inline-flex items-center gap-1 text-[10.5px] font-mono text-cyan-300 bg-cyan-500/10 border border-cyan-500/20 px-1.5 py-0.5 rounded-md" title="视觉模型">
+              <Server size={11} className="text-cyan-400" />
+              {modelInfo.provider && <span>{modelInfo.provider}</span>}
+              {modelInfo.provider && modelInfo.model && <span className="opacity-40">/</span>}
+              {modelInfo.model && <span>{modelInfo.model}</span>}
+            </span>
+          )}
+        </div>
+
+        {contentText && (
+          <button
+            type="button"
+            className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-panel3 hover:bg-edge text-inkdim hover:text-ink transition-colors text-[11px] cursor-pointer"
+            onClick={handleCopyResult}
+            title="复制识别分析全文"
+          >
+            {copiedResult ? <Check size={11} className="text-emerald-400" /> : <Copy size={11} />}
+            <span>{copiedResult ? "已复制" : "复制分析"}</span>
+          </button>
+        )}
+      </div>
+
+      <div className="p-3 space-y-3">
+        {/* 图片缩略图预览（若存在可用路径） */}
+        {displayImagePath && (
+          <div className="flex items-start gap-3 p-2.5 rounded-lg bg-black/30 border border-edge/40">
+            <div
+              className="relative group cursor-zoom-in shrink-0 w-24 h-24 rounded-md overflow-hidden bg-black/50 border border-edge/60 flex items-center justify-center"
+              onClick={() =>
+                setLightboxImage({
+                  src: displayImagePath,
+                  title: prompt || "目标图片",
+                })
+              }
+              title="点击查看大图"
+            >
+              <SafeImage
+                src={displayImagePath}
+                alt="目标图片"
+                className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200"
+              />
+              <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                <ZoomIn size={16} className="text-white" />
+              </div>
+            </div>
+            <div className="flex-1 min-w-0 space-y-1 text-[11.5px]">
+              <div className="text-inkdim font-mono truncate" title={displayImagePath}>
+                <span className="text-inkdim/60">路径:</span> {displayImagePath}
+              </div>
+              {p.prompt && (
+                <div className="text-ink/90 italic line-clamp-2">
+                  <span className="text-inkdim/60 not-italic">分析重点:</span> “{p.prompt}”
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* 识别分析正文内容 */}
+        {contentText && (
+          <div className="text-[12.5px] leading-relaxed text-ink select-text bg-panel3/30 rounded-lg p-3 border border-edge/40">
+            <Markdown content={contentText} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function ToolCard({ ev }: { ev: ToolEvent }) {
   if (ev.toolName === "spawn_subprocess" || ev.toolName === "spawn_subagent") {
     return <SubprocessBranchTree event={ev} />;
@@ -1291,22 +1503,23 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
   const isImageTool = ev.toolName === "generate_image";
   const imagePrompt = isImageTool ? String(ev.params?.prompt ?? "") : "";
   const isPlanTool = ["create_plan", "update_plan", "switch_plan"].includes(ev.toolName);
+  const isVisionTool = ev.toolName === "recognize_image";
 
   const toolModelInfo = useMemo(() => {
     return extractToolModelInfo(ev, settings, currentSession);
   }, [ev, settings, currentSession]);
 
-  // 计划工具与生图工具生成成功/执行中默认展开，失败默认收起；其他工具默认收起
+  // 计划工具、生图工具与识图工具执行中/成功默认展开，失败默认收起；其他工具默认收起
   const [expanded, setExpanded] = useState(() => {
-    if (isImageTool || isPlanTool) {
+    if (isImageTool || isVisionTool || isPlanTool) {
       return ev.status !== "failed" && ev.status !== "timeout" && ev.status !== "denied";
     }
     return false;
   });
 
-  // 当生图状态在执行或流转中变为失败时，自动收起卡片；生图成功展开；计划操作若流转失败也自动收起
+  // 当生图/识图状态在执行或流转中变为失败时，自动收起卡片；成功展开；计划操作若流转失败也自动收起
   useEffect(() => {
-    if (isImageTool) {
+    if (isImageTool || isVisionTool) {
       if (ev.status === "failed" || ev.status === "timeout" || ev.status === "denied") {
         setExpanded(false);
       } else if (ev.status === "success") {
@@ -1317,7 +1530,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
         setExpanded(false);
       }
     }
-  }, [isImageTool, isPlanTool, ev.status]);
+  }, [isImageTool, isVisionTool, isPlanTool, ev.status]);
 
   const generatedImagePath = useMemo(() => {
     if (ev.toolName !== "generate_image" || !ev.resultText) return null;
@@ -1662,6 +1875,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
   const showOutput = ev.status === "running" && output !== undefined;
   const showResult =
     !isImageTool &&
+    !isVisionTool &&
     !["record_memory", "read_memory", "create_plan", "update_plan", "switch_plan"].includes(ev.toolName) &&
     !!ev.resultText &&
     (ev.status === "success" || ev.status === "failed" || ev.status === "timeout" || ev.status === "denied");
@@ -1701,11 +1915,22 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
             className={`inline-flex items-center gap-1 text-[10.5px] font-mono px-2 py-0.5 rounded-md border shrink-0 transition-colors ${
               isImageTool
                 ? "bg-pink-500/10 text-pink-300 border-pink-500/25"
+                : isVisionTool
+                ? "bg-cyan-500/10 text-cyan-300 border-cyan-500/25"
                 : "bg-amber-500/10 text-amber-300 border-amber-500/25"
             }`}
             title={`实际调用模型: ${toolModelInfo.provider || "默认厂商"} / ${toolModelInfo.model || "默认模型"}`}
           >
-            <Server size={11} className={isImageTool ? "text-pink-400" : "text-amber-400"} />
+            <Server
+              size={11}
+              className={
+                isImageTool
+                  ? "text-pink-400"
+                  : isVisionTool
+                  ? "text-cyan-400"
+                  : "text-amber-400"
+              }
+            />
             {toolModelInfo.provider && <span className="font-medium">{toolModelInfo.provider}</span>}
             {toolModelInfo.provider && toolModelInfo.model && <span className="opacity-40">/</span>}
             {toolModelInfo.model && <span className="truncate max-w-[150px]">{toolModelInfo.model}</span>}
@@ -1878,6 +2103,11 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
           metadata={imageMetadata}
           modelInfo={toolModelInfo}
         />
+      )}
+
+      {/* 展开时：若是识图工具，展示专用视觉感知解析卡片 */}
+      {expanded && isVisionTool && (
+        <VisionRecognizeView ev={ev} modelInfo={toolModelInfo} />
       )}
 
       {/* 展开时：若是执行命令，先展示完整的命令行（带复制按钮与完整换行支持） */}
