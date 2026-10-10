@@ -684,25 +684,25 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "judge_decision",
-            description: "调用决策模型进行高精度二元判断。适用于评估条件是否满足、方案是否可行、代码是否合规、是否存在风险等对/错或真/假判断场景。",
+            description: "调用决策模型进行高精度二元判断。适用于评估条件是否满足、用户意图是否明确完整、方案是否可行、是否存在风险等对/错或真/假判断场景。",
             risk: Risk::ReadOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
                     "state": {
                         "type": "string",
-                        "description": "进行决策所依据的上下文事实、背景信息或代码内容"
+                        "description": "待判定或评估的业务命题、意图理解陈述、事实背景或方案说明"
                     },
                     "instruction": {
                         "type": "string",
-                        "description": "二元判断的核心命题或准则（例如：当前修改是否破坏了向后兼容性？）"
+                        "description": "可选：二元判断的核心命题或准则（例如：用户意图是否足够明确可直接执行交付？缺省时自动使用意图明确性与可行性准则）"
                     },
                     "model": {
                         "type": "string",
                         "description": "可选：指定决策模型。缺省时自动使用会话或全局绑定的决策模型"
                     }
                 },
-                "required": ["state", "instruction"]
+                "required": ["state"]
             }),
         },
         ToolSpec {
@@ -735,26 +735,26 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "score_decision",
-            description: "调用决策模型对目标方案或意图理解进行量化百分制评分与多维度质检评估。用于复杂需求、多步骤任务落地的方案准入审查。",
+            description: "调用决策模型对目标业务意图理解与交付边界进行量化百分制评分与多维度质检评估。用于第一层级意图理解与复杂需求方案准入审查。",
             risk: Risk::ReadOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
                     "understanding": {
                         "type": "string",
-                        "description": "大模型对用户核心意图、诉求细节与关键约束边界的深度剖析"
+                        "description": "对用户核心业务意向与诉求细节的简洁精准剖析（只描述用户要什么，严禁提及内部工具名、协作者或执行流水线）"
                     },
                     "plan": {
                         "type": "string",
-                        "description": "拟定下一步要执行的分步行动方案与工具调用路径"
+                        "description": "业务交付目标与交付边界/合理默认假设（例如交付规格、视觉风格、默认尺寸等业务约定；严禁提及内部底层工具调用与协作者名录）"
                     },
                     "state": {
                         "type": "string",
-                        "description": "可选：待评估的内容、方案、代码或补充上下文"
+                        "description": "可选：待评估的内容、方案或补充上下文"
                     },
                     "instruction": {
                         "type": "string",
-                        "description": "可选：评分目标与评价维度说明（缺省时自动使用方案质量与可行性审查准则）"
+                        "description": "可选：评分目标与评价维度说明（缺省时自动使用意图理解精准性与业务合理性审查准则）"
                     },
                     "rubric": {
                         "type": "array",
@@ -3619,8 +3619,23 @@ fn resolve_decision_model_for_tool(
 
 async fn judge_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let (provider, model) = resolve_decision_model_for_tool(args, ctx)?;
-    let state = args.get("state").and_then(|v| v.as_str()).ok_or("缺少 state 参数")?;
-    let instruction = args.get("instruction").and_then(|v| v.as_str()).ok_or("缺少 instruction 参数")?;
+    let state = args.get("state")
+        .or_else(|| args.get("statement"))
+        .or_else(|| args.get("understanding"))
+        .or_else(|| args.get("content"))
+        .and_then(|v| v.as_str())
+        .ok_or("缺少 state 参数（待判定的命题或上下文）")?;
+    let instruction_raw = args.get("instruction")
+        .or_else(|| args.get("question"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let default_instruction = "请对所给命题或业务意图陈述进行严格的二元明确性与可行性判定。若目标清晰、合理可行且无歧义，判定为 True；若存在重大缺陷或歧义，判定为 False。";
+    let instruction = if !instruction_raw.is_empty() {
+        instruction_raw
+    } else {
+        default_instruction
+    };
 
     let res = crate::jev::execute_decision(
         &provider,
@@ -3649,9 +3664,18 @@ async fn judge_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
 
 async fn choice_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let (provider, model) = resolve_decision_model_for_tool(args, ctx)?;
-    let state = args.get("state").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let instruction = args.get("instruction").and_then(|v| v.as_str()).unwrap_or("请根据上下文与候选选项，裁决选定最符合要求的目标分支。").trim();
+    let state = args.get("state")
+        .or_else(|| args.get("understanding"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let instruction = args.get("instruction")
+        .or_else(|| args.get("question"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("请根据业务上下文与候选选项，裁决选定最符合要求的目标分支。")
+        .trim();
     let options = args.get("options")
+        .or_else(|| args.get("choices"))
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
         .ok_or("缺少 options 参数或选项格式不正确")?;
@@ -3695,7 +3719,7 @@ async fn score_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
             s.push_str(&format!("【意图理解】\n{}\n\n", understanding));
         }
         if !plan.is_empty() {
-            s.push_str(&format!("【行动方案】\n{}\n\n", plan));
+            s.push_str(&format!("【交付边界与行动方案】\n{}\n\n", plan));
         }
         if !state_raw.is_empty() {
             s.push_str(&format!("【补充背景】\n{}", state_raw));
@@ -3708,7 +3732,7 @@ async fn score_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
     };
 
     let instruction_raw = args.get("instruction").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let default_instruction = "请对该意图剖析的精准性与行动方案的可行性进行严格百分制评分。若意图理解透彻且方案切实可行无高危越界，给出90分以上；若信息严重不足、存在臆测或方案缺陷，请给出合理扣分与修改建议。";
+    let default_instruction = "请对该业务意图剖析的精准性、边界约束与缺省假设的合理性进行严格百分制评分。若用户意图把握透彻且业务默认假设清晰合理无过度臆测，给出90分以上；若关键信息严重缺失、存在致命歧义或偏离用户初衷，给出合理扣分与修改建议。";
     let instruction = if !instruction_raw.is_empty() {
         instruction_raw
     } else {

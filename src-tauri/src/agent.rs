@@ -1712,6 +1712,18 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             })
         })
         .collect();
+    let decision_tool_names = ["judge_decision", "choice_decision", "score_decision"];
+    let decision_schemas: Vec<Value> = schemas
+        .iter()
+        .filter(|s| {
+            s.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|name| decision_tool_names.contains(&name))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
     let (max_steps, is_long_task) = {
         let db = state.db.lock().unwrap();
         if let Ok(Some(task)) = store::get_active_long_task(&db, session_id) {
@@ -1920,9 +1932,17 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         &project_plan_mode,
     );
 
-    // 注意：意图对齐与决策质检已全面重构为原生内生型 SOP 流程，
-    // 大模型在首步（Step 1）根据系统提示词中的 SOP 自主思考并调用 score_decision 工具质检，
-    // 思考过程、意图文本与决策工具卡片完整融合于常规对话执行流中，杜绝外置旁路门控导致的割裂与历史丢失。
+    // 第一层级 · 业务意图与交付边界定性（Phase 1 Intent & Alignment）：
+    // 当接收到用户新任务且启用了 intent_alignment_gate SOP 时，首步采用物理隔离机制：
+    // 1. 系统提示词使用极简 phase1_intent_system_prompt，完全剥离协作者名录、记忆大盘和工程落地规则；
+    // 2. 工具集物理隔离，仅下发 3 个决策工具（judge_decision / choice_decision / score_decision）；
+    // 3. 专职决策模型质检通过（或用户人工采纳）后，自适应转入第二阶段（Phase 2），恢复全局提示词与全量生产工具。
+    let is_sub = is_subagent || session.session_type == "collaborator" || session.session_type == "subprocess";
+    let enable_phase1 = !is_sub
+        && !settings.disabled_sops.iter().any(|s| s == "intent_alignment_gate")
+        && !decision_schemas.is_empty();
+    let mut intent_alignment_done = !enable_phase1;
+    let phase1_sys = phase1_intent_system_prompt(&session);
 
     let verified_intent_prefix: Option<String> = None;
     let mut sop_verified = false;
@@ -1933,6 +1953,13 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
     let mut has_checked_compaction = false;
     let mut created_plan_in_this_turn = false;
     for _step in 0..max_steps {
+        let is_in_phase1 = !intent_alignment_done;
+        let current_sys = if is_in_phase1 {
+            &phase1_sys
+        } else {
+            &sys
+        };
+
         // ---- 步骤 0：在首步或上下文逼近上限时检测是否触发自动压缩与确认 ----
         if !has_checked_compaction {
             let compacted = check_and_trigger_compaction(
@@ -1940,7 +1967,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 &state,
                 session_id,
                 &cfg,
-                &sys,
+                current_sys,
                 effective_ctx_limit,
             )
             .await;
@@ -1953,7 +1980,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         // ---- 步骤 1/2：组装上下文（含运行中被"引导"注入的新消息） ----
         let (messages, est_in, truncation_notice) = {
             let db = state.db.lock().unwrap();
-            build_context(&db, session_id, &sys, effective_ctx_limit)
+            build_context(&db, session_id, current_sys, effective_ctx_limit)
         };
         if let Some(ref notice) = truncation_notice {
             let _ = app.emit("context:truncated", notice);
@@ -2040,8 +2067,12 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             let sid_reason = sid2.clone();
             let mid_reason = mid2.clone();
 
-            // 生产工具始终 100% 全量暴露给大模型，决不动态过滤或隐藏工具列表，消除工具锁死隐患
-            let step_schemas = schemas.clone();
+            // 第一阶段（Phase 1 纯意图定性）仅下发决策工具；第二阶段（Phase 2）恢复暴露全量生产工具
+            let step_schemas = if is_in_phase1 {
+                decision_schemas.clone()
+            } else {
+                schemas.clone()
+            };
 
             let call = llm::chat_stream(
                 &cfg,
@@ -2405,6 +2436,11 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 )
                 .await
             };
+
+            // 决策工具质检通过（得分≥90/判定为真/选择明确）或用户在卡片上人工确认采纳后，解除 Phase 1 闸门，平滑转入 Phase 2
+            if matches!(tc.name.as_str(), "judge_decision" | "choice_decision" | "score_decision") && status == "success" {
+                intent_alignment_done = true;
+            }
 
             // 工具自动自纠错机制：非用户审批拒绝的执行失败触发内部微反思引导
             if status == "failed" {
@@ -2939,18 +2975,23 @@ async fn handle_tool_call(
 
             let preview = match tool_name {
                 "score_decision" => format!(
-                    "【核心意图】{}\n【拟定方向】{}",
+                    "【核心意图】{}\n【交付边界】{}",
                     args.get("understanding").and_then(|v| v.as_str()).unwrap_or(""),
                     args.get("plan").and_then(|v| v.as_str()).unwrap_or("")
                 ),
                 "judge_decision" => format!(
                     "【待判定事项】{}",
-                    args.get("statement").or_else(|| args.get("instruction")).and_then(|v| v.as_str()).unwrap_or("")
+                    args.get("state")
+                        .or_else(|| args.get("statement"))
+                        .or_else(|| args.get("understanding"))
+                        .or_else(|| args.get("instruction"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
                 ),
                 _ => format!(
                     "【决策问题】{}\n【备选分支】{}",
-                    args.get("question").and_then(|v| v.as_str()).unwrap_or(""),
-                    args.get("choices").map(|v| v.to_string()).unwrap_or_default()
+                    args.get("instruction").or_else(|| args.get("question")).and_then(|v| v.as_str()).unwrap_or(""),
+                    args.get("options").or_else(|| args.get("choices")).map(|v| v.to_string()).unwrap_or_default()
                 ),
             };
 
@@ -3892,6 +3933,49 @@ fn project_section(
     s
 }
 
+/// 第一层级 · 前置业务意图与交付边界定性专用系统提示词（Phase 1 Intent & Alignment）
+/// 严格物理剥离协作者名录、长期记忆大盘与工程落地实施规则，确保大模型输出 100% 纯净的业务意图分析与缺省假设。
+fn phase1_intent_system_prompt(session: &Session) -> String {
+    let os = if cfg!(windows) { "Windows" } else { "Unix-like" };
+    let ws_info = if session.workspace_path.is_empty() {
+        "当前会话处于通用对话模式（未绑定本地目录）".to_string()
+    } else {
+        format!("工作区根目录：{}", session.workspace_path)
+    };
+
+    format!(
+        r#"你是 harness_mini 的业务意图识别与决策对齐中枢。
+{ws_info}
+操作系统：{os}
+
+【当前阶段：第一层级 · 前置业务意图与交付边界定性（Phase 1 Intent & Alignment）】
+当前处于接收用户输入后的第一步。你的唯一职责是对用户的核心业务诉求进行纯粹的意图理解与交付边界定性，严禁直接推进具体工程实施或内部实现。
+
+工作规则与执行规范：
+1. 【深入思考与意图提炼】：
+   - 在思考区（<think>）中深入揣摩用户的核心目标、潜在诉求与缺省假设；
+   - 明确交付边界：若用户没有指定尺寸、风格、框架或格式等额外细节，提炼出合理通用的业务默认值（例如：生成图片未指定尺寸风格时，默认按标准海报/贺卡 1024x1024 交付；未指定代码框架时按项目现有约定）；
+   - 纯粹业务视角：只描述用户要什么、交付什么，严禁提及任何内部工具名称（如 get_collaborators、record_memory、recognize_image 等）、严禁提及协作者名录、严禁提及底层工具调用流水线！
+
+2. 【回复表达规范（极致简明）】：
+   - 在正文文本中必须保持极致简短，只输出两句话：
+     * 第 1 句：核心意向陈述（≤30字，概括用户要做什么）；
+     * 第 2 句：下一步交付方向（≤30字，说明交付边界或默认假设）；
+   - 严禁长篇大论，严禁提前展开具体实现细节。
+
+3. 【场景化决策工具选择（必须三选一调用）】：
+   提炼好业务意图后，必须根据场景调用以下决策工具之一进行业务准入质检：
+   - 【简单即时任务】（单点问答、简单生图、单处微调）：优先调用 `judge_decision`，判断当前需求是否目标清晰完整、默认假设合理可直接交付；
+   - 【存在分支路线】（如自研 vs 第三方库、方案 A vs 方案 B）：调用 `choice_decision`，裁决最优业务路径；
+   - 【复杂多步需求 / 系统重构】：调用 `score_decision`，对核心意图剖析与交付边界进行百分制评分。
+
+4. 【自动转入第二阶段】：
+   决策工具质检通过或用户人工采纳后，系统将自动激活第二阶段（Phase 2）工程落地规范并开放全量生产工具供你执行。"#,
+        ws_info = ws_info,
+        os = os
+    )
+}
+
 fn system_prompt(
     session: &Session,
     project_section: Option<&str>,
@@ -4555,7 +4639,7 @@ mod tests {
         assert!(all_enabled.contains("修改文件前必须先用 read_file 读取相关内容"));
         assert!(all_enabled.contains("精益代码研读与克制探索 SOP"));
         assert!(all_enabled.contains("todo 工具列出计划"));
-        assert!(all_enabled.contains("对话意图对齐与行动准入 SOP"));
+        assert!(all_enabled.contains("首步意图定性与场景化决策 SOP"));
 
         let disabled = vec![
             "plan_first".to_string(),
@@ -4571,8 +4655,25 @@ mod tests {
         assert!(!filtered.contains("todo 工具列出计划"));
         assert!(!filtered.contains("修改文件前必须先用 read_file 读取相关内容"));
         assert!(!filtered.contains("精益代码研读与克制探索 SOP"));
-        assert!(!filtered.contains("对话意图对齐与行动准入 SOP"));
+        assert!(!filtered.contains("首步意图定性与场景化决策 SOP"));
         assert!(filtered.contains("团队协作者优先委派原则"));
+    }
+
+    #[test]
+    fn test_phase1_intent_system_prompt_pure() {
+        let session = Session {
+            workspace_path: "D:\\ws".into(),
+            ..Default::default()
+        };
+        let p1 = phase1_intent_system_prompt(&session);
+        assert!(p1.contains("Phase 1 Intent & Alignment"));
+        assert!(p1.contains("工作区根目录：D:\\ws"));
+        assert!(p1.contains("judge_decision"));
+        assert!(p1.contains("score_decision"));
+        // 确保纯净性：物理剥离协作者名录与记忆大盘
+        assert!(!p1.contains("可用项目协作者名录"));
+        assert!(!p1.contains("本项目持久化认知与沉淀记忆"));
+        assert!(!p1.contains("conventions.md"));
     }
 
     #[test]
