@@ -2460,43 +2460,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                     );
                 }
 
-                if tc.name == "score_decision" {
-                    if let Ok(val) = serde_json::from_str::<Value>(&result_text) {
-                        let score_val = val.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-                        let score_pct = val.get("scorePercent").and_then(|v| v.as_u64()).map(|n| n as u32).unwrap_or((score_val * 100.0).round() as u32);
-                        let critique = val.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        result_text = if score_pct >= 90 {
-                            format!(
-                                "{}\n\n【方案打分结果】评分: {}%（质检通过，≥90分）。评估意见: {}\n请围绕确认的核心意图与分步行动方案推进后续执行。",
-                                result_text, score_pct, critique
-                            )
-                        } else {
-                            format!(
-                                "{}\n\n【方案打分结果】评分: {}%（未达到90分及格线！）。评估意见: {}\n⚠️ 质检意见提示存在理解偏差或关键动作遗漏。请在下一步思考中反思并调整行动方案，或向用户说明疑问寻求确认，切勿盲目修改代码！",
-                                result_text, score_pct, critique
-                            )
-                        };
-                    }
-                } else if tc.name == "judge_decision" {
-                    if let Ok(val) = serde_json::from_str::<Value>(&result_text) {
-                        let v = val.get("verdict").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let reason = val.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        result_text = format!(
-                            "{}\n\n【二元判定结果】判定结论: {}，依据说明: {}",
-                            result_text, if v { "符合" } else { "不符合" }, reason
-                        );
-                    }
-                } else if tc.name == "choice_decision" {
-                    if let Ok(val) = serde_json::from_str::<Value>(&result_text) {
-                        let choice_str = val.get("choice").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let reason = val.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        result_text = format!(
-                            "{}\n\n【分支选定结果】选定目标: `{}`，理由: {}",
-                            result_text, choice_str, reason
-                        );
-                    }
                 }
-            }
             // 工具结果作为 tool 消息进入上下文
             let tool_msg = {
                 let db = state.db.lock().unwrap();
@@ -2815,7 +2779,7 @@ async fn handle_tool_call(
     let exec = tools::execute(tool_name, args, &call_ctx, &on_partial).await;
     let elapsed = started.elapsed().as_millis() as u64;
 
-    let (status, text) = match exec {
+    let (mut status, mut text) = match exec {
         Ok(t) => ("success".to_string(), t),
         Err(e) => ("failed".to_string(), format!("工具执行失败：{e}")),
     };
@@ -2891,6 +2855,139 @@ async fn handle_tool_call(
         if let Some(p) = path_str {
             if let Some(obj) = ev.params.as_object_mut() {
                 obj.insert("memory_file_path".into(), json!(p));
+            }
+        }
+    }
+
+    // ---- 决策工具结果质检与人机协同审批挂起 ----
+    if matches!(tool_name, "score_decision" | "judge_decision" | "choice_decision") && status == "success" {
+        let parsed_json: Option<Value> = serde_json::from_str::<Value>(&text).ok().or_else(|| {
+            let t = text.trim();
+            let first_brace = t.find('{');
+            let last_brace = t.rfind('}');
+            if let (Some(fb), Some(lb)) = (first_brace, last_brace) {
+                if lb > fb {
+                    serde_json::from_str::<Value>(&t[fb..=lb]).ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+
+        let (is_passed, decision_summary, reason_str) = match tool_name {
+            "score_decision" => {
+                if let Some(ref val) = parsed_json {
+                    let score_val = val.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                    let pct = val.get("scorePercent").and_then(|v| v.as_u64()).map(|n| n as u32).unwrap_or((score_val * 100.0).round() as u32);
+                    let crit = val.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let passed = pct >= 90;
+                    let summary = format!("评分: {}%（{}）", pct, if passed { "质检通过，≥90分" } else { "未达90分及格线" });
+                    (passed, summary, crit)
+                } else {
+                    (false, "评分结果解析失败".to_string(), "返回结果非标准 JSON 格式".to_string())
+                }
+            }
+            "judge_decision" => {
+                if let Some(ref val) = parsed_json {
+                    let v = val.get("verdict").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let r = val.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let summary = format!("判定结论: {}", if v { "符合/明确通过" } else { "不符合/存疑" });
+                    (v, summary, r)
+                } else {
+                    (false, "判定结果解析失败".to_string(), "返回结果非标准 JSON 格式".to_string())
+                }
+            }
+            _ => { // choice_decision
+                if let Some(ref val) = parsed_json {
+                    let c = val.get("choice").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let r = val.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let need_ask = c.contains("澄清") || c.contains("确认") || c.contains("clarify") || c.contains("ask");
+                    let summary = format!("选定目标: `{}`", c);
+                    (!need_ask, summary, r)
+                } else {
+                    (false, "选择结果解析失败".to_string(), "返回结果非标准 JSON 格式".to_string())
+                }
+            }
+        };
+
+        if is_passed {
+            text = format!(
+                "{}\n\n【决策质检通过】{}。评估意见: {}\n请围绕确认的核心意图与方向顺畅推进后续工程执行。",
+                text, decision_summary, reason_str
+            );
+        } else {
+            // 决策未达标/存疑：触发人工审批挂起，等待用户确认采纳或补充指导
+            ev.status = "pending_approval".into();
+            ev.result_text = Some(text.clone());
+            ev.approval_scope = None;
+            {
+                let db = state.db.lock().unwrap();
+                let params_str = serde_json::to_string(&ev.params).ok();
+                let _ = store::update_tool_event_full(
+                    &db,
+                    &ev.id,
+                    "pending_approval",
+                    Some(&text),
+                    None,
+                    detected_sub_id.as_deref().or(ev.subprocess_id.as_deref()),
+                    params_str.as_deref(),
+                );
+            }
+            emit_tool(app, session_id, &ev);
+
+            let preview = match tool_name {
+                "score_decision" => format!(
+                    "【核心意图】{}\n【拟定方向】{}",
+                    args.get("understanding").and_then(|v| v.as_str()).unwrap_or(""),
+                    args.get("plan").and_then(|v| v.as_str()).unwrap_or("")
+                ),
+                "judge_decision" => format!(
+                    "【待判定事项】{}",
+                    args.get("statement").or_else(|| args.get("instruction")).and_then(|v| v.as_str()).unwrap_or("")
+                ),
+                _ => format!(
+                    "【决策问题】{}\n【备选分支】{}",
+                    args.get("question").and_then(|v| v.as_str()).unwrap_or(""),
+                    args.get("choices").map(|v| v.to_string()).unwrap_or_default()
+                ),
+            };
+
+            let jev_reason = format!("{}。详细意见: {}", decision_summary, reason_str);
+            let req = ApprovalRequest {
+                event_id: ev.id.clone(),
+                session_id: session_id.to_string(),
+                tool_name: tool_name.to_string(),
+                params: args.clone(),
+                risk: "intent_decision".into(),
+                preview,
+                force_once: true,
+                risk_source: Some("jev".into()),
+                jev_reason: Some(jev_reason),
+            };
+
+            let decision = approval::request_approval(app, &state, req).await;
+            match decision {
+                Decision::AllowOnce | Decision::AllowSession => {
+                    status = "success".into();
+                    text = format!(
+                        "{}\n\n【用户已人工确认采纳】用户已审阅方案并确认放行！请立即围绕当前方案推进后续执行，无需重复质检。",
+                        text
+                    );
+                    ev.approval_scope = Some("allow_once".into());
+                }
+                Decision::Deny(feedback) => {
+                    status = "denied".into();
+                    let user_msg = feedback
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| "用户未补充具体说明，建议反思方案并向用户说明疑问".to_string());
+                    text = format!(
+                        "{}\n\n【用户补充指导意见】：用户审阅后未直接放行，并给出了具体补充要求：“{}”。\n请严格根据用户的明确指导，反思并修正核心意图与行动方向，或再次向用户确认，切勿擅自偏离用户要求！",
+                        text, user_msg
+                    );
+                    ev.approval_scope = Some("denied".into());
+                }
             }
         }
     }
@@ -4037,34 +4134,39 @@ fn system_prompt(
         ));
         rule_num += 1;
 
+        if is_sop_enabled("intent_alignment_gate") {
+            rules.push(format!(
+                "{rule_num}. 【第一阶段：首步意图定性与场景化决策 SOP（接收到新任务的 Step 1 必须严格遵守）】：\n   \
+                 - 触发时机：当你接收到用户发送的新任务、功能需求、代码修改、生图或技术问题时，在第一步（Step 1）必须先进行意图定性与决策质检；日常问候或纯文本简答直接回复；后续分步执行步骤无需重复打分。\n   \
+                 - 第一步标准执行动作（按序执行，严禁越界）：\n     \
+                   1. 【深入思考】：在思考区（<think>）中深入揣摩用户真实核心诉求，消解代词与前序上下文意图；\n     \
+                   2. 【简明表达】：在回复正文文本中**只输出 1 句话核心意向（≤30字）和 1 句话下一步方向（≤30字）**，必须保持极致简明，严禁长篇大论或赘述执行细节；\n     \
+                   3. 【首步工具禁令】：第一步**严禁调用除决策工具外的任何工具**（严禁调用 `get_collaborators` 查协作者、严禁调用文件/代码搜索工具、严禁生图或编辑文件、严禁拆解子任务）；\n     \
+                   4. 【场景化决策工具选择（必须三选一调用）】：\n       \
+                      * **简单即时任务**（如问答、简单生图、单处微调）：优先调用 `judge_decision`，判断“该需求是否目标完全明确且无歧义，可直接执行？（True/False）”；\n       \
+                      * **方案存在分支路线**（如直接做 vs 委派协作者 vs 多个实现方案）：优先调用 `choice_decision`，从备选策略中裁决最优项；\n       \
+                      * **复杂多步业务改造 / 系统重构**：调用 `score_decision`，对核心意图理解与关键计划进行百分制评分（≥90分放行）。\n   \
+                 - 决策结果与人机协同机制：\n     \
+                   * 若质检通过（得分≥90分、judge=true、choice有效）：系统自动静默放行，立即激活第二阶段规则并在后续步骤推进工程落地；\n     \
+                   * 若质检存疑（得分<90分 或 judge=false）：系统将就地挂起并弹出确认卡片由用户亲自定夺。若用户点击【采纳方案】，工具将放行通知你继续；若用户点击【补充指导】，你必须在下一步严格依据用户的补充指导修正方案！"
+            ));
+            rule_num += 1;
+        }
+
         if is_sop_enabled("todo_lifecycle") {
-            rules.push(format!("{rule_num}. 接到多步任务时，先用 todo 工具列出计划，并随进展更新各项状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done（切勿遗留 in_progress 状态）。"));
+            rules.push(format!("{rule_num}. 【第二阶段：任务计划生命周期 SOP（意图质检放行后生效）】：接到多步任务时，在第一阶段意图质检放行后，方可用 todo 工具列出计划，并随进展更新各项状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done（切勿遗留 in_progress 状态）。"));
             rule_num += 1;
         }
 
         if is_sop_enabled("subagent_orchestration") {
             rules.push(format!(
-                "{rule_num}. 【团队协作者优先委派原则、反过度委派与自决准则】：\n   \
+                "{rule_num}. 【第二阶段：团队协作者优先委派原则、反过度委派与自决准则（意图质检放行后生效）】：\n   \
+                 - ⚠️ 前提约束：本规则仅在第一阶段意图质检通过（或用户人工采纳）后方可触发！第一步严禁直接调用 `get_collaborators` 或派发协作者。\n   \
                  - 角色定位：你作为总架构师与统筹协调者，拥有专属的常驻专家团队（见下方【可用项目协作者名录】）。\n   \
-                 - 强制委派机制：在接收到用户指令后，你必须首先对照各协作者的【主进程调度触发规则】；只要当前任务命中了某位空闲协作者的专属职责（例如涉及画图/生图/Logo制作命中【AI 绘画师】、涉及PRD/需求分析命中【产品经理】、涉及前端界面开发命中【前端开发】等），你【必须无条件优先且立即调用 `dispatch_collaborator` 工具】将任务委派给该协作者，并在调用后紧接着调用 `wait_collaborators` 等待成果汇报！\n   \
+                 - 强制委派机制：在意图对齐放行后，你必须首先对照各协作者的【主进程调度触发规则】；只要当前任务命中了某位空闲协作者的专属职责（例如涉及画图/生图/Logo制作命中【AI 绘画师】、涉及PRD/需求分析命中【产品经理】、涉及前端界面开发命中【前端开发】等），你【必须无条件优先且立即调用 `dispatch_collaborator` 工具】将任务委派给该协作者，并在调用后紧接着调用 `wait_collaborators` 等待成果汇报！\n   \
                  - 严禁越俎代庖：当名录中存在对应领域的专职协作者时，严禁自行直接执行！让专职角色做专职的事，你专注把控全局架构与成果汇总验收；\n   \
                  - 临时子进程协作：面对需要多步深度探索排查、跨模块重构、或需反复执行编译单测自检闭环的重型任务，可调用 `spawn_subprocess` 派生临时子进程处理。派发时务必使用 `relevant_files` / `pinned_context` 传入已知靶标文件与上下文图钉，让子进程跳过无意义的盲目搜索；\n   \
                  - ⚠️【反过度委派原则与自决准则 (Anti-Over-Delegation)】：若你在方案规划中或脑海中已经精确定位了目标文件、具体行数和拟追加的代码/方法（即微小明确的就地修改，如仅改动 1~2 个文件），【严禁派生子进程】！直接由你在主会话中调用 `read_file` 确认后用 `edit_file` 一步修改完成，杜绝因过度派发产生的额外上下文与等待开销。"
-            ));
-            rule_num += 1;
-        }
-
-        if is_sop_enabled("intent_alignment_gate") {
-            rules.push(format!(
-                "{rule_num}. 【首步对话意图对齐与行动准入 SOP（必须严格遵守）】：\n   \
-                 - 触发时机：当你接收到用户发送的新任务、功能需求、代码修改或复杂问题时，在第一步（Step 1）必须先进行意图对齐与自我质检；后续分步执行步骤无需重复打分；若为日常问候或纯文本简答可直接回复；\n   \
-                 - 第一步标准执行动作（必须按顺序执行）：\n     \
-                   1. 【深入思考】：在思考区（<think>）中深入揣摩用户真实核心诉求，结合前序多轮上下文进行代词消解与选项解析；\n     \
-                   2. 【简明表达】：在回复正文文本中先输出 1 句话核心意图（≤40字）和 2~3 项核心关键动作清单（每项≤25字）；\n     \
-                   3. 【质检调用】：**必须立即调用 `score_decision` 工具**，传入 `understanding`（你的核心意图理解）与 `plan`（拟定的关键动作清单），由决策模型进行契合度质检评分；\n   \
-                 - 决策结果与后续执行准则：\n     \
-                   * 若评分达标（≥90分）：质检通过，立即在后续步骤中顺畅调用各生产工具（如 read_file / create_plan / edit_file 等）推进工程落地；\n     \
-                   * 若评分未达标（<90分）：质检未通过，请根据工具返回的扣分意见反思调整方案，或向用户说明疑问寻求确认，切勿盲目修改代码！"
             ));
             rule_num += 1;
         }

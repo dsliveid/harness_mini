@@ -915,8 +915,16 @@ function ApprovalSection({ ev }: { ev: ToolEvent }) {
   const [copied, setCopied] = useState(false);
 
   if (!req) return null;
+
+  const isIntentDecision =
+    req.risk === "intent_decision" ||
+    ["score_decision", "judge_decision", "choice_decision"].includes(ev.toolName) ||
+    ["score_decision", "judge_decision", "choice_decision"].includes(req.toolName);
+
   const riskLabel =
-    req.toolName === "temp_merge"
+    isIntentDecision
+      ? "方案质检存疑"
+      : req.toolName === "temp_merge"
       ? "把临时空间变更合并写回你的原始目录"
       : req.toolName === "temp_restore"
         ? "恢复临时空间（丢弃之后的修改）"
@@ -948,52 +956,56 @@ function ApprovalSection({ ev }: { ev: ToolEvent }) {
   };
 
   return (
-    <div className="mt-2.5 border border-amber-500/40 bg-amber-500/5 rounded-xl p-3 shadow-sm animate-in fade-in duration-150">
-      <div className="text-[13px] font-medium text-amber-400 mb-1.5 flex items-center justify-between gap-1.5 flex-wrap">
+    <div className={`mt-2.5 border ${isIntentDecision ? "border-purple-500/40 bg-purple-500/5" : "border-amber-500/40 bg-amber-500/5"} rounded-xl p-3 shadow-sm animate-in fade-in duration-150`}>
+      <div className={`text-[13px] font-medium ${isIntentDecision ? "text-purple-400" : "text-amber-400"} mb-1.5 flex items-center justify-between gap-1.5 flex-wrap`}>
         <div className="flex items-center gap-1.5 flex-wrap">
-          <ShieldAlert size={16} className="shrink-0 text-amber-400" />
+          <ShieldAlert size={16} className={`shrink-0 ${isIntentDecision ? "text-purple-400" : "text-amber-400"}`} />
           <span>需要你的确认：{riskLabel}</span>
           {req.riskSource === "jev" && (
             <span className="text-[11px] px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/30 inline-flex items-center gap-1 font-mono">
               <Zap size={10} className="fill-purple-400 text-purple-400" />
-              <span>⚡ Jev 语义风控</span>
+              <span>⚡ {isIntentDecision ? "决策质检" : "Jev 语义风控"}</span>
             </span>
           )}
         </div>
         <button
           type="button"
-          className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 transition-colors"
+          className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded ${isIntentDecision ? "bg-purple-500/10 hover:bg-purple-500/20 text-purple-300" : "bg-amber-500/10 hover:bg-amber-500/20 text-amber-300"} transition-colors`}
           onClick={handleCopy}
-          title="复制命令内容"
+          title={isIntentDecision ? "复制方案内容" : "复制命令内容"}
         >
           {copied ? <Check size={12} className="text-green-400" /> : <Copy size={12} />}
           <span>{copied ? "已复制" : "复制"}</span>
         </button>
       </div>
-      {req.riskSource === "jev" && req.jevReason && (
+      {req.jevReason && (
         <div className="text-[12px] text-purple-200/90 bg-purple-950/40 border border-purple-500/30 rounded-lg px-2.5 py-1.5 mb-2 leading-relaxed">
-          <span className="font-semibold text-purple-300">拦截理由：</span>
+          <span className="font-semibold text-purple-300">{isIntentDecision ? "质检评估意见：" : "拦截理由："}</span>
           {req.jevReason}
         </div>
       )}
       <pre className="text-[12px] font-mono whitespace-pre-wrap break-all bg-panel border border-edge/60 rounded-lg p-2.5 max-h-48 overflow-y-auto text-ink select-text">
         {req.preview}
       </pre>
-      {req.forceOnce && (
+      {isIntentDecision ? (
+        <div className="text-[11px] text-purple-300/80 mt-1">
+          该方案经决策模型质检评分未达标或判定存疑。若方案符合你的预期，可直接点击「采纳方案，继续执行」；若需调整，请点击「补充指导」提供具体意见。
+        </div>
+      ) : req.forceOnce ? (
         <div className="text-[11px] text-amber-500/80 mt-1">
           {req.riskSource === "jev"
             ? "Jev 研判该命令具有不可逆或破坏性风险，已强制开启逐次人工确认，不可记忆放行。"
             : "检测到高危命令，仅允许逐次确认，不可记忆放行。"}
         </div>
-      )}
+      ) : null}
       <div className="flex items-center gap-2 mt-2 flex-wrap">
         <button
           className="px-3 py-1.5 rounded-lg bg-green-600/90 hover:bg-green-500 text-white text-[13px] transition-colors shadow-sm font-medium"
           onClick={() => respond("allow_once")}
         >
-          允许一次
+          {isIntentDecision ? "采纳方案，继续执行" : "允许一次"}
         </button>
-        {!req.forceOnce && (
+        {!req.forceOnce && !isIntentDecision && (
           <button
             className="px-3 py-1.5 rounded-lg bg-panel3 hover:bg-edge text-ink text-[13px] transition-colors"
             title="记住该规则：仅对当前对话生效，重启后仍保留；可在会话设置中删除"
@@ -1003,17 +1015,17 @@ function ApprovalSection({ ev }: { ev: ToolEvent }) {
           </button>
         )}
         <button
-          className="px-3 py-1.5 rounded-lg bg-panel3 hover:bg-edge text-red-400 text-[13px] transition-colors"
+          className={`px-3 py-1.5 rounded-lg bg-panel3 hover:bg-edge ${isIntentDecision ? "text-purple-300" : "text-red-400"} text-[13px] transition-colors`}
           onClick={() => setDenyOpen(!denyOpen)}
         >
-          拒绝
+          {isIntentDecision ? (denyOpen ? "收起补充" : "补充指导 / 调整方案") : "拒绝"}
         </button>
       </div>
       {denyOpen && (
         <div className="flex gap-2 mt-2">
           <input
             className="flex-1 bg-panel border border-edge rounded-lg px-2.5 py-1.5 text-[13px] outline-none focus:border-accent"
-            placeholder="拒绝原因（可选，将告知 Agent 以便调整方案）"
+            placeholder={isIntentDecision ? "补充指导意见（例如具体的文字、风格或修正意见，回车提交）" : "拒绝原因（可选，将告知 Agent 以便调整方案）"}
             value={reason}
             onChange={(e) => setReason(e.target.value)}
             onKeyDown={(e) => {
@@ -1021,10 +1033,10 @@ function ApprovalSection({ ev }: { ev: ToolEvent }) {
             }}
           />
           <button
-            className="px-3 py-1.5 rounded-lg bg-red-600/80 hover:bg-red-500 text-white text-[13px] transition-colors shadow-sm"
+            className={`px-3 py-1.5 rounded-lg ${isIntentDecision ? "bg-purple-600/80 hover:bg-purple-500" : "bg-red-600/80 hover:bg-red-500"} text-white text-[13px] transition-colors shadow-sm`}
             onClick={() => respond("deny", reason || undefined)}
           >
-            确认拒绝
+            {isIntentDecision ? "发送指导" : "确认拒绝"}
           </button>
         </div>
       )}
