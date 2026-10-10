@@ -446,20 +446,22 @@ export function TopBar() {
         {/* 模型切换器（统一 h-8 高度，下拉适配 245px） */}
         <div className="relative shrink-0">
           <button
-            className={`flex items-center gap-1.5 h-8 bg-panel2/60 hover:bg-panel2 border border-edge/60 hover:border-accent/40 rounded-lg px-2.5 text-[12px] text-ink shrink-0 transition-all cursor-pointer max-w-[130px] sm:max-w-[170px] ${
+            className={`flex items-center gap-1.5 h-8 bg-panel2/60 hover:bg-panel2 border border-edge/60 hover:border-accent/40 rounded-lg px-2.5 text-[12px] text-ink shrink-0 transition-all cursor-pointer max-w-[160px] sm:max-w-[240px] ${
               openMenu === "model" ? "border-accent/50 bg-panel2 ring-1 ring-accent/20" : ""
             }`}
             onClick={() => setOpenMenu(openMenu === "model" ? null : "model")}
             title={
               active
-                ? `${active.provider.name} / ${active.model}\n有效上下文上限: ${effectiveLimit.toLocaleString()} tokens (~${formatTokens(effectiveLimit)})${
+                ? `${active.provider.name}/${active.model}\n有效上下文上限: ${effectiveLimit.toLocaleString()} tokens (~${formatTokens(effectiveLimit)})${
                     isSessionOverridden ? " (仅当前对话生效)" : " (跟随模型默认)"
                   }\n有效思考程度: ${currentEffort === "default" ? "厂商默认 (不传)" : currentEffort.toUpperCase()}`
                 : "未配置模型"
             }
           >
             <Sparkles size={13} className="text-accent shrink-0" />
-            <span className="truncate min-w-0 flex-1 text-left">{active?.model ?? "选择模型"}</span>
+            <span className="truncate min-w-0 flex-1 text-left">
+              {active ? `${active.provider.name}/${active.model}` : "选择模型"}
+            </span>
             {currentEffort !== "default" && (
               <span
                 className="px-1 py-0.2 rounded text-[9.5px] bg-purple-500/15 text-purple-400 font-medium border border-purple-500/30 shrink-0"

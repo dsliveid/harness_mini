@@ -278,12 +278,13 @@ export function extractToolModelInfo(
   // 1. 优先尝试从 ev.resultText 中提取实际执行返回的厂商与模型（最准确）
   if (ev.resultText) {
     if (isImageTool || isVisionTool) {
+      const combinedMatch = ev.resultText.match(/厂商\/模型:\s*`?([^/`\n]+?)\s*\/\s*([^`\n]+?)`?/);
       const providerMatch = ev.resultText.match(/厂商:\s*`?([^`\n]+)`?/);
       const modelMatch = ev.resultText.match(/使用模型:\s*`?([^`\n]+)`?/);
       const errMatch = ev.resultText.match(/\[厂商:\s*([^/\]]+?)\s*\/\s*模型:\s*([^/\]]+?)\s*\]/);
 
-      const provider = providerMatch ? providerMatch[1].trim() : errMatch ? errMatch[1].trim() : undefined;
-      const model = modelMatch ? modelMatch[1].trim() : errMatch ? errMatch[2].trim() : undefined;
+      const provider = combinedMatch ? combinedMatch[1].trim() : providerMatch ? providerMatch[1].trim() : errMatch ? errMatch[1].trim() : undefined;
+      const model = combinedMatch ? combinedMatch[2].trim() : modelMatch ? modelMatch[1].trim() : errMatch ? errMatch[2].trim() : undefined;
 
       if (provider || model) {
         return { provider, model };
@@ -1249,15 +1250,18 @@ function ImageToolView({
               <Sparkles size={11} />
               <span>提示词</span>
             </span>
-            {(metadata?.provider || modelInfo?.provider) && (
-              <span className="inline-flex items-center gap-1 text-[10.5px] font-mono text-pink-300 bg-pink-500/10 border border-pink-500/20 px-1.5 py-0.5 rounded-md" title="生图厂商">
+            {((metadata?.provider || modelInfo?.provider) || (metadata?.model || modelInfo?.model)) && (
+              <span className="inline-flex items-center gap-1 text-[10.5px] font-mono text-pink-300 bg-pink-500/10 border border-pink-500/20 px-1.5 py-0.5 rounded-md" title="生图模型">
                 <Server size={11} className="text-pink-400" />
-                <span>{metadata?.provider || modelInfo?.provider}</span>
-              </span>
-            )}
-            {(metadata?.model || modelInfo?.model) && (
-              <span className="text-[10.5px] font-mono text-inkdim bg-panel3/80 border border-edge/60 px-1.5 py-0.5 rounded-md" title="生图模型">
-                {metadata?.model || modelInfo?.model}
+                {(metadata?.provider || modelInfo?.provider) && (
+                  <span className="font-medium">{metadata?.provider || modelInfo?.provider}</span>
+                )}
+                {(metadata?.provider || modelInfo?.provider) && (metadata?.model || modelInfo?.model) && (
+                  <span className="opacity-40">/</span>
+                )}
+                {(metadata?.model || modelInfo?.model) && (
+                  <span>{metadata?.model || modelInfo?.model}</span>
+                )}
               </span>
             )}
             {metadata?.resolution && (
@@ -1567,6 +1571,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
     if (!isImageTool || !ev.resultText) return null;
     const text = ev.resultText;
 
+    const combinedMatch = text.match(/厂商\/模型:\s*`?([^/`\n]+?)\s*\/\s*([^`\n]+?)`?/);
     const pathMatch = text.match(/保存路径:\s*`?([^`\n]+)`?/);
     const modelMatch = text.match(/使用模型:\s*`?([^`\n]+)`?/);
     const providerMatch = text.match(/厂商:\s*`?([^`\n]+)`?/);
@@ -1575,8 +1580,8 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
 
     return {
       imagePath: generatedImagePath || (pathMatch ? pathMatch[1].trim() : null),
-      provider: providerMatch ? providerMatch[1].trim() : toolModelInfo?.provider || null,
-      model: modelMatch ? modelMatch[1].trim() : toolModelInfo?.model || null,
+      provider: combinedMatch ? combinedMatch[1].trim() : providerMatch ? providerMatch[1].trim() : toolModelInfo?.provider || null,
+      model: combinedMatch ? combinedMatch[2].trim() : modelMatch ? modelMatch[1].trim() : toolModelInfo?.model || null,
       resolution: sizeMatch ? sizeMatch[1].trim() : (ev.params?.size ? String(ev.params.size) : null),
       fileSize: kbMatch ? kbMatch[1].trim() : null,
     };
@@ -1933,32 +1938,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
           <span className="text-[12px] text-ink font-medium">{label}</span>
           {toolCategoryBadge(ev.toolName)}
         </div>
-        {toolModelInfo && (toolModelInfo.provider || toolModelInfo.model) && (
-          <div
-            className={`inline-flex items-center gap-1 text-[10.5px] font-mono px-2 py-0.5 rounded-md border shrink-0 transition-colors ${
-              isImageTool
-                ? "bg-pink-500/10 text-pink-300 border-pink-500/25"
-                : isVisionTool
-                ? "bg-cyan-500/10 text-cyan-300 border-cyan-500/25"
-                : "bg-amber-500/10 text-amber-300 border-amber-500/25"
-            }`}
-            title={`实际调用模型: ${toolModelInfo.provider || "默认厂商"} / ${toolModelInfo.model || "默认模型"}`}
-          >
-            <Server
-              size={11}
-              className={
-                isImageTool
-                  ? "text-pink-400"
-                  : isVisionTool
-                  ? "text-cyan-400"
-                  : "text-amber-400"
-              }
-            />
-            {toolModelInfo.provider && <span className="font-medium">{toolModelInfo.provider}</span>}
-            {toolModelInfo.provider && toolModelInfo.model && <span className="opacity-40">/</span>}
-            {toolModelInfo.model && <span className="truncate max-w-[150px]">{toolModelInfo.model}</span>}
-          </div>
-        )}
+
         {ev.toolName !== "todo" && (
           <span
             className="text-[12px] font-mono text-inkdim truncate flex-1 min-w-0"

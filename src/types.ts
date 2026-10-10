@@ -296,6 +296,8 @@ export interface DirectDecisionResult {
 export interface AgentSopInfo {
   id: string;
   name: string;
+  phase: 1 | 2; // 1: 首步意图定性前置闸门, 2: 方案展开与工程执行
+  phaseLabel: string;
   category: "thinking" | "memory" | "orchestration" | "quality" | "workflow";
   categoryLabel: string;
   description: string;
@@ -305,59 +307,73 @@ export interface AgentSopInfo {
 export const AGENT_SOPS: AgentSopInfo[] = [
   {
     id: "intent_alignment_gate",
-    name: "对话意图对齐与计划前置评估规范",
+    name: "首步意图定性与场景化决策质检规范",
+    phase: 1,
+    phaseLabel: "第一层级 · 前置意图定性闸门",
     category: "thinking",
     categoryLabel: "思考范式",
-    description: "在主模型正式执行用户任务前，先提炼对用户意图的深度剖析与下一步行动计划；由决策模型进行严苛质检评分（达标阈值90%），未达标自动自愈迭代修正，全流程透明呈现并支持随时干预或跳过，确保理解与执行零偏差。",
-    disableEffect: "禁用后：跳过对话前置的意图剖析与决策质检打分闸门，大模型接收到用户消息后直接开始推理执行。",
+    description: "在主模型正式执行用户任务的第一步（Step 1），严禁调用业务工具，只输出极简核心意图（≤30字）与下一步方向（≤30字）；根据场景灵活调度三种决策工具进行质检：1) 简单即时任务调用 judge_decision 二元判断；2) 多路线任务调用 choice_decision 分支裁决；3) 复杂重构任务调用 score_decision 百分制评分（≥90分放行）。质检存疑时就地挂起并支持用户一键采纳或补充指导，杜绝理解偏差与无效循环。",
+    disableEffect: "禁用后：跳过首步意图定性前置闸门与决策工具调用约束，大模型接收到新任务后可直接调用生产工具执行。",
   },
   {
     id: "plan_first",
     name: "方案先行与计划中枢规范",
+    phase: 2,
+    phaseLabel: "第二层级 · 工程规划与落地执行",
     category: "thinking",
     categoryLabel: "思考范式",
-    description: "面对大改动任务（3个以上文件）或多轮需求，在 .harness/plans/ 自动建立结构化计划 MD 文档；需求变更时优先更新计划，后续严格根据计划分步执行，防止多轮需求失真与遗忘。",
+    description: "意图质检放行后，面对大改动任务（3个以上文件）或多轮需求，在 .harness/plans/ 自动建立结构化计划 MD 文档；需求变更时优先更新计划，后续严格根据计划分步执行，防止多轮需求失真与遗忘。",
     disableEffect: "禁用后：Agent 接到任务后可直接编写代码，不强制在 .harness/plans/ 建立结构化方案文档。",
-  },
-  {
-    id: "memory_distill",
-    name: "边读边记与认知沉淀规范",
-    category: "memory",
-    categoryLabel: "知识资产",
-    description: "内置工作区长期认知记忆（.harness/memory/）；常见技术栈提问优先秒级召回；深入探索或阅读多个文件后强制调用 record_memory 沉淀技术大盘与主题碎记；对话完成后台自动萃取 digests。",
-    disableEffect: "禁用后：移除强制调用 record_memory 沉淀约束，且会话结束后不触发后台自动提炼。",
-  },
-  {
-    id: "subagent_orchestration",
-    name: "子进程协作与架构编排规范",
-    category: "orchestration",
-    categoryLabel: "协同体系",
-    description: "面对复杂需求、多模块并发开发（如前后端分离、多业务模块并行）时，总架构师按标准流程（规划拆解 -> 派生子 Agent -> 等待汇聚 -> 全局验收）采用子进程协同提升效率与模块隔离度。",
-    disableEffect: "禁用后：停用多子进程协作编排指引，Agent 倾向于在单主进程内串行处理全部任务。",
-  },
-  {
-    id: "safe_code_edit",
-    name: "代码克制与精确修改规范",
-    category: "quality",
-    categoryLabel: "工程质量",
-    description: "修改文件前必须先用 read_file 读取相关内容，用 edit_file 做基于精确原文的最小化修改；新文件才用 write_file；动手前探索代码结构，修改后尽量用 run_command 运行构建或测试验证。",
-    disableEffect: "禁用后：移除代码最小化精确修改与构建验证的强指引约束。",
-  },
-  {
-    id: "surgical_code_reading",
-    name: "精益代码研读规范",
-    category: "quality",
-    categoryLabel: "工程质量",
-    description: "探索业务与代码时遵循漏斗式渐进探索（目录/清单 ➔ file_outline 骨架 ➔ grep 线索 ➔ 局部靶向精读）；严禁对大型文件进行多轮无休止的分页切片（offset_line）式逐行通读；修改前只精读最小必要上下文，严禁凭空盲猜。",
-    disableEffect: "禁用后：允许 Agent 自由阅读大段源码，解除对连续分页通读与精益读取的强约束。",
   },
   {
     id: "todo_lifecycle",
     name: "任务清单全生命周期规范",
+    phase: 2,
+    phaseLabel: "第二层级 · 工程规划与落地执行",
     category: "workflow",
     categoryLabel: "任务规划",
-    description: "接到多步任务时，先用 todo 工具列出计划，并随进展更新各项状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done，切勿遗留 in_progress 状态。",
+    description: "意图质检放行后，接到多步任务时先用 todo 工具列出计划，并随进展更新各项状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done，切勿遗留 in_progress 状态。",
     disableEffect: "禁用后：允许 Agent 自由多步推进，不强制调用 todo 工具维护状态清单。",
+  },
+  {
+    id: "subagent_orchestration",
+    name: "子进程协作与架构编排规范",
+    phase: 2,
+    phaseLabel: "第二层级 · 工程规划与落地执行",
+    category: "orchestration",
+    categoryLabel: "协同体系",
+    description: "意图质检放行后生效。面对复杂需求、多模块并发开发（如前后端分离、多业务模块并行）时，总架构师按标准流程（规划拆解 -> 派生子 Agent -> 等待汇聚 -> 全局验收）采用子进程协同提升效率与模块隔离度；严禁在首步意图定性阶段提前委派或查找协作者。",
+    disableEffect: "禁用后：停用多子进程协作编排指引，Agent 倾向于在单主进程内串行处理全部任务。",
+  },
+  {
+    id: "surgical_code_reading",
+    name: "精益代码研读规范",
+    phase: 2,
+    phaseLabel: "第二层级 · 工程规划与落地执行",
+    category: "quality",
+    categoryLabel: "工程质量",
+    description: "意图质检放行后生效。探索业务与代码时遵循漏斗式渐进探索（目录/清单 ➔ file_outline 骨架 ➔ grep 线索 ➔ 局部靶向精读）；严禁对大型文件进行多轮无休止的分页切片（offset_line）式逐行通读；修改前只精读最小必要上下文，严禁凭空盲猜。",
+    disableEffect: "禁用后：允许 Agent 自由阅读大段源码，解除对连续分页通读与精益读取的强约束。",
+  },
+  {
+    id: "safe_code_edit",
+    name: "代码克制与精确修改规范",
+    phase: 2,
+    phaseLabel: "第二层级 · 工程规划与落地执行",
+    category: "quality",
+    categoryLabel: "工程质量",
+    description: "意图质检放行后生效。修改文件前必须先用 read_file 读取相关内容，用 edit_file 做基于精确原文的最小化修改；新文件才用 write_file；动手前探索代码结构，修改后尽量用 run_command 运行构建或测试验证。",
+    disableEffect: "禁用后：移除代码最小化精确修改与构建验证的强指引约束。",
+  },
+  {
+    id: "memory_distill",
+    name: "边读边记与认知沉淀规范",
+    phase: 2,
+    phaseLabel: "第二层级 · 工程规划与落地执行",
+    category: "memory",
+    categoryLabel: "知识资产",
+    description: "意图质检放行后生效。内置工作区长期认知记忆（.harness/memory/）；常见技术栈提问优先秒级召回；深入探索或阅读多个文件后强制调用 record_memory 沉淀技术大盘与主题碎记；对话完成后台自动萃取 digests。",
+    disableEffect: "禁用后：移除强制调用 record_memory 沉淀约束，且会话结束后不触发后台自动提炼。",
   },
 ];
 

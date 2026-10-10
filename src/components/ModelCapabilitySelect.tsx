@@ -44,22 +44,22 @@ export function ModelCapabilitySelect({
   if (capability === "image_gen") {
     const act = resolveActiveImageModel(settings);
     defaultInherit = act
-      ? `跟随全局 (${act.model} · ${act.provider.name})`
+      ? `跟随全局 (${act.provider.name}/${act.model})`
       : "跟随全局 (未配置)";
   } else if (capability === "vision") {
     const act = resolveActiveVisionModel(settings);
     defaultInherit = act
-      ? `跟随全局 (${act.model} · ${act.provider.name})`
+      ? `跟随全局 (${act.provider.name}/${act.model})`
       : "跟随全局 (回落主对话模型)";
   } else if (capability === "decision") {
     const act = resolveActiveDecisionModel(settings);
     defaultInherit = act
-      ? `跟随全局 (${act.model} · ${act.provider.name})`
+      ? `跟随全局 (${act.provider.name}/${act.model})`
       : "跟随全局 (回落主对话模型)";
   } else if (capability === "chat") {
     const act = resolveActiveModel(settings);
     defaultInherit = act
-      ? `跟随全局 (${act.model} · ${act.provider.name})`
+      ? `跟随全局 (${act.provider.name}/${act.model})`
       : "跟随全局 (未配置)";
   } else {
     defaultInherit = "跟随系统全局默认";

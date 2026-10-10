@@ -572,6 +572,16 @@ export function SettingsModal() {
               {s.id}
             </code>
             <span className="text-[12px] text-ink font-medium">{s.name}</span>
+            <span
+              className={`text-[11px] px-2 py-0.5 rounded-full font-medium inline-flex items-center gap-1 ${
+                s.phase === 1
+                  ? "bg-purple-500/20 text-purple-300 border border-purple-500/40"
+                  : "bg-blue-500/10 text-blue-300/80 border border-blue-500/25"
+              }`}
+            >
+              {s.phase === 1 && <span className="w-1.5 h-1.5 rounded-full bg-purple-400"></span>}
+              {s.phaseLabel}
+            </span>
             {renderSopCategoryBadge(s.category, s.categoryLabel)}
           </div>
           <div className="text-[12px] text-inkdim mt-1.5 leading-relaxed">{s.description}</div>
@@ -1573,8 +1583,26 @@ export function SettingsModal() {
                     </div>
                   </div>
 
-                  <div className="flex flex-col gap-2 mt-4">
-                    {AGENT_SOPS.map(renderSopItem)}
+                  <div className="flex flex-col gap-5 mt-4">
+                    {/* 第一层级 */}
+                    <div className="flex flex-col gap-2">
+                      <div className="flex items-center gap-2 text-[12px] font-semibold text-purple-400 px-0.5">
+                        <span className="w-2 h-2 rounded-full bg-purple-400"></span>
+                        <span>第一层级 · 前置意图定性闸门（新任务 Step 1 专属）</span>
+                        <span className="text-[11px] font-normal text-inkdim">严禁调用业务工具，只输出极简意向+方向，调用决策工具质检</span>
+                      </div>
+                      {AGENT_SOPS.filter((s) => s.phase === 1).map(renderSopItem)}
+                    </div>
+
+                    {/* 第二层级 */}
+                    <div className="flex flex-col gap-2 mt-1">
+                      <div className="flex items-center gap-2 text-[12px] font-semibold text-blue-400 px-0.5">
+                        <span className="w-2 h-2 rounded-full bg-blue-400"></span>
+                        <span>第二层级 · 工程规划与落地执行规范（意图质检放行后生效）</span>
+                        <span className="text-[11px] font-normal text-inkdim">质检通过或人工放行后激活，包含计划制定、协作者委派、代码精读与精确编辑</span>
+                      </div>
+                      {AGENT_SOPS.filter((s) => s.phase === 2).map(renderSopItem)}
+                    </div>
                   </div>
                 </section>
               </div>
