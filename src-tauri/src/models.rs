@@ -564,21 +564,14 @@ pub fn resolve_active_vision_model(settings: &SettingsData) -> Option<(&Provider
     None
 }
 
-/// 解析全局生效的 (决策厂商, 决策模型)：优先全局激活项，若无则寻找具备 decision 能力的模型，再次回落到主对话模型
+/// 解析全局生效的 (决策厂商, 决策模型)：优先全局激活项，若未单独配置决策模型则严格回落到全局主对话模型
 pub fn resolve_active_decision_model(settings: &SettingsData) -> Option<(&ProviderCfg, &str)> {
     if let (Some(pid), Some(mid)) = (&settings.active_decision_provider_id, &settings.active_decision_model_id) {
         if let Some(p) = settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid)) {
             return Some((p, mid.as_str()));
         }
     }
-    // 回落：查找任意配置了 decision 能力的模型
-    for p in &settings.providers {
-        for m in &p.models {
-            if settings.has_capability(Some(&p.id), m, "decision") {
-                return Some((p, m.as_str()));
-            }
-        }
-    }
+    // 未单独配置决策模型时，严格回落到全局主对话模型
     resolve_active_model(settings)
 }
 

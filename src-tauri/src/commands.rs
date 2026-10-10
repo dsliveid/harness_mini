@@ -1769,25 +1769,15 @@ pub async fn run_direct_decision(
     };
 
     let resolved = if let (Some(pid), Some(mid)) = (&session.decision_provider_id, &session.decision_model_id) {
-        settings.providers.iter().find(|p| &p.id == pid).map(|p| (p.clone(), mid.clone()))
+        settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid)).map(|p| (p.clone(), mid.clone()))
     } else if let (Some(pid), Some(mid)) = (&settings.active_decision_provider_id, &settings.active_decision_model_id) {
         settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid)).map(|p| (p.clone(), mid.clone()))
     } else if let (Some(pid), Some(mid)) = (&session.provider_id, &session.model_id) {
-        if settings.has_capability(Some(pid), mid, "decision") {
-            settings.providers.iter().find(|p| &p.id == pid).map(|p| (p.clone(), mid.clone()))
-        } else if let Some(p) = settings.providers.iter().find(|p| &p.id == pid) {
-            p.models.iter().find(|m| settings.has_capability(Some(pid), m, "decision"))
-                .map(|m| (p.clone(), m.clone()))
-        } else {
-            None
-        }
+        // 未单独配置决策模型时，严格回落至当前会话的主对话模型
+        settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid)).map(|p| (p.clone(), mid.clone()))
     } else {
         None
     }
-    .or_else(|| {
-        crate::models::resolve_active_decision_model(&settings)
-            .map(|(p, m)| (p.clone(), m.to_string()))
-    })
     .or_else(|| {
         crate::models::resolve_active_model(&settings)
             .map(|(p, m)| (p.clone(), m.to_string()))

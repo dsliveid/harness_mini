@@ -1470,13 +1470,7 @@ export function resolveActiveDecisionModel(settings: Settings): { provider: Prov
       return { provider: p, model: settings.activeDecisionModelId };
     }
   }
-  for (const p of settings.providers) {
-    for (const m of p.models) {
-      if (hasModelCapability(settings, p.id, m, "decision")) {
-        return { provider: p, model: m };
-      }
-    }
-  }
+  // 未单独配置决策模型时，严格回落至当前主对话模型
   return resolveActiveModel(settings);
 }
 
