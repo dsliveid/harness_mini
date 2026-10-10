@@ -857,6 +857,7 @@ fn parse_understanding_and_plan(raw: &str) -> (String, String) {
 
 /// 提取最近几轮人机对话的关键摘要，用于意图对齐门控进行代词消解与上下文关联
 /// 提取最近几轮人机对话的完整上下文，用于意图对齐门控进行代词消解与选项解析（不截断选项与末尾内容）
+#[allow(dead_code)]
 fn format_recent_context_for_gate(msgs: &[crate::models::Message], trigger_msg_id: Option<&str>) -> String {
     let mut relevant = Vec::new();
     let mut count = 0;
@@ -898,6 +899,7 @@ fn is_clarification_intent_plan(plan: &str) -> bool {
 }
 
 /// 日常对话前置意图对齐门控（仅对用户输入做单轮决策，内容极简，<90分由用户采用或输入提示，决不隐藏工具）
+#[allow(dead_code)]
 async fn run_intent_alignment_gate(
     app: &AppHandle,
     state: &crate::AppState,
@@ -1911,63 +1913,16 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         };
         (sec, effective_plan_mode, neg_intent)
     };
-    let mut sys = system_prompt(
+    let sys = system_prompt(
         &session,
         project_section.as_deref(),
         &settings.disabled_sops,
         &project_plan_mode,
     );
 
-    // ---- 前置意图对齐门控（仅对用户输入做单轮决策，内容极简，<90分由用户采用或输入提示，决不隐藏工具） ----
-    let should_run_intent_alignment = {
-        let is_main_session = session.session_type == "main" || session.session_type.is_empty();
-        let is_sop_enabled = !settings.disabled_sops.iter().any(|s| s == "intent_alignment_gate");
-        if !is_main_session || !is_sop_enabled {
-            false
-        } else if let Some(ref m) = trigger_msg {
-            if m.role != "user" {
-                false
-            } else {
-                let text = m.content.as_deref().unwrap_or("").trim();
-                !text.is_empty()
-                    && !text.starts_with('/')
-                    && !text.starts_with("【协作者成果汇报")
-                    && !text.starts_with("请承接前文未完成的内容")
-                    && !text.starts_with("请根据上述工具执行结果")
-                    && !text.starts_with("请继续执行任务")
-            }
-        } else {
-            false
-        }
-    };
-
-    if should_run_intent_alignment {
-        if let Some(ref m) = trigger_msg {
-            let u_msg = m.content.as_deref().unwrap_or("").trim();
-            let recent_context = {
-                let db = state.db.lock().unwrap();
-                let all_m = store::all_messages(&db, session_id).unwrap_or_default();
-                format_recent_context_for_gate(&all_m, Some(&m.id))
-            };
-            if let Some((understanding, plan)) = run_intent_alignment_gate(
-                app,
-                &state,
-                &session,
-                parent_session.as_ref(),
-                &settings,
-                &cfg,
-                session_id,
-                run_id,
-                u_msg,
-                &recent_context,
-            ).await {
-                sys.push_str(&format!(
-                    "\n\n## 经过确认的当前核心意图与行动计划\n- **意图理解**: {}\n- **核心行动**: {}\n请严格围绕上述对齐的目标与行动推进，使用合适的工具完成任务。\n",
-                    understanding, plan
-                ));
-            }
-        }
-    }
+    // 注意：意图对齐与决策质检已全面重构为原生内生型 SOP 流程，
+    // 大模型在首步（Step 1）根据系统提示词中的 SOP 自主思考并调用 score_decision 工具质检，
+    // 思考过程、意图文本与决策工具卡片完整融合于常规对话执行流中，杜绝外置旁路门控导致的割裂与历史丢失。
 
     let verified_intent_prefix: Option<String> = None;
     let mut sop_verified = false;
@@ -2510,10 +2465,17 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                         let score_val = val.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
                         let score_pct = val.get("scorePercent").and_then(|v| v.as_u64()).map(|n| n as u32).unwrap_or((score_val * 100.0).round() as u32);
                         let critique = val.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        result_text = format!(
-                            "{}\n\n【方案打分结果】评分: {}%，评估意见: {}",
-                            result_text, score_pct, critique
-                        );
+                        result_text = if score_pct >= 90 {
+                            format!(
+                                "{}\n\n【方案打分结果】评分: {}%（质检通过，≥90分）。评估意见: {}\n请围绕确认的核心意图与分步行动方案推进后续执行。",
+                                result_text, score_pct, critique
+                            )
+                        } else {
+                            format!(
+                                "{}\n\n【方案打分结果】评分: {}%（未达到90分及格线！）。评估意见: {}\n⚠️ 质检意见提示存在理解偏差或关键动作遗漏。请在下一步思考中反思并调整行动方案，或向用户说明疑问寻求确认，切勿盲目修改代码！",
+                                result_text, score_pct, critique
+                            )
+                        };
                     }
                 } else if tc.name == "judge_decision" {
                     if let Ok(val) = serde_json::from_str::<Value>(&result_text) {
@@ -4094,9 +4056,15 @@ fn system_prompt(
 
         if is_sop_enabled("intent_alignment_gate") {
             rules.push(format!(
-                "{rule_num}. 【对话意图对齐与行动准入 SOP】：\n   \
-                 - 系统已在前置阶段针对用户输入完成了意图理解与行动规划确认。请严格围绕确认的目标与分步计划推进执行；\n   \
-                 - 所有工具均已全量就绪可用，请严格按规范开展代码阅读、编辑与自检。"
+                "{rule_num}. 【首步对话意图对齐与行动准入 SOP（必须严格遵守）】：\n   \
+                 - 触发时机：当你接收到用户发送的新任务、功能需求、代码修改或复杂问题时，在第一步（Step 1）必须先进行意图对齐与自我质检；后续分步执行步骤无需重复打分；若为日常问候或纯文本简答可直接回复；\n   \
+                 - 第一步标准执行动作（必须按顺序执行）：\n     \
+                   1. 【深入思考】：在思考区（<think>）中深入揣摩用户真实核心诉求，结合前序多轮上下文进行代词消解与选项解析；\n     \
+                   2. 【简明表达】：在回复正文文本中先输出 1 句话核心意图（≤40字）和 2~3 项核心关键动作清单（每项≤25字）；\n     \
+                   3. 【质检调用】：**必须立即调用 `score_decision` 工具**，传入 `understanding`（你的核心意图理解）与 `plan`（拟定的关键动作清单），由决策模型进行契合度质检评分；\n   \
+                 - 决策结果与后续执行准则：\n     \
+                   * 若评分达标（≥90分）：质检通过，立即在后续步骤中顺畅调用各生产工具（如 read_file / create_plan / edit_file 等）推进工程落地；\n     \
+                   * 若评分未达标（<90分）：质检未通过，请根据工具返回的扣分意见反思调整方案，或向用户说明疑问寻求确认，切勿盲目修改代码！"
             ));
             rule_num += 1;
         }

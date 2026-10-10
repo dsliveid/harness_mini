@@ -169,11 +169,11 @@ function paramTitle(ev: ToolEvent): string {
   const p = ev.params ?? {};
   switch (ev.toolName) {
     case "judge_decision":
-      return `【判断】${p.statement ?? ""}`;
+      return `【判断】${p.statement ?? p.state ?? p.instruction ?? ""}`;
     case "choice_decision":
-      return `【选择】${p.question ?? ""}`;
+      return `【选择】${p.question ?? p.instruction ?? p.state ?? ""}`;
     case "score_decision":
-      return `【评分】${p.target ?? ""}`;
+      return `【意图质检】${p.understanding ?? p.target ?? p.state ?? p.instruction ?? ""}`;
     case "run_command":
       return String(p.command ?? "");
     case "glob":
@@ -221,7 +221,7 @@ function paramTitle(ev: ToolEvent): string {
 const TOOL_LABELS: Record<string, string> = {
   judge_decision: "判断决策",
   choice_decision: "选择决策",
-  score_decision: "评分决策",
+  score_decision: "意图质检",
   read_file: "读取文件",
   list_dir: "列出目录",
   glob: "查找文件",
@@ -647,6 +647,16 @@ function DecisionCardView({
     try {
       return JSON.parse(ev.resultText);
     } catch {
+      const text = ev.resultText.trim();
+      const firstBrace = text.indexOf("{");
+      const lastBrace = text.lastIndexOf("}");
+      if (firstBrace !== -1 && lastBrace > firstBrace) {
+        try {
+          return JSON.parse(text.substring(firstBrace, lastBrace + 1));
+        } catch {
+          return null;
+        }
+      }
       return null;
     }
   }, [ev.resultText]);
@@ -1504,22 +1514,23 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
   const imagePrompt = isImageTool ? String(ev.params?.prompt ?? "") : "";
   const isPlanTool = ["create_plan", "update_plan", "switch_plan"].includes(ev.toolName);
   const isVisionTool = ev.toolName === "recognize_image";
+  const isDecisionTool = ["judge_decision", "choice_decision", "score_decision"].includes(ev.toolName);
 
   const toolModelInfo = useMemo(() => {
     return extractToolModelInfo(ev, settings, currentSession);
   }, [ev, settings, currentSession]);
 
-  // 计划工具、生图工具与识图工具执行中/成功默认展开，失败默认收起；其他工具默认收起
+  // 计划工具、生图工具、识图工具与决策工具执行中/成功默认展开，失败默认收起；其他工具默认收起
   const [expanded, setExpanded] = useState(() => {
-    if (isImageTool || isVisionTool || isPlanTool) {
+    if (isImageTool || isVisionTool || isPlanTool || isDecisionTool) {
       return ev.status !== "failed" && ev.status !== "timeout" && ev.status !== "denied";
     }
     return false;
   });
 
-  // 当生图/识图状态在执行或流转中变为失败时，自动收起卡片；成功展开；计划操作若流转失败也自动收起
+  // 当生图/识图/决策状态在执行或流转中变为失败时，自动收起卡片；成功展开；计划操作若流转失败也自动收起
   useEffect(() => {
-    if (isImageTool || isVisionTool) {
+    if (isImageTool || isVisionTool || isDecisionTool) {
       if (ev.status === "failed" || ev.status === "timeout" || ev.status === "denied") {
         setExpanded(false);
       } else if (ev.status === "success") {
@@ -1530,7 +1541,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
         setExpanded(false);
       }
     }
-  }, [isImageTool, isVisionTool, isPlanTool, ev.status]);
+  }, [isImageTool, isVisionTool, isPlanTool, isDecisionTool, ev.status]);
 
   const generatedImagePath = useMemo(() => {
     if (ev.toolName !== "generate_image" || !ev.resultText) return null;

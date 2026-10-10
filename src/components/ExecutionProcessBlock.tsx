@@ -481,6 +481,12 @@ export function ExecutionProcessBlock({
   const tokensStr = tokens > 0 ? `${tokens.toLocaleString()} tokens` : null;
   const isReverted = useMemo(() => steps.length > 0 && steps.some((s) => !!s.revertedAt), [steps]);
 
+  const hasDecisionTool = useMemo(() => {
+    return steps.some((s) =>
+      s.toolEvents?.some((t) => ["score_decision", "judge_decision", "choice_decision"].includes(t.toolName))
+    );
+  }, [steps]);
+
   const isAlignmentPassed = Boolean(resolvedAlignment?.passed || resolvedAlignment?.status === "passed");
   const isAlignmentInProgress = Boolean(
     resolvedAlignment &&
@@ -511,7 +517,7 @@ export function ExecutionProcessBlock({
           />
           {isRunning ? (
             <Loader2 size={15} className="text-blue-400 animate-spin shrink-0" />
-          ) : isAlignmentPassed && toolCount === 0 && stepCount <= 1 ? (
+          ) : (isAlignmentPassed || hasDecisionTool) && toolCount === 0 && stepCount <= 1 ? (
             <ShieldCheck size={15} className="text-emerald-400 shrink-0" />
           ) : toolCount === 0 ? (
             <Brain size={15} className="text-purple-400 shrink-0" />
@@ -534,6 +540,8 @@ export function ExecutionProcessBlock({
                   ? `执行过程 (含意图质检 · ${stepCount} 个步骤)`
                   : "意图质检已完成"
                 : `思考过程 (${stepCount} 个步骤)`
+              : hasDecisionTool
+              ? `执行过程 (含意图质检 · ${stepCount} 个步骤)`
               : `执行过程 (${stepCount} 个步骤)`}
           </span>
 
@@ -543,7 +551,7 @@ export function ExecutionProcessBlock({
             </span>
           )}
 
-          {isAlignmentPassed && (
+          {(isAlignmentPassed || hasDecisionTool) && (
             <span className="text-[11px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 shrink-0 font-medium">
               意图已对齐
             </span>
