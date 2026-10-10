@@ -1290,6 +1290,75 @@ async fn run_intent_alignment_gate(
     }
 }
 
+/// 推理思考模型（如 DeepSeek-R1、QwQ 等）可能将最终答复输出在思考流中，
+/// 尝试精准切分内部推演草稿与面向用户的正式交付结论，杜绝草稿外泄与正文被关进抽屉。
+fn rescue_reasoning_deliverable(reasoning: &str) -> (String, String) {
+    let trimmed = reasoning.trim();
+    if trimmed.is_empty() {
+        return (String::new(), String::new());
+    }
+
+    // 1. 显式 stop token 遗留或 end 标记（如 end**结论先说**、end## 先给结论、end: ...）
+    static END_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let end_re = END_RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)(?:^|[\r\n\s。！!])(end[\s:：\r\n]*(\*\*|##|#|【|一句话|结论|核心|直接))").unwrap()
+    });
+
+    // 2. 结论/答复段落标志（以换行为前导）
+    static TITLE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let title_re = TITLE_RE.get_or_init(|| {
+        regex::Regex::new(r"(?:\n\s*\n|\n)(##\s+|\*\*(?:先给结论|核心结论|结论先说|最终结论|结论|一句话结论|总结|总览|回答|建议)\*\*|【(?:先给结论|核心结论|结论先说|最终结论|结论|一句话结论|总结|总览|回答|建议)】|(?:先给结论|核心结论|结论先说|最终结论|一句话结论)[：:])").unwrap()
+    });
+
+    // 3. 强段落转折标志（\n\n综上所述、\n\n因此，、\n\n基于以上分析）
+    static SUMMARY_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let summary_re = SUMMARY_RE.get_or_init(|| {
+        regex::Regex::new(r"(?:\n\s*\n)(#+\s+|因此[，,]|综上所述[，,]|基于以上分析[，,])").unwrap()
+    });
+
+    if let Some(caps) = end_re.captures(trimmed) {
+        if let Some(end_block) = caps.get(1) {
+            let start = end_block.start();
+            let target_start = caps.get(2).map(|c| c.start()).unwrap_or(end_block.end());
+            let head = trimmed[..start].trim().to_string();
+            let tail = trimmed[target_start..].trim().to_string();
+            if !tail.is_empty() {
+                return (head, tail);
+            }
+        }
+    }
+
+    if let Some(caps) = title_re.captures(trimmed) {
+        if let Some(mat) = caps.get(0) {
+            let start = mat.start();
+            let target_start = caps.get(1).map(|c| c.start()).unwrap_or(start);
+            let head = trimmed[..start].trim().to_string();
+            let tail = trimmed[target_start..].trim().to_string();
+            if !tail.is_empty() {
+                return (head, tail);
+            }
+        }
+    }
+
+    if let Some(caps) = summary_re.captures(trimmed) {
+        if let Some(mat) = caps.get(0) {
+            let start = mat.start();
+            let target_start = caps.get(1).map(|c| c.start()).unwrap_or(start);
+            let head = trimmed[..start].trim().to_string();
+            let tail = trimmed[target_start..].trim().to_string();
+            if !tail.is_empty() {
+                return (head, tail);
+            }
+        }
+    }
+
+    // 无法精准切分时的兜底：保留完整思考，正文赋予规范的提取引用块，绝不冒充正常纯净文本
+    (
+        trimmed.to_string(),
+        format!("> 💡 *（模型未在交付正文通道输出，已从推演记录中提取如下内容）*\n\n{}", trimmed),
+    )
+}
+
 /// Agent 单次运行主循环（§5.1）
 async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &str) -> (RunOutcome, Option<String>, RunTokenMetrics) {
     let mut last_assistant_id: Option<String> = None;
@@ -2150,8 +2219,18 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         // 空回复防护：模型不支持流式/工具或名称错误时给出明确提示
         if result.tool_calls.is_empty() && result.content.trim().is_empty() {
             if !result.reasoning.trim().is_empty() {
-                // 推理思考模型（如 DeepSeek-R1、QwQ 等）可能将汇报输出在思考流中，兜底提取正文，避免误杀
-                result.content = format!("【思考过程汇报】\n{}", result.reasoning.trim());
+                // 推理思考模型（如 DeepSeek-R1、QwQ 等）可能将汇报输出在思考流中，精准切分，避免误杀与内外错位
+                let (clean_reasoning, extracted_content) = rescue_reasoning_deliverable(&result.reasoning);
+                result.reasoning = clean_reasoning;
+                result.content = extracted_content;
+                app.state::<crate::AppState>().emit(
+                    "message:delta",
+                    &json!({
+                        "sessionId": session_id,
+                        "messageId": assistant_id,
+                        "delta": &result.content
+                    }),
+                );
             } else {
                 // 清理本次为该步骤预占位的空 assistant 消息，防止留在数据库中变成僵尸占位
                 {
@@ -3994,7 +4073,8 @@ fn system_prompt(
 工作规则：
 1. 当前会话没有绑定本地目录，文件与命令类工具（read_file / write_file / edit_file / glob / grep / list_dir / run_command）均不可用，不要尝试调用；相关的问题直接以文字回答或给出建议代码。
 2. 如果用户需要你实际读写文件、执行命令，请提示：在顶栏点击工作区按钮选择目录后再继续。
-3. 全程使用简体中文与用户交流，回答准确、简洁。"#,
+3. 全程使用简体中文与用户交流，回答准确、简洁。
+4. 【思考与交付通道分离规范（严禁正文留空）】：若当前模型具备深度思考能力（Thinking/Reasoning），思考过程仅用于你内部的逻辑推导与推演；面向用户的最终回答与结论必须完整输出在正式正文（Content）中，严禁在思考结束后直接停止生成导致正文留空。"#,
             os = os
         )
     } else if is_collab {
@@ -4248,7 +4328,7 @@ fn system_prompt(
         rules.push(format!("{rule_num}. 不要执行破坏性命令（如递归删除、格式化磁盘等），它们会被强制要求用户确认。"));
         rule_num += 1;
 
-        rules.push(format!("{rule_num}. 全程使用简体中文与用户交流；最终回复简洁总结：做了什么、改了哪些文件、验证结果如何。"));
+        rules.push(format!("{rule_num}. 全程使用简体中文与用户交流；最终回复简洁总结：做了什么、改了哪些文件、验证结果如何。若具备深度思考能力（Thinking/Reasoning），思考过程仅用于内部推导与规划，最终面向用户的答复必须且只能输出在正文（Content）中，严禁在正文中留空。"));
 
         let rules_text = rules.join("\n");
         format!(
@@ -4330,6 +4410,27 @@ mod tests {
         let cjk = estimate_tokens("一二三四五六七八九十");
         let ascii = estimate_tokens("abcdefghij");
         assert!(cjk > ascii);
+    }
+
+    #[test]
+    fn test_rescue_reasoning_deliverable() {
+        // 场景 1：end 标记加粗结论
+        let sample1 = "思考草稿... 保持简洁但信息密集。end**结论先说：对乳糖不耐受者，喝牛奶弊大于利。**\n\n详细展开...";
+        let (r1, c1) = rescue_reasoning_deliverable(sample1);
+        assert_eq!(r1, "思考草稿... 保持简洁但信息密集。");
+        assert_eq!(c1, "**结论先说：对乳糖不耐受者，喝牛奶弊大于利。**\n\n详细展开...");
+
+        // 场景 2：Markdown 标题结论
+        let sample2 = "内部推演完毕。\n\n## 先给结论\n\n总体弊大于利。";
+        let (r2, c2) = rescue_reasoning_deliverable(sample2);
+        assert_eq!(r2, "内部推演完毕。");
+        assert_eq!(c2, "## 先给结论\n\n总体弊大于利。");
+
+        // 场景 3：无结构纯思考
+        let sample3 = "我在思考，我想想怎么回答用户。";
+        let (r3, c3) = rescue_reasoning_deliverable(sample3);
+        assert_eq!(r3, "我在思考，我想想怎么回答用户。");
+        assert!(c3.starts_with("> 💡 *（模型未在交付正文通道输出"));
     }
 
     #[test]

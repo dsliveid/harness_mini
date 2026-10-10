@@ -49,6 +49,25 @@ export function extractIntentAlignmentFromReasoning(reasoning?: string | null): 
   };
 }
 
+/** 清洗可能夹带【思考过程汇报】旧版兜底标记的历史正文，精确提取最终交付结论 */
+export function cleanDeliverableContent(content?: string | null): string {
+  if (!content) return "";
+  const trimmed = content.trim();
+  if (!trimmed.startsWith("【思考过程汇报】")) return trimmed;
+  const withoutPrefix = trimmed.replace(/^【思考过程汇报】\s*/, "");
+  const match = withoutPrefix.match(
+    /(?:(?:^|\n|[\s。！!])end\s*(?:\n+|[\s:：])*(?=\*\*|##|#|【|一句话|结论|核心|直接)|(?:\n\s*\n|\n)(?=(?:##|\*\*|【)?(?:先给结论|核心结论|结论先说|最终结论|结论|一句话结论|总(?:结|览)|回答|建议)(?:\*\*|】)?[:：\s])|(?:\n\s*\n)(?=(?:#+\s+|因此[，,]|综上所述[，,]|基于以上分析[，,])))/i
+  );
+  if (match && match.index != null) {
+    const tailRaw = withoutPrefix.slice(match.index + match[0].length).trim();
+    const cleanTail = tailRaw.replace(/^end[:：\s]*/i, "").trim();
+    if (cleanTail.length > 0) {
+      return cleanTail;
+    }
+  }
+  return withoutPrefix;
+}
+
 /**
  * 将平铺的时间线消息按轮次聚合成：用户提问 -> 中间执行过程 (含前置意图对齐门控与多步工具折叠) -> 最终交付成果
  * 方案 B：执行与思考过程全内置于抽屉内流式生长，运行期间全程保持展开与稳态，任务彻底完成后自动折叠
@@ -157,10 +176,11 @@ export function groupTimelineItems(
           isRunning: false,
           intentAlignment: turnAlignment,
         });
-        if (singleMsg.content && singleMsg.content.trim().length > 0) {
+        const cleanSingle = cleanDeliverableContent(singleMsg.content);
+        if (cleanSingle.length > 0) {
           result.push({
             type: "message",
-            msg: { ...singleMsg, reasoning: null, turnToolEvents: singleMsg.toolEvents },
+            msg: { ...singleMsg, content: cleanSingle, reasoning: null, turnToolEvents: singleMsg.toolEvents },
           });
         }
       } else if (turnAlignment) {
@@ -176,10 +196,13 @@ export function groupTimelineItems(
           isRunning: false,
           intentAlignment: turnAlignment,
         });
-        result.push({
-          type: "message",
-          msg: { ...singleMsg, reasoning: null },
-        });
+        const cleanSingle = cleanDeliverableContent(singleMsg.content);
+        if (cleanSingle.length > 0) {
+          result.push({
+            type: "message",
+            msg: { ...singleMsg, content: cleanSingle, reasoning: null },
+          });
+        }
       } else if (hasReasoning && singleMsg.content && singleMsg.content.trim().length > 0) {
         // 单步同时具备思考过程与回复正文：思考过程收归抽屉并默认折叠，外部仅留干净的正文交付
         const metrics = turnMetricsMap.get(singleMsg.id);
@@ -191,13 +214,19 @@ export function groupTimelineItems(
           isRunning: false,
           intentAlignment: turnAlignment,
         });
-        result.push({
-          type: "message",
-          msg: { ...singleMsg, reasoning: null },
-        });
+        const cleanSingle = cleanDeliverableContent(singleMsg.content);
+        if (cleanSingle.length > 0) {
+          result.push({
+            type: "message",
+            msg: { ...singleMsg, content: cleanSingle, reasoning: null },
+          });
+        }
       } else {
         // 纯单步普通文本答复
-        result.push({ type: "message", msg: singleMsg });
+        const cleanSingle = cleanDeliverableContent(singleMsg.content);
+        if (cleanSingle.length > 0) {
+          result.push({ type: "message", msg: { ...singleMsg, content: cleanSingle } });
+        }
       }
       currentAssistantSteps = [];
       return;
@@ -236,15 +265,19 @@ export function groupTimelineItems(
         intentAlignment: turnAlignment,
       });
 
-      result.push({
-        type: "message",
-        msg: {
-          ...lastMsg,
-          reasoning: null,
-          turnToolEvents: allTurnToolEvents,
-          revertedAt: turnRevertedAt,
-        },
-      });
+      const cleanLast = cleanDeliverableContent(lastMsg.content);
+      if (cleanLast.length > 0) {
+        result.push({
+          type: "message",
+          msg: {
+            ...lastMsg,
+            content: cleanLast,
+            reasoning: null,
+            turnToolEvents: allTurnToolEvents,
+            revertedAt: turnRevertedAt,
+          },
+        });
+      }
     } else {
       // 整轮所有步骤均包含工具调用（如中断在工具执行）
       const metrics =
@@ -260,11 +293,13 @@ export function groupTimelineItems(
         intentAlignment: turnAlignment,
       });
 
-      if (lastMsg.content && lastMsg.content.trim().length > 0) {
+      const cleanLast = cleanDeliverableContent(lastMsg.content);
+      if (cleanLast.length > 0) {
         result.push({
           type: "message",
           msg: {
             ...lastMsg,
+            content: cleanLast,
             reasoning: null,
             turnToolEvents: allTurnToolEvents,
             revertedAt: turnRevertedAt,
