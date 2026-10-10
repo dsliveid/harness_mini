@@ -90,17 +90,15 @@ export function ModelContextModal({
 
           {/* 模型信息横条 */}
           <div className="flex items-center justify-between px-3 py-2 rounded-xl bg-panel3/60 border border-edge/60">
-            <div className="flex flex-col min-w-0">
+            <div className="flex flex-col min-w-0 flex-1">
               <span className="text-[11px] text-inkdim">当前对话使用模型</span>
-              <span className="font-mono font-medium text-ink truncate max-w-[280px]" title={modelName}>
-                {modelName}
+              <span
+                className="font-mono font-medium text-ink truncate max-w-[380px]"
+                title={providerName ? `${providerName}/${modelName}` : modelName}
+              >
+                {providerName ? `${providerName}/${modelName}` : modelName}
               </span>
             </div>
-            {providerName && (
-              <span className="text-[11px] px-2 py-0.5 rounded-full bg-panel border border-edge text-inkdim shrink-0">
-                {providerName}
-              </span>
-            )}
           </div>
 
           {/* 快捷规格标签 */}

@@ -94,6 +94,7 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
   const deleteCollaborator = useStore((s) => s.deleteCollaborator);
   const pushToast = useStore((s) => s.pushToast);
   const setShowTokenStatsModal = useStore((s) => s.setShowTokenStatsModal);
+  const settings = useStore((s) => s.settings);
 
   const [loading, setLoading] = useState(!collab);
   const [input, setInput] = useState("");
@@ -652,18 +653,30 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
             </span>
             {/* Model Badges */}
             <div className="flex items-center gap-1.5 shrink-0 text-[10.5px]">
-              {(collab.modelId || collab.model_id) && (
-                <span className="px-1.5 py-0.5 rounded bg-panel3 border border-edge text-inkdim font-mono flex items-center gap-1" title="对话思考驱动模型">
-                  <Cpu size={10} className="text-accent" />
-                  <span>{collab.modelId || collab.model_id}</span>
-                </span>
-              )}
-              {(collab.imageModelId || collab.image_model_id) && (
-                <span className="px-1.5 py-0.5 rounded bg-purple-500/10 border border-purple-500/30 text-purple-300 font-mono flex items-center gap-1" title="专属生图执行模型">
-                  <Palette size={10} className="text-purple-300" />
-                  <span>{collab.imageModelId || collab.image_model_id}</span>
-                </span>
-              )}
+              {(() => {
+                const mainPid = collab.providerId || collab.provider_id;
+                const mainMid = collab.modelId || collab.model_id;
+                const mainP = settings.providers?.find((p) => p.id === mainPid);
+                const mainDisplay = mainP?.name && mainMid ? `${mainP.name}/${mainMid}` : mainMid;
+                return mainDisplay ? (
+                  <span className="px-1.5 py-0.5 rounded bg-panel3 border border-edge text-inkdim font-mono flex items-center gap-1" title={`对话思考驱动模型: ${mainDisplay}`}>
+                    <Cpu size={10} className="text-accent" />
+                    <span>{mainDisplay}</span>
+                  </span>
+                ) : null;
+              })()}
+              {(() => {
+                const imgPid = collab.imageProviderId || collab.image_provider_id;
+                const imgMid = collab.imageModelId || collab.image_model_id;
+                const imgP = settings.providers?.find((p) => p.id === imgPid);
+                const imgDisplay = imgP?.name && imgMid ? `${imgP.name}/${imgMid}` : imgMid;
+                return imgDisplay ? (
+                  <span className="px-1.5 py-0.5 rounded bg-purple-500/10 border border-purple-500/30 text-purple-300 font-mono flex items-center gap-1" title={`专属生图执行模型: ${imgDisplay}`}>
+                    <Palette size={10} className="text-purple-300" />
+                    <span>{imgDisplay}</span>
+                  </span>
+                ) : null;
+              })()}
             </div>
           </div>
           {(collab.dispatchRule || collab.dispatch_rule) && (

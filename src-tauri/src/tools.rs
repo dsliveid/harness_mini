@@ -3370,7 +3370,7 @@ async fn generate_image_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
     let kb = img_bytes.len() / 1024;
 
     Ok(format!(
-        "🎨 图片生成成功！\n- 保存路径: `{target_str}`\n- 厂商: `{}`\n- 使用模型: `{model_name}`\n- 提示词: {prompt}\n- 分辨率: {size_display}\n- 大小: {kb} KB\n\n![{prompt}]({target_str})",
+        "🎨 图片生成成功！\n- 保存路径: `{target_str}`\n- 厂商/模型: `{}/{model_name}`\n- 提示词: {prompt}\n- 分辨率: {size_display}\n- 大小: {kb} KB\n\n![{prompt}]({target_str})",
         provider.name
     ))
 }
@@ -3555,7 +3555,7 @@ async fn recognize_image_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Str
     let kb = bytes.len() / 1024;
 
     Ok(format!(
-        "👁️ 图像识别完成！\n- 目标图片: `{target_display_path}`\n- 厂商: `{}`\n- 使用模型: `{model_name}`\n- 大小: {kb} KB\n- 分析要求: {prompt}\n\n### 识别与分析结果：\n{}",
+        "👁️ 图像识别完成！\n- 目标图片: `{target_display_path}`\n- 厂商/模型: `{}/{model_name}`\n- 大小: {kb} KB\n- 分析要求: {prompt}\n\n### 识别与分析结果：\n{}",
         provider.name,
         res.content.trim()
     ))

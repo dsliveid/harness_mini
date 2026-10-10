@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useStore } from "../store";
-import { hasModelCapability, defaultDispatchRuleForRole } from "../types";
+import { hasModelCapability, defaultDispatchRuleForRole, resolveActiveModel } from "../types";
 import { ipc } from "../ipc";
 import {
   Users,
@@ -343,7 +343,10 @@ export function EditCollaboratorModal() {
     }
   };
 
-  const activeModelName = settings?.activeModelId || settings?.activeModel || "全局激活模型";
+  const activeMod = resolveActiveModel(settings);
+  const activeModelName = activeMod
+    ? `${activeMod.provider.name}/${activeMod.model}`
+    : settings?.activeModelId || settings?.activeModel || "全局激活模型";
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4 animate-in fade-in duration-150">

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useStore, currentSession } from "../store";
-import { hasModelCapability } from "../types";
+import { hasModelCapability, resolveActiveModel } from "../types";
 import {
   Users,
   X,
@@ -233,7 +233,10 @@ export function CreateCollaboratorModal() {
     }
   };
 
-  const activeModelName = settings?.activeModelId || settings?.activeModel || "全局激活模型";
+  const activeMod = resolveActiveModel(settings);
+  const activeModelName = activeMod
+    ? `${activeMod.provider.name}/${activeMod.model}`
+    : settings?.activeModelId || settings?.activeModel || "全局激活模型";
 
 
   return (

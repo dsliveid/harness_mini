@@ -45,6 +45,10 @@ export function SessionSettingsModal() {
 
   const currentPid = session.providerId ?? session.provider_id ?? settings.activeProviderId ?? null;
   const currentMid = session.modelId ?? session.model_id ?? settings.activeModelId ?? settings.activeModel ?? "默认模型";
+  const currentP = settings.providers.find((p) => p.id === currentPid);
+  const currentModelDisplay = currentP?.name && currentMid && currentMid !== "默认模型"
+    ? `${currentP.name}/${currentMid}`
+    : currentMid;
   const defaultLimit = resolveModelContextLimit(settings, currentPid, currentMid);
   const effectiveLimit = session.contextTokenLimit ?? defaultLimit;
   const isCustomSession = session.contextTokenLimit != null;
@@ -189,7 +193,7 @@ export function SessionSettingsModal() {
                 <div className="flex items-center justify-between px-3 py-2 rounded-xl bg-panel3/50 border border-edge/60 text-[12px]">
                   <div className="flex flex-col min-w-0">
                     <span className="text-[11px] text-inkdim">当前对话使用模型</span>
-                    <span className="font-mono font-medium text-ink truncate">{currentMid}</span>
+                    <span className="font-mono font-medium text-ink truncate" title={currentModelDisplay}>{currentModelDisplay}</span>
                   </div>
                   <div className="text-[11px] text-inkdim text-right">
                     <div>模型默认: <span className="font-mono text-ink">{formatTokens(defaultLimit)}</span></div>

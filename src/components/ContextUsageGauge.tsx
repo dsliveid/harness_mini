@@ -332,14 +332,12 @@ export function ContextUsageGauge({ session, className = "" }: ContextUsageGauge
 
           {/* 模型与厂商 */}
           <div className="flex items-center justify-between text-[11px] text-inkdim mt-2 font-mono">
-            <span className="truncate max-w-[190px]" title={info.modelName}>
-              模型: <span className="text-ink font-medium">{info.modelName}</span>
+            <span
+              className="truncate max-w-[280px]"
+              title={info.providerName ? `${info.providerName}/${info.modelName}` : info.modelName}
+            >
+              模型: <span className="text-ink font-medium">{info.providerName ? `${info.providerName}/${info.modelName}` : info.modelName}</span>
             </span>
-            {info.providerName && (
-              <span className="truncate max-w-[95px] text-inkdim/80 text-[10.5px]">
-                {info.providerName}
-              </span>
-            )}
           </div>
 
           {/* Token 数值与比例 */}
