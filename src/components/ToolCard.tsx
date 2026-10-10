@@ -1,7 +1,8 @@
 import { useState, useMemo, useEffect } from "react";
 import { ipc } from "../ipc";
 import { useStore } from "../store";
-import type { ToolEvent } from "../types";
+import type { ToolEvent, Settings, Session } from "../types";
+import { resolveActiveImageModel, resolveActiveDecisionModel, hasModelCapability } from "../types";
 import { Markdown } from "./Markdown";
 import { SubprocessBranchTree } from "./SubprocessBranchTree";
 import { SafeImage } from "./SafeImage";
@@ -31,6 +32,7 @@ import {
   Sparkles,
   BookOpen,
   Lightbulb,
+  Server,
 } from "./Icons";
 
 function statusBadge(status: string, revertedAt?: string | null) {
@@ -243,6 +245,106 @@ const TOOL_LABELS: Record<string, string> = {
   wait_collaborators: "等待协作者汇报",
   get_collaborators: "查询项目协作者",
 };
+
+/**
+ * 提取生图与决策工具实际调用的模型与厂商信息
+ * 1. 优先从工具执行结果 (resultText / JSON) 中提取实际调用厂商与模型
+ * 2. 失败时从后端注入的错误前缀 [厂商: xxx / 模型: yyy] 提取
+ * 3. 正在执行中或未产生产物时，回退到当前会话专属配置或全局生效配置进行精准推算
+ */
+export function extractToolModelInfo(
+  ev: ToolEvent,
+  settings?: Settings,
+  session?: Session | null
+): { provider?: string; model?: string } | null {
+  const isImageTool = ev.toolName === "generate_image";
+  const isDecisionTool = ["judge_decision", "choice_decision", "score_decision"].includes(ev.toolName);
+  if (!isImageTool && !isDecisionTool) return null;
+
+  // 1. 优先尝试从 ev.resultText 中提取实际执行返回的厂商与模型（最准确）
+  if (ev.resultText) {
+    if (isImageTool) {
+      const providerMatch = ev.resultText.match(/厂商:\s*`?([^`\n]+)`?/);
+      const modelMatch = ev.resultText.match(/使用模型:\s*`?([^`\n]+)`?/);
+      const errMatch = ev.resultText.match(/\[厂商:\s*([^/\]]+?)\s*\/\s*模型:\s*([^/\]]+?)\s*\]/);
+
+      const provider = providerMatch ? providerMatch[1].trim() : errMatch ? errMatch[1].trim() : undefined;
+      const model = modelMatch ? modelMatch[1].trim() : errMatch ? errMatch[2].trim() : undefined;
+
+      if (provider || model) {
+        return { provider, model };
+      }
+    } else if (isDecisionTool) {
+      try {
+        const parsed = JSON.parse(ev.resultText);
+        if (parsed && typeof parsed === "object") {
+          const provider = typeof parsed.provider === "string" ? parsed.provider.trim() : undefined;
+          const model = typeof parsed.model === "string" ? parsed.model.trim() : undefined;
+          if (provider || model) {
+            return { provider, model };
+          }
+        }
+      } catch {
+        // 非有效 JSON，检查是否有注入的错误前缀
+      }
+      const errMatch = ev.resultText.match(/\[厂商:\s*([^/\]]+?)\s*\/\s*模型:\s*([^/\]]+?)\s*\]/);
+      if (errMatch) {
+        return { provider: errMatch[1].trim(), model: errMatch[2].trim() };
+      }
+    }
+  }
+
+  // 2. 如果未从 resultText 提取到（如 running、pending_approval 等状态），根据配置推算
+  if (!settings) return null;
+
+  if (isImageTool) {
+    if (ev.params?.model) {
+      const reqM = String(ev.params.model).trim();
+      const p = settings.providers?.find((item) => item.models?.includes(reqM));
+      return { provider: p?.name || p?.id, model: reqM };
+    }
+    const sessPid = session?.imageProviderId || session?.image_provider_id;
+    const sessMid = session?.imageModelId || session?.image_model_id;
+    if (sessPid && sessMid) {
+      const p = settings.providers?.find((item) => item.id === sessPid);
+      return { provider: p?.name || sessPid, model: sessMid };
+    }
+    const activeImg = resolveActiveImageModel(settings);
+    if (activeImg) {
+      return { provider: activeImg.provider.name || activeImg.provider.id, model: activeImg.model };
+    }
+    const mainPid = session?.providerId || session?.provider_id;
+    const mainMid = session?.modelId || session?.model_id;
+    if (mainPid && mainMid && hasModelCapability(settings, mainPid, mainMid, "image_gen")) {
+      const p = settings.providers?.find((item) => item.id === mainPid);
+      return { provider: p?.name || mainPid, model: mainMid };
+    }
+  } else if (isDecisionTool) {
+    if (ev.params?.model) {
+      const reqM = String(ev.params.model).trim();
+      const p = settings.providers?.find((item) => item.models?.includes(reqM));
+      return { provider: p?.name || p?.id, model: reqM };
+    }
+    const sessPid = session?.decisionProviderId || session?.decision_provider_id;
+    const sessMid = session?.decisionModelId || session?.decision_model_id;
+    if (sessPid && sessMid) {
+      const p = settings.providers?.find((item) => item.id === sessPid);
+      return { provider: p?.name || sessPid, model: sessMid };
+    }
+    const activeDec = resolveActiveDecisionModel(settings);
+    if (activeDec) {
+      return { provider: activeDec.provider.name || activeDec.provider.id, model: activeDec.model };
+    }
+    const mainPid = session?.providerId || session?.provider_id;
+    const mainMid = session?.modelId || session?.model_id;
+    if (mainPid && mainMid && hasModelCapability(settings, mainPid, mainMid, "decision")) {
+      const p = settings.providers?.find((item) => item.id === mainPid);
+      return { provider: p?.name || mainPid, model: mainMid };
+    }
+  }
+
+  return null;
+}
 
 function PlanCardView({
   ev,
@@ -488,7 +590,13 @@ function MemoryCardView({
   );
 }
 
-function DecisionCardView({ ev }: { ev: ToolEvent }) {
+function DecisionCardView({
+  ev,
+  modelInfo,
+}: {
+  ev: ToolEvent;
+  modelInfo?: { provider?: string; model?: string } | null;
+}) {
   const p = ev.params || {};
   const isJudge = ev.toolName === "judge_decision";
   const isChoice = ev.toolName === "choice_decision";
@@ -503,20 +611,72 @@ function DecisionCardView({ ev }: { ev: ToolEvent }) {
     }
   }, [ev.resultText]);
 
+  const effectiveModelInfo = useMemo(() => {
+    const prov = (typeof parsedResult?.provider === "string" ? parsedResult.provider : undefined) || modelInfo?.provider;
+    const mod = (typeof parsedResult?.model === "string" ? parsedResult.model : undefined) || modelInfo?.model;
+    if (prov || mod) return { provider: prov, model: mod };
+    return null;
+  }, [parsedResult, modelInfo]);
+
+  if (ev.status === "failed" || ev.status === "denied" || ev.status === "timeout") {
+    return (
+      <div className="mt-2 text-[12px] bg-red-500/10 border border-red-500/30 rounded-xl p-3 text-red-300 space-y-2">
+        <div className="font-medium flex items-center justify-between gap-1.5 text-red-400 flex-wrap">
+          <div className="flex items-center gap-1.5">
+            <ShieldAlert size={15} />
+            <span>决策执行未完成 ({ev.status})</span>
+          </div>
+          {effectiveModelInfo && (effectiveModelInfo.provider || effectiveModelInfo.model) && (
+            <span className="inline-flex items-center gap-1 text-[11px] font-mono px-2 py-0.5 rounded bg-red-950/50 border border-red-500/30 text-red-300">
+              <Server size={11} />
+              {effectiveModelInfo.provider && <span>{effectiveModelInfo.provider}</span>}
+              {effectiveModelInfo.provider && effectiveModelInfo.model && <span>/</span>}
+              {effectiveModelInfo.model && <span>{effectiveModelInfo.model}</span>}
+            </span>
+          )}
+        </div>
+        <div className="text-[11.5px] font-mono whitespace-pre-wrap text-red-300/90 max-h-36 overflow-y-auto selection:bg-red-500/30">
+          {ev.resultText || "决策执行异常，未获取到结构化裁决结果"}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="mt-2 text-[12px] bg-amber-500/5 border border-amber-500/25 rounded-xl p-3 space-y-2.5">
       <div className="flex items-center justify-between gap-2 flex-wrap">
-        <div className="flex items-center gap-1.5 font-semibold text-amber-300">
-          <Zap size={14} className="text-amber-400" />
-          <span>
-            {isJudge ? "二元判断决策" : isChoice ? "多选裁决决策" : "指标评分决策"}
-          </span>
+        <div className="flex items-center gap-2 flex-wrap">
+          <div className="flex items-center gap-1.5 font-semibold text-amber-300">
+            <Zap size={14} className="text-amber-400" />
+            <span>
+              {isJudge ? "二元判断决策" : isChoice ? "多选裁决决策" : "指标评分决策"}
+            </span>
+          </div>
+          {effectiveModelInfo && (effectiveModelInfo.provider || effectiveModelInfo.model) && (
+            <span
+              className="inline-flex items-center gap-1 text-[10.5px] font-mono px-2 py-0.5 rounded-md bg-amber-500/10 text-amber-300 border border-amber-500/25"
+              title={`决策实际调用: ${effectiveModelInfo.provider || "默认厂商"} / ${effectiveModelInfo.model || "默认模型"}`}
+            >
+              <Server size={11} className="text-amber-400" />
+              {effectiveModelInfo.provider && <span className="font-medium">{effectiveModelInfo.provider}</span>}
+              {effectiveModelInfo.provider && effectiveModelInfo.model && <span className="opacity-40">/</span>}
+              {effectiveModelInfo.model && <span>{effectiveModelInfo.model}</span>}
+            </span>
+          )}
         </div>
-        {parsedResult?.confidence != null && (
-          <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-300 border border-amber-500/20">
-            置信度: {(Number(parsedResult.confidence) * 100).toFixed(0)}%
-          </span>
-        )}
+        <div className="flex items-center gap-2">
+          {ev.status === "running" && (
+            <span className="inline-flex items-center gap-1 text-[11px] text-amber-400 animate-pulse font-sans">
+              <Loader2 size={12} className="animate-spin" />
+              <span>决策研判中...</span>
+            </span>
+          )}
+          {parsedResult?.confidence != null && (
+            <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-300 border border-amber-500/20">
+              置信度: {(Number(parsedResult.confidence) * 100).toFixed(0)}%
+            </span>
+          )}
+        </div>
       </div>
 
       {isJudge && (
@@ -847,16 +1007,19 @@ function ImageToolView({
   imagePath,
   prompt,
   metadata,
+  modelInfo,
 }: {
   ev: ToolEvent;
   imagePath: string | null;
   prompt: string;
   metadata: {
     imagePath?: string | null;
+    provider?: string | null;
     model?: string | null;
     resolution?: string | null;
     fileSize?: string | null;
   } | null;
+  modelInfo?: { provider?: string; model?: string } | null;
 }) {
   const setLightboxImage = useStore((s) => s.setLightboxImage);
   const pushToast = useStore((s) => s.pushToast);
@@ -900,6 +1063,14 @@ function ImageToolView({
           <Sparkles size={12} className="absolute text-pink-300 animate-pulse" />
         </div>
         <div className="text-[13px] font-medium text-ink">正在绘制图像，请稍候…</div>
+        {modelInfo && (modelInfo.provider || modelInfo.model) && (
+          <div className="inline-flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-0.5 rounded-md bg-pink-500/10 text-pink-300 border border-pink-500/20">
+            <Server size={11} className="text-pink-400" />
+            {modelInfo.provider && <span className="font-medium">{modelInfo.provider}</span>}
+            {modelInfo.provider && modelInfo.model && <span className="opacity-40">/</span>}
+            {modelInfo.model && <span>{modelInfo.model}</span>}
+          </div>
+        )}
         {prompt && (
           <div className="text-[11.5px] text-inkdim/80 text-center max-w-md line-clamp-2 italic px-2">
             “{prompt}”
@@ -913,9 +1084,19 @@ function ImageToolView({
   if (ev.status === "failed" || ev.status === "denied" || ev.status === "timeout") {
     return (
       <div className="mt-2.5 rounded-xl border border-red-500/30 bg-red-500/10 p-3.5 text-red-300">
-        <div className="font-medium text-[12.5px] flex items-center gap-1.5 mb-1.5 text-red-400">
-          <ShieldAlert size={15} />
-          <span>图片生成失败</span>
+        <div className="font-medium text-[12.5px] flex items-center justify-between gap-1.5 mb-1.5 text-red-400 flex-wrap">
+          <div className="flex items-center gap-1.5">
+            <ShieldAlert size={15} />
+            <span>图片生成失败</span>
+          </div>
+          {modelInfo && (modelInfo.provider || modelInfo.model) && (
+            <span className="inline-flex items-center gap-1 text-[11px] font-mono px-2 py-0.5 rounded bg-red-950/50 border border-red-500/30 text-red-300">
+              <Server size={11} />
+              {modelInfo.provider && <span>{modelInfo.provider}</span>}
+              {modelInfo.provider && modelInfo.model && <span>/</span>}
+              {modelInfo.model && <span>{modelInfo.model}</span>}
+            </span>
+          )}
         </div>
         <div className="text-[12px] font-mono whitespace-pre-wrap text-red-300/90 max-h-40 overflow-y-auto selection:bg-red-500/30">
           {ev.resultText || "未知错误"}
@@ -1006,9 +1187,15 @@ function ImageToolView({
               <Sparkles size={11} />
               <span>提示词</span>
             </span>
-            {metadata?.model && (
+            {(metadata?.provider || modelInfo?.provider) && (
+              <span className="inline-flex items-center gap-1 text-[10.5px] font-mono text-pink-300 bg-pink-500/10 border border-pink-500/20 px-1.5 py-0.5 rounded-md" title="生图厂商">
+                <Server size={11} className="text-pink-400" />
+                <span>{metadata?.provider || modelInfo?.provider}</span>
+              </span>
+            )}
+            {(metadata?.model || modelInfo?.model) && (
               <span className="text-[10.5px] font-mono text-inkdim bg-panel3/80 border border-edge/60 px-1.5 py-0.5 rounded-md" title="生图模型">
-                {metadata.model}
+                {metadata?.model || modelInfo?.model}
               </span>
             )}
             {metadata?.resolution && (
@@ -1093,6 +1280,8 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
   const setLightboxImage = useStore((s) => s.setLightboxImage);
   const isRunning = useStore((s) => (s.currentId ? s.runStatus[s.currentId] === "running" : false));
   const lastRunOutcome = useStore((s) => (s.currentId ? s.lastRunOutcome[s.currentId] : undefined));
+  const settings = useStore((s) => s.settings);
+  const currentSession = useStore((s) => s.sessions.find((x) => x.id === s.currentId));
   const [terminating, setTerminating] = useState(false);
   const [copied, setCopied] = useState(false);
   const title = paramTitle(ev);
@@ -1102,6 +1291,11 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
   const isImageTool = ev.toolName === "generate_image";
   const imagePrompt = isImageTool ? String(ev.params?.prompt ?? "") : "";
   const isPlanTool = ["create_plan", "update_plan", "switch_plan"].includes(ev.toolName);
+
+  const toolModelInfo = useMemo(() => {
+    return extractToolModelInfo(ev, settings, currentSession);
+  }, [ev, settings, currentSession]);
+
   // 计划工具与生图工具生成成功/执行中默认展开，失败默认收起；其他工具默认收起
   const [expanded, setExpanded] = useState(() => {
     if (isImageTool || isPlanTool) {
@@ -1139,16 +1333,18 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
 
     const pathMatch = text.match(/保存路径:\s*`?([^`\n]+)`?/);
     const modelMatch = text.match(/使用模型:\s*`?([^`\n]+)`?/);
+    const providerMatch = text.match(/厂商:\s*`?([^`\n]+)`?/);
     const sizeMatch = text.match(/分辨率:\s*([^\n]+)/);
     const kbMatch = text.match(/大小:\s*([^\n]+)/);
 
     return {
       imagePath: generatedImagePath || (pathMatch ? pathMatch[1].trim() : null),
-      model: modelMatch ? modelMatch[1].trim() : null,
+      provider: providerMatch ? providerMatch[1].trim() : toolModelInfo?.provider || null,
+      model: modelMatch ? modelMatch[1].trim() : toolModelInfo?.model || null,
       resolution: sizeMatch ? sizeMatch[1].trim() : (ev.params?.size ? String(ev.params.size) : null),
       fileSize: kbMatch ? kbMatch[1].trim() : null,
     };
-  }, [isImageTool, ev.resultText, generatedImagePath, ev.params]);
+  }, [isImageTool, ev.resultText, generatedImagePath, ev.params, toolModelInfo]);
 
   const handleCopyCommand = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -1500,6 +1696,21 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
           <span className="text-[12px] text-ink font-medium">{label}</span>
           {toolCategoryBadge(ev.toolName)}
         </div>
+        {toolModelInfo && (toolModelInfo.provider || toolModelInfo.model) && (
+          <div
+            className={`inline-flex items-center gap-1 text-[10.5px] font-mono px-2 py-0.5 rounded-md border shrink-0 transition-colors ${
+              isImageTool
+                ? "bg-pink-500/10 text-pink-300 border-pink-500/25"
+                : "bg-amber-500/10 text-amber-300 border-amber-500/25"
+            }`}
+            title={`实际调用模型: ${toolModelInfo.provider || "默认厂商"} / ${toolModelInfo.model || "默认模型"}`}
+          >
+            <Server size={11} className={isImageTool ? "text-pink-400" : "text-amber-400"} />
+            {toolModelInfo.provider && <span className="font-medium">{toolModelInfo.provider}</span>}
+            {toolModelInfo.provider && toolModelInfo.model && <span className="opacity-40">/</span>}
+            {toolModelInfo.model && <span className="truncate max-w-[150px]">{toolModelInfo.model}</span>}
+          </div>
+        )}
         {ev.toolName !== "todo" && (
           <span
             className="text-[12px] font-mono text-inkdim truncate flex-1 min-w-0"
@@ -1665,6 +1876,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
           imagePath={generatedImagePath}
           prompt={imagePrompt || title}
           metadata={imageMetadata}
+          modelInfo={toolModelInfo}
         />
       )}
 
@@ -1700,7 +1912,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
 
       {/* 展开时：若是决策工具，展示专用决策卡片 */}
       {expanded && ["judge_decision", "choice_decision", "score_decision"].includes(ev.toolName) && (
-        <DecisionCardView ev={ev} />
+        <DecisionCardView ev={ev} modelInfo={toolModelInfo} />
       )}
 
       {expanded && showResult && !["judge_decision", "choice_decision", "score_decision"].includes(ev.toolName) && (

@@ -3306,7 +3306,8 @@ async fn generate_image_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
         session_id: None,
     };
 
-    let img_bytes = crate::llm::generate_image_api(&cfg, prompt, size).await?;
+    let img_bytes = crate::llm::generate_image_api(&cfg, prompt, size).await
+        .map_err(|e| format!("生图失败 [厂商: {} / 模型: {}]: {e}", provider.name, model_name))?;
 
     let target_path = if let Some(fname) = filename_arg.map(|s| s.trim()).filter(|s| !s.is_empty()) {
         if !ctx.workspace.as_os_str().is_empty() {
@@ -3345,7 +3346,8 @@ async fn generate_image_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
     let kb = img_bytes.len() / 1024;
 
     Ok(format!(
-        "🎨 图片生成成功！\n- 保存路径: `{target_str}`\n- 使用模型: `{model_name}`\n- 提示词: {prompt}\n- 分辨率: {size_display}\n- 大小: {kb} KB\n\n![{prompt}]({target_str})"
+        "🎨 图片生成成功！\n- 保存路径: `{target_str}`\n- 厂商: `{}`\n- 使用模型: `{model_name}`\n- 提示词: {prompt}\n- 分辨率: {size_display}\n- 大小: {kb} KB\n\n![{prompt}]({target_str})",
+        provider.name
     ))
 }
 
@@ -3420,10 +3422,14 @@ async fn judge_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
         None,
         ctx.proxy_url.clone(),
     )
-    .await?;
+    .await
+    .map_err(|e| format!("决策执行失败 [厂商: {} / 模型: {}]: {e}", provider.name, model))?;
 
     let mut val = serde_json::to_value(&res).map_err(|e| e.to_string())?;
     if let Value::Object(ref mut map) = val {
+        map.insert("provider".into(), Value::String(provider.name.clone()));
+        map.insert("providerId".into(), Value::String(provider.id.clone()));
+        map.insert("model".into(), Value::String(model.clone()));
         map.insert("state".into(), Value::String(state.to_string()));
         map.insert("instruction".into(), Value::String(instruction.to_string()));
     }
@@ -3450,10 +3456,14 @@ async fn choice_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Str
         None,
         ctx.proxy_url.clone(),
     )
-    .await?;
+    .await
+    .map_err(|e| format!("决策执行失败 [厂商: {} / 模型: {}]: {e}", provider.name, model))?;
 
     let mut val = serde_json::to_value(&res).map_err(|e| e.to_string())?;
     if let Value::Object(ref mut map) = val {
+        map.insert("provider".into(), Value::String(provider.name.clone()));
+        map.insert("providerId".into(), Value::String(provider.id.clone()));
+        map.insert("model".into(), Value::String(model.clone()));
         map.insert("options".into(), serde_json::json!(options));
         map.insert("state".into(), Value::String(state.to_string()));
         map.insert("instruction".into(), Value::String(instruction.to_string()));
@@ -3509,13 +3519,17 @@ async fn score_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
         rubric,
         ctx.proxy_url.clone(),
     )
-    .await?;
+    .await
+    .map_err(|e| format!("决策执行失败 [厂商: {} / 模型: {}]: {e}", provider.name, model))?;
 
     let score_val = res.score.unwrap_or(0.0);
     let score_pct = (score_val * 100.0).round() as u32;
 
     let mut val = serde_json::to_value(&res).map_err(|e| e.to_string())?;
     if let Value::Object(ref mut map) = val {
+        map.insert("provider".into(), Value::String(provider.name.clone()));
+        map.insert("providerId".into(), Value::String(provider.id.clone()));
+        map.insert("model".into(), Value::String(model.clone()));
         if !understanding.is_empty() {
             map.insert("understanding".into(), Value::String(understanding.to_string()));
         }
