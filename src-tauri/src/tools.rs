@@ -3256,10 +3256,10 @@ async fn generate_image_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
     // 解析生图模型 (Provider, ModelName)：
     // 1. 若工具参数显式指定了 model，优先在所有厂商中匹配
     // 2. 检查会话专属（或继承父会话）生图模型 image_provider_id / image_model_id
-    // 3. 检查会话专属（或继承父会话）主模型 provider_id / model_id 是否具备 image_gen 能力
-    // 4. 检查会话所属 provider 是否有其他模型具备 image_gen 能力
-    // 5. 检查全局 active_image_provider_id / active_image_model_id
-    // 6. 查找全局任意厂商中具备 image_gen 能力的模型
+    // 3. 优先使用全局配置的生图模型 active_image_provider_id / active_image_model_id（界面上会话未指定时为“跟随全局”）
+    // 4. 回落：检查会话专属（或继承父会话）主模型 provider_id / model_id 是否具备 image_gen 能力
+    // 5. 回落：检查会话所属 provider 是否有其他模型具备 image_gen 能力
+    // 6. 回落：查找全局任意厂商中具备 image_gen 能力的模型
     let resolved = if let Some(req_m) = requested_model {
         settings.providers.iter().find(|p| p.models.iter().any(|m| m == req_m))
             .map(|p| (p.clone(), req_m.to_string()))
@@ -3267,6 +3267,9 @@ async fn generate_image_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
     } else if let (Some(pid), Some(mid)) = (effective_image_provider_id, effective_image_model_id) {
         settings.providers.iter().find(|p| &p.id == pid)
             .map(|p| (p.clone(), mid.to_string()))
+    } else if let (Some(pid), Some(mid)) = (&settings.active_image_provider_id, &settings.active_image_model_id) {
+        settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid))
+            .map(|p| (p.clone(), mid.clone()))
     } else if let (Some(pid), Some(mid)) = (effective_provider_id, effective_model_id) {
         if settings.has_capability(Some(pid), mid, "image_gen") {
             settings.providers.iter().find(|p| &p.id == pid).map(|p| (p.clone(), mid.to_string()))
@@ -3330,6 +3333,10 @@ async fn generate_image_tool(args: &Value, ctx: &ToolCtx) -> Result<String, Stri
         tokio::fs::create_dir_all(parent).await.map_err(|e| format!("创建图片存储目录失败: {e}"))?;
     }
 
+    if img_bytes.is_empty() {
+        return Err("生图失败：接口返回的图片二进制数据为空 (0 字节)".to_string());
+    }
+
     tokio::fs::write(&target_path, &img_bytes).await.map_err(|e| format!("写入图片文件失败: {e}"))?;
 
     let raw_target_str = target_path.to_string_lossy().to_string();
@@ -3370,6 +3377,9 @@ fn resolve_decision_model_for_tool(
             .or_else(|| crate::models::resolve_active_model(&settings).map(|(p, _)| (p.clone(), req_m.to_string())))
     } else if let (Some(pid), Some(mid)) = (&session.decision_provider_id, &session.decision_model_id) {
         settings.providers.iter().find(|p| &p.id == pid)
+            .map(|p| (p.clone(), mid.clone()))
+    } else if let (Some(pid), Some(mid)) = (&settings.active_decision_provider_id, &settings.active_decision_model_id) {
+        settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid))
             .map(|p| (p.clone(), mid.clone()))
     } else if let (Some(pid), Some(mid)) = (&session.provider_id, &session.model_id) {
         if settings.has_capability(Some(pid), mid, "decision") {

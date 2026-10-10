@@ -478,30 +478,40 @@ pub async fn generate_image_api(
 
     let val: Value = resp.json().await.map_err(|e| format!("生图响应解析失败: {e}"))?;
 
-    // 1. 尝试提取 OpenAI 标准 data[0].b64_json
+    // 1. 尝试提取 OpenAI 标准 data[0].b64_json（需非空）
     if let Some(b64) = val.get("data")
         .and_then(|d| d.get(0))
         .and_then(|item| item.get("b64_json"))
         .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
     {
-        return base64::engine::general_purpose::STANDARD
+        let bytes = base64::engine::general_purpose::STANDARD
             .decode(b64)
-            .map_err(|e| format!("Base64 解码失败: {e}"));
+            .map_err(|e| format!("Base64 解码失败: {e}"))?;
+        if !bytes.is_empty() {
+            return Ok(bytes);
+        }
     }
 
-    // 2. 尝试提取 images[0] (部分 WebUI 或本地生图服务返回)
+    // 2. 尝试提取 images[0] (部分 WebUI 或本地生图服务返回，需非空)
     if let Some(b64) = val.get("images")
         .and_then(|d| d.get(0))
         .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
     {
         let clean_b64 = if let Some(idx) = b64.find(',') {
             &b64[idx + 1..]
         } else {
             b64
         };
-        return base64::engine::general_purpose::STANDARD
+        let bytes = base64::engine::general_purpose::STANDARD
             .decode(clean_b64)
-            .map_err(|e| format!("Base64 解码失败: {e}"));
+            .map_err(|e| format!("Base64 解码失败: {e}"))?;
+        if !bytes.is_empty() {
+            return Ok(bytes);
+        }
     }
 
     // 3. 尝试提取 data[0].url 并发起 HTTP GET 下载
@@ -509,6 +519,8 @@ pub async fn generate_image_api(
         .and_then(|d| d.get(0))
         .and_then(|item| item.get("url"))
         .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
     {
         let img_resp = get_client(cfg.proxy_url.as_deref())
             .get(img_url)
@@ -519,10 +531,12 @@ pub async fn generate_image_api(
             return Err(format!("下载图片失败，HTTP 状态: {}", img_resp.status()));
         }
         let bytes = img_resp.bytes().await.map_err(|e| format!("读取图片数据失败: {e}"))?;
-        return Ok(bytes.to_vec());
+        if !bytes.is_empty() {
+            return Ok(bytes.to_vec());
+        }
     }
 
-    Err(format!("未能从生图响应中解析到图片数据: {}", truncate(&val.to_string(), 500)))
+    Err(format!("未能从生图响应中解析到有效图片数据: {}", truncate(&val.to_string(), 500)))
 }
 
 #[cfg(test)]

@@ -1770,6 +1770,8 @@ pub async fn run_direct_decision(
 
     let resolved = if let (Some(pid), Some(mid)) = (&session.decision_provider_id, &session.decision_model_id) {
         settings.providers.iter().find(|p| &p.id == pid).map(|p| (p.clone(), mid.clone()))
+    } else if let (Some(pid), Some(mid)) = (&settings.active_decision_provider_id, &settings.active_decision_model_id) {
+        settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid)).map(|p| (p.clone(), mid.clone()))
     } else if let (Some(pid), Some(mid)) = (&session.provider_id, &session.model_id) {
         if settings.has_capability(Some(pid), mid, "decision") {
             settings.providers.iter().find(|p| &p.id == pid).map(|p| (p.clone(), mid.clone()))
