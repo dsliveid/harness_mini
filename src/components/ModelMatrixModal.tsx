@@ -55,15 +55,15 @@ export function ModelMatrixModal() {
   // 解析全局实际生效的能力模型，供跟随全局时展示具体模型名称
   const activeImage = resolveActiveImageModel(settings);
   const activeImageDesc = activeImage
-    ? `${activeImage.model} (${activeImage.provider.name})`
+    ? `${activeImage.provider.name}/${activeImage.model}`
     : "未配置";
   const activeVision = resolveActiveVisionModel(settings);
   const activeVisionDesc = activeVision
-    ? `${activeVision.model} (${activeVision.provider.name})`
+    ? `${activeVision.provider.name}/${activeVision.model}`
     : "回落主对话模型";
   const activeDecision = resolveActiveDecisionModel(settings);
   const activeDecisionDesc = activeDecision
-    ? `${activeDecision.model} (${activeDecision.provider.name})`
+    ? `${activeDecision.provider.name}/${activeDecision.model}`
     : "回落主对话模型";
 
   // 当前主对话模型显示名
@@ -80,6 +80,11 @@ export function ModelMatrixModal() {
       : isDraft && draft
       ? draft.providerId || settings.activeProviderId || null
       : settings.activeProviderId || null;
+
+  const currentChatProvider = settings.providers.find((p) => p.id === currentChatPid);
+  const currentChatDisplay = currentChatProvider?.name && currentChatModelName && currentChatModelName !== "未配置" && currentChatModelName !== "未指定（跟随系统）"
+    ? `${currentChatProvider.name}/${currentChatModelName}`
+    : currentChatModelName;
 
   const chatLimit =
     targetSession?.contextTokenLimit ??
@@ -256,8 +261,8 @@ export function ModelMatrixModal() {
             <div className="flex items-center gap-2 text-inkdim truncate min-w-0">
               <Cpu size={13} className="text-accent shrink-0" />
               <span>当前主对话模型：</span>
-              <span className="font-mono text-ink font-medium truncate">
-                {currentChatModelName}
+              <span className="font-mono text-ink font-medium truncate" title={currentChatDisplay}>
+                {currentChatDisplay}
               </span>
             </div>
             <div className="flex items-center gap-2 shrink-0 ml-2">
