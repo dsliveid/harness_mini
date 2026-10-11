@@ -1266,10 +1266,10 @@ export function SettingsModal() {
                     </label>
                     <label className="flex flex-col gap-1">
                       <span
-                        className="text-inkdim"
+                        className="text-inkdim whitespace-nowrap"
                         title="全局新建对话的默认最大工具调用步数。在具体会话中可单独在「会话设置 -> 运行步数」中自由调整或一键追加"
                       >
-                        最大步数（全局默认）
+                        最大步数
                       </span>
                       <input
                         className={inputCls}
