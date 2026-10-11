@@ -20,6 +20,7 @@ import {
   ChevronUp,
   Code,
   ListTodo,
+  FileText,
 } from "../components/Icons";
 import { Markdown } from "../components/Markdown";
 import hljs from "highlight.js";
@@ -58,6 +59,7 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
   const [data, setData] = useState<FileTextContent | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [fileDeleted, setFileDeleted] = useState(false);
   const [copied, setCopied] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [showSearch, setShowSearch] = useState(false);
@@ -226,16 +228,33 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
 
   const loadFile = async (silent = false) => {
     if (!silent) setLoading(true);
-    setError(null);
+    if (!silent) {
+      setError(null);
+      setFileDeleted(false);
+    }
     try {
       const res = await ipc.readTextFile(tab.path);
       setData(res);
+      setFileDeleted(false);
+      setError(null);
       // 未被手动编辑时才更新编辑区内容，防止覆盖用户正在输入的内容
       setEditContent((prev) => (!isDirty ? res.content : prev));
       // 同时提取符号大纲
       void loadOutline();
     } catch (e) {
-      if (!silent) setError(String(e));
+      const errStr = String(e);
+      const isNotExist =
+        errStr.includes("文件不存在") ||
+        errStr.toLowerCase().includes("not found") ||
+        errStr.toLowerCase().includes("os error 2") ||
+        errStr.includes("No such file");
+      if (isNotExist) {
+        setFileDeleted(true);
+        setData(null);
+        setError(null);
+      } else {
+        if (!silent) setError(errStr);
+      }
     } finally {
       if (!silent) setLoading(false);
     }
@@ -251,20 +270,23 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
   };
 
   const handleSave = async () => {
-    if (isSaving || !data || data.isBinary) return;
+    if (isSaving || (data && data.isBinary)) return;
     setIsSaving(true);
     try {
       await ipc.saveTextFile(tab.path, editContent, tab.sessionId);
-      setData((prev) =>
-        prev
-          ? {
-              ...prev,
-              content: editContent,
-              lines_count: editContent.split("\n").length,
-              size_bytes: new TextEncoder().encode(editContent).length,
-            }
-          : prev
-      );
+      const fileName = tab.path.replace(/\\/g, "/").split("/").pop() || tab.title;
+      setData({
+        path: tab.path,
+        name: fileName,
+        content: editContent,
+        language: data?.language || (isMarkdown ? "markdown" : ""),
+        linesCount: editContent.split("\n").length,
+        sizeBytes: new TextEncoder().encode(editContent).length,
+        isBinary: false,
+        isTruncated: false,
+      });
+      setFileDeleted(false);
+      setError(null);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
       void loadOutline();
@@ -414,6 +436,11 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
       <div className="h-10 px-4 border-b border-edge/60 bg-panel2/60 flex items-center justify-between shrink-0 text-[12px]">
         <div className="flex items-center gap-2 min-w-0">
           <span className="font-semibold text-ink truncate">{tab.title}</span>
+          {fileDeleted && (
+            <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30 shrink-0 font-medium font-sans">
+              已删除
+            </span>
+          )}
           <span className="text-inkdim font-mono text-[11px] truncate max-w-[340px]" title={tab.path}>
             {tab.path}
           </span>
@@ -730,6 +757,121 @@ export function CodeViewer({ tab }: { tab: FileViewerTab }) {
                 }
               }}
             />
+          </div>
+        ) : fileDeleted ? (
+          /* 文件已被删除或未在本地磁盘找到专属展陈看板 */
+          <div className="flex-1 flex flex-col items-center justify-center p-8 bg-panel select-text overflow-y-auto">
+            <div className="max-w-xl w-full bg-panel2 border border-edge rounded-2xl p-6 shadow-xl flex flex-col items-center text-center animate-in fade-in duration-150">
+              <div className="w-14 h-14 rounded-2xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center text-amber-400 mb-3.5 shadow-xs">
+                <FileText size={26} />
+              </div>
+
+              <div className="flex items-center gap-2 mb-1.5">
+                <h3 className="text-[15px] font-semibold text-ink">文件已被删除或未在本地磁盘找到</h3>
+                <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/35 font-medium">
+                  已删除
+                </span>
+              </div>
+
+              <p className="text-[12.5px] text-inkdim mb-5 max-w-md leading-relaxed">
+                当前无法读取该文件的内容。该文件可能已被清理删除、重命名，或尚未在工作区磁盘落盘。
+              </p>
+
+              {/* 原本位置与上下文档案卡 */}
+              <div className="w-full bg-panel3/70 border border-edge/80 rounded-xl p-4 text-left text-[12px] space-y-3 mb-6 font-mono">
+                <div>
+                  <div className="text-[11px] text-inkdim mb-1 font-sans font-medium">原本文件名称:</div>
+                  <div className="text-ink font-semibold flex items-center justify-between">
+                    <span className="truncate">{tab.title}</span>
+                  </div>
+                </div>
+
+                <div>
+                  <div className="text-[11px] text-inkdim mb-1 font-sans font-medium">原本完整物理路径:</div>
+                  <div className="text-ink break-all bg-panel/90 p-2.5 rounded-lg border border-edge/60 text-[11.5px] select-all flex items-center justify-between gap-2">
+                    <span className="truncate">{tab.path}</span>
+                    <button
+                      type="button"
+                      className="shrink-0 text-inkdim hover:text-ink text-[11px] font-sans flex items-center gap-1 cursor-pointer transition-colors px-1.5 py-0.5 rounded hover:bg-panel3"
+                      onClick={handleCopyPath}
+                      title="复制完整物理路径"
+                    >
+                      {copied ? (
+                        <>
+                          <Check size={12} className="text-emerald-400" />
+                          <span className="text-emerald-400 font-medium">已复制</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy size={12} />
+                          <span>复制路径</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                {effectiveWorkspace && (
+                  <div>
+                    <div className="text-[11px] text-inkdim mb-1 font-sans font-medium">所属工作区根目录:</div>
+                    <div className="text-inkdim/90 truncate bg-panel/50 px-2 py-1 rounded border border-edge/40">
+                      {effectiveWorkspace}
+                    </div>
+                  </div>
+                )}
+
+                {(() => {
+                  const norm = tab.path.replace(/\\/g, "/");
+                  const parent = norm.includes("/") ? norm.slice(0, norm.lastIndexOf("/")) : "";
+                  if (!parent) return null;
+                  return (
+                    <div>
+                      <div className="text-[11px] text-inkdim mb-1 font-sans font-medium">原本所在文件夹:</div>
+                      <div className="text-inkdim/90 truncate bg-panel/50 px-2 py-1 rounded border border-edge/40">
+                        {parent}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+
+              {/* 快捷操作区 */}
+              <div className="flex flex-wrap items-center justify-center gap-2.5">
+                <button
+                  type="button"
+                  className="px-4 py-2 rounded-xl bg-accent text-white hover:bg-accent/90 text-[12px] font-medium flex items-center gap-1.5 transition-colors cursor-pointer shadow-sm"
+                  onClick={handleOpenDir}
+                  title="在系统资源管理器中打开该文件原本所在的文件夹目录"
+                >
+                  <FolderOpen size={14} />
+                  <span>在资源管理器中打开所在目录</span>
+                </button>
+
+                <button
+                  type="button"
+                  className="px-3.5 py-2 rounded-xl bg-panel3 hover:bg-edge border border-edge text-ink text-[12px] flex items-center gap-1.5 transition-colors cursor-pointer"
+                  onClick={() => {
+                    setFileDeleted(false);
+                    setViewMode("edit");
+                    setEditContent("");
+                  }}
+                  title="在原路径重新创建并编辑此文件"
+                >
+                  <Edit3 size={13} />
+                  <span>重新创建此文件</span>
+                </button>
+
+                <button
+                  type="button"
+                  className="px-3 py-2 rounded-xl bg-panel3 hover:bg-edge border border-edge text-inkdim hover:text-ink text-[12px] flex items-center gap-1.5 transition-colors cursor-pointer"
+                  onClick={() => void loadFile(false)}
+                  title="重新检测本地磁盘是否存在该文件"
+                >
+                  <RotateCcw size={13} />
+                  <span>重新检测</span>
+                </button>
+              </div>
+            </div>
           </div>
         ) : isRenderedMarkdown ? (
           /* Markdown 格式渲染预览区域 */

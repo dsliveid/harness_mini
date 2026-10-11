@@ -133,19 +133,32 @@ export const PathLink: React.FC<PathLinkProps> = ({
       );
     }
     if (isExplicitLink) {
-      // 作者明确写了 [name](path) 语法，但文件确实不存在：展示失效提示
+      // 目标文件已在磁盘中被清理或删除：依然允许点击打开文件查看器查看原路径档案与所在目录
+      const absPath =
+        inspectInfo?.absPath ||
+        resolveAbsolutePath(parsed.cleanPath, effectiveWorkspace, currentDocPath);
+
       return (
         <a
           href={`#path:${parsed.cleanPath}`}
           onClick={(e) => {
             e.preventDefault();
-            pushToast(`未在工作区找到目标: ${parsed.cleanPath}`, "warning");
+            ipc.openFileViewer({
+              id: `file:${absPath}`,
+              type: "file",
+              title: parsed.fileName,
+              subtitle: parsed.cleanPath,
+              path: absPath,
+              highlightLine: parsed.highlightLine,
+              highlightRange: parsed.highlightRange,
+              workspacePath: effectiveWorkspace,
+            });
           }}
-          className="inline-flex items-center gap-1 font-mono text-[12px] text-zinc-400 hover:text-zinc-200 line-through decoration-dotted select-none px-1.5 py-0.5 rounded border border-dashed border-zinc-700/60 bg-zinc-800/30"
-          title={`目标路径未找到: ${parsed.cleanPath}`}
+          className="inline-flex items-center gap-1 font-mono text-[12px] text-amber-300/80 hover:text-amber-200 select-none px-1.5 py-0.5 rounded border border-dashed border-amber-500/35 bg-amber-500/10 hover:bg-amber-500/20 cursor-pointer transition-colors"
+          title={`文件已在磁盘中清理或删除（点击可查看其原本位置档案）: ${parsed.cleanPath}`}
         >
           <span>{children || parsed.cleanPath}</span>
-          <span className="text-[10px] text-amber-400 font-sans">(未找到)</span>
+          <span className="text-[10px] text-amber-400 font-sans font-medium">(已删除)</span>
         </a>
       );
     }

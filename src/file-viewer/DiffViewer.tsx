@@ -287,9 +287,9 @@ export function DiffViewer({ tab }: { tab: DiffViewerTab }) {
   const [activeHunkIndex, setActiveHunkIndex] = useState<number>(0);
   const [revertMsg, setRevertMsg] = useState<string | null>(null);
 
-  const loadDiff = async () => {
-    setLoading(true);
-    setError(null);
+  const loadDiff = async (silent = false) => {
+    if (!silent) setLoading(true);
+    if (!silent) setError(null);
     try {
       if (tab.diffSource === "temp" && tab.sessionId && tab.projectKey) {
         const res = await ipc.getTempChangeDiff(tab.sessionId, tab.projectKey, tab.path);
@@ -298,11 +298,12 @@ export function DiffViewer({ tab }: { tab: DiffViewerTab }) {
         const res = await ipc.getFileDiff(tab.path, tab.oldContent, tab.newContent, tab.workspacePath);
         setDiff(res);
       }
+      setError(null);
       setActiveHunkIndex(0);
     } catch (e) {
-      setError(String(e));
+      if (!silent) setError(String(e));
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
@@ -314,7 +315,7 @@ export function DiffViewer({ tab }: { tab: DiffViewerTab }) {
   // 窗口切回焦点时自动静默刷新差量对比
   useEffect(() => {
     const handleFocus = () => {
-      void loadDiff();
+      void loadDiff(true);
     };
     window.addEventListener("focus", handleFocus);
     return () => window.removeEventListener("focus", handleFocus);
@@ -459,7 +460,7 @@ export function DiffViewer({ tab }: { tab: DiffViewerTab }) {
             type="button"
             className="p-1.5 rounded-lg text-inkdim hover:text-ink hover:bg-panel3 transition-colors cursor-pointer"
             title="刷新 Diff (Ctrl+R / F5)"
-            onClick={loadDiff}
+            onClick={() => void loadDiff()}
           >
             <RotateCcw size={14} />
           </button>
@@ -531,7 +532,7 @@ export function DiffViewer({ tab }: { tab: DiffViewerTab }) {
             <div className="text-[13px] font-medium">{error}</div>
             <button
               className="mt-2 px-3 py-1 bg-panel3 rounded-lg text-ink text-[12px] hover:bg-edge"
-              onClick={loadDiff}
+              onClick={() => void loadDiff()}
             >
               重新加载
             </button>

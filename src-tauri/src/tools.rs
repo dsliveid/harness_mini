@@ -833,9 +833,9 @@ pub fn tool_specs() -> Vec<ToolSpec> {
 
 pub fn is_high_danger(cmd: &str) -> bool {
     let patterns = [
-        r"(?i)\brm\s+(-[a-z]+)*\s*-?[a-z]*[rf]",
-        r"(?i)\bdel\s+/[sq]",
-        r"(?i)\brd\s+/s",
+        r"(?i)\brm\s+(-[a-z]+)*\s*-[a-z]*r[a-z]*\b",
+        r"(?i)\bdel\b.*?(?:[/\\]s\b|[/\\]s:)",
+        r"(?i)\b(?:rd|rmdir)\b.*?(?:[/\\]s\b|[/\\]s:)",
         r"(?i)\bformat\s+[a-z]:",
         r"(?i)\bmkfs",
         r"(?i)\bdd\s+if=",
@@ -3787,8 +3787,17 @@ mod tests {
     #[test]
     fn test_high_danger() {
         assert!(is_high_danger("rm -rf /"));
+        assert!(is_high_danger("rm -r /tmp"));
+        assert!(!is_high_danger("rm -f test.txt"));
+        assert!(!is_high_danger("rm file.txt"));
         assert!(is_high_danger("git reset --hard HEAD~1"));
         assert!(is_high_danger("del /s /q *.tmp"));
+        assert!(is_high_danger("del /q /s *.tmp"));
+        assert!(!is_high_danger("del /q tmp-verify.ps1"));
+        assert!(!is_high_danger("cmd /c \"del /q tmp-verify.ps1\" 2>&1"));
+        assert!(!is_high_danger("del tmp-verify.ps1"));
+        assert!(is_high_danger("rd /s /q temp"));
+        assert!(!is_high_danger("rd temp"));
         assert!(!is_high_danger("npm run build"));
         assert!(!is_high_danger("cargo test"));
     }
