@@ -1807,6 +1807,7 @@ pub struct TaskCheckpoint {
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolLogFilter {
+    pub category: Option<String>, // "all" | "conversation" | "tool"
     pub project_id: Option<String>,
     pub session_id: Option<String>,
     pub status: Option<String>, // "all" | "error_only" | "failed" | "denied" | "timeout" | "success"
@@ -1836,6 +1837,9 @@ pub struct ToolLogItem {
     pub project_id: Option<String>,
     pub project_name: Option<String>,
     pub reasoning: Option<String>,
+    pub log_type: Option<String>, // "tool" | "user" | "assistant" | "system"
+    pub role: Option<String>,
+    pub content: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

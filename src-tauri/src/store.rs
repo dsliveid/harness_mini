@@ -818,16 +818,35 @@ mod tests {
         insert_tool_event(&conn, &ev2).unwrap();
         insert_tool_event(&conn, &ev3).unwrap();
 
-        // 1. 全量查询
-        let all_res = query_tool_logs(&conn, &ToolLogFilter::default()).unwrap();
-        assert_eq!(all_res.total_count, 3);
-        assert_eq!(all_res.error_count, 2);
-        assert_eq!(all_res.items.len(), 3);
+        // 1. 工具日志查询
+        let tool_res = query_tool_logs(&conn, &ToolLogFilter {
+            category: Some("tool".into()),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(tool_res.total_count, 3);
+        assert_eq!(tool_res.error_count, 2);
+        assert_eq!(tool_res.items.len(), 3);
         // 验证聚类聚合
-        assert_eq!(all_res.top_errors.len(), 1);
-        assert_eq!(all_res.top_errors[0].tool_name, "read_file");
-        assert_eq!(all_res.top_errors[0].count, 2);
-        assert_eq!(all_res.top_errors[0].session_count, 2);
+        assert_eq!(tool_res.top_errors.len(), 1);
+        assert_eq!(tool_res.top_errors[0].tool_name, "read_file");
+        assert_eq!(tool_res.top_errors[0].count, 2);
+        assert_eq!(tool_res.top_errors[0].session_count, 2);
+
+        // 1.1 对话日志查询 (数据库中有 msg1 和 msg2 共 2 条消息)
+        let conv_res = query_tool_logs(&conn, &ToolLogFilter {
+            category: Some("conversation".into()),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(conv_res.total_count, 2);
+        assert_eq!(conv_res.items.len(), 2);
+
+        // 1.2 全量联合日志查询 (3 个工具事件 + 2 条对话消息 = 5 条)
+        let all_res = query_tool_logs(&conn, &ToolLogFilter {
+            category: Some("all".into()),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(all_res.total_count, 5);
+        assert_eq!(all_res.items.len(), 5);
 
         // 2. 仅看异常
         let err_res = query_tool_logs(&conn, &ToolLogFilter {
@@ -847,6 +866,7 @@ mod tests {
 
         // 5. 日期范围过滤
         let date_match_res = query_tool_logs(&conn, &ToolLogFilter {
+            category: Some("tool".into()),
             start_date: Some("2026-09-30".into()),
             end_date: Some("2026-09-30".into()),
             ..Default::default()
@@ -854,6 +874,7 @@ mod tests {
         assert_eq!(date_match_res.items.len(), 3);
 
         let date_miss_res = query_tool_logs(&conn, &ToolLogFilter {
+            category: Some("tool".into()),
             start_date: Some("2026-10-01".into()),
             ..Default::default()
         }).unwrap();
@@ -5538,11 +5559,138 @@ pub fn sync_session_todos_after_revert(
     Ok(Some(serde_json::json!([])))
 }
 
-/// 多维度查询工具调用日志与异常审计记录，包含统计指标与高频错误聚类
+/// 多维度查询全景活动日志（工具调用、对话消息、系统通知）与异常审计记录
 pub fn query_tool_logs(conn: &Connection, filter: &ToolLogFilter) -> Result<ToolLogQueryResult, String> {
     let page = filter.page.unwrap_or(1).max(1);
     let page_size = filter.page_size.unwrap_or(30).clamp(1, 200);
     let offset = (page - 1) * page_size;
+
+    let category = filter.category.as_deref().unwrap_or("all");
+    let is_tool_only = category == "tool"
+        || (filter.tool_name.is_some()
+            && filter.tool_name.as_deref() != Some("all")
+            && !["用户消息", "AI 答复", "系统通知"].contains(&filter.tool_name.as_deref().unwrap_or("")));
+    let is_conv_only = category == "conversation" || category == "message";
+
+    let source_sql = if is_tool_only {
+        r#"
+        SELECT
+            'tool' as log_type,
+            te.id as id,
+            te.message_id as message_id,
+            te.tool_name as tool_name,
+            te.tool_call_id as tool_call_id,
+            te.params_json as params_json,
+            te.result_text as result_text,
+            te.status as status,
+            te.approval_scope as approval_scope,
+            te.created_at as created_at,
+            te.subprocess_id as subprocess_id,
+            s.id as session_id,
+            s.title as session_title,
+            s.project_id as project_id,
+            p.name as project_name,
+            m.reasoning as reasoning,
+            m.role as role,
+            m.content as content
+        FROM tool_events te
+        JOIN messages m ON te.message_id = m.id
+        JOIN sessions s ON m.session_id = s.id
+        LEFT JOIN projects p ON s.project_id = p.id
+        "#.to_string()
+    } else if is_conv_only {
+        r#"
+        SELECT
+            m.role as log_type,
+            m.id as id,
+            m.id as message_id,
+            CASE m.role
+                WHEN 'user' THEN '用户消息'
+                WHEN 'assistant' THEN 'AI 答复'
+                WHEN 'system' THEN '系统通知'
+                ELSE m.role
+            END as tool_name,
+            m.tool_call_id as tool_call_id,
+            ('{"role":"' || m.role || '"}') as params_json,
+            m.content as result_text,
+            CASE
+                WHEN m.role = 'system' AND (m.content LIKE '%⚠️%' OR m.content LIKE '%error%' OR m.content LIKE '%fail%' OR m.content LIKE '%失败%') THEN 'failed'
+                ELSE 'success'
+            END as status,
+            NULL as approval_scope,
+            m.created_at as created_at,
+            NULL as subprocess_id,
+            s.id as session_id,
+            s.title as session_title,
+            s.project_id as project_id,
+            p.name as project_name,
+            m.reasoning as reasoning,
+            m.role as role,
+            m.content as content
+        FROM messages m
+        JOIN sessions s ON m.session_id = s.id
+        LEFT JOIN projects p ON s.project_id = p.id
+        WHERE (m.role IN ('user', 'system') OR (m.role = 'assistant' AND (COALESCE(TRIM(m.content), '') != '' OR COALESCE(TRIM(m.reasoning), '') != '')))
+        "#.to_string()
+    } else {
+        r#"
+        SELECT
+            'tool' as log_type,
+            te.id as id,
+            te.message_id as message_id,
+            te.tool_name as tool_name,
+            te.tool_call_id as tool_call_id,
+            te.params_json as params_json,
+            te.result_text as result_text,
+            te.status as status,
+            te.approval_scope as approval_scope,
+            te.created_at as created_at,
+            te.subprocess_id as subprocess_id,
+            s.id as session_id,
+            s.title as session_title,
+            s.project_id as project_id,
+            p.name as project_name,
+            m.reasoning as reasoning,
+            m.role as role,
+            m.content as content
+        FROM tool_events te
+        JOIN messages m ON te.message_id = m.id
+        JOIN sessions s ON m.session_id = s.id
+        LEFT JOIN projects p ON s.project_id = p.id
+        UNION ALL
+        SELECT
+            m.role as log_type,
+            m.id as id,
+            m.id as message_id,
+            CASE m.role
+                WHEN 'user' THEN '用户消息'
+                WHEN 'assistant' THEN 'AI 答复'
+                WHEN 'system' THEN '系统通知'
+                ELSE m.role
+            END as tool_name,
+            m.tool_call_id as tool_call_id,
+            ('{"role":"' || m.role || '"}') as params_json,
+            m.content as result_text,
+            CASE
+                WHEN m.role = 'system' AND (m.content LIKE '%⚠️%' OR m.content LIKE '%error%' OR m.content LIKE '%fail%' OR m.content LIKE '%失败%') THEN 'failed'
+                ELSE 'success'
+            END as status,
+            NULL as approval_scope,
+            m.created_at as created_at,
+            NULL as subprocess_id,
+            s.id as session_id,
+            s.title as session_title,
+            s.project_id as project_id,
+            p.name as project_name,
+            m.reasoning as reasoning,
+            m.role as role,
+            m.content as content
+        FROM messages m
+        JOIN sessions s ON m.session_id = s.id
+        LEFT JOIN projects p ON s.project_id = p.id
+        WHERE (m.role IN ('user', 'system') OR (m.role = 'assistant' AND (COALESCE(TRIM(m.content), '') != '' OR COALESCE(TRIM(m.reasoning), '') != '')))
+        "#.to_string()
+    };
 
     let mut where_clauses: Vec<String> = Vec::new();
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
@@ -5551,10 +5699,10 @@ pub fn query_tool_logs(conn: &Connection, filter: &ToolLogFilter) -> Result<Tool
         let trimmed = pid.trim();
         if !trimmed.is_empty() && trimmed != "all" {
             if trimmed == "unassigned" {
-                where_clauses.push("(s.project_id IS NULL OR s.project_id = '')".to_string());
+                where_clauses.push("(u.project_id IS NULL OR u.project_id = '')".to_string());
             } else {
                 params.push(rusqlite::types::Value::Text(trimmed.to_string()));
-                where_clauses.push(format!("s.project_id = ?{}", params.len()));
+                where_clauses.push(format!("u.project_id = ?{}", params.len()));
             }
         }
     }
@@ -5563,7 +5711,7 @@ pub fn query_tool_logs(conn: &Connection, filter: &ToolLogFilter) -> Result<Tool
         let trimmed = sid.trim();
         if !trimmed.is_empty() && trimmed != "all" {
             params.push(rusqlite::types::Value::Text(trimmed.to_string()));
-            where_clauses.push(format!("m.session_id = ?{}", params.len()));
+            where_clauses.push(format!("u.session_id = ?{}", params.len()));
         }
     }
 
@@ -5572,11 +5720,11 @@ pub fn query_tool_logs(conn: &Connection, filter: &ToolLogFilter) -> Result<Tool
         match trimmed {
             "all" | "" => {}
             "error_only" => {
-                where_clauses.push("te.status IN ('failed', 'denied', 'timeout')".to_string());
+                where_clauses.push("u.status IN ('failed', 'denied', 'timeout')".to_string());
             }
             other => {
                 params.push(rusqlite::types::Value::Text(other.to_string()));
-                where_clauses.push(format!("te.status = ?{}", params.len()));
+                where_clauses.push(format!("u.status = ?{}", params.len()));
             }
         }
     }
@@ -5585,7 +5733,7 @@ pub fn query_tool_logs(conn: &Connection, filter: &ToolLogFilter) -> Result<Tool
         let trimmed = tool.trim();
         if !trimmed.is_empty() && trimmed != "all" {
             params.push(rusqlite::types::Value::Text(trimmed.to_string()));
-            where_clauses.push(format!("te.tool_name = ?{}", params.len()));
+            where_clauses.push(format!("u.tool_name = ?{}", params.len()));
         }
     }
 
@@ -5601,8 +5749,12 @@ pub fn query_tool_logs(conn: &Connection, filter: &ToolLogFilter) -> Result<Tool
             let p3 = params.len();
             params.push(rusqlite::types::Value::Text(pattern.clone()));
             let p4 = params.len();
+            params.push(rusqlite::types::Value::Text(pattern.clone()));
+            let p5 = params.len();
+            params.push(rusqlite::types::Value::Text(pattern.clone()));
+            let p6 = params.len();
             where_clauses.push(format!(
-                "(te.params_json LIKE ?{p1} OR te.result_text LIKE ?{p2} OR s.title LIKE ?{p3} OR te.tool_name LIKE ?{p4})"
+                "(u.params_json LIKE ?{p1} OR u.result_text LIKE ?{p2} OR u.session_title LIKE ?{p3} OR u.tool_name LIKE ?{p4} OR u.reasoning LIKE ?{p5} OR u.content LIKE ?{p6})"
             ));
         }
     }
@@ -5612,7 +5764,7 @@ pub fn query_tool_logs(conn: &Connection, filter: &ToolLogFilter) -> Result<Tool
         if !trimmed.is_empty() {
             let date_part = if trimmed.len() >= 10 { &trimmed[..10] } else { trimmed };
             params.push(rusqlite::types::Value::Text(date_part.to_string()));
-            where_clauses.push(format!("substr(te.created_at, 1, 10) >= ?{}", params.len()));
+            where_clauses.push(format!("substr(u.created_at, 1, 10) >= ?{}", params.len()));
         }
     }
 
@@ -5621,7 +5773,7 @@ pub fn query_tool_logs(conn: &Connection, filter: &ToolLogFilter) -> Result<Tool
         if !trimmed.is_empty() {
             let date_part = if trimmed.len() >= 10 { &trimmed[..10] } else { trimmed };
             params.push(rusqlite::types::Value::Text(date_part.to_string()));
-            where_clauses.push(format!("substr(te.created_at, 1, 10) <= ?{}", params.len()));
+            where_clauses.push(format!("substr(u.created_at, 1, 10) <= ?{}", params.len()));
         }
     }
 
@@ -5633,10 +5785,8 @@ pub fn query_tool_logs(conn: &Connection, filter: &ToolLogFilter) -> Result<Tool
 
     // 1. 查询当前条件下的总数与异常数
     let count_sql = format!(
-        "SELECT COUNT(*), COUNT(CASE WHEN te.status != 'success' THEN 1 END)
-         FROM tool_events te
-         JOIN messages m ON te.message_id = m.id
-         JOIN sessions s ON m.session_id = s.id
+        "SELECT COUNT(*), COUNT(CASE WHEN u.status != 'success' THEN 1 END)
+         FROM ({source_sql}) u
          {where_sql}"
     );
     let (total_count, error_count): (u32, u32) = {
@@ -5650,16 +5800,13 @@ pub fn query_tool_logs(conn: &Connection, filter: &ToolLogFilter) -> Result<Tool
 
     // 2. 查询分页列表
     let list_sql = format!(
-        "SELECT te.id, te.message_id, te.tool_name, te.tool_call_id, te.params_json,
-                te.result_text, te.status, te.approval_scope, te.created_at, te.subprocess_id,
-                s.id as session_id, s.title as session_title, s.project_id, p.name as project_name,
-                m.reasoning
-         FROM tool_events te
-         JOIN messages m ON te.message_id = m.id
-         JOIN sessions s ON m.session_id = s.id
-         LEFT JOIN projects p ON s.project_id = p.id
+        "SELECT u.id, u.message_id, u.tool_name, u.tool_call_id, u.params_json,
+                u.result_text, u.status, u.approval_scope, u.created_at, u.subprocess_id,
+                u.session_id, u.session_title, u.project_id, u.project_name,
+                u.reasoning, u.log_type, u.role, u.content
+         FROM ({source_sql}) u
          {where_sql}
-         ORDER BY te.created_at DESC
+         ORDER BY u.created_at DESC
          LIMIT ?{} OFFSET ?{}",
         params.len() + 1,
         params.len() + 2
@@ -5690,6 +5837,9 @@ pub fn query_tool_logs(conn: &Connection, filter: &ToolLogFilter) -> Result<Tool
                 project_id: r.get(12)?,
                 project_name: r.get(13)?,
                 reasoning: r.get(14)?,
+                log_type: r.get(15)?,
+                role: r.get(16)?,
+                content: r.get(17)?,
             })
         })
         .map_err(|e| e.to_string())?

@@ -50,8 +50,40 @@ function formatTimestamp(isoStr?: string | null): string {
   }
 }
 
-function statusBadge(status: string) {
-  switch (status) {
+function statusBadge(item: ToolLogItem) {
+  if (item.logType === "user") {
+    return (
+      <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-blue-500/15 text-blue-400 border border-blue-500/30 shrink-0 font-medium">
+        <MessageSquare size={11} />
+        <span>用户提问</span>
+      </span>
+    );
+  }
+  if (item.logType === "assistant") {
+    return (
+      <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-purple-500/15 text-purple-400 border border-purple-500/30 shrink-0 font-medium">
+        <Sparkles size={11} />
+        <span>AI 答复</span>
+      </span>
+    );
+  }
+  if (item.logType === "system") {
+    const isError = item.status === "failed";
+    return (
+      <span
+        className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full shrink-0 font-medium ${
+          isError
+            ? "bg-red-500/15 text-red-400 border border-red-500/30"
+            : "bg-amber-500/15 text-amber-400 border border-amber-500/30"
+        }`}
+      >
+        <ShieldAlert size={11} />
+        <span>系统通知</span>
+      </span>
+    );
+  }
+
+  switch (item.status) {
     case "success":
       return (
         <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 shrink-0 font-medium">
@@ -95,7 +127,7 @@ function statusBadge(status: string) {
     default:
       return (
         <span className="text-[11px] px-2 py-0.5 rounded-full bg-panel3 text-inkdim shrink-0">
-          {status}
+          {item.status}
         </span>
       );
   }
@@ -111,9 +143,10 @@ export function LogViewerModal() {
   const selectSession = useStore((s) => s.selectSession);
   const pushToast = useStore((s) => s.pushToast);
 
-  // 状态筛选
+  // 状态与分类筛选
   const [selectedProjectId, setSelectedProjectId] = useState<string>("all");
-  const [statusFilter, setStatusFilter] = useState<string>("error_only"); // 默认展示异常
+  const [categoryFilter, setCategoryFilter] = useState<"all" | "conversation" | "tool">("all");
+  const [statusFilter, setStatusFilter] = useState<string>("all"); // 默认展示全部状态
   const [toolNameFilter, setToolNameFilter] = useState<string>("all");
   const [keyword, setKeyword] = useState<string>("");
   const [searchInput, setSearchInput] = useState<string>("");
@@ -125,7 +158,7 @@ export function LogViewerModal() {
   const [startDate, setStartDate] = useState<string>("");
   const [endDate, setEndDate] = useState<string>("");
 
-  // 视图模式：'stream' (调用明细流) | 'clusters' (同款异常聚类)
+  // 视图模式：'stream' (明细流) | 'clusters' (同款异常聚类)
   const [activeTab, setActiveTab] = useState<"stream" | "clusters">("stream");
 
   // 数据集
@@ -134,20 +167,26 @@ export function LogViewerModal() {
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
 
   // 复制提示
-  const [copiedType, setCopiedType] = useState<"params" | "result" | null>(null);
+  const [copiedType, setCopiedType] = useState<"params" | "result" | "content" | "reasoning" | null>(null);
 
   // 初始化参数应用
   useEffect(() => {
-    if (show && initialFilter) {
-      if (initialFilter.projectId) setSelectedProjectId(initialFilter.projectId);
-      if (initialFilter.status) setStatusFilter(initialFilter.status);
-      if (initialFilter.toolName) setToolNameFilter(initialFilter.toolName);
-      if (initialFilter.startDate) setStartDate(initialFilter.startDate);
-      if (initialFilter.endDate) setEndDate(initialFilter.endDate);
-      if (initialFilter.startDate || initialFilter.endDate) setDatePreset("custom");
-      if (initialFilter.keyword) {
-        setKeyword(initialFilter.keyword);
-        setSearchInput(initialFilter.keyword);
+    if (show) {
+      if (initialFilter) {
+        if (initialFilter.category) setCategoryFilter(initialFilter.category);
+        if (initialFilter.projectId) setSelectedProjectId(initialFilter.projectId);
+        if (initialFilter.status) setStatusFilter(initialFilter.status);
+        if (initialFilter.toolName) setToolNameFilter(initialFilter.toolName);
+        if (initialFilter.startDate) setStartDate(initialFilter.startDate);
+        if (initialFilter.endDate) setEndDate(initialFilter.endDate);
+        if (initialFilter.startDate || initialFilter.endDate) setDatePreset("custom");
+        if (initialFilter.keyword) {
+          setKeyword(initialFilter.keyword);
+          setSearchInput(initialFilter.keyword);
+        }
+      } else {
+        setStatusFilter("all");
+        setCategoryFilter("all");
       }
     }
   }, [show, initialFilter]);
@@ -213,6 +252,7 @@ export function LogViewerModal() {
     setLoading(true);
     try {
       const filter: ToolLogFilter = {
+        category: categoryFilter,
         projectId: selectedProjectId === "all" ? null : selectedProjectId,
         status: statusFilter === "all" ? null : statusFilter,
         toolName: toolNameFilter === "all" ? null : toolNameFilter,
@@ -242,7 +282,7 @@ export function LogViewerModal() {
       void fetchData();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [show, selectedProjectId, statusFilter, toolNameFilter, keyword, startDate, endDate, page]);
+  }, [show, categoryFilter, selectedProjectId, statusFilter, toolNameFilter, keyword, startDate, endDate, page]);
 
 
   // 当前选中的条目
@@ -274,7 +314,9 @@ export function LogViewerModal() {
     ]);
     if (queryResult?.items) {
       for (const it of queryResult.items) {
-        set.add(it.toolName);
+        if (it.logType === "tool") {
+          set.add(it.toolName);
+        }
       }
     }
     return Array.from(set).sort();
@@ -289,7 +331,7 @@ export function LogViewerModal() {
   const topErrors = queryResult?.topErrors ?? [];
   const totalPages = queryResult?.totalPages ?? 1;
 
-  const copyText = async (text: string, type: "params" | "result") => {
+  const copyText = async (text: string, type: "params" | "result" | "content" | "reasoning") => {
     try {
       await navigator.clipboard.writeText(text);
       setCopiedType(type);
@@ -306,6 +348,7 @@ export function LogViewerModal() {
   };
 
   const handleApplyTopErrorFilter = (toolName: string, errSummary: string) => {
+    setCategoryFilter("tool");
     setToolNameFilter(toolName);
     // 截取前 20 个字符做关键词过滤
     const cleanKw = errSummary.replace(/[\[\]【】()（）]/g, "").trim().slice(0, 15);
@@ -332,10 +375,10 @@ export function LogViewerModal() {
             </div>
             <div>
               <div className="text-[15px] font-semibold text-ink flex items-center gap-2">
-                <span>工具调用与异常日志中心</span>
+                <span>运行与活动日志中心</span>
                 {loading && <span className="text-[11px] text-cyan-400 font-normal animate-pulse">检索中…</span>}
               </div>
-              <div className="text-[11px] text-inkdim">跨会话排查工具调用失败原因、入参出参报文及同款异常模式</div>
+              <div className="text-[11px] text-inkdim">跨会话排查对话流、模型思考、工具调用报文及异常审计记录</div>
             </div>
           </div>
 
@@ -374,7 +417,7 @@ export function LogViewerModal() {
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
               <div className="bg-panel border border-edge/70 rounded-xl p-3 shadow-sm">
                 <div className="flex items-center justify-between text-inkdim text-[11px] mb-0.5">
-                  <span>符合条件总调用</span>
+                  <span>符合条件总记录</span>
                   <Layers size={13} className="text-accent" />
                 </div>
                 <div className="text-xl font-bold text-ink">{totalCount.toLocaleString()}</div>
@@ -382,7 +425,7 @@ export function LogViewerModal() {
 
               <div className="bg-panel border border-edge/70 rounded-xl p-3 shadow-sm">
                 <div className="flex items-center justify-between text-inkdim text-[11px] mb-0.5">
-                  <span>异常调用总数</span>
+                  <span>异常记录总数</span>
                   <AlertTriangle size={13} className="text-red-400" />
                 </div>
                 <div className="text-xl font-bold text-red-400">{errorCount.toLocaleString()}</div>
@@ -436,42 +479,67 @@ export function LogViewerModal() {
                     </select>
                   </div>
 
-                  {/* 工具名称过滤 */}
-                  <div className="flex items-center gap-1.5 text-[12px] text-inkdim">
-                    <span className="shrink-0">工具:</span>
-                    <select
-                      className="bg-panel2 border border-edge rounded-lg px-2.5 py-1 text-[12px] text-ink outline-none hover:bg-panel3 focus:border-accent cursor-pointer max-w-[150px]"
-                      value={toolNameFilter}
-                      onChange={(e) => {
-                        setToolNameFilter(e.target.value);
-                        setPage(1);
-                      }}
-                    >
-                      <option value="all">全部工具</option>
-                      {commonTools.map((t) => (
-                        <option key={t} value={t}>
-                          {t}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-
-                  {/* 状态过滤选项 */}
+                  {/* 日志类别过滤 */}
                   <div className="flex items-center bg-panel2 border border-edge rounded-lg p-0.5 text-[11.5px]">
                     <button
                       className={`px-2 py-0.8 rounded-md transition-colors cursor-pointer ${
-                        statusFilter === "error_only"
-                          ? "bg-red-500/20 text-red-300 font-medium"
-                          : "text-inkdim hover:text-ink"
+                        categoryFilter === "all" ? "bg-panel3 text-ink font-medium" : "text-inkdim hover:text-ink"
                       }`}
                       onClick={() => {
-                        setStatusFilter("error_only");
+                        setCategoryFilter("all");
                         setPage(1);
                       }}
-                      title="仅看失败、被拦截和超时的调用"
                     >
-                      仅看异常
+                      全部日志
                     </button>
+                    <button
+                      className={`px-2 py-0.8 rounded-md transition-colors cursor-pointer ${
+                        categoryFilter === "conversation" ? "bg-accent/15 text-accent font-medium" : "text-inkdim hover:text-ink"
+                      }`}
+                      onClick={() => {
+                        setCategoryFilter("conversation");
+                        setPage(1);
+                      }}
+                    >
+                      对话日志
+                    </button>
+                    <button
+                      className={`px-2 py-0.8 rounded-md transition-colors cursor-pointer ${
+                        categoryFilter === "tool" ? "bg-accent/15 text-accent font-medium" : "text-inkdim hover:text-ink"
+                      }`}
+                      onClick={() => {
+                        setCategoryFilter("tool");
+                        setPage(1);
+                      }}
+                    >
+                      工具调用
+                    </button>
+                  </div>
+
+                  {/* 工具名称过滤 (仅在非纯对话视角展示) */}
+                  {categoryFilter !== "conversation" && (
+                    <div className="flex items-center gap-1.5 text-[12px] text-inkdim">
+                      <span className="shrink-0">工具:</span>
+                      <select
+                        className="bg-panel2 border border-edge rounded-lg px-2.5 py-1 text-[12px] text-ink outline-none hover:bg-panel3 focus:border-accent cursor-pointer max-w-[150px]"
+                        value={toolNameFilter}
+                        onChange={(e) => {
+                          setToolNameFilter(e.target.value);
+                          setPage(1);
+                        }}
+                      >
+                        <option value="all">全部工具</option>
+                        {commonTools.map((t) => (
+                          <option key={t} value={t}>
+                            {t}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+
+                  {/* 状态过滤选项 */}
+                  <div className="flex items-center bg-panel2 border border-edge rounded-lg p-0.5 text-[11.5px]">
                     <button
                       className={`px-2 py-0.8 rounded-md transition-colors cursor-pointer ${
                         statusFilter === "all" ? "bg-panel3 text-ink font-medium" : "text-inkdim hover:text-ink"
@@ -482,6 +550,20 @@ export function LogViewerModal() {
                       }}
                     >
                       全部状态
+                    </button>
+                    <button
+                      className={`px-2 py-0.8 rounded-md transition-colors cursor-pointer ${
+                        statusFilter === "error_only"
+                          ? "bg-red-500/20 text-red-300 font-medium"
+                          : "text-inkdim hover:text-ink"
+                      }`}
+                      onClick={() => {
+                        setStatusFilter("error_only");
+                        setPage(1);
+                      }}
+                      title="仅看失败、被拦截和超时的记录"
+                    >
+                      仅看异常
                     </button>
                     <button
                       className={`px-2 py-0.8 rounded-md transition-colors cursor-pointer ${
@@ -525,7 +607,7 @@ export function LogViewerModal() {
                     <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-inkdim" />
                     <input
                       type="text"
-                      placeholder="搜索入参/出参/错误文本..."
+                      placeholder="搜索正文/思考/入参/出参..."
                       className="bg-panel2 border border-edge rounded-lg pl-7 pr-7 py-1 text-[12px] text-ink placeholder:text-inkdim/50 outline-none hover:bg-panel3 focus:border-accent w-56"
                       value={searchInput}
                       onChange={(e) => setSearchInput(e.target.value)}
@@ -548,7 +630,7 @@ export function LogViewerModal() {
                       }`}
                       onClick={() => setActiveTab("stream")}
                     >
-                      调用列表 ({totalCount})
+                      明细列表 ({totalCount})
                     </button>
                     <button
                       className={`px-2.5 py-0.8 rounded-md transition-colors cursor-pointer flex items-center gap-1 ${
@@ -711,7 +793,7 @@ export function LogViewerModal() {
                 <div className="flex-1 overflow-y-auto divide-y divide-edge/40">
                   {items.length === 0 ? (
                     <div className="h-48 flex flex-col items-center justify-center text-inkdim text-[13px]">
-                      <span>暂无匹配的调用记录</span>
+                      <span>暂无匹配的日志记录</span>
                     </div>
                   ) : (
                     items.map((item) => {
@@ -728,7 +810,7 @@ export function LogViewerModal() {
                         >
                           <div className="flex items-center justify-between gap-2 mb-1.5">
                             <div className="flex items-center gap-1.5 min-w-0 flex-1">
-                              {statusBadge(item.status)}
+                              {statusBadge(item)}
                               <span className="font-mono text-[12px] font-semibold text-ink truncate">
                                 {item.toolName}
                               </span>
@@ -748,8 +830,12 @@ export function LogViewerModal() {
                             )}
                           </div>
 
-                          {/* 简要报错或入参 */}
-                          {item.status !== "success" && item.resultText ? (
+                          {/* 简要报错、对话正文或入参 */}
+                          {item.logType !== "tool" ? (
+                            <div className="text-[11.5px] text-inkdim/80 line-clamp-2 leading-relaxed bg-panel2/40 px-2 py-1 rounded border border-edge/30">
+                              {item.content || item.reasoning || "[空文本]"}
+                            </div>
+                          ) : item.status !== "success" && item.resultText ? (
                             <div className="text-[11px] text-red-400 font-mono truncate bg-red-500/5 px-1.5 py-0.5 rounded border border-red-500/15">
                               {item.resultText}
                             </div>
@@ -796,7 +882,7 @@ export function LogViewerModal() {
                     <div className="bg-panel border border-edge rounded-xl p-4 shadow-sm">
                       <div className="flex items-center justify-between mb-2.5">
                         <div className="flex items-center gap-2">
-                          {statusBadge(selectedItem.status)}
+                          {statusBadge(selectedItem)}
                           <span className="font-mono text-[14px] font-bold text-ink">
                             {selectedItem.toolName}
                           </span>
@@ -805,7 +891,7 @@ export function LogViewerModal() {
                         <button
                           className="px-2.5 py-1 rounded-lg text-[11.5px] bg-accent/15 text-accent hover:bg-accent/25 border border-accent/20 transition-colors flex items-center gap-1 cursor-pointer"
                           onClick={() => handleJumpToSession(selectedItem.sessionId)}
-                          title="跳转至产生该工具调用的会话页面"
+                          title="跳转至产生该记录的会话页面"
                         >
                           <ExternalLink size={12} />
                           <span>跳转至该对话</span>
@@ -832,7 +918,7 @@ export function LogViewerModal() {
                           </div>
                         )}
                         <div className="col-span-2 truncate font-mono text-[10.5px] text-inkdim/60">
-                          Event ID: {selectedItem.id}
+                          {selectedItem.logType === "tool" ? `Event ID: ${selectedItem.id}` : `Message ID: ${selectedItem.id}`}
                         </div>
                       </div>
                     </div>
@@ -840,39 +926,20 @@ export function LogViewerModal() {
                     {/* 模型思考过程上下文 (Reasoning Context) */}
                     {selectedItem.reasoning && (
                       <div className="bg-panel border border-edge rounded-xl p-3.5 shadow-sm">
-                        <div className="flex items-center gap-1.5 text-[12px] font-medium text-purple-400 mb-2">
-                          <Brain size={14} />
-                          <span>触发本次调用的模型思考过程 (Reasoning Context)</span>
-                        </div>
-                        <div className="text-[12px] text-inkdim font-mono bg-panel2/80 rounded-lg p-2.5 max-h-36 overflow-y-auto whitespace-pre-wrap leading-relaxed border border-edge/50">
-                          {selectedItem.reasoning}
-                        </div>
-                      </div>
-                    )}
-
-                    {/* 出参与报错结果 (Result / Error) */}
-                    <div className="bg-panel border border-edge rounded-xl p-4 shadow-sm flex flex-col">
-                      <div className="flex items-center justify-between mb-2">
-                        <div className="flex items-center gap-1.5 text-[12.5px] font-medium text-ink">
-                          {selectedItem.status !== "success" ? (
-                            <>
-                              <XCircle size={14} className="text-red-400" />
-                              <span className="text-red-400 font-semibold">执行出参 / 错误原因 (Error / Result)</span>
-                            </>
-                          ) : (
-                            <>
-                              <CheckCircle2 size={14} className="text-emerald-400" />
-                              <span>执行结果出参 (Result Output)</span>
-                            </>
-                          )}
-                        </div>
-
-                        {selectedItem.resultText && (
+                        <div className="flex items-center justify-between mb-2">
+                          <div className="flex items-center gap-1.5 text-[12px] font-medium text-purple-400">
+                            <Brain size={14} />
+                            <span>
+                              {selectedItem.logType === "tool"
+                                ? "触发本次调用的模型思考过程 (Reasoning Context)"
+                                : "模型深度思考过程 (Reasoning)"}
+                            </span>
+                          </div>
                           <button
                             className="text-[11.5px] text-inkdim hover:text-ink flex items-center gap-1 transition-colors cursor-pointer"
-                            onClick={() => copyText(selectedItem.resultText ?? "", "result")}
+                            onClick={() => copyText(selectedItem.reasoning ?? "", "reasoning")}
                           >
-                            {copiedType === "result" ? (
+                            {copiedType === "reasoning" ? (
                               <>
                                 <Check size={12} className="text-emerald-400" />
                                 <span className="text-emerald-400">已复制</span>
@@ -880,59 +947,137 @@ export function LogViewerModal() {
                             ) : (
                               <>
                                 <Copy size={12} />
-                                <span>复制出参</span>
+                                <span>复制思考</span>
                               </>
                             )}
                           </button>
-                        )}
+                        </div>
+                        <div className="text-[12px] text-inkdim font-mono bg-panel2/80 rounded-lg p-2.5 max-h-48 overflow-y-auto whitespace-pre-wrap leading-relaxed border border-edge/50">
+                          {selectedItem.reasoning}
+                        </div>
                       </div>
+                    )}
 
-                      <pre
-                        className={`text-[12px] font-mono rounded-lg p-3 max-h-60 overflow-y-auto whitespace-pre-wrap leading-relaxed border ${
-                          selectedItem.status !== "success"
-                            ? "bg-red-500/5 text-red-300 border-red-500/20"
-                            : "bg-panel2 text-ink border-edge"
-                        }`}
-                      >
-                        {selectedItem.resultText || "[无返回内容]"}
-                      </pre>
-                    </div>
+                    {/* 对话消息正文 (当为对话日志时展示) */}
+                    {selectedItem.logType !== "tool" ? (
+                      <div className="bg-panel border border-edge rounded-xl p-4 shadow-sm flex flex-col">
+                        <div className="flex items-center justify-between mb-2">
+                          <div className="flex items-center gap-1.5 text-[12.5px] font-medium text-ink">
+                            <MessageSquare size={14} className="text-accent" />
+                            <span>消息正文内容 (Message Content)</span>
+                          </div>
 
-                    {/* 完整入参 (Input Parameters JSON) */}
-                    <div className="bg-panel border border-edge rounded-xl p-4 shadow-sm flex flex-col">
-                      <div className="flex items-center justify-between mb-2">
-                        <div className="flex items-center gap-1.5 text-[12.5px] font-medium text-ink">
-                          <Wrench size={14} className="text-accent" />
-                          <span>完整调用入参 (Input Params JSON)</span>
+                          {selectedItem.content && (
+                            <button
+                              className="text-[11.5px] text-inkdim hover:text-ink flex items-center gap-1 transition-colors cursor-pointer"
+                              onClick={() => copyText(selectedItem.content ?? "", "content")}
+                            >
+                              {copiedType === "content" ? (
+                                <>
+                                  <Check size={12} className="text-emerald-400" />
+                                  <span className="text-emerald-400">已复制</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Copy size={12} />
+                                  <span>复制正文</span>
+                                </>
+                              )}
+                            </button>
+                          )}
                         </div>
 
-                        <button
-                          className="text-[11.5px] text-inkdim hover:text-ink flex items-center gap-1 transition-colors cursor-pointer"
-                          onClick={() => copyText(JSON.stringify(selectedItem.params, null, 2), "params")}
-                        >
-                          {copiedType === "params" ? (
-                            <>
-                              <Check size={12} className="text-emerald-400" />
-                              <span className="text-emerald-400">已复制</span>
-                            </>
-                          ) : (
-                            <>
-                              <Copy size={12} />
-                              <span>复制入参 JSON</span>
-                            </>
-                          )}
-                        </button>
+                        <pre className="text-[12px] font-mono text-ink bg-panel2 border border-edge rounded-lg p-3 max-h-72 overflow-y-auto whitespace-pre-wrap leading-relaxed">
+                          {selectedItem.content || "[空内容]"}
+                        </pre>
                       </div>
+                    ) : (
+                      <>
+                        {/* 出参与报错结果 (Result / Error) */}
+                        <div className="bg-panel border border-edge rounded-xl p-4 shadow-sm flex flex-col">
+                          <div className="flex items-center justify-between mb-2">
+                            <div className="flex items-center gap-1.5 text-[12.5px] font-medium text-ink">
+                              {selectedItem.status !== "success" ? (
+                                <>
+                                  <XCircle size={14} className="text-red-400" />
+                                  <span className="text-red-400 font-semibold">执行出参 / 错误原因 (Error / Result)</span>
+                                </>
+                              ) : (
+                                <>
+                                  <CheckCircle2 size={14} className="text-emerald-400" />
+                                  <span>执行结果出参 (Result Output)</span>
+                                </>
+                              )}
+                            </div>
 
-                      <pre className="text-[12px] font-mono text-cyan-300 bg-panel2 border border-edge rounded-lg p-3 max-h-64 overflow-y-auto whitespace-pre-wrap leading-relaxed">
-                        {JSON.stringify(selectedItem.params, null, 2)}
-                      </pre>
-                    </div>
+                            {selectedItem.resultText && (
+                              <button
+                                className="text-[11.5px] text-inkdim hover:text-ink flex items-center gap-1 transition-colors cursor-pointer"
+                                onClick={() => copyText(selectedItem.resultText ?? "", "result")}
+                              >
+                                {copiedType === "result" ? (
+                                  <>
+                                    <Check size={12} className="text-emerald-400" />
+                                    <span className="text-emerald-400">已复制</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Copy size={12} />
+                                    <span>复制出参</span>
+                                  </>
+                                )}
+                              </button>
+                            )}
+                          </div>
+
+                          <pre
+                            className={`text-[12px] font-mono rounded-lg p-3 max-h-60 overflow-y-auto whitespace-pre-wrap leading-relaxed border ${
+                              selectedItem.status !== "success"
+                                ? "bg-red-500/5 text-red-300 border-red-500/20"
+                                : "bg-panel2 text-ink border-edge"
+                            }`}
+                          >
+                            {selectedItem.resultText || "[无返回内容]"}
+                          </pre>
+                        </div>
+
+                        {/* 完整入参 (Input Parameters JSON) */}
+                        <div className="bg-panel border border-edge rounded-xl p-4 shadow-sm flex flex-col">
+                          <div className="flex items-center justify-between mb-2">
+                            <div className="flex items-center gap-1.5 text-[12.5px] font-medium text-ink">
+                              <Wrench size={14} className="text-accent" />
+                              <span>完整调用入参 (Input Params JSON)</span>
+                            </div>
+
+                            <button
+                              className="text-[11.5px] text-inkdim hover:text-ink flex items-center gap-1 transition-colors cursor-pointer"
+                              onClick={() => copyText(JSON.stringify(selectedItem.params, null, 2), "params")}
+                            >
+                              {copiedType === "params" ? (
+                                <>
+                                  <Check size={12} className="text-emerald-400" />
+                                  <span className="text-emerald-400">已复制</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Copy size={12} />
+                                  <span>复制入参 JSON</span>
+                                </>
+                              )}
+                            </button>
+                          </div>
+
+                          <pre className="text-[12px] font-mono text-cyan-300 bg-panel2 border border-edge rounded-lg p-3 max-h-64 overflow-y-auto whitespace-pre-wrap leading-relaxed">
+                            {JSON.stringify(selectedItem.params, null, 2)}
+                          </pre>
+                        </div>
+                      </>
+                    )}
                   </>
                 ) : (
                   <div className="h-full flex flex-col items-center justify-center text-inkdim text-[13px]">
                     <ScrollText size={32} className="text-inkdim/40 mb-2" />
-                    <span>请在左侧列表中选择一条调用日志查看详情</span>
+                    <span>请在左侧列表中选择一条日志记录查看详情</span>
                   </div>
                 )}
               </div>

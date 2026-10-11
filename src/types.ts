@@ -683,6 +683,7 @@ export interface ToolEvent {
 }
 
 export interface ToolLogFilter {
+  category?: "all" | "conversation" | "tool" | null;
   projectId?: string | null;
   sessionId?: string | null;
   status?: string | null; // "all" | "error_only" | "failed" | "denied" | "timeout" | "success"
@@ -710,6 +711,9 @@ export interface ToolLogItem {
   projectId?: string | null;
   projectName?: string | null;
   reasoning?: string | null;
+  logType?: "tool" | "user" | "assistant" | "system" | null;
+  role?: string | null;
+  content?: string | null;
 }
 
 export interface TopErrorSummary {
