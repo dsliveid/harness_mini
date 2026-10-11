@@ -53,7 +53,7 @@ export function extractIntentAlignmentFromReasoning(reasoning?: string | null): 
 export function cleanDeliverableContent(content?: string | null): string {
   if (!content) return "";
   const trimmed = content.trim();
-  if (!trimmed.startsWith("【思考过程汇报】")) return trimmed;
+  if (!trimmed.startsWith("【思考过程汇报】")) return content;
   const withoutPrefix = trimmed.replace(/^【思考过程汇报】\s*/, "");
   const match = withoutPrefix.match(
     /(?:(?:^|\n|[\s。！!])end\s*(?:\n+|[\s:：])*(?=\*\*|##|#|【|一句话|结论|核心|直接)|(?:\n\s*\n|\n)(?=(?:##|\*\*|【)?(?:先给结论|核心结论|结论先说|最终结论|结论|一句话结论|总(?:结|览)|回答|建议)(?:\*\*|】)?[:：\s])|(?:\n\s*\n)(?=(?:#+\s+|因此[，,]|综上所述[，,]|基于以上分析[，,])))/i
@@ -70,7 +70,9 @@ export function cleanDeliverableContent(content?: string | null): string {
 
 /**
  * 将平铺的时间线消息按轮次聚合成：用户提问 -> 中间执行过程 (含前置意图对齐门控与多步工具折叠) -> 最终交付成果
- * 方案 B：执行与思考过程全内置于抽屉内流式生长，运行期间全程保持展开与稳态，任务彻底完成后自动折叠
+ * 双轨恒定容器模型 (Dual-track Container Model)：
+ * - 过程轨 (Execution Track)：所有中间思考与工具调用卡片收拢于过程抽屉内，无论是运行中还是已完成均自始至终在上方稳态展示
+ * - 交付轨 (Deliverable Track)：最终结论与交付答复自始至终独立于过程抽屉之外，在下方流式或静态呈现，绝不被塞入抽屉导致被吞
  */
 export function groupTimelineItems(
   items: (
@@ -119,129 +121,20 @@ export function groupTimelineItems(
   const flushAssistantSteps = (isCurrentRunningTurn: boolean) => {
     if (currentAssistantSteps.length === 0) return;
 
-    // ----------------------------------------------------
-    // 场景 1：当前轮次正在运行中 (running === true 且是当前活跃尾部轮次)
-    // ----------------------------------------------------
-    if (isCurrentRunningTurn) {
-      const turnAlignment = findIntentAlignmentForSteps(currentAssistantSteps) || activeIntentAlignment;
-      const hasProcessNature =
-        currentAssistantSteps.length > 1 ||
-        currentAssistantSteps.some((m) => hasAnyTools(m) || hasAnyReasoning(m)) ||
-        Boolean(turnAlignment);
-
-      if (hasProcessNature) {
-        // 方案 B 核心：一旦具备执行、思考或前置意图门控特征，所有步骤自始至终稳定挂载在同一个抽屉内
-        const firstId = currentAssistantSteps[0].id;
-        const lastMsg = currentAssistantSteps[currentAssistantSteps.length - 1];
-        const metrics =
-          turnMetricsMap.get(lastMsg.id) ?? turnMetricsMap.get(firstId);
-
-        result.push({
-          type: "process",
-          id: `process-${firstId}`,
-          steps: currentAssistantSteps,
-          turnMetrics: metrics,
-          isRunning: true,
-          intentAlignment: turnAlignment,
-        });
-        currentAssistantSteps = [];
-        return;
-      }
-
-      // 纯单步极简普通文本流式（无工具、无思考、无前置门控）：直接在外部作为普通消息流式呈现
-      result.push({ type: "message", msg: currentAssistantSteps[0] });
-      currentAssistantSteps = [];
-      return;
-    }
-
-    // ----------------------------------------------------
-    // 场景 2：轮次已完结态 (Completed Turn)
-    // ----------------------------------------------------
-    const turnAlignment = findIntentAlignmentForSteps(currentAssistantSteps);
-
-    // 2.1 单步 assistant 消息
-    if (currentAssistantSteps.length === 1) {
-      const singleMsg = currentAssistantSteps[0];
-      const hasTools = hasAnyTools(singleMsg);
-      const hasReasoning = hasAnyReasoning(singleMsg);
-
-      if (hasTools) {
-        // 单步工具调用：放入已完成折叠抽屉
-        const metrics = turnMetricsMap.get(singleMsg.id);
-        result.push({
-          type: "process",
-          id: `process-${singleMsg.id}`,
-          steps: [singleMsg],
-          turnMetrics: metrics,
-          isRunning: false,
-          intentAlignment: turnAlignment,
-        });
-        const cleanSingle = cleanDeliverableContent(singleMsg.content);
-        if (cleanSingle.length > 0) {
-          result.push({
-            type: "message",
-            msg: { ...singleMsg, content: cleanSingle, reasoning: null, turnToolEvents: singleMsg.toolEvents },
-          });
-        }
-      } else if (turnAlignment) {
-        // 具备意图对齐门控：门控卡片放入已完成折叠抽屉，外部展示交付答复
-        const metrics = turnMetricsMap.get(singleMsg.id);
-        result.push({
-          type: "process",
-          id: `process-${singleMsg.id}`,
-          steps: hasReasoning
-            ? [{ ...singleMsg, id: `${singleMsg.id}-reasoning`, content: null, toolEvents: [], toolCalls: [] }]
-            : [],
-          turnMetrics: metrics,
-          isRunning: false,
-          intentAlignment: turnAlignment,
-        });
-        const cleanSingle = cleanDeliverableContent(singleMsg.content);
-        if (cleanSingle.length > 0) {
-          result.push({
-            type: "message",
-            msg: { ...singleMsg, content: cleanSingle, reasoning: null },
-          });
-        }
-      } else if (hasReasoning && singleMsg.content && singleMsg.content.trim().length > 0) {
-        // 单步同时具备思考过程与回复正文：思考过程收归抽屉并默认折叠，外部仅留干净的正文交付
-        const metrics = turnMetricsMap.get(singleMsg.id);
-        result.push({
-          type: "process",
-          id: `process-${singleMsg.id}`,
-          steps: [{ ...singleMsg, id: `${singleMsg.id}-reasoning`, content: null, toolEvents: [], toolCalls: [] }],
-          turnMetrics: metrics,
-          isRunning: false,
-          intentAlignment: turnAlignment,
-        });
-        const cleanSingle = cleanDeliverableContent(singleMsg.content);
-        if (cleanSingle.length > 0) {
-          result.push({
-            type: "message",
-            msg: { ...singleMsg, content: cleanSingle, reasoning: null },
-          });
-        }
-      } else {
-        // 纯单步普通文本答复
-        const cleanSingle = cleanDeliverableContent(singleMsg.content);
-        if (cleanSingle.length > 0) {
-          result.push({ type: "message", msg: { ...singleMsg, content: cleanSingle } });
-        }
-      }
-      currentAssistantSteps = [];
-      return;
-    }
-
-    // 2.2 多步 assistant 消息
     const lastMsg = currentAssistantSteps[currentAssistantSteps.length - 1];
     const lastHasTools = hasAnyTools(lastMsg);
     const lastHasReasoning = hasAnyReasoning(lastMsg);
+    const isDeliverable = !lastHasTools;
 
     const allTurnToolEvents = currentAssistantSteps.flatMap((m) => m.toolEvents || []);
     const turnRevertedAt = currentAssistantSteps.find((m) => m.revertedAt)?.revertedAt || lastMsg.revertedAt;
+    const turnAlignment =
+      findIntentAlignmentForSteps(currentAssistantSteps) ||
+      (isCurrentRunningTurn ? activeIntentAlignment : undefined);
 
-    if (!lastHasTools) {
-      // 最后一条是无工具的交付答复：前序所有步骤（以及最后一条的思考过程，若有）收拢入执行过程，正文作为外部交付成果
+    if (isDeliverable) {
+      // 场景 A：最后一条消息无工具调用（属于最终交付答复或正在输出最终正文）
+      // 前序所有步骤（以及最后一条的思考过程，若有）归入执行过程轨 (Execution Track)
       const processSteps = currentAssistantSteps.slice(0, currentAssistantSteps.length - 1);
       if (lastHasReasoning) {
         processSteps.push({
@@ -253,20 +146,26 @@ export function groupTimelineItems(
         });
       }
 
-      const metrics =
-        turnMetricsMap.get(lastMsg.id) ?? turnMetricsMap.get(processSteps[0]?.id);
+      const hasProcessNature = processSteps.length > 0 || Boolean(turnAlignment);
+      if (hasProcessNature) {
+        const firstId = processSteps[0]?.id || lastMsg.id;
+        const metrics = turnMetricsMap.get(lastMsg.id) ?? turnMetricsMap.get(firstId);
+        result.push({
+          type: "process",
+          id: `process-${firstId}`,
+          steps: processSteps,
+          turnMetrics: metrics,
+          // 工具执行阶段已结束，当前处于最终交付阶段或已完结，过程抽屉保持已完成稳态
+          isRunning: false,
+          intentAlignment: turnAlignment,
+        });
+      }
 
-      result.push({
-        type: "process",
-        id: `process-${processSteps[0]?.id || lastMsg.id}`,
-        steps: processSteps,
-        turnMetrics: metrics,
-        isRunning: false,
-        intentAlignment: turnAlignment,
-      });
-
+      // 交付成果轨 (Deliverable Track)：双轨恒定容器模型，无论运行中还是已完成均独立渲染在外部
       const cleanLast = cleanDeliverableContent(lastMsg.content);
-      if (cleanLast.length > 0) {
+      const hasDeliverableContent =
+        cleanLast.length > 0 || (isCurrentRunningTurn && lastMsg.content != null);
+      if (hasDeliverableContent) {
         result.push({
           type: "message",
           msg: {
@@ -279,32 +178,34 @@ export function groupTimelineItems(
         });
       }
     } else {
-      // 整轮所有步骤均包含工具调用（如中断在工具执行）
+      // 场景 B：最后一条消息仍包含工具调用（正在执行工具或执行中途受阻/中断）
       const metrics =
-        turnMetricsMap.get(lastMsg.id) ??
-        turnMetricsMap.get(currentAssistantSteps[0]?.id);
+        turnMetricsMap.get(lastMsg.id) ?? turnMetricsMap.get(currentAssistantSteps[0]?.id);
 
       result.push({
         type: "process",
         id: `process-${currentAssistantSteps[0].id}`,
         steps: currentAssistantSteps,
         turnMetrics: metrics,
-        isRunning: false,
+        isRunning: isCurrentRunningTurn,
         intentAlignment: turnAlignment,
       });
 
-      const cleanLast = cleanDeliverableContent(lastMsg.content);
-      if (cleanLast.length > 0) {
-        result.push({
-          type: "message",
-          msg: {
-            ...lastMsg,
-            content: cleanLast,
-            reasoning: null,
-            turnToolEvents: allTurnToolEvents,
-            revertedAt: turnRevertedAt,
-          },
-        });
+      // 若非运行态（如被中断或达到步数限制停止），且最后一步伴随有总结文本，亦提取展示
+      if (!isCurrentRunningTurn) {
+        const cleanLast = cleanDeliverableContent(lastMsg.content);
+        if (cleanLast.length > 0) {
+          result.push({
+            type: "message",
+            msg: {
+              ...lastMsg,
+              content: cleanLast,
+              reasoning: null,
+              turnToolEvents: allTurnToolEvents,
+              revertedAt: turnRevertedAt,
+            },
+          });
+        }
       }
     }
 

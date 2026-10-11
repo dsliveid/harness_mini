@@ -1,4 +1,4 @@
-import { useEffect, useRef, useMemo } from "react";
+import { useEffect, useRef, useMemo, useState } from "react";
 import { ipc } from "../ipc";
 import { currentMessages, currentSession, useStore } from "../store";
 import { DRAFT_ID, computeTurnMetrics, type Message, type SessionCompaction } from "../types";
@@ -9,7 +9,7 @@ import { ExecutionProcessBlock, groupTimelineItems } from "./ExecutionProcessBlo
 import { ToolRetryBanner } from "./ToolRetryBanner";
 import { CompactionBanner, CompactedHistoryCard } from "./CompactionBanner";
 import { TruncationNoticeList } from "./TruncationNoticeCard";
-import { Bot, Plus, Sprout, ShieldCheck, AlertTriangle, Loader2, Play, RotateCcw, Zap } from "./Icons";
+import { Bot, Plus, Sprout, ShieldCheck, AlertTriangle, Loader2, Play, RotateCcw, Zap, ChevronDown } from "./Icons";
 
 const EMPTY_PROPOSALS: any[] = [];
 const EMPTY_COMPACTIONS: any[] = [];
@@ -158,6 +158,8 @@ export function ChatView() {
     );
   }, [timelineItems, turnMetricsMap, running, intentAlignments, currentIntentAlignment, currentId]);
 
+  const [showScrollBottom, setShowScrollBottom] = useState(false);
+
   useEffect(() => {
     const el = boxRef.current;
     if (el && stick.current) {
@@ -168,8 +170,40 @@ export function ChatView() {
   const onScroll = () => {
     const el = boxRef.current;
     if (!el) return;
-    stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
+    const isAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+    stick.current = isAtBottom;
+    setShowScrollBottom(!isAtBottom);
   };
+
+  // 轮次完结态切换：当一轮执行完结并产生最终答复时，平滑滚动触底，确保结论完整可见
+  const wasRunningRef = useRef(running);
+  useEffect(() => {
+    if (wasRunningRef.current && !running) {
+      const el = boxRef.current;
+      if (el) {
+        el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+        stick.current = true;
+        setShowScrollBottom(false);
+      }
+    }
+    wasRunningRef.current = running;
+  }, [running]);
+
+  const lastUserMsgId = useMemo(() => {
+    return [...msgs].reverse().find((m) => m.role === "user" && !m.queued)?.id;
+  }, [msgs]);
+
+  // 新发起用户提问时强制锚定贴底
+  const prevLastUserRef = useRef(lastUserMsgId);
+  useEffect(() => {
+    if (lastUserMsgId && lastUserMsgId !== prevLastUserRef.current) {
+      stick.current = true;
+      setShowScrollBottom(false);
+      const el = boxRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    }
+    prevLastUserRef.current = lastUserMsgId;
+  }, [lastUserMsgId]);
 
   // 当切换到一个已有消息历史但本地尚未缓存完毕的会话时，展示轻量 loading，消除空会话卡片闪烁
   const isInitialLoading = Boolean(currentId && currentId !== DRAFT_ID && msgs.length === 0 && session?.lastMessageAt);
@@ -245,7 +279,6 @@ export function ChatView() {
     );
   }
 
-  const lastUserMsgId = [...msgs].reverse().find((m) => m.role === "user" && !m.queued)?.id;
   const isTempConv = !!session?.isTemp || (currentId === DRAFT_ID && !!draft?.temp);
 
   return (
@@ -394,6 +427,24 @@ export function ChatView() {
 
         </div>
       </div>
+      {showScrollBottom && (
+        <button
+          type="button"
+          onClick={() => {
+            const el = boxRef.current;
+            if (el) {
+              el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+              stick.current = true;
+              setShowScrollBottom(false);
+            }
+          }}
+          className="absolute bottom-6 right-8 z-30 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-panel2/95 hover:bg-panel border border-edge hover:border-accent/50 shadow-xl text-[12px] font-medium text-inkdim hover:text-ink backdrop-blur-md transition-all cursor-pointer select-none animate-in fade-in slide-in-from-bottom-2 duration-150"
+          title="回到底部最新答复"
+        >
+          <ChevronDown size={14} className="text-accent shrink-0" />
+          <span>最新答复</span>
+        </button>
+      )}
     </div>
   );
 }
