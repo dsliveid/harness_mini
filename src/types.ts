@@ -761,6 +761,32 @@ export interface Message {
   turnToolEvents?: ToolEvent[];
 }
 
+/**
+ * AI Agent 轮次领域模型 (Turn Domain Model)
+ * 工业级规范（方案 A）：会话由严格的 Turn 结构构成，物理分离过程轨与交付轨。
+ */
+export interface TurnExecutionTrack {
+  id: string;
+  steps: Message[];
+  isRunning: boolean;
+  turnMetrics?: TurnMetrics;
+  intentAlignment?: IntentAlignmentEvent;
+}
+
+export interface TurnDeliverableTrack {
+  message: Message;
+  cleanContent: string;
+}
+
+export interface AgentTurn {
+  id: string;
+  runId?: string;
+  triggerUserMsg?: Message;
+  status: "idle" | "running" | "completed" | "failed" | "cancelled";
+  process?: TurnExecutionTrack;
+  deliverable?: TurnDeliverableTrack;
+}
+
 export interface SnapshotFileDiff {
   filePath: string;
   isNewFile: boolean;

@@ -86,7 +86,6 @@ export function groupTimelineItems(
   currentSessionId?: string | null
 ): GroupedTimelineItem[] {
   const result: GroupedTimelineItem[] = [];
-  let currentAssistantSteps: Message[] = [];
 
   const hasAnyTools = (msg: Message) =>
     (msg.toolEvents?.length ?? 0) > 0 ||
@@ -118,13 +117,18 @@ export function groupTimelineItems(
     }
   }
 
-  const flushAssistantSteps = (isCurrentRunningTurn: boolean) => {
+  let currentAssistantSteps: Message[] = [];
+  let currentTriggerUserMsg: Message | undefined;
+
+  const flushTurn = (isCurrentRunningTurn: boolean) => {
     if (currentAssistantSteps.length === 0) return;
 
+    const firstMsg = currentAssistantSteps[0];
     const lastMsg = currentAssistantSteps[currentAssistantSteps.length - 1];
-    const lastHasTools = hasAnyTools(lastMsg);
-    const lastHasReasoning = hasAnyReasoning(lastMsg);
-    const isDeliverable = !lastHasTools;
+
+    // 绝对稳定的轮次 Key：优先绑定触发该轮次的 userMsg.id，或 runId / 首个步骤 id
+    // 整个轮次生命周期内 100% 恒定不变，绝对杜绝 React 组件在步骤流式推进中发生 Unmount/Remount
+    const stableTurnKey = currentTriggerUserMsg?.id || firstMsg.runId || firstMsg.id;
 
     const allTurnToolEvents = currentAssistantSteps.flatMap((m) => m.toolEvents || []);
     const turnRevertedAt = currentAssistantSteps.find((m) => m.revertedAt)?.revertedAt || lastMsg.revertedAt;
@@ -132,76 +136,141 @@ export function groupTimelineItems(
       findIntentAlignmentForSteps(currentAssistantSteps) ||
       (isCurrentRunningTurn ? activeIntentAlignment : undefined);
 
-    if (isDeliverable) {
-      // 场景 A：最后一条消息无工具调用（属于最终交付答复或正在输出最终正文）
-      // 前序所有步骤（以及最后一条的思考过程，若有）归入执行过程轨 (Execution Track)
-      const processSteps = currentAssistantSteps.slice(0, currentAssistantSteps.length - 1);
-      if (lastHasReasoning) {
-        processSteps.push({
-          ...lastMsg,
-          id: `${lastMsg.id}-reasoning`,
-          content: null,
-          toolEvents: [],
-          toolCalls: [],
-        });
+    const metrics =
+      (firstMsg.runId ? turnMetricsMap.get(firstMsg.runId) : undefined) ??
+      turnMetricsMap.get(lastMsg.id) ??
+      turnMetricsMap.get(firstMsg.id);
+
+    const anyStepHasTools = currentAssistantSteps.some(hasAnyTools);
+    const lastHasTools = hasAnyTools(lastMsg);
+    const lastHasReasoning = hasAnyReasoning(lastMsg);
+
+    // 核心不变量（方案 A 轮次领域模型）：
+    // 过程抽屉的运行态严格且唯一受整个轮次的运行状态控制！
+    // 只要当前轮次处于运行中，isProcessRunning 始终为 true，绝不允许被单步微观属性临时翻转！
+    const isProcessRunning = isCurrentRunningTurn;
+
+    if (anyStepHasTools || currentAssistantSteps.length > 1) {
+      // 场景 A：多步工具执行轮次（ReAct Multi-step Loop）
+      // 若最后一步无工具调用，则最后一步为最终交付答复（Deliverable），其前序步骤及思考过程归入过程轨
+      const isLastStepDeliverable = !lastHasTools;
+
+      let processSteps: Message[];
+      let deliverableMsg: Message | undefined;
+
+      if (isLastStepDeliverable) {
+        processSteps = currentAssistantSteps.slice(0, currentAssistantSteps.length - 1);
+        if (lastHasReasoning) {
+          processSteps.push({
+            ...lastMsg,
+            id: `${lastMsg.id}-reasoning`,
+            content: null,
+            toolEvents: [],
+            toolCalls: [],
+          });
+        }
+        deliverableMsg = lastMsg;
+      } else {
+        // 最后一步仍包含工具调用（正在执行工具，或中途停止）
+        processSteps = currentAssistantSteps;
+        // 若已停止（非运行态）且最后一步携带了总结文本，提取作为交付
+        if (!isCurrentRunningTurn) {
+          deliverableMsg = lastMsg;
+        }
       }
 
-      const hasProcessNature = processSteps.length > 0 || Boolean(turnAlignment);
-      if (hasProcessNature) {
-        const firstId = processSteps[0]?.id || lastMsg.id;
-        const metrics = turnMetricsMap.get(lastMsg.id) ?? turnMetricsMap.get(firstId);
+      // 过程轨发射：只要有步骤或有意图门控即呈现过程抽屉
+      if (processSteps.length > 0 || Boolean(turnAlignment)) {
         result.push({
           type: "process",
-          id: `process-${firstId}`,
+          id: `process-turn-${stableTurnKey}`,
           steps: processSteps,
           turnMetrics: metrics,
-          // 工具执行阶段已结束，当前处于最终交付阶段或已完结，过程抽屉保持已完成稳态
-          isRunning: false,
+          isRunning: isProcessRunning,
           intentAlignment: turnAlignment,
         });
       }
 
-      // 交付成果轨 (Deliverable Track)：双轨恒定容器模型，无论运行中还是已完成均独立渲染在外部
-      const cleanLast = cleanDeliverableContent(lastMsg.content);
-      const hasDeliverableContent =
-        cleanLast.length > 0 || (isCurrentRunningTurn && lastMsg.content != null);
-      if (hasDeliverableContent) {
-        result.push({
-          type: "message",
-          msg: {
-            ...lastMsg,
-            content: cleanLast,
-            reasoning: null,
-            turnToolEvents: allTurnToolEvents,
-            revertedAt: turnRevertedAt,
-          },
-        });
-      }
-    } else {
-      // 场景 B：最后一条消息仍包含工具调用（正在执行工具或执行中途受阻/中断）
-      const metrics =
-        turnMetricsMap.get(lastMsg.id) ?? turnMetricsMap.get(currentAssistantSteps[0]?.id);
-
-      result.push({
-        type: "process",
-        id: `process-${currentAssistantSteps[0].id}`,
-        steps: currentAssistantSteps,
-        turnMetrics: metrics,
-        isRunning: isCurrentRunningTurn,
-        intentAlignment: turnAlignment,
-      });
-
-      // 若非运行态（如被中断或达到步数限制停止），且最后一步伴随有总结文本，亦提取展示
-      if (!isCurrentRunningTurn) {
-        const cleanLast = cleanDeliverableContent(lastMsg.content);
-        if (cleanLast.length > 0) {
+      // 交付轨发射：双轨恒定容器模型，无论运行中还是已完成均独立渲染在外部
+      if (deliverableMsg) {
+        const cleanContent = cleanDeliverableContent(deliverableMsg.content);
+        const hasContent =
+          cleanContent.length > 0 || (isCurrentRunningTurn && deliverableMsg.content != null);
+        if (hasContent) {
           result.push({
             type: "message",
             msg: {
-              ...lastMsg,
-              content: cleanLast,
+              ...deliverableMsg,
+              content: cleanContent,
               reasoning: null,
               turnToolEvents: allTurnToolEvents,
+              revertedAt: turnRevertedAt,
+            },
+          });
+        }
+      }
+    } else {
+      // 场景 B：单步助手消息（Single-step Assistant）
+      const singleMsg = currentAssistantSteps[0];
+      const singleHasTools = hasAnyTools(singleMsg);
+      const singleHasReasoning = hasAnyReasoning(singleMsg);
+
+      if (singleHasTools) {
+        // 单步直接调用了工具
+        result.push({
+          type: "process",
+          id: `process-turn-${stableTurnKey}`,
+          steps: [singleMsg],
+          turnMetrics: metrics,
+          isRunning: isProcessRunning,
+          intentAlignment: turnAlignment,
+        });
+        const cleanSingle = cleanDeliverableContent(singleMsg.content);
+        if (cleanSingle.length > 0 || (isCurrentRunningTurn && singleMsg.content != null)) {
+          result.push({
+            type: "message",
+            msg: {
+              ...singleMsg,
+              content: cleanSingle,
+              reasoning: null,
+              turnToolEvents: singleMsg.toolEvents,
+              revertedAt: turnRevertedAt,
+            },
+          });
+        }
+      } else if (turnAlignment || singleHasReasoning) {
+        // 单步无工具，但具备思考过程或意图门控卡片
+        result.push({
+          type: "process",
+          id: `process-turn-${stableTurnKey}`,
+          steps: singleHasReasoning
+            ? [{ ...singleMsg, id: `${singleMsg.id}-reasoning`, content: null, toolEvents: [], toolCalls: [] }]
+            : [],
+          turnMetrics: metrics,
+          isRunning: isProcessRunning,
+          intentAlignment: turnAlignment,
+        });
+        const cleanSingle = cleanDeliverableContent(singleMsg.content);
+        if (cleanSingle.length > 0 || (isCurrentRunningTurn && singleMsg.content != null)) {
+          result.push({
+            type: "message",
+            msg: {
+              ...singleMsg,
+              content: cleanSingle,
+              reasoning: null,
+              revertedAt: turnRevertedAt,
+            },
+          });
+        }
+      } else {
+        // 纯单步极简普通文本答复（无工具、无思考、无门控）：直接在外部作为普通消息呈现
+        const cleanSingle = cleanDeliverableContent(singleMsg.content);
+        if (cleanSingle.length > 0 || (isCurrentRunningTurn && singleMsg.content != null)) {
+          result.push({
+            type: "message",
+            msg: {
+              ...singleMsg,
+              content: cleanSingle,
               revertedAt: turnRevertedAt,
             },
           });
@@ -215,35 +284,40 @@ export function groupTimelineItems(
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     if (item.type === "compaction") {
-      flushAssistantSteps(false);
+      flushTurn(false);
+      currentTriggerUserMsg = undefined;
       result.push(item);
     } else if (item.msg.role === "assistant") {
-      // 检查 runId 边界：若新步骤与当前累积步骤的 runId 明确不同，强制切断并结算前序抽屉，杜绝跨轮次混合
+      // 检查 runId 边界：若新步骤与当前累积步骤的 runId 明确不同，强制切断并结算前序轮次，杜绝跨轮次混合
       if (
         currentAssistantSteps.length > 0 &&
         currentAssistantSteps[0].runId &&
         item.msg.runId &&
         currentAssistantSteps[0].runId !== item.msg.runId
       ) {
-        flushAssistantSteps(false);
+        flushTurn(false);
       }
       currentAssistantSteps.push(item.msg);
     } else {
       // user 消息或其他非 assistant 角色
-      flushAssistantSteps(false);
+      flushTurn(false);
+      if (item.msg.role === "user") {
+        currentTriggerUserMsg = item.msg;
+      } else {
+        currentTriggerUserMsg = undefined;
+      }
       result.push(item);
     }
   }
 
   // 处理时间线尾部的当前轮次
   const isTailActive = running && lastAssistantIdx >= 0;
-  flushAssistantSteps(isTailActive);
+  flushTurn(isTailActive);
 
   // 若当前正在运行中，且尚未产生 assistant 消息（例如正在进行前置意图对齐与质检门控，或首步思考准备中）
   if (running && (lastAssistantIdx < 0 || lastAssistantIdx < items.length - 1)) {
     const lastItem = items[items.length - 1];
     if (lastItem && lastItem.type === "message" && lastItem.msg.role === "user") {
-      // 检查 activeIntentAlignment 是否匹配当前会话与最新提问
       const isRelevantAlignment = Boolean(
         activeIntentAlignment &&
           (activeIntentAlignment.status === "analyzing" ||
@@ -255,7 +329,7 @@ export function groupTimelineItems(
 
       result.push({
         type: "process",
-        id: `process-running-${lastItem.msg.id}`,
+        id: `process-turn-${lastItem.msg.id}`,
         steps: [],
         isRunning: true,
         intentAlignment: isRelevantAlignment ? activeIntentAlignment : undefined,

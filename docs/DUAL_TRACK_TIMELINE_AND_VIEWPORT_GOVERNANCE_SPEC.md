@@ -118,6 +118,19 @@
    - 当用户在长任务执行期间向上翻阅前序工具清单导致脱钩时，右下角优雅弹出半透明的浮动药丸按钮；
    - 用户只需点击一次即可平滑重回最新答复底部。
 
+### 4.4 方案 A：Turn 领域模型与卡片自动收起治理 (Turn Domain Model Invariants)
+
+针对多步执行过程中“每个步骤过程卡片自动收起一次并闪烁展开”的严重交互问题，采用工业级标杆（Claude Code / Cursor）的 **Turn 领域模型** 确立两大绝对不变量：
+
+1. **绝对恒定的轮次 Key（Immutable Turn Key Invariant）**：
+   - 过程抽屉的 Key 统一绑定为 `process-turn-${triggerUserMsg.id || runId}`；
+   - 在整个任务流式生命周期中，无论是首步思考、多步工具调用还是最终交付，Key 保持绝对恒定；
+   - 杜绝因 Key 变化引发的 React DOM 销毁与组件实例重建（Unmount / Remount）。
+2. **运行态轮次级锁定（Turn Status Lock-in Invariant）**：
+   - 过程抽屉的 `isRunning` 属性严格且唯一由**本轮次的运行态**（`isCurrentRunningTurn`）决定；
+   - 彻底废除任何依据中间单步消息“暂无工具调用”而将 `isRunning` 强行篡改为 `false` 的微观猜测；
+   - 只要当前轮次处于运行中，卡片内部的折叠状态机（`wasRunningRef`）绝不被意外触发，卡片稳定自旋展开，直至后端整轮任务彻底完结（`run:status(idle)`）时优雅收起一次。
+
 ---
 
 ## 五、验证结果与防劣化测试保障
@@ -128,5 +141,6 @@
    - 执行 `cargo check`：0 错误。
    - 执行 `cargo test`：全量 152 个单元测试与集成测试全部 PASSED。
 3. **架构度量改善**：
-   - `ExecutionProcessBlock.tsx` 净剔除 130+ 行冗余嵌套分支；
-   - 消除容器在运行态与完结态之间的动态形态变异（Mode Morphing），前后端逻辑解耦清晰。
+   - 确立 `AgentTurn` 领域对象，从根本上消灭了单步猜测与状态机抖动；
+   - 彻底消除了执行过程中卡片“每步自动折叠一次”与“正文闪烁外露后吸回”的视觉伪影；
+   - 全链路向后兼容，会话切换与历史持久化平滑健壮。
