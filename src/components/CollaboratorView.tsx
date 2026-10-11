@@ -659,9 +659,9 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
                 const mainP = settings.providers?.find((p) => p.id === mainPid);
                 const mainDisplay = mainP?.name && mainMid ? `${mainP.name}/${mainMid}` : mainMid;
                 return mainDisplay ? (
-                  <span className="px-1.5 py-0.5 rounded bg-panel3 border border-edge text-inkdim font-mono flex items-center gap-1" title={`对话思考驱动模型: ${mainDisplay}`}>
-                    <Cpu size={10} className="text-accent" />
-                    <span>{mainDisplay}</span>
+                  <span className="px-1.5 py-0.5 rounded bg-panel3 border border-edge text-inkdim font-mono flex items-center gap-1 max-w-[150px] sm:max-w-[200px]" title={`对话思考驱动模型: ${mainDisplay}`}>
+                    <Cpu size={10} className="text-accent shrink-0" />
+                    <span className="truncate">{mainDisplay}</span>
                   </span>
                 ) : null;
               })()}
@@ -671,9 +671,21 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
                 const imgP = settings.providers?.find((p) => p.id === imgPid);
                 const imgDisplay = imgP?.name && imgMid ? `${imgP.name}/${imgMid}` : imgMid;
                 return imgDisplay ? (
-                  <span className="px-1.5 py-0.5 rounded bg-purple-500/10 border border-purple-500/30 text-purple-300 font-mono flex items-center gap-1" title={`专属生图执行模型: ${imgDisplay}`}>
-                    <Palette size={10} className="text-purple-300" />
-                    <span>{imgDisplay}</span>
+                  <span className="px-1.5 py-0.5 rounded bg-pink-500/10 border border-pink-500/30 text-pink-300 font-mono flex items-center gap-1 max-w-[150px] sm:max-w-[200px]" title={`专属生图执行模型: ${imgDisplay}`}>
+                    <Palette size={10} className="text-pink-400 shrink-0" />
+                    <span className="truncate">{imgDisplay}</span>
+                  </span>
+                ) : null;
+              })()}
+              {(() => {
+                const visPid = collab.visionProviderId || collab.vision_provider_id;
+                const visMid = collab.visionModelId || collab.vision_model_id;
+                const visP = settings.providers?.find((p) => p.id === visPid);
+                const visDisplay = visP?.name && visMid ? `${visP.name}/${visMid}` : visMid;
+                return visDisplay ? (
+                  <span className="px-1.5 py-0.5 rounded bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 font-mono flex items-center gap-1 max-w-[150px] sm:max-w-[200px]" title={`专属视觉感知模型: ${visDisplay}`}>
+                    <Eye size={10} className="text-cyan-400 shrink-0" />
+                    <span className="truncate">{visDisplay}</span>
                   </span>
                 ) : null;
               })()}

@@ -260,6 +260,52 @@ const TOOL_LABELS: Record<string, string> = {
 };
 
 /**
+ * 从生图/识图工具执行文本中解析实际执行的厂商与模型
+ * 支持：
+ * - 成功产物：`- 厂商/模型: `OpenAI/dall-e-3`` 或 `- 厂商/模型: `SiliconFlow/black-forest-labs/FLUX.1-schnell``
+ * - 错误前缀：`[厂商: OpenAI / 模型: dall-e-3]` 或 `[厂商: SiliconFlow / 模型: black-forest-labs/FLUX.1-schnell]`
+ * - 独立标记：`- 厂商: xxx` 与 `- 使用模型: yyy`
+ */
+export function parseProviderAndModelFromText(text?: string | null): { provider?: string; model?: string } | null {
+  if (!text) return null;
+
+  // 1. 匹配 `- 厂商/模型: `provider/model`` (贪婪匹配到闭合反引号或行尾，且兼容模型名中包含 / 的情况)
+  const combinedMatch = text.match(/厂商\/模型:\s*`?([^`\r\n]+)`?/);
+  if (combinedMatch) {
+    const raw = combinedMatch[1].trim();
+    const slashIdx = raw.indexOf("/");
+    if (slashIdx !== -1) {
+      const provider = raw.slice(0, slashIdx).trim();
+      const model = raw.slice(slashIdx + 1).trim();
+      if (provider || model) {
+        return { provider: provider || undefined, model: model || undefined };
+      }
+    }
+  }
+
+  // 2. 匹配 `[厂商: xxx / 模型: yyy]` (模型名可包含 / 直到 ])
+  const errMatch = text.match(/\[厂商:\s*([^/\]]+?)\s*\/\s*模型:\s*([^\]]+?)\s*\]/);
+  if (errMatch) {
+    const provider = errMatch[1].trim();
+    const model = errMatch[2].trim();
+    if (provider || model) {
+      return { provider: provider || undefined, model: model || undefined };
+    }
+  }
+
+  // 3. 独立字段回退匹配
+  const providerMatch = text.match(/厂商:\s*`?([^`\r\n]+)`?/);
+  const modelMatch = text.match(/使用模型:\s*`?([^`\r\n]+)`?/);
+  const provider = providerMatch ? providerMatch[1].trim() : undefined;
+  const model = modelMatch ? modelMatch[1].trim() : undefined;
+  if (provider || model) {
+    return { provider, model };
+  }
+
+  return null;
+}
+
+/**
  * 提取生图、识图与决策工具实际调用的模型与厂商信息
  * 1. 优先从工具执行结果 (resultText / JSON) 中提取实际调用厂商与模型
  * 2. 失败时从后端注入的错误前缀 [厂商: xxx / 模型: yyy] 提取
@@ -278,16 +324,9 @@ export function extractToolModelInfo(
   // 1. 优先尝试从 ev.resultText 中提取实际执行返回的厂商与模型（最准确）
   if (ev.resultText) {
     if (isImageTool || isVisionTool) {
-      const combinedMatch = ev.resultText.match(/厂商\/模型:\s*`?([^/`\n]+?)\s*\/\s*([^`\n]+?)`?/);
-      const providerMatch = ev.resultText.match(/厂商:\s*`?([^`\n]+)`?/);
-      const modelMatch = ev.resultText.match(/使用模型:\s*`?([^`\n]+)`?/);
-      const errMatch = ev.resultText.match(/\[厂商:\s*([^/\]]+?)\s*\/\s*模型:\s*([^/\]]+?)\s*\]/);
-
-      const provider = combinedMatch ? combinedMatch[1].trim() : providerMatch ? providerMatch[1].trim() : errMatch ? errMatch[1].trim() : undefined;
-      const model = combinedMatch ? combinedMatch[2].trim() : modelMatch ? modelMatch[1].trim() : errMatch ? errMatch[2].trim() : undefined;
-
-      if (provider || model) {
-        return { provider, model };
+      const parsed = parseProviderAndModelFromText(ev.resultText);
+      if (parsed) {
+        return parsed;
       }
     } else if (isDecisionTool) {
       try {
@@ -705,13 +744,13 @@ function DecisionCardView({
           </div>
           {effectiveModelInfo && (effectiveModelInfo.provider || effectiveModelInfo.model) && (
             <span
-              className="inline-flex items-center gap-1 text-[10.5px] font-mono px-2 py-0.5 rounded-md bg-amber-500/10 text-amber-300 border border-amber-500/25"
-              title={`决策实际调用: ${effectiveModelInfo.provider || "默认厂商"} / ${effectiveModelInfo.model || "默认模型"}`}
+              className="inline-flex items-center gap-1 text-[10.5px] font-mono px-2 py-0.5 rounded-md bg-amber-500/10 text-amber-300 border border-amber-500/25 max-w-[280px] sm:max-w-[380px]"
+              title={`决策实际调用: ${[effectiveModelInfo.provider, effectiveModelInfo.model].filter(Boolean).join(" / ")}`}
             >
-              <Server size={11} className="text-amber-400" />
-              {effectiveModelInfo.provider && <span className="font-medium">{effectiveModelInfo.provider}</span>}
-              {effectiveModelInfo.provider && effectiveModelInfo.model && <span className="opacity-40">/</span>}
-              {effectiveModelInfo.model && <span>{effectiveModelInfo.model}</span>}
+              <Server size={11} className="text-amber-400 shrink-0" />
+              {effectiveModelInfo.provider && <span className="font-medium shrink-0">{effectiveModelInfo.provider}</span>}
+              {effectiveModelInfo.provider && effectiveModelInfo.model && <span className="opacity-40 shrink-0">/</span>}
+              {effectiveModelInfo.model && <span className="truncate">{effectiveModelInfo.model}</span>}
             </span>
           )}
         </div>
@@ -1127,11 +1166,14 @@ function ImageToolView({
         </div>
         <div className="text-[13px] font-medium text-ink">正在绘制图像，请稍候…</div>
         {modelInfo && (modelInfo.provider || modelInfo.model) && (
-          <div className="inline-flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-0.5 rounded-md bg-pink-500/10 text-pink-300 border border-pink-500/20">
-            <Server size={11} className="text-pink-400" />
-            {modelInfo.provider && <span className="font-medium">{modelInfo.provider}</span>}
-            {modelInfo.provider && modelInfo.model && <span className="opacity-40">/</span>}
-            {modelInfo.model && <span>{modelInfo.model}</span>}
+          <div
+            className="inline-flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-0.5 rounded-md bg-pink-500/10 text-pink-300 border border-pink-500/20 max-w-[320px] sm:max-w-[420px]"
+            title={`生图模型: ${[modelInfo.provider, modelInfo.model].filter(Boolean).join(" / ")}`}
+          >
+            <Server size={11} className="text-pink-400 shrink-0" />
+            {modelInfo.provider && <span className="font-medium shrink-0">{modelInfo.provider}</span>}
+            {modelInfo.provider && modelInfo.model && <span className="opacity-40 shrink-0">/</span>}
+            {modelInfo.model && <span className="truncate">{modelInfo.model}</span>}
           </div>
         )}
         {prompt && (
@@ -1153,11 +1195,14 @@ function ImageToolView({
             <span>图片生成失败</span>
           </div>
           {modelInfo && (modelInfo.provider || modelInfo.model) && (
-            <span className="inline-flex items-center gap-1 text-[11px] font-mono px-2 py-0.5 rounded bg-red-950/50 border border-red-500/30 text-red-300">
-              <Server size={11} />
-              {modelInfo.provider && <span>{modelInfo.provider}</span>}
-              {modelInfo.provider && modelInfo.model && <span>/</span>}
-              {modelInfo.model && <span>{modelInfo.model}</span>}
+            <span
+              className="inline-flex items-center gap-1 text-[11px] font-mono px-2 py-0.5 rounded bg-red-950/50 border border-red-500/30 text-red-300 max-w-[320px] sm:max-w-[420px]"
+              title={`生图模型: ${[modelInfo.provider, modelInfo.model].filter(Boolean).join(" / ")}`}
+            >
+              <Server size={11} className="shrink-0" />
+              {modelInfo.provider && <span className="shrink-0">{modelInfo.provider}</span>}
+              {modelInfo.provider && modelInfo.model && <span className="shrink-0">/</span>}
+              {modelInfo.model && <span className="truncate">{modelInfo.model}</span>}
             </span>
           )}
         </div>
@@ -1250,20 +1295,22 @@ function ImageToolView({
               <Sparkles size={11} />
               <span>提示词</span>
             </span>
-            {((metadata?.provider || modelInfo?.provider) || (metadata?.model || modelInfo?.model)) && (
-              <span className="inline-flex items-center gap-1 text-[10.5px] font-mono text-pink-300 bg-pink-500/10 border border-pink-500/20 px-1.5 py-0.5 rounded-md" title="生图模型">
-                <Server size={11} className="text-pink-400" />
-                {(metadata?.provider || modelInfo?.provider) && (
-                  <span className="font-medium">{metadata?.provider || modelInfo?.provider}</span>
-                )}
-                {(metadata?.provider || modelInfo?.provider) && (metadata?.model || modelInfo?.model) && (
-                  <span className="opacity-40">/</span>
-                )}
-                {(metadata?.model || modelInfo?.model) && (
-                  <span>{metadata?.model || modelInfo?.model}</span>
-                )}
-              </span>
-            )}
+            {((metadata?.provider || modelInfo?.provider) || (metadata?.model || modelInfo?.model)) && (() => {
+              const p = metadata?.provider || modelInfo?.provider;
+              const m = metadata?.model || modelInfo?.model;
+              const fullTitle = `生图模型: ${[p, m].filter(Boolean).join(" / ")}`;
+              return (
+                <span
+                  className="inline-flex items-center gap-1 text-[10.5px] font-mono text-pink-300 bg-pink-500/10 border border-pink-500/20 px-1.5 py-0.5 rounded-md max-w-[280px] sm:max-w-[380px]"
+                  title={fullTitle}
+                >
+                  <Server size={11} className="text-pink-400 shrink-0" />
+                  {p && <span className="font-medium shrink-0">{p}</span>}
+                  {p && m && <span className="opacity-40 shrink-0">/</span>}
+                  {m && <span className="truncate">{m}</span>}
+                </span>
+              );
+            })()}
             {metadata?.resolution && (
               <span className="text-[10.5px] font-mono text-inkdim bg-panel3/80 border border-edge/60 px-1.5 py-0.5 rounded-md" title="图片分辨率">
                 {metadata.resolution}
@@ -1387,11 +1434,14 @@ function VisionRecognizeView({
         </div>
         <div className="text-[13px] font-medium text-ink">视觉模型正在理解分析图像，请稍候…</div>
         {modelInfo && (modelInfo.provider || modelInfo.model) && (
-          <div className="inline-flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-0.5 rounded-md bg-cyan-500/10 text-cyan-300 border border-cyan-500/20">
-            <Server size={11} className="text-cyan-400" />
-            {modelInfo.provider && <span className="font-medium">{modelInfo.provider}</span>}
-            {modelInfo.provider && modelInfo.model && <span className="opacity-40">/</span>}
-            {modelInfo.model && <span>{modelInfo.model}</span>}
+          <div
+            className="inline-flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-0.5 rounded-md bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 max-w-[320px] sm:max-w-[420px]"
+            title={`视觉模型: ${[modelInfo.provider, modelInfo.model].filter(Boolean).join(" / ")}`}
+          >
+            <Server size={11} className="text-cyan-400 shrink-0" />
+            {modelInfo.provider && <span className="font-medium shrink-0">{modelInfo.provider}</span>}
+            {modelInfo.provider && modelInfo.model && <span className="opacity-40 shrink-0">/</span>}
+            {modelInfo.model && <span className="truncate">{modelInfo.model}</span>}
           </div>
         )}
         {displayImagePath && (
@@ -1413,11 +1463,14 @@ function VisionRecognizeView({
             <span>图像识别未完成 ({ev.status})</span>
           </div>
           {modelInfo && (modelInfo.provider || modelInfo.model) && (
-            <span className="inline-flex items-center gap-1 text-[11px] font-mono px-2 py-0.5 rounded bg-red-950/50 border border-red-500/30 text-red-300">
-              <Server size={11} />
-              {modelInfo.provider && <span>{modelInfo.provider}</span>}
-              {modelInfo.provider && modelInfo.model && <span>/</span>}
-              {modelInfo.model && <span>{modelInfo.model}</span>}
+            <span
+              className="inline-flex items-center gap-1 text-[11px] font-mono px-2 py-0.5 rounded bg-red-950/50 border border-red-500/30 text-red-300 max-w-[320px] sm:max-w-[420px]"
+              title={`视觉模型: ${[modelInfo.provider, modelInfo.model].filter(Boolean).join(" / ")}`}
+            >
+              <Server size={11} className="shrink-0" />
+              {modelInfo.provider && <span className="shrink-0">{modelInfo.provider}</span>}
+              {modelInfo.provider && modelInfo.model && <span className="shrink-0">/</span>}
+              {modelInfo.model && <span className="truncate">{modelInfo.model}</span>}
             </span>
           )}
         </div>
@@ -1437,14 +1490,22 @@ function VisionRecognizeView({
             <Eye size={12} />
             <span>视觉感知解析</span>
           </span>
-          {modelInfo && (modelInfo.provider || modelInfo.model) && (
-            <span className="inline-flex items-center gap-1 text-[10.5px] font-mono text-cyan-300 bg-cyan-500/10 border border-cyan-500/20 px-1.5 py-0.5 rounded-md" title="视觉模型">
-              <Server size={11} className="text-cyan-400" />
-              {modelInfo.provider && <span>{modelInfo.provider}</span>}
-              {modelInfo.provider && modelInfo.model && <span className="opacity-40">/</span>}
-              {modelInfo.model && <span>{modelInfo.model}</span>}
-            </span>
-          )}
+          {modelInfo && (modelInfo.provider || modelInfo.model) && (() => {
+            const p = modelInfo.provider;
+            const m = modelInfo.model;
+            const fullTitle = `视觉模型: ${[p, m].filter(Boolean).join(" / ")}`;
+            return (
+              <span
+                className="inline-flex items-center gap-1 text-[10.5px] font-mono text-cyan-300 bg-cyan-500/10 border border-cyan-500/20 px-1.5 py-0.5 rounded-md max-w-[280px] sm:max-w-[380px]"
+                title={fullTitle}
+              >
+                <Server size={11} className="text-cyan-400 shrink-0" />
+                {p && <span className="font-medium shrink-0">{p}</span>}
+                {p && m && <span className="opacity-40 shrink-0">/</span>}
+                {m && <span className="truncate">{m}</span>}
+              </span>
+            );
+          })()}
         </div>
 
         {contentText && (
@@ -1571,17 +1632,15 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
     if (!isImageTool || !ev.resultText) return null;
     const text = ev.resultText;
 
-    const combinedMatch = text.match(/厂商\/模型:\s*`?([^/`\n]+?)\s*\/\s*([^`\n]+?)`?/);
+    const parsedModel = parseProviderAndModelFromText(text);
     const pathMatch = text.match(/保存路径:\s*`?([^`\n]+)`?/);
-    const modelMatch = text.match(/使用模型:\s*`?([^`\n]+)`?/);
-    const providerMatch = text.match(/厂商:\s*`?([^`\n]+)`?/);
     const sizeMatch = text.match(/分辨率:\s*([^\n]+)/);
     const kbMatch = text.match(/大小:\s*([^\n]+)/);
 
     return {
       imagePath: generatedImagePath || (pathMatch ? pathMatch[1].trim() : null),
-      provider: combinedMatch ? combinedMatch[1].trim() : providerMatch ? providerMatch[1].trim() : toolModelInfo?.provider || null,
-      model: combinedMatch ? combinedMatch[2].trim() : modelMatch ? modelMatch[1].trim() : toolModelInfo?.model || null,
+      provider: parsedModel?.provider || toolModelInfo?.provider || null,
+      model: parsedModel?.model || toolModelInfo?.model || null,
       resolution: sizeMatch ? sizeMatch[1].trim() : (ev.params?.size ? String(ev.params.size) : null),
       fileSize: kbMatch ? kbMatch[1].trim() : null,
     };

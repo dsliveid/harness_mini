@@ -804,7 +804,7 @@ export function SettingsModal() {
                                     const caps = resolveModelCapabilities(local, p.id, m);
                                     return (
                                       <div key={m} className="flex items-center gap-2 bg-panel2 border border-edge rounded-lg px-2.5 py-1.5">
-                                        <span className="font-mono text-[12px] flex-1 truncate">{m}</span>
+                                        <span className="font-mono text-[12px] flex-1 truncate" title={m}>{m}</span>
 
                                         {/* 模型能力标签微调 */}
                                         <div className="flex items-center gap-1 shrink-0" title="模型能力标记（点击切换）">

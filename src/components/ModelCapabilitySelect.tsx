@@ -67,13 +67,20 @@ export function ModelCapabilitySelect({
 
   const effectiveInheritLabel = inheritLabel ?? defaultInherit;
 
-  // 检查当前选中项是否具备能力
+  // 检查当前选中项是否具备能力与计算悬浮展示文本
   let isCurrentValid = true;
+  let selectedTitle = effectiveInheritLabel;
   if (value) {
     const parts = value.split("::");
     if (parts.length === 2) {
       isCurrentValid = hasModelCapability(settings, parts[0], parts[1], capability);
+      const foundProvider = providers.find((p) => p.id === parts[0]);
+      selectedTitle = foundProvider
+        ? `${meta.label}模型: ${foundProvider.name} / ${parts[1]}`
+        : `${meta.label}模型: ${parts[1]}`;
     }
+  } else {
+    selectedTitle = `${meta.label}模型: ${effectiveInheritLabel}`;
   }
 
   return (
@@ -81,6 +88,7 @@ export function ModelCapabilitySelect({
       <select
         value={value}
         disabled={disabled}
+        title={selectedTitle}
         onChange={(e) => onChange(e.target.value)}
         className={`w-full px-2.5 py-1.5 rounded-lg bg-panel2 border text-[12px] focus:outline-none transition-colors truncate ${
           !isCurrentValid

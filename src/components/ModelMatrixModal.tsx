@@ -66,6 +66,16 @@ export function ModelMatrixModal() {
     ? `${activeDecision.provider.name}/${activeDecision.model}`
     : "回落主对话模型";
 
+  const resolveDisplayFromKey = (key: string): string | null => {
+    if (!key) return null;
+    const parts = key.split("::");
+    if (parts.length === 2 && parts[0] && parts[1]) {
+      const p = settings.providers?.find((item) => item.id === parts[0]);
+      return p ? `${p.name}/${parts[1]}` : parts[1];
+    }
+    return null;
+  };
+
   // 当前主对话模型显示名
   const currentChatModelName =
     isConfiguringSession && targetSession
@@ -288,9 +298,18 @@ export function ModelMatrixModal() {
                   image_gen
                 </span>
               </div>
-              <span className="text-[11px] text-pink-400/80">
-                {imageKey ? "已指定专属模型" : `跟随全局: ${activeImageDesc}`}
-              </span>
+              {(() => {
+                const custom = resolveDisplayFromKey(imageKey);
+                const desc = custom ? `专属: ${custom}` : `跟随全局: ${activeImageDesc}`;
+                return (
+                  <span
+                    className="text-[11px] text-pink-400/80 truncate max-w-[220px]"
+                    title={`生图模型: ${custom || activeImageDesc}`}
+                  >
+                    {desc}
+                  </span>
+                );
+              })()}
             </div>
             <p className="text-[11px] text-inkdim leading-relaxed">
               {MODEL_CAPABILITY_METAS.image_gen.description}。调用 <code className="font-mono text-pink-400">generate_image</code> 工具时定向调用，杜绝纯文本模型下发导致的 400 Bad Request。
@@ -318,9 +337,18 @@ export function ModelMatrixModal() {
                   vision
                 </span>
               </div>
-              <span className="text-[11px] text-purple-400/80">
-                {visionKey ? "已指定专属模型" : `跟随全局: ${activeVisionDesc}`}
-              </span>
+              {(() => {
+                const custom = resolveDisplayFromKey(visionKey);
+                const desc = custom ? `专属: ${custom}` : `跟随全局: ${activeVisionDesc}`;
+                return (
+                  <span
+                    className="text-[11px] text-purple-400/80 truncate max-w-[220px]"
+                    title={`视觉模型: ${custom || activeVisionDesc}`}
+                  >
+                    {desc}
+                  </span>
+                );
+              })()}
             </div>
             <p className="text-[11px] text-inkdim leading-relaxed">
               {MODEL_CAPABILITY_METAS.vision.description}。当用户上传截图、UI 设计稿或图片附件时，自动调度多模态视觉模型进行深度语义理解。
@@ -348,9 +376,18 @@ export function ModelMatrixModal() {
                   decision
                 </span>
               </div>
-              <span className="text-[11px] text-emerald-400/80">
-                {decisionKey ? "已指定专属模型" : `跟随全局: ${activeDecisionDesc}`}
-              </span>
+              {(() => {
+                const custom = resolveDisplayFromKey(decisionKey);
+                const desc = custom ? `专属: ${custom}` : `跟随全局: ${activeDecisionDesc}`;
+                return (
+                  <span
+                    className="text-[11px] text-emerald-400/80 truncate max-w-[220px]"
+                    title={`决策模型: ${custom || activeDecisionDesc}`}
+                  >
+                    {desc}
+                  </span>
+                );
+              })()}
             </div>
             <p className="text-[11px] text-inkdim leading-relaxed">
               {MODEL_CAPABILITY_METAS.decision.description}。支持 TypeSafe AI 或标准 LLM，驱动判断、选择与评分决策工具、意图对齐门控及 /jev: 决策指令。
