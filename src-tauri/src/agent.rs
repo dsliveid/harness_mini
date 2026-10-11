@@ -1784,16 +1784,12 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         })
         .cloned()
         .collect();
-    let (max_steps, is_long_task) = {
+    let is_long_task = {
         let db = state.db.lock().unwrap();
         if let Ok(Some(task)) = store::get_active_long_task(&db, session_id) {
-            if task.status == "running" || task.status == "planning" {
-                (task.max_steps.max(1), true)
-            } else {
-                (settings.max_steps.max(1) as usize, false)
-            }
+            task.status == "running" || task.status == "planning"
         } else {
-            (settings.max_steps.max(1) as usize, false)
+            false
         }
     };
 
@@ -2012,7 +2008,36 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
     let mut tool_tracker = ToolErrorTracker::new(2);
     let mut has_checked_compaction = false;
     let mut created_plan_in_this_turn = false;
-    for _step in 0..max_steps {
+    let mut _step = 0usize;
+    let reached_max_steps;
+    loop {
+        let current_max_steps = {
+            let db = state.db.lock().unwrap();
+            if is_long_task {
+                if let Ok(Some(task)) = store::get_active_long_task(&db, session_id) {
+                    task.max_steps.max(1)
+                } else {
+                    store::get_session(&db, session_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.max_steps)
+                        .map(|v| v as usize)
+                        .unwrap_or(settings.max_steps.max(1) as usize)
+                }
+            } else {
+                store::get_session(&db, session_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.max_steps)
+                    .map(|v| v as usize)
+                    .unwrap_or(settings.max_steps.max(1) as usize)
+            }
+        };
+
+        if _step >= current_max_steps {
+            reached_max_steps = current_max_steps;
+            break;
+        }
         let is_in_phase1 = !intent_alignment_done;
         let current_sys = if is_in_phase1 {
             &phase1_sys
@@ -2054,12 +2079,12 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         };
 
         // 临界步数倒计时收敛提醒：当步数接近上限时注入高优先级系统收敛提示，防止达到 maxSteps 硬性强杀导致无输出
-        let remaining_steps = max_steps.saturating_sub(_step);
-        if remaining_steps <= 3 && max_steps > 3 {
+        let remaining_steps = current_max_steps.saturating_sub(_step);
+        if remaining_steps <= 3 && current_max_steps > 3 {
             let limit_label = if is_long_task {
-                format!("单子任务轮次预算硬上限（{max_steps} 轮）")
+                format!("单子任务轮次预算硬上限（{current_max_steps} 轮）")
             } else {
-                format!("最大步数上限（{max_steps}）")
+                format!("最大步数上限（{current_max_steps}）")
             };
             let warn_content = format!(
                 "【⚠️ 临界步数紧急预警：当前仅剩最后 {remaining_steps} 步，即将达到{limit_label}！严禁继续调用任何探索、排查或读取类工具！必须立即根据目前已掌握的所有信息，按规定结构化格式输出最终总结与交付回复！】"
@@ -2119,7 +2144,6 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
 
-            let mut last_flush = Instant::now();
             let app_text = app2.clone();
             let sid_text = sid2.clone();
             let mid_text = mid2.clone();
@@ -2147,18 +2171,10 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                             "message:delta",
                             &json!({"sessionId": sid_text, "messageId": mid_text, "delta": delta}),
                         );
-                        // 周期性落库，防止崩溃丢失全部内容
-                        if last_flush.elapsed() > Duration::from_millis(800) {
-                            let st = app_text.state::<crate::AppState>();
-                            let db = st.db.lock().unwrap();
-                            let _ = store::update_message_content(&db, &mid_text, &b.clone(), None);
-                            last_flush = Instant::now();
-                        }
                     }
                 },
                 {
                     let rbuf2 = rbuf2.clone();
-                    let mut reasoning_flush = Instant::now();
                     move |delta| {
                         let mut b = rbuf2.lock().unwrap();
                         b.push_str(delta);
@@ -2166,12 +2182,6 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                             "message:reasoning:delta",
                             &json!({"sessionId": sid_reason, "messageId": mid_reason, "delta": delta}),
                         );
-                        if reasoning_flush.elapsed() > Duration::from_millis(800) {
-                            let st = app_reason.state::<crate::AppState>();
-                            let db = st.db.lock().unwrap();
-                            let _ = store::update_message_reasoning(&db, &mid_reason, &b.clone());
-                            reasoning_flush = Instant::now();
-                        }
                     }
                 },
             )
@@ -2360,6 +2370,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                                 );
                                 let _ = store::new_message(&db, session_id, "user", Some(err_prompt), false);
                             }
+                            _step += 1;
                             continue;
                         }
                         Err(e) => {
@@ -2629,12 +2640,13 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             let _ = status;
         }
         // 回到下一轮循环
+        _step += 1;
     }
 
     let err_msg = if is_long_task {
-        format!("单子任务已达到最大轮次预算上限（{max_steps} 轮），为防止死循环已安全中止。可在设置中调整「单子任务轮次预算」。")
+        format!("单子任务已达到最大轮次预算上限（{reached_max_steps} 轮），为防止死循环已安全中止。可在会话设置中调整「单子任务轮次预算」。")
     } else {
-        format!("已达到最大步数（{max_steps}），任务中止。可在设置中调整「最大步数」。")
+        format!("已达到最大步数（{reached_max_steps}），任务中止。可在会话设置或下方快捷操作中调整「最大步数」并继续推进。")
     };
     emit_error(
         app,

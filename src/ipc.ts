@@ -108,6 +108,8 @@ export const ipc = {
   setSessionMode: (id: string, mode: string) => invoke<void>("set_session_mode", { id, mode }),
   setSessionContextLimit: (id: string, limit: number | null) =>
     invoke<void>("set_session_context_limit", { id, limit }),
+  setSessionMaxSteps: (id: string, maxSteps: number | null) =>
+    invoke<void>("set_session_max_steps", { id, maxSteps }),
   setSessionWorkspace: (id: string, path: string) =>
     invoke<void>("set_session_workspace", { id, path }),
   setSessionProject: (id: string, projectId: string | null) =>

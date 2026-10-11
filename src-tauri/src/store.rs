@@ -292,6 +292,7 @@ fn init(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "sessions", "forked_from_session_id", "forked_from_session_id TEXT")?;
     ensure_column(conn, "sessions", "forked_from_message_id", "forked_from_message_id TEXT")?;
     ensure_column(conn, "sessions", "reasoning_effort", "reasoning_effort TEXT")?;
+    ensure_column(conn, "sessions", "max_steps", "max_steps INTEGER")?;
     ensure_column(conn, "messages", "attachments_json", "attachments_json TEXT")?;
     ensure_column(conn, "tool_events", "subprocess_id", "subprocess_id TEXT")?;
     ensure_column(conn, "messages", "reverted_at", "reverted_at TEXT")?;
@@ -1032,6 +1033,30 @@ mod tests {
         set_session_context_limit(&legacy_conn, &legacy_s.id, Some(64_000)).unwrap();
         let fetched_legacy = get_session(&legacy_conn, &legacy_s.id).unwrap().unwrap();
         assert_eq!(fetched_legacy.context_token_limit, Some(64_000));
+    }
+
+    #[test]
+    fn test_session_max_steps_crud() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        // 1. 创建会话后设置自定义 max_steps
+        let s = create_session(&conn, "D:\\ws", None, "test_session", "confirm").unwrap();
+        assert_eq!(s.max_steps, None);
+
+        set_session_max_steps(&conn, &s.id, Some(50)).unwrap();
+        let fetched = get_session(&conn, &s.id).unwrap().unwrap();
+        assert_eq!(fetched.max_steps, Some(50));
+
+        // 2. 更新为新的数值
+        set_session_max_steps(&conn, &s.id, Some(100)).unwrap();
+        let updated = get_session(&conn, &s.id).unwrap().unwrap();
+        assert_eq!(updated.max_steps, Some(100));
+
+        // 3. 清除会话级自定义，恢复为 None (跟随全局默认)
+        set_session_max_steps(&conn, &s.id, None).unwrap();
+        let cleared = get_session(&conn, &s.id).unwrap().unwrap();
+        assert_eq!(cleared.max_steps, None);
     }
 
     #[test]
@@ -2018,6 +2043,7 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         forked_from_message_id: r.get(33)?,
         reasoning_effort: r.get(34)?,
         last_run_status: None,
+        max_steps: r.get::<_, Option<i64>>(35).ok().flatten().map(|v| v as u32),
     })
 }
 
@@ -2028,7 +2054,7 @@ const SESSION_COLS: &str =
      last_reported_msg_id, auto_report, trigger_tool_event_id, provider_id, model_id, \
      dispatch_rule, image_provider_id, image_model_id, vision_provider_id, vision_model_id, \
      decision_provider_id, decision_model_id, \
-     forked_from_session_id, forked_from_message_id, reasoning_effort";
+     forked_from_session_id, forked_from_message_id, reasoning_effort, max_steps";
 
 fn attach_session_tokens(conn: &Connection, sessions: &mut [Session]) -> Result<(), String> {
     if sessions.is_empty() {
@@ -2347,6 +2373,7 @@ pub fn create_session_with_models(
         forked_from_message_id: None,
         reasoning_effort: reasoning_effort.map(|s| s.to_string()),
         last_run_status: None,
+        max_steps: None,
     };
     conn.execute(
         "INSERT INTO sessions(
@@ -2448,6 +2475,7 @@ pub fn create_collaborator_session(
         forked_from_message_id: None,
         reasoning_effort: None,
         last_run_status: None,
+        max_steps: None,
     };
     conn.execute(
         "INSERT INTO sessions(
@@ -2674,6 +2702,7 @@ pub fn create_subprocess_session(
         forked_from_message_id: None,
         reasoning_effort,
         last_run_status: None,
+        max_steps: None,
     };
     conn.execute(
         "INSERT INTO sessions(
@@ -2813,7 +2842,7 @@ pub fn fork_session_at_message(
             trigger_tool_event_id, provider_id, model_id, dispatch_rule,
             image_provider_id, image_model_id, vision_provider_id, vision_model_id,
             decision_provider_id, decision_model_id,
-            forked_from_session_id, forked_from_message_id, reasoning_effort
+            forked_from_session_id, forked_from_message_id, reasoning_effort, max_steps
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, 'active',
             ?6, ?6, ?6, 0,
@@ -2823,7 +2852,7 @@ pub fn fork_session_at_message(
             NULL, ?8, ?9, NULL,
             ?10, ?11, ?12, ?13,
             ?14, ?15,
-            ?16, ?17, ?18
+            ?16, ?17, ?18, ?19
         )",
         params![
             new_session_id,
@@ -2844,6 +2873,7 @@ pub fn fork_session_at_message(
             source_session_id,
             target_message_id,
             source_session.reasoning_effort,
+            source_session.max_steps.map(|v| v as i64),
         ],
     )
     .map_err(|e| format!("创建分支会话失败: {}", e))?;
@@ -3114,6 +3144,16 @@ pub fn set_session_context_limit(conn: &Connection, id: &str, limit: Option<usiz
     conn.execute(
         "UPDATE sessions SET context_token_limit = ?2, updated_at = ?3 WHERE id = ?1",
         params![id, limit.map(|v| v as i64), now()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 设置会话专属最大工具步数上限（None 表示清除专属设置，恢复跟随全局默认）
+pub fn set_session_max_steps(conn: &Connection, id: &str, max_steps: Option<u32>) -> Result<(), String> {
+    conn.execute(
+        "UPDATE sessions SET max_steps = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, max_steps.map(|v| v as i64), now()],
     )
     .map_err(|e| e.to_string())?;
     Ok(())

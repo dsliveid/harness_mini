@@ -3,10 +3,10 @@ import { ipc } from "../ipc";
 import { useStore } from "../store";
 import { ModalClose } from "./ModalActions";
 import { askConfirm } from "./PromptModal";
-import { KeyRound, Shield, Trash2, Sliders, RotateCcw, Sparkles } from "./Icons";
+import { KeyRound, Shield, Trash2, Sliders, RotateCcw, Sparkles, Zap } from "./Icons";
 import { formatTokens, resolveModelContextLimit, MODEL_CONTEXT_PRESETS } from "../types";
 
-type Tab = "mode" | "rules" | "context";
+type Tab = "mode" | "budget" | "rules" | "context";
 
 const inputCls = "bg-panel border border-edge rounded-lg px-2 py-1.5 text-[13px] outline-none focus:border-accent";
 
@@ -52,6 +52,10 @@ export function SessionSettingsModal() {
   const defaultLimit = resolveModelContextLimit(settings, currentPid, currentMid);
   const effectiveLimit = session.contextTokenLimit ?? defaultLimit;
   const isCustomSession = session.contextTokenLimit != null;
+
+  const defaultMaxSteps = settings.maxSteps ?? 30;
+  const effectiveMaxSteps = session.maxSteps ?? defaultMaxSteps;
+  const isCustomMaxSteps = session.maxSteps != null;
 
   const changeMode = async (next: "confirm" | "full_access") => {
     if (next === "full_access") {
@@ -100,6 +104,12 @@ export function SessionSettingsModal() {
                 <span>访问模式</span>
               </span>
             </button>
+            <button className={menuCls(tab === "budget")} onClick={() => setTab("budget")}>
+              <span className="flex items-center gap-2">
+                <Zap size={15} />
+                <span>运行步数</span>
+              </span>
+            </button>
             <button className={menuCls(tab === "rules")} onClick={() => setTab("rules")}>
               <span className="flex items-center gap-2">
                 <Shield size={15} />
@@ -140,6 +150,105 @@ export function SessionSettingsModal() {
                     变更前确认：只读工具自动执行；写入与命令执行需审批，可在审批条选「本会话允许」记下规则减少打断（高危命令仍逐次确认）。
                   </div>
                 )}
+              </section>
+            )}
+
+            {tab === "budget" && (
+              <section className="max-w-[480px] flex flex-col gap-4">
+                <div>
+                  <div className="font-medium mb-1">单次回复最大步数（Step Budget）</div>
+                  <div className="text-[12px] text-inkdim leading-relaxed">
+                    控制 Agent 在本会话单次执行中连续调用工具的最大轮数上限。
+                    <br />
+                    · 变更即时生效于当前对话，正在运行中的任务调大步数无需中断即可继续推进。
+                    <br />
+                    · 达到上限停下时，亦可在聊天消息末尾直接点击「追加 20 步并继续」。
+                  </div>
+                </div>
+
+                {/* 快捷预设 */}
+                <div>
+                  <div className="text-[12px] text-inkdim mb-1.5">快捷预设</div>
+                  <div className="flex items-center gap-2">
+                    {[20, 30, 50, 80, 100].map((preset) => (
+                      <button
+                        key={preset}
+                        type="button"
+                        onClick={async () => {
+                          try {
+                            await ipc.setSessionMaxSteps(session.id, preset);
+                          } catch (e) {
+                            pushToast(String(e));
+                          }
+                        }}
+                        className={`px-3 py-1.5 rounded-lg border text-[12px] font-medium transition-colors cursor-pointer ${
+                          effectiveMaxSteps === preset
+                            ? "bg-accent/15 border-accent text-accent"
+                            : "bg-panel border-edge text-ink hover:border-inkdim hover:bg-panel3"
+                        }`}
+                      >
+                        {preset} 步
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 自定义步数输入 */}
+                <div>
+                  <div className="text-[12px] text-inkdim mb-1.5">自定义步数 (1 - 200)</div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={1}
+                      max={200}
+                      className={`${inputCls} w-32`}
+                      value={effectiveMaxSteps}
+                      onChange={async (e) => {
+                        const val = parseInt(e.target.value, 10);
+                        if (isNaN(val) || val < 1) return;
+                        const clamped = Math.min(Math.max(val, 1), 200);
+                        try {
+                          await ipc.setSessionMaxSteps(session.id, clamped);
+                        } catch (err) {
+                          pushToast(String(err));
+                        }
+                      }}
+                    />
+                    <span className="text-[12px] text-inkdim">步 / 轮</span>
+                  </div>
+                </div>
+
+                {/* 状态与重置 */}
+                <div className="p-3 rounded-xl bg-panel3/30 border border-edge/50 flex items-center justify-between text-[11px]">
+                  <div className="text-inkdim">
+                    当前状态：
+                    {isCustomMaxSteps ? (
+                      <span className="text-amber-400 font-medium inline-flex items-center gap-1">
+                        <Sparkles size={11} className="shrink-0" />
+                        <span>本对话专属自定义（{session.maxSteps} 步）</span>
+                      </span>
+                    ) : (
+                      <span className="text-emerald-400">跟随全局默认（{defaultMaxSteps} 步）</span>
+                    )}
+                  </div>
+                  {isCustomMaxSteps && (
+                    <button
+                      type="button"
+                      className="px-2.5 py-1 rounded-lg bg-panel hover:bg-edge border border-edge text-inkdim hover:text-ink transition-colors flex items-center gap-1 cursor-pointer"
+                      onClick={async () => {
+                        try {
+                          await ipc.setSessionMaxSteps(session.id, null);
+                          pushToast("已恢复跟随全局默认设置");
+                        } catch (e) {
+                          pushToast(String(e));
+                        }
+                      }}
+                    >
+                      <RotateCcw size={11} />
+                      <span>恢复全局默认</span>
+                    </button>
+                  )}
+                </div>
               </section>
             )}
 

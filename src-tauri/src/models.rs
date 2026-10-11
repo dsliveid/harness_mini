@@ -896,6 +896,9 @@ pub struct Session {
     /// 最近一次 Run 的执行终态（'done' | 'failed' | 'interrupted' | 'cancelled' | 'running'）
     #[serde(default)]
     pub last_run_status: Option<String>,
+    /// 会话专属单次运行最大步数上限（为空则跟随全局默认）
+    #[serde(default)]
+    pub max_steps: Option<u32>,
 }
 
 fn default_auto_report() -> Option<bool> {
@@ -950,6 +953,7 @@ impl Default for Session {
             forked_from_message_id: None,
             reasoning_effort: None,
             last_run_status: None,
+            max_steps: None,
         }
     }
 }

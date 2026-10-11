@@ -38,7 +38,7 @@ export function Composer() {
   const session = useStore((s) => (s.currentId && s.currentId !== DRAFT_ID ? s.sessions.find((x) => x.id === s.currentId) ?? null : null));
   const draft = useStore((s) => s.draft);
   const tempInfo = useStore((s) => s.tempInfo);
-  const settings = useStore((s) => s.settings);
+  const fallbackModel = useStore((s) => s.settings.activeModelId || s.settings.activeModel || "");
   const pushToast = useStore((s) => s.pushToast);
   const setShowTokenStatsModal = useStore((s) => s.setShowTokenStatsModal);
   const setShowCreateCollaboratorModal = useStore((s) => s.setShowCreateCollaboratorModal);
@@ -316,7 +316,7 @@ export function Composer() {
   };
 
   const activeModel =
-    session?.modelId || session?.model_id || draft?.modelId || settings?.activeModelId || settings?.activeModel || "";
+    session?.modelId || session?.model_id || draft?.modelId || fallbackModel;
 
   const checkVisionAndSend = async (bypassVisionCheck = false) => {
     const t = text.trim();

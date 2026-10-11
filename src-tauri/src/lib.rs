@@ -391,6 +391,7 @@ pub fn run() {
             commands::unarchive_session,
             commands::set_session_mode,
             commands::set_session_context_limit,
+            commands::set_session_max_steps,
             commands::set_session_workspace,
             commands::set_session_project,
             commands::get_messages,

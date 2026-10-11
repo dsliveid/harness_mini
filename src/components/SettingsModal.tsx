@@ -392,9 +392,7 @@ export function SettingsModal() {
       const activeM = local.activeModelId ?? local.activeModel ?? null;
       const toSave = { ...local, activeModelId: activeM, activeModel: activeM };
       await ipc.setSettings(toSave);
-      const fresh = await ipc.getSettings();
-      setSettingsLocal(fresh);
-      setLocal(fresh);
+      setSettingsLocal(toSave);
       return true;
     } catch (e) {
       pushToast(String(e));
@@ -1267,15 +1265,20 @@ export function SettingsModal() {
                       </select>
                     </label>
                     <label className="flex flex-col gap-1">
-                      <span className="text-inkdim" title="常规对话单次运行的最大工具调用步数">最大步数</span>
+                      <span
+                        className="text-inkdim"
+                        title="全局新建对话的默认最大工具调用步数。在具体会话中可单独在「会话设置 -> 运行步数」中自由调整或一键追加"
+                      >
+                        最大步数（全局默认）
+                      </span>
                       <input
                         className={inputCls}
                         type="number"
                         min={1}
-                        max={100}
+                        max={200}
                         value={local.maxSteps}
                         onChange={(e) => setLocal({ ...local, maxSteps: Number(e.target.value) || 30 })}
-                        title="常规对话单次运行的最大工具调用步数"
+                        title="全局新建对话的默认最大工具调用步数（可在单会话中单独覆盖）"
                       />
                     </label>
                     <label className="flex flex-col gap-1">

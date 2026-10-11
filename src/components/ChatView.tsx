@@ -1,4 +1,5 @@
 import { useEffect, useRef, useMemo } from "react";
+import { ipc } from "../ipc";
 import { currentMessages, currentSession, useStore } from "../store";
 import { DRAFT_ID, computeTurnMetrics, type Message, type SessionCompaction } from "../types";
 import { FloatingTaskPanel } from "./FloatingTaskPanel";
@@ -23,7 +24,9 @@ export function ChatView() {
   const loadEarlier = useStore((s) => s.loadEarlier);
   const newDraft = useStore((s) => s.newDraft);
   const setShowSettings = useStore((s) => s.setShowSettings);
-  const providers = useStore((s) => s.settings.providers);
+  const hasConfiguredModels = useStore((s) => s.settings.providers.some((p) => (p.models ?? []).length > 0));
+  const defaultMaxSteps = useStore((s) => s.settings.maxSteps ?? 30);
+  const pushToast = useStore((s) => s.pushToast);
   const projects = useStore((s) => s.projects);
   const draft = useStore((s) => s.draft);
   const proposals = useStore((s) => (s.currentId ? s.activeProposals[s.currentId] : undefined)) ?? EMPTY_PROPOSALS;
@@ -85,6 +88,15 @@ export function ChatView() {
     }
     return false;
   }, [running, currentId, msgs.length, lastRunOutcome, lastMsg]);
+
+  const isMaxStepsStopped = useMemo(() => {
+    if (!lastMsg) return false;
+    const content = lastMsg.content || "";
+    return (
+      (lastMsg.role === "system" || lastMsg.role === "assistant") &&
+      (content.includes("已达到最大步数") || content.includes("最大轮次预算上限"))
+    );
+  }, [lastMsg]);
 
   // 构建包含消息和历史压缩卡片的时间线序列（历史消息保持完整展示，压缩卡片内联在对应阶段）
   const timelineItems = useMemo(() => {
@@ -171,7 +183,7 @@ export function ChatView() {
   }
 
   if (!currentId || msgs.length === 0) {
-    const noProvider = providers.every((p) => !(p.models ?? []).length);
+    const noProvider = !hasConfiguredModels;
     const noWorkspace = currentId === DRAFT_ID ? !draft?.workspacePath : !session?.workspacePath;
     const isTempDraft = currentId === DRAFT_ID ? !!draft?.temp : !!session?.isTemp;
     const project = currentId === DRAFT_ID
@@ -325,14 +337,40 @@ export function ChatView() {
                 <AlertTriangle size={18} className="shrink-0 text-amber-400" />
                 <div>
                   <div className="font-medium text-amber-300">
-                    {lastRunOutcome === "cancelled" ? "对话执行已手动中止" : "对话执行中断或遇到异常"}
+                    {isMaxStepsStopped
+                      ? "任务已达到单次运行最大步数上限"
+                      : lastRunOutcome === "cancelled"
+                      ? "对话执行已手动中止"
+                      : "对话执行中断或遇到异常"}
                   </div>
                   <div className="text-[12px] text-amber-200/70 mt-0.5">
-                    您可以选择重试本轮，或让 Agent 基于当前已有上下文继续向下推进。
+                    {isMaxStepsStopped
+                      ? "您可以一键为当前对话追加步数并无缝继续执行，或重试本轮。"
+                      : "您可以选择重试本轮，或让 Agent 基于当前已有上下文继续向下推进。"}
                   </div>
                 </div>
               </div>
-              <div className="flex items-center gap-2 shrink-0 self-end sm:self-auto">
+              <div className="flex items-center gap-2 shrink-0 self-end sm:self-auto flex-wrap">
+                {isMaxStepsStopped && (
+                  <button
+                    onClick={async () => {
+                      const cur = session?.maxSteps ?? defaultMaxSteps;
+                      const next = cur + 20;
+                      try {
+                        await ipc.setSessionMaxSteps(currentId, next);
+                        pushToast(`已为本会话追加 20 步（当前上限：${next} 步）`, "success");
+                        void continueTurn(currentId);
+                      } catch (err: any) {
+                        pushToast(String(err));
+                      }
+                    }}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600/30 hover:bg-emerald-600/40 text-emerald-200 border border-emerald-500/40 text-[12px] font-medium transition-colors shadow-sm"
+                    title="为当前会话步数上限增加 20 步并继续推进任务"
+                  >
+                    <Plus size={13} />
+                    <span>追加 20 步并继续</span>
+                  </button>
+                )}
                 <button
                   onClick={() => void retryTurn(currentId)}
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/30 text-[12px] font-medium transition-colors shadow-sm"

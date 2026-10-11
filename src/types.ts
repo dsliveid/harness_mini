@@ -488,6 +488,8 @@ export interface Session {
   /** 思考程度（low / medium / high / default 即默认不传） */
   reasoningEffort?: ReasoningEffort | string | null;
   reasoning_effort?: string | null;
+  /** 会话专属最大工具步数上限（为空则跟随全局默认） */
+  maxSteps?: number | null;
 }
 
 export interface SubagentCreateInput {

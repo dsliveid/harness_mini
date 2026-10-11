@@ -1579,8 +1579,6 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
   const setLightboxImage = useStore((s) => s.setLightboxImage);
   const isRunning = useStore((s) => (s.currentId ? s.runStatus[s.currentId] === "running" : false));
   const lastRunOutcome = useStore((s) => (s.currentId ? s.lastRunOutcome[s.currentId] : undefined));
-  const settings = useStore((s) => s.settings);
-  const currentSession = useStore((s) => s.sessions.find((x) => x.id === s.currentId));
   const [terminating, setTerminating] = useState(false);
   const [copied, setCopied] = useState(false);
   const title = paramTitle(ev);
@@ -1592,10 +1590,21 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
   const isPlanTool = ["create_plan", "update_plan", "switch_plan"].includes(ev.toolName);
   const isVisionTool = ev.toolName === "recognize_image";
   const isDecisionTool = ["judge_decision", "choice_decision", "score_decision"].includes(ev.toolName);
+  const needsModelInfo = isImageTool || isVisionTool || isDecisionTool;
 
-  const toolModelInfo = useMemo(() => {
-    return extractToolModelInfo(ev, settings, currentSession);
-  }, [ev, settings, currentSession]);
+  // 关键解耦：只有生图/识图/决策工具才解析模型信息，常规工具不提取；使用等值判定切断无关配置变更导致的重渲染风暴
+  const toolModelInfo = useStore(
+    (s) => {
+      if (!needsModelInfo) return null;
+      const sess = s.currentId ? s.sessions.find((x) => x.id === s.currentId) : null;
+      return extractToolModelInfo(ev, s.settings, sess);
+    },
+    (prev, next) => {
+      if (prev === next) return true;
+      if (!prev || !next) return false;
+      return prev.provider === next.provider && prev.model === next.model;
+    }
+  );
 
   // 计划工具、生图工具、识图工具与决策工具执行中/成功默认展开，失败默认收起；其他工具默认收起
   const [expanded, setExpanded] = useState(() => {

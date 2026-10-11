@@ -508,6 +508,21 @@ pub fn set_session_context_limit(
     Ok(())
 }
 
+#[tauri::command]
+pub fn set_session_max_steps(
+    state: State<'_, crate::AppState>,
+    app: AppHandle,
+    id: String,
+    max_steps: Option<u32>,
+) -> Result<(), String> {
+    {
+        let db = state.db.lock().unwrap();
+        store::set_session_max_steps(&db, &id, max_steps)?;
+    }
+    emit_session(&state, &app, &id);
+    Ok(())
+}
+
 /// 放行指定对话下所有挂起的审批请求（切换到「完全访问」时调用）
 fn resolve_pending_approvals(state: &crate::AppState, app: &AppHandle, session_id: &str) {
     let pending: Vec<(String, tokio::sync::oneshot::Sender<crate::approval::Decision>)> = {
