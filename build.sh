@@ -1,18 +1,29 @@
 #!/usr/bin/env bash
 #
-# harness_mini 简易打包脚本：构建前端 + 编译 Rust + 生成 NSIS 安装包
+# harness_mini 编译可执行文件脚本（只构建可执行文件，不生成安装包）
 # 用法：./build.sh [--debug]
+#
+# 如需打包为可安装文件（NSIS 安装包），请使用 ./build-install.sh
 
 set -euo pipefail
 
 # 无论从哪里调用，都先切到脚本所在目录（= 项目根）
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# --debug：构建 debug 版（编译快，不优化；产物在 target/debug）
 BUILD_PROFILE="release"
-if [ "${1:-}" = "--debug" ]; then
-  BUILD_PROFILE="debug"
-fi
+EXTRA_ARGS=()
+
+for arg in "$@"; do
+  case "$arg" in
+    --debug)
+      BUILD_PROFILE="debug"
+      EXTRA_ARGS+=("--debug")
+      ;;
+    *)
+      EXTRA_ARGS+=("$arg")
+      ;;
+  esac
+done
 
 # ---- 1. 基础环境检查 ----
 for cmd in node npm cargo; do
@@ -32,19 +43,31 @@ if [ ! -d node_modules ]; then
   npm install
 fi
 
-# ---- 3. 打包：tauri build 会先构建前端（vite build），再编译 Rust 并产出安装包 ----
-echo "==> 开始打包（profile: $BUILD_PROFILE）..."
-if [ "$BUILD_PROFILE" = "debug" ]; then
-  npm run tauri -- build --debug
-else
-  npm run tauri -- build
-fi
+# ---- 3. 编译：tauri build --no-bundle 构建前端与 Rust 可执行文件，跳过安装包生成 ----
+echo "==> 开始编译可执行文件（profile: $BUILD_PROFILE, --no-bundle）..."
+npm run tauri -- build --no-bundle "${EXTRA_ARGS[@]}"
 
 # ---- 4. 列出产物 ----
 TARGET_DIR="src-tauri/target/$BUILD_PROFILE"
 echo
 echo "==> 构建完成，产物："
-[ -f "$TARGET_DIR/harness-mini.exe" ] && echo "  可执行文件  $TARGET_DIR/harness-mini.exe"
-for installer in "$TARGET_DIR"/bundle/nsis/*.exe; do
-  [ -f "$installer" ] && echo "  安装包      $installer"
-done
+FOUND=0
+EXE_PATH=""
+if [ -f "$TARGET_DIR/harness-mini.exe" ]; then
+  EXE_PATH="$TARGET_DIR/harness-mini.exe"
+elif [ -f "$TARGET_DIR/harness-mini" ]; then
+  EXE_PATH="$TARGET_DIR/harness-mini"
+fi
+
+if [ -n "$EXE_PATH" ]; then
+  size="$(ls -lh "$EXE_PATH" 2>/dev/null | awk '{print $5}')"
+  echo "  可执行文件  $EXE_PATH  ($size)"
+  FOUND=1
+fi
+
+if [ "$FOUND" = "0" ]; then
+  echo "  提示：未在 $TARGET_DIR 下找到可执行文件，请检查上方编译输出。"
+else
+  echo
+  echo "  说明：如需生成安装包（.exe 安装程序），请运行 ./build-install.sh"
+fi

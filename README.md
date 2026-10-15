@@ -44,7 +44,7 @@ npm run tauri dev  # 开发模式（Rust 首次编译较久）
 - 同一工作区内多开受 cargo 产物锁限制（旧实例运行中时无法重链接 `harness-mini.exe`），
   多目录副本各自独立 target，无此限制。
 
-## 构建安装包
+## 构建产物
 
 ```bash
 npm run tauri build
@@ -55,12 +55,20 @@ npm run tauri build
 或用便捷脚本（构建结束后自动列出产物路径与体积）：
 
 ```bash
-./build.sh                # release 可执行文件 + NSIS 安装包（Windows：build.cmd）
-./build.sh --no-bundle    # 只编译可执行文件，不生成安装包
+# 仅编译为可执行文件（推荐日常快速构建）
+./build.sh                # release 可执行文件（Windows：build.cmd）
 ./build.sh --debug        # debug 构建，仅用于验证
-./build.sh --clean        # 构建前 cargo clean（全量重编译）
-./build.sh --dry-run      # 只检查环境并打印将要执行的命令，不真正构建
-./build.sh --no-pause     # 失败后不等待回车，立即退出
+
+# 打包为可安装文件（包含可执行文件 + NSIS 安装包，用于正式发布）
+./build-install.sh        # release 可执行文件 + NSIS 安装包（Windows：build-install.cmd）
+./build-install.sh --debug
+```
+
+或使用 npm 快捷命令：
+
+```bash
+npm run build:exe         # 仅编译可执行文件（--no-bundle）
+npm run build:install     # 打包完整安装包
 ```
 
 两个脚本用 bash 编写，可在 Git Bash、Linux、macOS 直接运行。Windows 上 Git Bash 若不在 PATH，

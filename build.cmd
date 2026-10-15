@@ -1,7 +1,7 @@
 @echo off
 rem harness_mini build launcher for Windows.
 rem
-rem Usage: build.cmd [options]   (options are forwarded to build.sh, e.g. --no-bundle)
+rem Usage: build.cmd [options]   (options are forwarded to build.sh, e.g. --debug)
 rem
 rem The project scripts are written in bash, which is not on the Windows PATH by
 rem default, so this launcher locates Git Bash automatically:
