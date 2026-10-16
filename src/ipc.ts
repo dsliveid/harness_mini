@@ -286,7 +286,6 @@ export const ipc = {
     invoke<ApprovalRule[]>("list_session_rules", { sessionId }),
   deleteSessionRule: (sessionId: string, id: string) =>
     invoke<ApprovalRule[]>("delete_session_rule", { sessionId, id }),
-  getSessionTodos: (sessionId: string) => invoke<any>("get_session_todos", { sessionId }),
 
   // 临时空间
   allocTempCode: (projectId: string) => invoke<TempAlloc>("alloc_temp_code", { projectId }),

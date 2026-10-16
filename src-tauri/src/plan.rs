@@ -14,6 +14,12 @@ pub struct PlanMeta {
     pub updated_at: String,
     pub version: u32,
     pub session_id: String,
+    /// 归属事实：本方案的来源助手消息 ID（写入时固化，老文件缺失即为 None，不做任何猜测回填）
+    #[serde(default)]
+    pub source_message_id: Option<String>,
+    /// 归属事实：本方案的来源工具事件 ID（写入时固化，老文件缺失即为 None，不做任何猜测回填）
+    #[serde(default)]
+    pub source_tool_event_id: Option<String>,
 }
 
 impl Default for PlanMeta {
@@ -27,8 +33,15 @@ impl Default for PlanMeta {
             updated_at: now,
             version: 1,
             session_id: String::new(),
+            source_message_id: None,
+            source_tool_event_id: None,
         }
     }
+}
+
+/// 归属来源归一化：仅裁剪空白，空串一律视为"未确定"（None），绝不猜测推导
+fn normalize_source(v: Option<&str>) -> Option<String> {
+    v.map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string())
 }
 
 /// 计划执行清单步骤
@@ -53,6 +66,12 @@ pub struct PlanSummary {
     pub total_steps: usize,
     pub completed_steps: usize,
     pub is_active: bool,
+    /// 归属事实（来自 Frontmatter）：来源助手消息 ID；老方案文件缺失时为 None
+    #[serde(default)]
+    pub source_message_id: Option<String>,
+    /// 归属事实（来自 Frontmatter）：来源工具事件 ID；老方案文件缺失时为 None
+    #[serde(default)]
+    pub source_tool_event_id: Option<String>,
     #[serde(default)]
     pub steps: Vec<PlanStep>,
     #[serde(default)]
@@ -132,6 +151,10 @@ pub fn parse_frontmatter(content: &str) -> (PlanMeta, String) {
                 }
             } else if let Some(v) = line.strip_prefix("session_id:") {
                 meta.session_id = v.trim().trim_matches('"').trim_matches('\'').to_string();
+            } else if let Some(v) = line.strip_prefix("source_message_id:") {
+                meta.source_message_id = normalize_source(Some(v.trim().trim_matches('"').trim_matches('\'')));
+            } else if let Some(v) = line.strip_prefix("source_tool_event_id:") {
+                meta.source_tool_event_id = normalize_source(Some(v.trim().trim_matches('"').trim_matches('\'')));
             }
         }
         (meta, body.to_string())
@@ -142,17 +165,25 @@ pub fn parse_frontmatter(content: &str) -> (PlanMeta, String) {
 
 /// 格式化为带有 Frontmatter 的完整 Markdown
 pub fn format_with_frontmatter(meta: &PlanMeta, body: &str) -> String {
-    format!(
-        "---\nid: \"{}\"\ntitle: \"{}\"\nstatus: \"{}\"\ncreated_at: \"{}\"\nupdated_at: \"{}\"\nversion: {}\nsession_id: \"{}\"\n---\n\n{}",
+    let mut fm = format!(
+        "---\nid: \"{}\"\ntitle: \"{}\"\nstatus: \"{}\"\ncreated_at: \"{}\"\nupdated_at: \"{}\"\nversion: {}\nsession_id: \"{}\"\n",
         meta.id.replace('"', "\\\""),
         meta.title.replace('"', "\\\""),
         meta.status,
         meta.created_at,
         meta.updated_at,
         meta.version,
-        meta.session_id,
-        body.trim()
-    )
+        meta.session_id
+    );
+    // 归属事实仅在已确定（Some）时落盘；未确定则完全不写该字段，保持"没有事实就不写"语义
+    if let Some(v) = &meta.source_message_id {
+        fm.push_str(&format!("source_message_id: \"{}\"\n", v.replace('"', "\\\"")));
+    }
+    if let Some(v) = &meta.source_tool_event_id {
+        fm.push_str(&format!("source_tool_event_id: \"{}\"\n", v.replace('"', "\\\"")));
+    }
+    fm.push_str(&format!("---\n\n{}", body.trim()));
+    fm
 }
 
 /// 从正文中提取步骤清单（- [x], - [/], - [ ]）
@@ -384,6 +415,8 @@ pub fn create_plan_with_effect(
     files: &[String],
     steps: &[String],
     verification: Option<&str>,
+    source_message_id: Option<&str>,
+    source_tool_event_id: Option<&str>,
     conn: Option<&rusqlite::Connection>,
 ) -> Result<PlanEffect, String> {
     ensure_plans_dir(workspace)?;
@@ -429,6 +462,8 @@ pub fn create_plan_with_effect(
         updated_at: Utc::now().to_rfc3339(),
         version: 1,
         session_id: session_id.to_string(),
+        source_message_id: normalize_source(source_message_id),
+        source_tool_event_id: normalize_source(source_tool_event_id),
     };
 
     let files_list = if files.is_empty() {
@@ -531,6 +566,8 @@ pub fn create_plan(
     files: &[String],
     steps: &[String],
     verification: Option<&str>,
+    source_message_id: Option<&str>,
+    source_tool_event_id: Option<&str>,
     conn: Option<&rusqlite::Connection>,
 ) -> Result<String, String> {
     create_plan_with_effect(
@@ -542,6 +579,8 @@ pub fn create_plan(
         files,
         steps,
         verification,
+        source_message_id,
+        source_tool_event_id,
         conn,
     )
     .map(|e| e.message)
@@ -557,6 +596,8 @@ pub fn update_plan_with_effect(
     step_updates: Option<&[Value]>,
     modified_sections: Option<&Value>,
     revision_note: Option<&str>,
+    source_message_id: Option<&str>,
+    source_tool_event_id: Option<&str>,
     conn: Option<&rusqlite::Connection>,
 ) -> Result<PlanUpdateEffect, String> {
     ensure_plans_dir(workspace)?;
@@ -568,6 +609,14 @@ pub fn update_plan_with_effect(
     };
 
     let old_bytes = fs::read(&file_path).map_err(|e| format!("读取计划文件失败: {e}"))?;
+
+    // 首次归因：仅在来源为空时补写本次事件来源，绝不覆盖已有的非空归属
+    if meta.source_message_id.is_none() {
+        meta.source_message_id = normalize_source(source_message_id);
+    }
+    if meta.source_tool_event_id.is_none() {
+        meta.source_tool_event_id = normalize_source(source_tool_event_id);
+    }
 
     let time_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     meta.version += 1;
@@ -771,6 +820,8 @@ pub fn update_plan(
     step_updates: Option<&[Value]>,
     modified_sections: Option<&Value>,
     revision_note: Option<&str>,
+    source_message_id: Option<&str>,
+    source_tool_event_id: Option<&str>,
     conn: Option<&rusqlite::Connection>,
 ) -> Result<String, String> {
     update_plan_with_effect(
@@ -782,6 +833,8 @@ pub fn update_plan(
         step_updates,
         modified_sections,
         revision_note,
+        source_message_id,
+        source_tool_event_id,
         conn,
     )
     .map(|e| e.message)
@@ -883,6 +936,8 @@ pub fn switch_plan(
     workspace: &Path,
     session_id: &str,
     plan_id: &str,
+    source_message_id: Option<&str>,
+    source_tool_event_id: Option<&str>,
     conn: Option<&rusqlite::Connection>,
 ) -> Result<String, String> {
     ensure_plans_dir(workspace)?;
@@ -906,6 +961,13 @@ pub fn switch_plan(
 
     target_meta.status = "in_progress".into();
     target_meta.updated_at = Utc::now().to_rfc3339();
+    // 首次归因：仅在来源为空时补写本次事件来源，绝不覆盖已有的非空归属
+    if target_meta.source_message_id.is_none() {
+        target_meta.source_message_id = normalize_source(source_message_id);
+    }
+    if target_meta.source_tool_event_id.is_none() {
+        target_meta.source_tool_event_id = normalize_source(source_tool_event_id);
+    }
     let updated = format_with_frontmatter(&target_meta, &target_body);
     fs::write(&target_path, updated).map_err(|e| format!("保存切换后的计划失败: {e}"))?;
 
@@ -1028,6 +1090,8 @@ pub fn list_plans(
                             total_steps: steps.len(),
                             completed_steps: completed_count,
                             is_active,
+                            source_message_id: meta.source_message_id,
+                            source_tool_event_id: meta.source_tool_event_id,
                             steps,
                             body,
                         });
@@ -1122,8 +1186,251 @@ pub fn load_active_plan_context(
     }
 }
 
+// ---------- 归属回填（一次性运维工具：只落库已确证的归属事实，绝无猜测） ----------
+
+/// 单个方案文件的回填判定
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanBackfillItem {
+    pub filename: String,
+    pub plan_id: String,
+    /// already_attributed | written | unattributable | ambiguous
+    pub decision: String,
+    /// 命中依据：filename（文件名精确） | title（标题全等）
+    pub matched_by: Option<String>,
+    pub source_message_id: Option<String>,
+    pub source_tool_event_id: Option<String>,
+}
+
+/// 归属回填报告（dry-run 与 apply 给出同一份决策，dry-run 仅不落盘）
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PlanBackfillReport {
+    pub applied: bool,
+    pub session_id: String,
+    /// 扫描到的本会话方案文件数（含已有归属者）
+    pub scanned: usize,
+    /// 已具备归属、直接跳过（幂等依据）
+    pub already_attributed: usize,
+    /// 判定写回数（apply=false 时即为"可安全写回数"预演）
+    pub written: usize,
+    /// 无任何命中，无法归属
+    pub unattributable: usize,
+    /// 多命中，一律置空不猜
+    pub ambiguous: usize,
+    pub items: Vec<PlanBackfillItem>,
+}
+
+/// 读取目录下的方案文件（内存快照，供归属回填与撤回校准共用）
+fn read_plan_files(dir: &Path) -> Vec<(PathBuf, PlanMeta, String)> {
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    let (meta, body) = parse_frontmatter(&content);
+                    files.push((path, meta, body));
+                }
+            }
+        }
+    }
+    files
+}
+
+/// 文件名 slug：剥离 create_plan 命名规则中的 `<yyyyMMdd>-` 日期前缀
+fn file_name_slug(stem: &str) -> &str {
+    let b = stem.as_bytes();
+    if b.len() > 9 && b[..8].iter().all(|c| c.is_ascii_digit()) && b[8] == b'-' {
+        &stem[9..]
+    } else {
+        stem
+    }
+}
+
+/// 事件创建时间的 yyyyMMdd；不可解析即 None（绝不猜测）
+fn event_date8(created_at: &str) -> Option<String> {
+    let s = created_at.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc).format("%Y%m%d").to_string());
+    }
+    if s.len() >= 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-' {
+        let digits = s[..10].replace('-', "");
+        if digits.len() == 8 && digits.bytes().all(|c| c.is_ascii_digit()) {
+            return Some(digits);
+        }
+    }
+    None
+}
+
+/// 会话内 create_plan 事件（严格：消息未撤回 + status=success）
+/// 返回 (event_id, message_id, title, 事件日期 yyyyMMdd)
+fn session_create_plan_events(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Vec<(String, String, String, Option<String>)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT te.id, te.message_id, te.params_json, te.created_at
+             FROM tool_events te
+             JOIN messages m ON te.message_id = m.id
+             WHERE m.session_id = ?1 AND m.reverted_at IS NULL
+               AND te.tool_name = 'create_plan'
+               AND te.status = 'success'
+             ORDER BY m.seq ASC, te.created_at ASC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let rows = stmt
+        .query_map(rusqlite::params![session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut out = Vec::new();
+    for r in rows.flatten() {
+        let params: Value = serde_json::from_str(&r.2).unwrap_or(Value::Null);
+        let title = params
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        out.push((r.0, r.1, title, event_date8(&r.3)));
+    }
+    Ok(out)
+}
+
+/// 历史方案归属回填：仅处理 source_message_id / source_tool_event_id 均为空的文件。
+/// 强路径：事件日期 + sanitize_slug(title) 拼出的文件名与磁盘文件名精确一致，且唯一命中；
+/// 弱路径：title 全等且 sanitize_slug(title) 与文件名 slug 一致，且唯一命中；
+/// 多命中一律不写（保持为空），无命中视为无法归属。已有归属的文件直接跳过（幂等）。
+pub fn backfill_plan_sources(
+    conn: &rusqlite::Connection,
+    workspace: &Path,
+    session_id: &str,
+    include_archived: bool,
+    apply: bool,
+) -> Result<PlanBackfillReport, String> {
+    let mut report = PlanBackfillReport {
+        applied: apply,
+        session_id: session_id.to_string(),
+        ..Default::default()
+    };
+    if workspace.as_os_str().is_empty() || session_id.is_empty() {
+        return Ok(report);
+    }
+    let pdir = plans_dir(workspace);
+    if !pdir.exists() {
+        return Ok(report);
+    }
+
+    let events = session_create_plan_events(conn, session_id)?;
+
+    let mut dirs = vec![pdir.clone()];
+    if include_archived {
+        let adir = archive_dir(workspace);
+        if adir.exists() {
+            dirs.push(adir);
+        }
+    }
+
+    for dir in dirs {
+        for (path, mut meta, body) in read_plan_files(&dir) {
+            if meta.session_id != session_id {
+                continue;
+            }
+            let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            report.scanned += 1;
+
+            if meta.source_message_id.is_some() || meta.source_tool_event_id.is_some() {
+                report.already_attributed += 1;
+                report.items.push(PlanBackfillItem {
+                    filename,
+                    plan_id: meta.id.clone(),
+                    decision: "already_attributed".into(),
+                    matched_by: None,
+                    source_message_id: meta.source_message_id.clone(),
+                    source_tool_event_id: meta.source_tool_event_id.clone(),
+                });
+                continue;
+            }
+
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let stem_slug = file_name_slug(stem).to_string();
+            // 强路径：事件日期 + title slug 还原出的文件名与磁盘文件名逐字符相等
+            let strong: Vec<_> = events
+                .iter()
+                .filter(|e| {
+                    e.3.as_deref()
+                        .map(|d| format!("{}-{}", d, sanitize_slug(&e.2)) == stem)
+                        .unwrap_or(false)
+                })
+                .collect();
+            // 弱路径：title 全等 + slug 与文件名一致
+            let weak: Vec<_> = events
+                .iter()
+                .filter(|e| {
+                    !e.2.is_empty()
+                        && !meta.title.trim().is_empty()
+                        && e.2 == meta.title.trim()
+                        && sanitize_slug(&e.2) == stem_slug
+                })
+                .collect();
+
+            let (decision, matched) = if strong.len() > 1 {
+                ("ambiguous", None)
+            } else if strong.len() == 1 {
+                ("written", Some((strong[0], "filename")))
+            } else if weak.len() > 1 {
+                ("ambiguous", None)
+            } else if weak.len() == 1 {
+                ("written", Some((weak[0], "title")))
+            } else {
+                ("unattributable", None)
+            };
+
+            let (smsg, sevt, by) = match matched {
+                Some((ev, by)) => (Some(ev.1.clone()), Some(ev.0.clone()), Some(by.to_string())),
+                None => (None, None, None),
+            };
+
+            if decision == "written" {
+                report.written += 1;
+                if apply {
+                    meta.source_message_id = smsg.clone();
+                    meta.source_tool_event_id = sevt.clone();
+                    // 不触碰 updated_at：回填不改变方案的排序与版本事实
+                    let full = format_with_frontmatter(&meta, &body);
+                    fs::write(&path, full).map_err(|e| format!("回填归属写盘失败: {e}"))?;
+                }
+            } else if decision == "ambiguous" {
+                report.ambiguous += 1;
+            } else {
+                report.unattributable += 1;
+            }
+
+            report.items.push(PlanBackfillItem {
+                filename,
+                plan_id: meta.id.clone(),
+                decision: decision.into(),
+                matched_by: by,
+                source_message_id: smsg,
+                source_tool_event_id: sevt,
+            });
+        }
+    }
+
+    Ok(report)
+}
+
 /// 在会话撤回（revert_to_message / turn_revert）或重做（reapply）后，
 /// 自动校准当前会话绑定的活动方案 (active_plan_id) 与磁盘方案状态。
+/// 归属只认两类事实：① 方案已固化的来源（source_tool_event_id / source_message_id）；
+/// ② 工具显式入参 plan_id。无匹配即置空，无任何正则解析、slug 推导或磁盘模糊兜底。
 pub fn sync_session_plans_after_revert(
     conn: &rusqlite::Connection,
     workspace: &Path,
@@ -1133,10 +1440,16 @@ pub fn sync_session_plans_after_revert(
         return Ok(None);
     }
 
-    // 1. 查询会话中所有有效（reverted_at IS NULL）且按顺序降序排列的方案工具事件
+    // 本会话磁盘方案的内存快照（仅作精确 id / 归属事实匹配，不做任何兜底挑选）
+    let files: Vec<(PathBuf, PlanMeta, String)> = read_plan_files(&plans_dir(workspace))
+        .into_iter()
+        .filter(|(_, meta, _)| meta.session_id == session_id)
+        .collect();
+
+    // 1. 会话内有效的方案工具事件（消息未撤回 + status=success），按消息 seq 降序
     let mut stmt = conn
         .prepare(
-            "SELECT te.tool_name, te.params_json, te.result_text
+            "SELECT te.id, te.message_id, te.tool_name, te.params_json
              FROM tool_events te
              JOIN messages m ON te.message_id = m.id
              WHERE m.session_id = ?1 AND m.reverted_at IS NULL
@@ -1146,96 +1459,84 @@ pub fn sync_session_plans_after_revert(
         )
         .map_err(|e| e.to_string())?;
 
-    let events: Vec<(String, String, String)> = stmt
+    let events: Vec<(String, String, String, String)> = stmt
         .query_map(rusqlite::params![session_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?.unwrap_or_default(),
             ))
         })
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
         .collect();
 
-    let mut candidate_plan_id: Option<String> = None;
+    let mut resolved_idx: Option<usize> = None;
+    for (event_id, message_id, tool_name, params_str) in &events {
+        // 事实一：事件/消息即该方案已固化的来源（唯一命中才采信）
+        let by_event: Vec<usize> = files
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, m, _))| m.source_tool_event_id.as_deref() == Some(event_id.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+        let by_msg: Vec<usize> = files
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, m, _))| m.source_message_id.as_deref() == Some(message_id.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+        let hit = if by_event.len() == 1 {
+            Some(by_event[0])
+        } else if by_event.is_empty() && by_msg.len() == 1 {
+            Some(by_msg[0])
+        } else {
+            None
+        };
+        if let Some(i) = hit {
+            resolved_idx = Some(i);
+            break;
+        }
 
-    for (name, params_str, result_text) in &events {
-        let params: Value = serde_json::from_str(params_str).unwrap_or(Value::Null);
-        if name == "switch_plan" {
-            if let Some(pid) = params.get("plan_id").and_then(|v| v.as_str()) {
-                candidate_plan_id = Some(pid.to_string());
-                break;
-            }
-        } else if name == "create_plan" {
-            // 从 result_text 中提取活动计划ID: `plan-xxx`
-            if let Some(start) = result_text.find("活动计划ID: `") {
-                let rest = &result_text[start + 16..];
-                if let Some(end) = rest.find('`') {
-                    candidate_plan_id = Some(rest[..end].to_string());
+        // 事实二：工具显式入参 plan_id（确定标识，非推导）；命中失败继续向前追溯，不猜
+        if tool_name != "create_plan" {
+            let params: Value = serde_json::from_str(params_str).unwrap_or(Value::Null);
+            if let Some(pid) = params
+                .get("plan_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                let exact: Vec<usize> = files
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (p, m, _))| {
+                        m.id == pid || p.file_stem().and_then(|s| s.to_str()) == Some(pid)
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if exact.len() == 1 {
+                    resolved_idx = Some(exact[0]);
                     break;
                 }
             }
-            if let Some(title) = params.get("title").and_then(|v| v.as_str()) {
-                let slug = sanitize_slug(title);
-                candidate_plan_id = Some(format!("plan-{}", slug));
-                break;
-            }
-        } else if name == "update_plan" {
-            if let Some(pid) = params.get("plan_id").and_then(|v| v.as_str()) {
-                candidate_plan_id = Some(pid.to_string());
-                break;
-            }
         }
     }
 
-    // 2. 检查候选计划在工作区物理磁盘上是否存在
-    let pdir = plans_dir(workspace);
+    // 2. 命中方案若非 in_progress，恢复为 in_progress（撤回后回到该方案的执行态）
     let mut resolved_active_id: Option<String> = None;
-
-    if let Some(cid) = candidate_plan_id {
-        if let Some((path, mut meta, body)) = find_plan_file(workspace, session_id, Some(&cid), Some(conn)) {
-            resolved_active_id = Some(meta.id.clone());
-            // 确保该有效方案恢复为 in_progress 状态
-            if meta.status != "in_progress" {
-                meta.status = "in_progress".into();
-                meta.updated_at = Utc::now().to_rfc3339();
-                let full = format_with_frontmatter(&meta, &body);
-                let _ = fs::write(&path, full);
-            }
+    if let Some(i) = resolved_idx {
+        let (path, mut meta, body) = files[i].clone();
+        resolved_active_id = Some(meta.id.clone());
+        if meta.status != "in_progress" {
+            meta.status = "in_progress".into();
+            meta.updated_at = Utc::now().to_rfc3339();
+            let full = format_with_frontmatter(&meta, &body);
+            let _ = fs::write(&path, full);
         }
     }
 
-    // 3. 若未通过历史事件找到，但磁盘上仍有属于本 session 的方案，取最新的一个
-    if resolved_active_id.is_none() && pdir.exists() {
-        if let Ok(entries) = fs::read_dir(&pdir) {
-            let mut session_plans = Vec::new();
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
-                    if let Ok(content) = fs::read_to_string(&path) {
-                        let (meta, body) = parse_frontmatter(&content);
-                        if meta.session_id == session_id {
-                            session_plans.push((path, meta, body));
-                        }
-                    }
-                }
-            }
-            // 按更新时间降序
-            session_plans.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
-            if let Some((path, mut meta, body)) = session_plans.into_iter().next() {
-                resolved_active_id = Some(meta.id.clone());
-                if meta.status != "in_progress" {
-                    meta.status = "in_progress".into();
-                    meta.updated_at = Utc::now().to_rfc3339();
-                    let full = format_with_frontmatter(&meta, &body);
-                    let _ = fs::write(&path, full);
-                }
-            }
-        }
-    }
-
-    // 4. 将 resolved_active_id 写回 session_kv
     set_active_plan_id(Some(conn), session_id, resolved_active_id.as_deref())?;
 
     Ok(resolved_active_id)
@@ -1272,6 +1573,8 @@ mod tests {
             updated_at: "2026-09-22T10:00:00Z".into(),
             version: 1,
             session_id: "sess-123".into(),
+            source_message_id: Some("msg-abc".into()),
+            source_tool_event_id: Some("evt-xyz".into()),
         };
         let body = "## 一、需求背景\n这是测试正文内容";
         let formatted = format_with_frontmatter(&meta, body);
@@ -1280,7 +1583,170 @@ mod tests {
         assert_eq!(parsed_meta.id, "plan-test-1");
         assert_eq!(parsed_meta.title, "测试计划");
         assert_eq!(parsed_meta.version, 1);
+        assert_eq!(parsed_meta.source_message_id.as_deref(), Some("msg-abc"));
+        assert_eq!(parsed_meta.source_tool_event_id.as_deref(), Some("evt-xyz"));
+        assert_eq!(parsed_meta, meta);
         assert!(parsed_body.contains("这是测试正文内容"));
+    }
+
+    #[test]
+    fn test_frontmatter_source_roundtrip_and_absent() {
+        let mut meta = PlanMeta {
+            id: "plan-src-1".into(),
+            title: "归属方案".into(),
+            status: "in_progress".into(),
+            created_at: "2026-10-16T10:00:00Z".into(),
+            updated_at: "2026-10-16T10:00:00Z".into(),
+            version: 1,
+            session_id: "sess-src".into(),
+            source_message_id: Some("msg-1".into()),
+            source_tool_event_id: Some("evt-1".into()),
+        };
+        let formatted = format_with_frontmatter(&meta, "## 一、需求背景\n正文");
+        assert!(formatted.contains("source_message_id: \"msg-1\""));
+        assert!(formatted.contains("source_tool_event_id: \"evt-1\""));
+        let (parsed, body) = parse_frontmatter(&formatted);
+        assert_eq!(parsed, meta);
+        assert!(body.contains("正文"));
+
+        // 来源未确定（None）时完全不落盘该字段，往返后仍为 None
+        meta.source_message_id = None;
+        meta.source_tool_event_id = None;
+        let formatted_none = format_with_frontmatter(&meta, "正文");
+        assert!(!formatted_none.contains("source_message_id"));
+        assert!(!formatted_none.contains("source_tool_event_id"));
+        let (parsed_none, _) = parse_frontmatter(&formatted_none);
+        assert_eq!(parsed_none, meta);
+    }
+
+    #[test]
+    fn test_frontmatter_legacy_without_source_fields() {
+        // 老方案文件：无 source_* 字段，必须正常解析且其它字段零丢失
+        let legacy = "---\nid: \"plan-old-1\"\ntitle: \"老方案\"\nstatus: \"in_progress\"\ncreated_at: \"2026-01-01T00:00:00Z\"\nupdated_at: \"2026-01-02T00:00:00Z\"\nversion: 3\nsession_id: \"sess-old\"\n---\n\n## 一、需求背景\n老正文\n";
+        let (meta, body) = parse_frontmatter(legacy);
+        assert_eq!(meta.id, "plan-old-1");
+        assert_eq!(meta.title, "老方案");
+        assert_eq!(meta.version, 3);
+        assert_eq!(meta.session_id, "sess-old");
+        assert_eq!(meta.source_message_id, None);
+        assert_eq!(meta.source_tool_event_id, None);
+        assert!(body.contains("老正文"));
+
+        // 空串来源同样视为未确定（None），严禁任何猜测式推导
+        let blank = legacy.replace(
+            "id: \"plan-old-1\"",
+            "id: \"plan-old-1\"\nsource_message_id: \"\"\nsource_tool_event_id: \"  \"",
+        );
+        let (meta_blank, body_blank) = parse_frontmatter(&blank);
+        assert_eq!(meta_blank.source_message_id, None);
+        assert_eq!(meta_blank.source_tool_event_id, None);
+        assert!(body_blank.contains("老正文"));
+    }
+
+    #[test]
+    fn test_plan_source_attribution_first_write_wins() {
+        let tmp = TempDir::new();
+        let ws = tmp.path();
+        let sid = "session-src";
+
+        // 1. 创建时固化归属，并经 list_plans 对外输出
+        create_plan(
+            ws,
+            sid,
+            "归属固化方案",
+            "目标",
+            "架构",
+            &[],
+            &["步骤1".into()],
+            None,
+            Some("msg-create"),
+            Some("evt-create"),
+            None,
+        )
+        .unwrap();
+        let list = list_plans(ws, Some(sid), false, None).unwrap();
+        assert_eq!(list[0].source_message_id.as_deref(), Some("msg-create"));
+        assert_eq!(list[0].source_tool_event_id.as_deref(), Some("evt-create"));
+
+        // 2. update_plan 传入不同来源：已有非空归属绝不被覆盖（首次归因语义）
+        update_plan(
+            ws,
+            sid,
+            None,
+            "推进步骤",
+            None,
+            None,
+            None,
+            None,
+            Some("msg-update"),
+            Some("evt-update"),
+            None,
+        )
+        .unwrap();
+        let list2 = list_plans(ws, Some(sid), false, None).unwrap();
+        assert_eq!(list2[0].source_message_id.as_deref(), Some("msg-create"));
+        assert_eq!(list2[0].source_tool_event_id.as_deref(), Some("evt-create"));
+
+        // 3. 老方案文件（来源为空）在后续更新时补写本次事件来源
+        let legacy_path = plans_dir(ws).join("20260101-legacy.md");
+        fs::write(
+            &legacy_path,
+            "---\nid: \"plan-legacy\"\ntitle: \"老方案\"\nstatus: \"in_progress\"\ncreated_at: \"2026-01-01T00:00:00Z\"\nupdated_at: \"2026-01-01T00:00:00Z\"\nversion: 1\nsession_id: \"session-src\"\n---\n\n## 四、分步执行清单\n- [ ] 步骤 1：老步骤\n",
+        )
+        .unwrap();
+        update_plan(
+            ws,
+            sid,
+            Some("plan-legacy"),
+            "补写归属",
+            None,
+            None,
+            None,
+            None,
+            Some("msg-fill"),
+            Some("evt-fill"),
+            None,
+        )
+        .unwrap();
+        let (meta_legacy, _) = parse_frontmatter(&fs::read_to_string(&legacy_path).unwrap());
+        assert_eq!(meta_legacy.source_message_id.as_deref(), Some("msg-fill"));
+        assert_eq!(meta_legacy.source_tool_event_id.as_deref(), Some("evt-fill"));
+        assert_eq!(meta_legacy.title, "老方案");
+
+        // 4. switch_plan 对无归属方案补写来源
+        create_plan(
+            ws,
+            sid,
+            "无归属方案B",
+            "目标B",
+            "架构B",
+            &[],
+            &["步骤B1".into()],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let list3 = list_plans(ws, Some(sid), false, None).unwrap();
+        let plan_b = list3.iter().find(|p| p.title == "无归属方案B").unwrap();
+        assert_eq!(plan_b.source_message_id, None);
+        assert_eq!(plan_b.source_tool_event_id, None);
+        let plan_b_id = plan_b.id.clone();
+
+        switch_plan(
+            ws,
+            sid,
+            &plan_b_id,
+            Some("msg-switch"),
+            Some("evt-switch"),
+            None,
+        )
+        .unwrap();
+        let list4 = list_plans(ws, Some(sid), false, None).unwrap();
+        let plan_b2 = list4.iter().find(|p| p.title == "无归属方案B").unwrap();
+        assert_eq!(plan_b2.source_message_id.as_deref(), Some("msg-switch"));
+        assert_eq!(plan_b2.source_tool_event_id.as_deref(), Some("evt-switch"));
     }
 
     #[test]
@@ -1299,6 +1765,8 @@ mod tests {
             &["src/auth.rs".into()],
             &["实现编解码".into(), "接入中间件".into()],
             Some("cargo test"),
+            None,
+            None,
             None,
         );
         assert!(res.is_ok());
@@ -1324,6 +1792,8 @@ mod tests {
             updates.as_array().map(|v| v.as_slice()),
             None,
             Some("完成 JWT 编解码实现"),
+            None,
+            None,
             None,
         );
         assert!(up_res.is_ok());
@@ -1359,6 +1829,8 @@ mod tests {
             Some(&new_steps_mod),
             None,
             None,
+            None,
+            None,
         );
         assert!(mod_res.is_ok());
         let list4 = list_plans(ws, Some(sid), false, None).unwrap();
@@ -1372,6 +1844,8 @@ mod tests {
             None,
             "全部完成交付",
             Some("completed"),
+            None,
+            None,
             None,
             None,
             None,
@@ -1399,6 +1873,8 @@ mod tests {
             "架构A",
             &[],
             &["步骤A1".into()],
+            None,
+            None,
             None,
             None,
         )
@@ -1452,6 +1928,8 @@ mod tests {
             &["实现登录接口".into()],
             None,
             None,
+            None,
+            None,
         ).unwrap();
 
         // 再次查询不存在的 plan_id，验证提示包含了现有的计划 ID 和标题
@@ -1460,7 +1938,7 @@ mod tests {
         assert!(err2.contains("已有的计划文档包括"));
 
         // switch_plan 也应包含已有计划提示
-        let err3 = switch_plan(ws, sid, "wrong_id", None).unwrap_err();
+        let err3 = switch_plan(ws, sid, "wrong_id", None, None, None).unwrap_err();
         assert!(err3.contains("用户认证系统重构"));
         assert!(err3.contains("已有的计划文档包括"));
 
@@ -1497,6 +1975,8 @@ mod tests {
             &[],
             &["实现登录".into(), "实现刷新".into()],
             None,
+            None,
+            None,
             Some(&conn),
         ).unwrap();
 
@@ -1512,6 +1992,211 @@ mod tests {
         assert!(ctx.contains("严禁擅自修改计划文档"));
     }
 
+    /// 造一条会话消息（供 tool_events 的 JOIN 与 seq 排序使用）
+    fn insert_test_message(conn: &rusqlite::Connection, id: &str, sid: &str, seq: i64) {
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions(id, title, workspace_path, status, created_at, updated_at)
+             VALUES (?1, 't', '', 'active', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            rusqlite::params![sid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages(id, session_id, seq, role, content, created_at)
+             VALUES (?1, ?2, ?3, 'assistant', '', '2026-01-01T00:00:00Z')",
+            rusqlite::params![id, sid, seq],
+        )
+        .unwrap();
+    }
+
+    /// 造一条 create_plan 工具事件
+    fn insert_test_plan_event(
+        conn: &rusqlite::Connection,
+        id: &str,
+        msg_id: &str,
+        title: &str,
+        created_at: &str,
+        status: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO tool_events(id, message_id, tool_name, params_json, result_text, status, created_at)
+             VALUES (?1, ?2, 'create_plan', ?3, '', ?4, ?5)",
+            rusqlite::params![
+                id,
+                msg_id,
+                serde_json::json!({ "title": title }).to_string(),
+                status,
+                created_at
+            ],
+        )
+        .unwrap();
+    }
+
+    /// 写一个"老方案文件"（frontmatter 不含任何归属字段）
+    fn write_legacy_plan(ws: &Path, filename: &str, plan_id: &str, title: &str, sid: &str) -> PathBuf {
+        ensure_plans_dir(ws).unwrap();
+        let path = plans_dir(ws).join(filename);
+        let content = format!(
+            "---\nid: \"{plan_id}\"\ntitle: \"{title}\"\nstatus: \"in_progress\"\ncreated_at: \"2026-01-01T00:00:00Z\"\nupdated_at: \"2026-01-01T00:00:00Z\"\nversion: 1\nsession_id: \"{sid}\"\n---\n\n## 四、分步执行清单\n- [ ] 步骤 1：老步骤\n"
+        );
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn read_meta(path: &Path) -> (PlanMeta, String) {
+        parse_frontmatter(&fs::read_to_string(path).unwrap())
+    }
+
+    #[test]
+    fn test_backfill_plan_sources_unique_hit_then_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        let tmp = TempDir::new();
+        let ws = tmp.path();
+        let sid = "session-backfill-unique";
+
+        let path = write_legacy_plan(
+            ws,
+            "20260101-唯一命中方案.md",
+            "plan-20260101-唯一命中方案",
+            "唯一命中方案",
+            sid,
+        );
+        insert_test_message(&conn, "msg-1", sid, 1);
+        insert_test_plan_event(&conn, "evt-1", "msg-1", "唯一命中方案", "2026-01-01T00:00:00Z", "success");
+
+        // 1. dry-run：给出写回决策但不落盘
+        let dry = backfill_plan_sources(&conn, ws, sid, false, false).unwrap();
+        assert!(!dry.applied);
+        assert_eq!((dry.scanned, dry.written, dry.unattributable, dry.ambiguous), (1, 1, 0, 0));
+        assert_eq!(dry.items[0].decision, "written");
+        assert_eq!(dry.items[0].matched_by.as_deref(), Some("filename"));
+        let (meta_dry, _) = read_meta(&path);
+        assert_eq!(meta_dry.source_message_id, None);
+        assert_eq!(meta_dry.source_tool_event_id, None);
+
+        // 2. apply：唯一命中写回两个归属事实
+        let applied = backfill_plan_sources(&conn, ws, sid, false, true).unwrap();
+        assert_eq!(applied.written, 1);
+        let (meta1, _) = read_meta(&path);
+        assert_eq!(meta1.source_message_id.as_deref(), Some("msg-1"));
+        assert_eq!(meta1.source_tool_event_id.as_deref(), Some("evt-1"));
+
+        // 3. 幂等：重复执行 no-op（非空即跳过，文件内容逐字符不变）
+        let before = fs::read_to_string(&path).unwrap();
+        let again = backfill_plan_sources(&conn, ws, sid, false, true).unwrap();
+        assert_eq!((again.scanned, again.already_attributed, again.written), (1, 1, 0));
+        assert_eq!(again.items[0].decision, "already_attributed");
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn test_backfill_plan_sources_multi_hit_stays_empty() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        let tmp = TempDir::new();
+        let ws = tmp.path();
+        let sid = "session-backfill-ambiguous";
+
+        let path = write_legacy_plan(
+            ws,
+            "20260101-重复方案.md",
+            "plan-20260101-重复方案",
+            "重复方案",
+            sid,
+        );
+        insert_test_message(&conn, "msg-1", sid, 1);
+        insert_test_message(&conn, "msg-2", sid, 2);
+        insert_test_plan_event(&conn, "evt-1", "msg-1", "重复方案", "2026-01-01T00:00:00Z", "success");
+        insert_test_plan_event(&conn, "evt-2", "msg-2", "重复方案", "2026-01-01T00:05:00Z", "success");
+
+        let before = fs::read_to_string(&path).unwrap();
+        let report = backfill_plan_sources(&conn, ws, sid, false, true).unwrap();
+        assert_eq!((report.written, report.ambiguous, report.unattributable), (0, 1, 0));
+        assert_eq!(report.items[0].decision, "ambiguous");
+        // 多命中一律置空不猜：文件内容未被改写
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        let (meta, _) = read_meta(&path);
+        assert_eq!(meta.source_message_id, None);
+        assert_eq!(meta.source_tool_event_id, None);
+    }
+
+    #[test]
+    fn test_backfill_plan_sources_weak_path_title_match() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        let tmp = TempDir::new();
+        let ws = tmp.path();
+        let sid = "session-backfill-weak";
+
+        // 文件名日期与事件日期不一致 → 强路径不成立，仅弱路径（title 全等 + slug 一致）成立
+        let path = write_legacy_plan(
+            ws,
+            "20260101-弱路径方案.md",
+            "plan-20260101-弱路径方案",
+            "弱路径方案",
+            sid,
+        );
+        insert_test_message(&conn, "msg-1", sid, 1);
+        insert_test_plan_event(&conn, "evt-1", "msg-1", "弱路径方案", "2026-02-02T00:00:00Z", "success");
+
+        let report = backfill_plan_sources(&conn, ws, sid, false, true).unwrap();
+        assert_eq!((report.written, report.ambiguous, report.unattributable), (1, 0, 0));
+        assert_eq!(report.items[0].matched_by.as_deref(), Some("title"));
+        let (meta, _) = read_meta(&path);
+        assert_eq!(meta.source_message_id.as_deref(), Some("msg-1"));
+        assert_eq!(meta.source_tool_event_id.as_deref(), Some("evt-1"));
+    }
+
+    #[test]
+    fn test_backfill_plan_sources_legacy_without_facts_is_unattributable() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        let tmp = TempDir::new();
+        let ws = tmp.path();
+        let sid = "session-backfill-legacy";
+
+        // 老方案文件：无归属字段，且会话内没有任何与之匹配的事件 → 保持为空
+        let path = write_legacy_plan(ws, "20250909-远古方案.md", "plan-20250909-远古方案", "远古方案", sid);
+        let before = fs::read_to_string(&path).unwrap();
+
+        let report = backfill_plan_sources(&conn, ws, sid, false, true).unwrap();
+        assert_eq!((report.scanned, report.written, report.unattributable, report.ambiguous), (1, 0, 1, 0));
+        assert_eq!(report.items[0].decision, "unattributable");
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn test_backfill_plan_sources_ignores_reverted_and_failed_events() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        let tmp = TempDir::new();
+        let ws = tmp.path();
+        let sid = "session-backfill-strict";
+
+        let path = write_legacy_plan(
+            ws,
+            "20260101-严格范围方案.md",
+            "plan-20260101-严格范围方案",
+            "严格范围方案",
+            sid,
+        );
+        // 已撤回消息上的事件 + status 非 success 的事件，均不得作为归属依据
+        insert_test_message(&conn, "msg-reverted", sid, 1);
+        insert_test_plan_event(&conn, "evt-reverted", "msg-reverted", "严格范围方案", "2026-01-01T00:00:00Z", "success");
+        conn.execute(
+            "UPDATE messages SET reverted_at = '2026-01-01T01:00:00Z' WHERE id = 'msg-reverted'",
+            [],
+        )
+        .unwrap();
+        insert_test_message(&conn, "msg-failed", sid, 2);
+        insert_test_plan_event(&conn, "evt-failed", "msg-failed", "严格范围方案", "2026-01-01T00:00:00Z", "failed");
+
+        let before = fs::read_to_string(&path).unwrap();
+        let report = backfill_plan_sources(&conn, ws, sid, false, true).unwrap();
+        assert_eq!((report.written, report.unattributable, report.ambiguous), (0, 1, 0));
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
     #[test]
     fn test_plan_effects_and_sync_after_revert() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1520,7 +2205,7 @@ mod tests {
         let ws = tmp.path();
         let sid = "session-test-revert";
 
-        // 1. 创建第一个方案
+        // 1. 创建第一个方案（归属固化 evt-1 / msg-1）
         let eff1 = create_plan_with_effect(
             ws,
             sid,
@@ -1530,10 +2215,14 @@ mod tests {
             &[],
             &["步骤1".into()],
             None,
+            Some("msg-1"),
+            Some("evt-1"),
             Some(&conn),
         ).unwrap();
         assert!(eff1.new_plan_rel.starts_with(".harness/plans/"));
         assert!(eff1.suspended_plan_rel.is_none());
+        insert_test_message(&conn, "msg-1", sid, 1);
+        insert_test_plan_event(&conn, "evt-1", "msg-1", "方案一", "2026-01-01T00:00:00Z", "success");
 
         let active_pid1 = get_active_plan_id(Some(&conn), sid);
         assert!(active_pid1.is_some());
@@ -1548,25 +2237,67 @@ mod tests {
             &[],
             &["步骤2".into()],
             None,
+            Some("msg-2"),
+            Some("evt-2"),
             Some(&conn),
         ).unwrap();
         assert!(eff2.suspended_plan_rel.is_some());
         assert_eq!(eff2.suspended_plan_rel.as_deref(), Some(eff1.new_plan_rel.as_str()));
+        insert_test_message(&conn, "msg-2", sid, 2);
+        insert_test_plan_event(&conn, "evt-2", "msg-2", "方案二", "2026-01-01T00:01:00Z", "success");
 
         let active_pid2 = get_active_plan_id(Some(&conn), sid);
         assert!(active_pid2.is_some());
         assert_ne!(active_pid1, active_pid2);
 
-        // 3. 模拟撤回：将方案二的物理文件删除（如同 snapshot_revert 将新建文件删除）
+        // 3. 额外放一个本会话的"诱饵"老方案文件（无任何归属事实）：不得被磁盘模糊兜底捞为活动方案
+        let decoy = write_legacy_plan(ws, "20990101-诱饵方案.md", "plan-20990101-诱饵方案", "诱饵方案", sid);
+
+        // 4. 模拟撤回 msg-2：消息软撤回 + 方案二物理文件被快照回滚删除
+        conn.execute(
+            "UPDATE messages SET reverted_at = '2026-01-01T00:02:00Z' WHERE id = 'msg-2'",
+            [],
+        )
+        .unwrap();
         let plan2_path = ws.join(&eff2.new_plan_rel);
         let _ = fs::remove_file(&plan2_path);
 
-        // 4. 调用 sync_session_plans_after_revert：应自动校准回方案一并置为活动方案
+        // 5. 校准：唯一来源事实（evt-1）命中方案一，而非最新的诱饵文件
         let synced_id = sync_session_plans_after_revert(&conn, ws, sid).unwrap();
         assert_eq!(synced_id, active_pid1);
+        assert_eq!(get_active_plan_id(Some(&conn), sid), active_pid1);
 
-        let cur_active = get_active_plan_id(Some(&conn), sid);
-        assert_eq!(cur_active, active_pid1);
+        // 6. 方案一被恢复为 in_progress
+        let (meta1, _) = read_meta(&ws.join(&eff1.new_plan_rel));
+        assert_eq!(meta1.status, "in_progress");
+
+        // 7. 诱饵文件依旧无归属（撤回校准绝不猜测填充）
+        let (decoy_meta, _) = read_meta(&decoy);
+        assert_eq!(decoy_meta.source_tool_event_id, None);
+        assert_eq!(decoy_meta.source_message_id, None);
+    }
+
+    #[test]
+    fn test_sync_after_revert_without_source_facts_clears_active() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        let tmp = TempDir::new();
+        let ws = tmp.path();
+        let sid = "session-revert-no-facts";
+
+        // 无归属老方案文件 + 一个与任何方案都无来源关系的事件
+        write_legacy_plan(ws, "20260101-无事实方案.md", "plan-20260101-无事实方案", "无事实方案", sid);
+        insert_test_message(&conn, "msg-x", sid, 1);
+        insert_test_plan_event(&conn, "evt-x", "msg-x", "无事实方案", "2026-01-01T00:00:00Z", "success");
+        set_active_plan_id(Some(&conn), sid, Some("plan-stale")).unwrap();
+
+        // 无来源事实可依 → active_plan_id 置空，绝不靠磁盘"最新一个"兜底复活
+        let synced = sync_session_plans_after_revert(&conn, ws, sid).unwrap();
+        assert_eq!(synced, None);
+        assert_eq!(get_active_plan_id(Some(&conn), sid), None);
+
+        // 且未退化的 System Prompt 路径：find_plan_file 仍按"本会话 in_progress 最新方案"解析出该文件
+        assert!(find_plan_file(ws, sid, None, Some(&conn)).is_some());
     }
 }
 

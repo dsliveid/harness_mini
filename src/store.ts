@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "./ipc";
-import { DRAFT_ID, resolveActiveModel, samePath, sortMessages, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type TodoItem, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem, type FocusFloatingTarget, type PlanSummary, type IntentAlignmentEvent, type IntentInterventionRequest } from "./types";
+import { DRAFT_ID, resolveActiveModel, samePath, sortMessages, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem, type FocusFloatingTarget, type PlanSummary, type IntentAlignmentEvent, type IntentInterventionRequest } from "./types";
 
 
 export interface EditingMessageTarget {
@@ -201,8 +201,6 @@ interface Store {
   sessionSettingsId: string | null;
   /** 各对话的审批规则（会话级：仅对所属对话生效），按会话 id 缓存 */
   sessionRules: Record<string, ApprovalRule[]>;
-  /** 会话任务清单，按会话 id 缓存 */
-  sessionTodos: Record<string, TodoItem[]>;
   /** 会话方案计划清单，按会话 id 缓存 */
   sessionPlans: Record<string, PlanSummary[]>;
   /** 程序数据目录状态；pending=true 时启动拦截对话框等待用户选择 */
@@ -322,7 +320,6 @@ interface Store {
   onSessionUpdate: (s: Session) => void;
   onSessionsChanged: (p?: { deleted?: string; archived?: string; unarchived?: string; created?: string }) => Promise<void>;
   onTempUpdate: (p: { sessionId: string; info: TempInfo }) => void;
-  onSessionTodos: (p: { sessionId: string; todos: TodoItem[] }) => void;
   planRefreshTick: number;
   triggerPlansRefresh: () => void;
   loadPlans: (sessionId?: string) => Promise<void>;
@@ -589,7 +586,6 @@ export const useStore = create<Store>((set, get) => ({
   projectSettingsId: null,
   sessionSettingsId: null,
   sessionRules: {},
-  sessionTodos: {},
   sessionPlans: {},
   dataStatus: null,
   collaborators: {},
@@ -990,7 +986,6 @@ export const useStore = create<Store>((set, get) => ({
       readOnly: false,
       editingMessage: null,
       messages: { ...get().messages, [DRAFT_ID]: [] },
-      sessionTodos: { ...get().sessionTodos, [DRAFT_ID]: [] },
       sessionPlans: { ...get().sessionPlans, [DRAFT_ID]: [] },
       focusFloatingTaskId: null,
       activeCollaboratorId: null,
@@ -1030,7 +1025,6 @@ export const useStore = create<Store>((set, get) => ({
         readOnly: false,
         editingMessage: null,
         messages: { ...get().messages, [DRAFT_ID]: [] },
-        sessionTodos: { ...get().sessionTodos, [DRAFT_ID]: [] },
         sessionPlans: { ...get().sessionPlans, [DRAFT_ID]: [] },
         focusFloatingTaskId: null,
         activeCollaboratorId: null,
@@ -1126,9 +1120,8 @@ export const useStore = create<Store>((set, get) => ({
     void Promise.allSettled([
       ipc.listQueued(id),
       isTemp ? ipc.getTempInfo(id) : Promise.resolve(null),
-      ipc.getSessionTodos(id),
       ipc.listGrowths(undefined, "proposed"),
-    ]).then(([qRes, tempRes, todosRes, growthsRes]) => {
+    ]).then(([qRes, tempRes, growthsRes]) => {
       if (currentToken !== latestSelectSessionToken) return;
       set((st) => {
         const next: Partial<Store> = {};
@@ -1140,13 +1133,6 @@ export const useStore = create<Store>((set, get) => ({
         }
         if (tempRes.status === "fulfilled" && tempRes.value) {
           next.tempInfo = { ...st.tempInfo, [id]: tempRes.value };
-        }
-        if (todosRes.status === "fulfilled") {
-          const val = todosRes.value;
-          next.sessionTodos = {
-            ...st.sessionTodos,
-            [id]: val && Array.isArray(val.todos) ? val.todos : [],
-          };
         }
         if (growthsRes.status === "fulfilled" && Array.isArray(growthsRes.value)) {
           const forThis = growthsRes.value.filter((g) => g.sessionId === id);
@@ -1598,25 +1584,11 @@ export const useStore = create<Store>((set, get) => ({
         return { toolOutputs: outs };
       });
     }
-    // todo 或方案工具更新时同步任务清单
-    if (ev.toolName === "todo" && ev.status === "success" && Array.isArray(ev.params?.todos)) {
-      set((st) => ({
-        sessionTodos: { ...st.sessionTodos, [p.sessionId]: ev.params.todos },
-      }));
-    } else if (
+    // 方案工具更新时刷新方案清单
+    if (
       (ev.toolName === "create_plan" || ev.toolName === "update_plan" || ev.toolName === "switch_plan") &&
       ev.status === "success"
     ) {
-      ipc.getSessionTodos(p.sessionId).then(
-        (val) => {
-          if (Array.isArray(val?.todos)) {
-            set((st) => ({
-              sessionTodos: { ...st.sessionTodos, [p.sessionId]: val.todos },
-            }));
-          }
-        },
-        () => {}
-      );
       void get().loadPlans(p.sessionId);
     }
   },
@@ -1722,13 +1694,6 @@ export const useStore = create<Store>((set, get) => ({
     }));
   },
 
-  onSessionTodos(p) {
-    if (!p?.sessionId || !Array.isArray(p.todos)) return;
-    set((st) => ({
-      sessionTodos: { ...st.sessionTodos, [p.sessionId]: p.todos },
-    }));
-  },
-
   planRefreshTick: 0,
   triggerPlansRefresh() {
     set((st) => ({ planRefreshTick: st.planRefreshTick + 1 }));
@@ -1782,25 +1747,6 @@ export const useStore = create<Store>((set, get) => ({
           };
         }
       }
-      let nextTodos = st.sessionTodos;
-      // 运行完成时增加双重兜底：若对话正常交付完成，收尾全部任务为 done；若中途停止/失败，将进行中任务置为 pending
-      if (st.sessionTodos[p.sessionId]) {
-        const cur = st.sessionTodos[p.sessionId];
-        if (p.status === "done") {
-          nextTodos = {
-            ...st.sessionTodos,
-            [p.sessionId]: cur.map((t) => ({ ...t, status: "done" })),
-          };
-        } else if (p.status !== "running") {
-          if (cur.some((t) => t.status === "in_progress")) {
-            nextTodos = {
-              ...st.sessionTodos,
-              [p.sessionId]: cur.map((t) => (t.status === "in_progress" ? { ...t, status: "pending" } : t)),
-            };
-          }
-        }
-      }
-
       // 若当前会话关联长任务且运行被中止/失败，立即将长任务及进行中的子步骤置为 interrupted/failed，严禁变为 completed
       let nextActiveTasks = st.activeTasks;
       if (p.status !== "running" && p.status !== "done" && st.activeTasks[p.sessionId]) {
@@ -1886,7 +1832,6 @@ export const useStore = create<Store>((set, get) => ({
         lastRunOutcome: { ...st.lastRunOutcome, [p.sessionId]: p.status },
         sessions: st.sessions.map((s) => (s.id === p.sessionId ? { ...s, lastRunStatus: p.status } : s)),
         toolRetryStatus: nextRetry,
-        sessionTodos: nextTodos,
         activeTasks: nextActiveTasks,
         subprocesses: nextSubprocesses,
         subagents: nextSubagents,

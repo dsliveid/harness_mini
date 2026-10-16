@@ -1,18 +1,15 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { currentMessages, currentSession, useStore } from "../store";
 import { ipc } from "../ipc";
 import {
   type ActivePlanDetail,
   type PlanSummary,
   type TimelineTask,
-  type TimelineTaskItem,
-  type TaskStatus,
-  type TodoItem,
   type ToolEvent,
   type FocusFloatingTarget,
-  type Message,
   DRAFT_ID,
 } from "../types";
+import { deriveBoards, type Board } from "./boardProjection";
 import { Markdown } from "./Markdown";
 import {
   CheckSquare,
@@ -170,7 +167,6 @@ function RunningCommandCard({ ev }: { ev: ToolEvent }) {
   );
 }
 
-const EMPTY_TODOS: TodoItem[] = [];
 const EMPTY_PLANS: PlanSummary[] = [];
 const EMPTY_COLLABS: any[] = [];
 const EMPTY_SUBPROCESSES: any[] = [];
@@ -190,7 +186,6 @@ export function FloatingTaskPanel() {
       ""
   );
   const isRunning = useStore((s) => (s.currentId ? s.runStatus[s.currentId] === "running" : false));
-  const rawTodos: TodoItem[] = useStore((s) => (s.currentId ? s.sessionTodos[s.currentId] ?? EMPTY_TODOS : EMPTY_TODOS));
   const plans: PlanSummary[] = useStore((s) => (s.currentId ? s.sessionPlans[s.currentId] ?? EMPTY_PLANS : EMPTY_PLANS));
   const loadPlans = useStore((s) => s.loadPlans);
   const lastRunOutcome = useStore((s) => (s.currentId ? s.lastRunOutcome[s.currentId] : undefined));
@@ -217,11 +212,9 @@ export function FloatingTaskPanel() {
   }, [currentId, currentSessionObj?.parentSessionId, collabs, subprocesses, subagents]);
 
   const [collapsed, setCollapsed] = useState(false);
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [showPlanModal, setShowPlanModal] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [highlightedTaskId, setHighlightedTaskId] = useState<string | null>(null);
-  const retryCountRef = useRef(0);
 
   // 当会话切换时按需拉取方案清单
   useEffect(() => {
@@ -248,270 +241,18 @@ export function FloatingTaskPanel() {
     }
   }, [lastPlanEventKey, currentId, loadPlans]);
 
-  // 2. 从消息流中提取独立的 todo 任务清单（按真实对话轮次 Turn 折叠聚合）
-  const todoTasks = useMemo(() => {
-    const list: TimelineTask[] = [];
-    if (!currentId || currentId === DRAFT_ID) return list;
+  // 2. 统一看板投影：可见消息流 + 方案清单 -> 按来源消息 seq 升序的时间线（唯一真相源，无兜底分支）
+  const timeline: Board[] = useMemo(
+    () =>
+      currentId && currentId !== DRAFT_ID
+        ? deriveBoards(msgs, plans, { isRunning, lastRunOutcome, relatedSessionIds })
+        : [],
+    [currentId, msgs, plans, isRunning, lastRunOutcome, relatedSessionIds]
+  );
 
-    // 严格过滤已被软撤回的消息以及 tool/queued 消息
-    const validMsgs = msgs.filter((m) => !m.revertedAt && !m.queued && m.role !== "tool");
-    if (validMsgs.length === 0) {
-      if (rawTodos.length > 0) {
-        const items: TimelineTaskItem[] = rawTodos.map((t, idx) => ({
-          index: idx + 1,
-          content: t.content,
-          status: isRunning ? t.status : t.status === "in_progress" ? "done" : t.status,
-        }));
-        list.push({
-          id: "raw-session-todos",
-          type: "todo",
-          title: "当前任务清单",
-          status: isRunning ? "in_progress" : "completed",
-          items,
-        });
-      }
-      return list;
-    }
-
-    // 按对话轮次（以 user 消息作为轮次分界）聚合
-    interface TurnGroup {
-      userMsg?: Message;
-      assistants: Message[];
-      isLatestTurn: boolean;
-    }
-    const turns: TurnGroup[] = [];
-    let currentTurn: TurnGroup = { assistants: [], isLatestTurn: false };
-
-    for (let i = 0; i < validMsgs.length; i++) {
-      const m = validMsgs[i];
-      if (m.role === "user") {
-        if (currentTurn.userMsg || currentTurn.assistants.length > 0) {
-          turns.push(currentTurn);
-        }
-        currentTurn = { userMsg: m, assistants: [], isLatestTurn: false };
-      } else if (m.role === "assistant") {
-        currentTurn.assistants.push(m);
-      }
-    }
-    if (currentTurn.userMsg || currentTurn.assistants.length > 0) {
-      turns.push(currentTurn);
-    }
-    if (turns.length > 0) {
-      turns[turns.length - 1].isLatestTurn = true;
-    }
-
-    // 收集每一轮对话中最后的有效 todo 快照（折叠同轮次内的初始化、进展和收尾调用）
-    interface ParsedTurnTodo {
-      turnIndex: number;
-      lastTodoEv: any;
-      lastTodoMsg: Message;
-      matchedEventIds: string[];
-      isLatestTurn: boolean;
-      rawItems: any[];
-    }
-    const parsedTurns: ParsedTurnTodo[] = [];
-
-    for (let turnIdx = 0; turnIdx < turns.length; turnIdx++) {
-      const turn = turns[turnIdx];
-      let turnLastTodoEv: any = null;
-      let turnLastTodoMsg: Message | null = null;
-      const turnEventIds: string[] = [];
-
-      for (const a of turn.assistants) {
-        if (!a.toolEvents) continue;
-        const todoEvs = a.toolEvents.filter(
-          (ev: ToolEvent) => ev.toolName === "todo" && Array.isArray(ev.params?.todos) && ev.params.todos.length > 0
-        );
-        for (const ev of todoEvs) {
-          turnEventIds.push(ev.id);
-          turnLastTodoEv = ev;
-          turnLastTodoMsg = a;
-        }
-      }
-
-      if (turnLastTodoEv && turnLastTodoMsg) {
-        const rawItems = turnLastTodoEv.params?.todos ?? [];
-        if (Array.isArray(rawItems) && rawItems.length > 0) {
-          parsedTurns.push({
-            turnIndex: turnIdx,
-            lastTodoEv: turnLastTodoEv,
-            lastTodoMsg: turnLastTodoMsg,
-            matchedEventIds: turnEventIds,
-            isLatestTurn: turn.isLatestTurn,
-            rawItems,
-          });
-        }
-      }
-    }
-
-    const totalValidTurns = parsedTurns.length;
-    const isAbnormalStop =
-      lastRunOutcome === "cancelled" ||
-      lastRunOutcome === "interrupted" ||
-      lastRunOutcome === "failed" ||
-      lastRunOutcome === "error";
-
-    for (let i = 0; i < totalValidTurns; i++) {
-      const pt = parsedTurns[i];
-      const isTaskRunning = isRunning && pt.isLatestTurn;
-
-      const items: TimelineTaskItem[] = pt.rawItems.map((t: any, idx: number) => {
-        let itemStatus: TaskStatus;
-        if (isTaskRunning) {
-          itemStatus = t.status || "pending";
-        } else if (isAbnormalStop && pt.isLatestTurn) {
-          itemStatus = t.status === "in_progress" ? "pending" : (t.status || "pending");
-        } else {
-          // 正常完成（历史轮次已沉淀，或当前轮次正常交付结束）：
-          // 优先采用 rawTodos（经过后端 auto_finish_session_todos 校准为 done）对应项状态；
-          // 若对应项为 done，或原始为 in_progress/pending，均标记为 done
-          const rawMatch = pt.isLatestTurn ? rawTodos[idx]?.status : undefined;
-          if (rawMatch === "done") {
-            itemStatus = "done";
-          } else if (t.status === "in_progress" || t.status === "pending" || !t.status) {
-            itemStatus = "done";
-          } else {
-            itemStatus = t.status;
-          }
-        }
-        return {
-          index: idx + 1,
-          content: String(t.content || ""),
-          status: itemStatus,
-        };
-      });
-
-      const allDone = items.every((t) => t.status === "done");
-      const status: TaskStatus = isTaskRunning ? "in_progress" : allDone ? "completed" : "pending";
-      const title = totalValidTurns > 1 ? `第 ${i + 1} 轮任务清单` : "当前任务清单";
-
-      list.push({
-        id: `todo-${pt.lastTodoEv.id}`,
-        type: "todo",
-        title,
-        status,
-        items,
-        messageId: pt.lastTodoMsg.id,
-        toolEventId: pt.lastTodoEv.id,
-        toolEventIds: pt.matchedEventIds,
-        createdAt: pt.lastTodoMsg.createdAt || "",
-      });
-    }
-
-    // 兜底：若消息流中未解析出 todo 任务，但 store 中有活跃的 rawTodos
-    if (list.length === 0 && rawTodos.length > 0 && currentId !== DRAFT_ID) {
-      const items: TimelineTaskItem[] = rawTodos.map((t, idx) => ({
-        index: idx + 1,
-        content: t.content,
-        status: isRunning
-          ? t.status
-          : isAbnormalStop
-          ? (t.status === "in_progress" ? "pending" : t.status)
-          : "done",
-      }));
-      const allDone = items.every((t) => t.status === "done");
-      list.push({
-        id: "raw-session-todos",
-        type: "todo",
-        title: "当前任务清单",
-        status: isRunning ? "in_progress" : allDone ? "completed" : "pending",
-        items,
-      });
-    }
-
-    return list;
-  }, [currentId, msgs, rawTodos, isRunning, lastRunOutcome]);
-
-  // 3. 将物理方案转换为 TimelineTask，并关联其在对话消息流中的出处位置（收集所有关联事件，支持多事件反查）
-  const planTasks = useMemo(() => {
-    const list: TimelineTask[] = [];
-    if (!currentId || currentId === DRAFT_ID) return list;
-
-    for (const p of plans) {
-      // 严格会话边界隔离：方案所属的 session_id 必须与当前会话（或关联协作者/父子会话）相匹配
-      if (p.session_id && p.session_id !== currentId && !relatedSessionIds.has(p.session_id)) {
-        continue;
-      }
-
-      const items: TimelineTaskItem[] = p.steps
-        ? p.steps.map((s) => ({
-            index: s.index,
-            content: `步骤 ${s.index}：${s.content}`,
-            status: s.status,
-          }))
-        : [];
-
-      // 在消息流中寻找生成/更新该方案的所有工具事件
-      let foundMsgId: string | undefined;
-      let foundEventId: string | undefined;
-      const matchedEventIds: string[] = [];
-
-      for (const m of msgs) {
-        if (!m.toolEvents || m.revertedAt) continue;
-        for (const ev of m.toolEvents) {
-          if (["create_plan", "update_plan", "switch_plan", "read_plan"].includes(ev.toolName)) {
-            const evTitle = typeof ev.params?.title === "string" ? ev.params.title.trim().toLowerCase() : "";
-            const planTitle = (p.title || "").trim().toLowerCase();
-            const evPlanId = typeof ev.params?.plan_id === "string" ? ev.params.plan_id.trim() : "";
-            const pFilename = p.filename || "";
-
-            const matchesTitle = evTitle && planTitle && (evTitle === planTitle || planTitle.includes(evTitle) || evTitle.includes(planTitle));
-            const matchesId = evPlanId && (evPlanId === p.id || p.id.includes(evPlanId));
-            const matchesFilename = pFilename && ev.resultText && ev.resultText.includes(pFilename);
-            const matchesResultPlanId = p.id && ev.resultText && ev.resultText.includes(p.id);
-
-            if (matchesTitle || matchesId || matchesFilename || matchesResultPlanId) {
-              if (!foundMsgId) foundMsgId = m.id;
-              if (!foundEventId) foundEventId = ev.id;
-              matchedEventIds.push(ev.id);
-            }
-          }
-        }
-      }
-
-      // 兜底容错：若当前只有 1 个方案且未通过精确条件匹配，将对话中唯一的方案类事件关联上
-      if (matchedEventIds.length === 0 && plans.length === 1) {
-        for (const m of msgs) {
-          if (!m.toolEvents || m.revertedAt) continue;
-          for (const ev of m.toolEvents) {
-            if (["create_plan", "update_plan", "switch_plan"].includes(ev.toolName)) {
-              if (!foundMsgId) foundMsgId = m.id;
-              if (!foundEventId) foundEventId = ev.id;
-              matchedEventIds.push(ev.id);
-            }
-          }
-        }
-      }
-
-      list.push({
-        id: p.id,
-        type: "plan",
-        title: p.title || "任务计划方案",
-        version: p.version,
-        filename: p.filename,
-        status: p.status as TaskStatus,
-        items,
-        body: p.body || "",
-        messageId: foundMsgId,
-        toolEventId: foundEventId,
-        toolEventIds: matchedEventIds,
-        createdAt: p.created_at,
-        updatedAt: p.updated_at,
-      });
-    }
-    return list;
-  }, [plans, msgs, currentId, relatedSessionIds]);
-
-  // 4. 统一任务时间线（按时间升序排列，最新项排在末尾）
-  const timeline: TimelineTask[] = useMemo(() => {
-    const combined = [...planTasks, ...todoTasks];
-    combined.sort((a, b) => {
-      const tA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-      const tB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-      return tA - tB;
-    });
-    return combined;
-  }, [planTasks, todoTasks]);
+  // 展示层只渲染投影末项：唯一看板，无选择态、无翻页
+  const currentTask: Board | null =
+    timeline.length > 0 ? timeline[timeline.length - 1] : null;
 
   // 匹配特定任务/方案的逻辑（支持按 eventId, planId, filename, title 综合判定）
   const matchTarget = useCallback((targetInfo: string | FocusFloatingTarget, t: TimelineTask): boolean => {
@@ -564,117 +305,56 @@ export function FloatingTaskPanel() {
     return false;
   }, []);
 
-  // 5. 响应外部（如 ToolCard 点击「浮窗查看」）的聚焦指令（带异步加载防抖重试与视觉高亮）
+  // 5. 响应外部（如 ToolCard 点击「浮窗查看」）的聚焦指令
+  // 历史看板跳转能力已下线：看板只保留投影末项，若聚焦目标命中当前显示的这条看板则高亮，
+  // 否则直接清空该聚焦指令（不跳转、不重试）。历史内容仍可在对话消息内联卡片中查看。
   useEffect(() => {
-    if (!focusFloatingTaskId) {
-      retryCountRef.current = 0;
-      return;
-    }
+    if (!focusFloatingTaskId) return;
 
-    const found = timeline.find((t) => matchTarget(focusFloatingTaskId, t));
-    if (found) {
-      setSelectedTaskId(found.id);
+    if (currentTask && matchTarget(focusFloatingTaskId, currentTask)) {
       setCollapsed(false);
-      setHighlightedTaskId(found.id);
-      setTimeout(() => {
-        setHighlightedTaskId((prev) => (prev === found.id ? null : prev));
+      setHighlightedTaskId(currentTask.id);
+      const timer = setTimeout(() => {
+        setHighlightedTaskId((prev) => (prev === currentTask.id ? null : prev));
       }, 2000);
       setFocusFloatingTaskId(null);
-      retryCountRef.current = 0;
-      return;
-    }
-
-    // 若未直接命中，且重试次数小于 3 次，主动触发 loadPlans 并在异步返回后由 timeline 变化重新触发本 effect
-    if (retryCountRef.current < 3) {
-      retryCountRef.current += 1;
-      if (currentId) void loadPlans(currentId);
-      const timer = setTimeout(() => {
-        // 等待下一渲染帧重新触发
-      }, 250);
       return () => clearTimeout(timer);
-    } else {
-      // 达到重试上限仍未找到具体项，若时间线非空则兜底展开浮窗
-      if (timeline.length > 0) {
-        setCollapsed(false);
-      }
-      setFocusFloatingTaskId(null);
-      retryCountRef.current = 0;
     }
-  }, [focusFloatingTaskId, timeline, matchTarget, currentId, loadPlans, setFocusFloatingTaskId]);
 
-  // 6. 默认选中逻辑：若未选中或旧项失效，优先选处于进行中的任务，否则选最新任务（末尾项）
-  useEffect(() => {
-    if (timeline.length === 0) {
-      setSelectedTaskId(null);
-      return;
-    }
-    setSelectedTaskId((prev) => {
-      if (prev && timeline.some((t) => t.id === prev)) {
-        return prev;
-      }
-      const inProgressTask = timeline.find((t) => t.status === "in_progress");
-      return inProgressTask ? inProgressTask.id : timeline[timeline.length - 1].id;
-    });
-  }, [currentId, timeline]);
+    setFocusFloatingTaskId(null);
+  }, [focusFloatingTaskId, currentTask, matchTarget, setFocusFloatingTaskId]);
 
-  // 当前激活的任务
-  const currentTask = useMemo(() => {
-    if (timeline.length === 0) return null;
-    return timeline.find((t) => t.id === selectedTaskId) || timeline[timeline.length - 1];
-  }, [timeline, selectedTaskId]);
-
-  const currentIndex = useMemo(() => {
-    if (!currentTask) return -1;
-    return timeline.findIndex((t) => t.id === currentTask.id);
-  }, [timeline, currentTask]);
-
-  // 步骤勾选切换处理
+  // 步骤勾选切换处理（仅方案类型可写回；todo 快照来自消息流，不可回写，故为只读展示）
   const handleToggleStep = async (stepIndex: number, currentStatus: string) => {
-    if (!currentTask) return;
+    if (!currentTask || currentTask.type !== "plan" || !currentWorkspace || !currentId) return;
     const nextStatus = currentStatus === "done" ? "pending" : "done";
 
-    if (currentTask.type === "plan" && currentWorkspace && currentId) {
-      const targetPlan = plans.find((p) => p.id === currentTask.id);
-      if (targetPlan && targetPlan.steps) {
-        const oldSteps = targetPlan.steps;
-        const updatedSteps = oldSteps.map((s) =>
-          s.index === stepIndex ? { ...s, status: nextStatus as "pending" | "done" } : s
-        );
-        useStore.setState((st) => ({
-          sessionPlans: {
-            ...st.sessionPlans,
-            [currentId]: (st.sessionPlans[currentId] || []).map((p) =>
-              p.id === currentTask.id ? { ...p, steps: updatedSteps } : p
-            ),
-          },
-        }));
+    const targetPlan = plans.find((p) => p.id === currentTask.id);
+    if (!targetPlan || !targetPlan.steps) return;
+    const oldSteps = targetPlan.steps;
+    const updatedSteps = oldSteps.map((s) =>
+      s.index === stepIndex ? { ...s, status: nextStatus as "pending" | "done" } : s
+    );
+    useStore.setState((st) => ({
+      sessionPlans: {
+        ...st.sessionPlans,
+        [currentId]: (st.sessionPlans[currentId] || []).map((p) =>
+          p.id === currentTask.id ? { ...p, steps: updatedSteps } : p
+        ),
+      },
+    }));
 
-        try {
-          await ipc.updatePlanStepStatus(
-            currentWorkspace,
-            currentTask.id,
-            stepIndex,
-            nextStatus,
-            currentId
-          );
-        } catch (err) {
-          console.error("更新计划步骤状态失败:", err);
-          useStore.setState((st) => ({
-            sessionPlans: {
-              ...st.sessionPlans,
-              [currentId]: (st.sessionPlans[currentId] || []).map((p) =>
-                p.id === currentTask.id ? { ...p, steps: oldSteps } : p
-              ),
-            },
-          }));
-        }
-      }
-    } else if (currentTask.type === "todo" && currentId) {
-      const nextRaw = rawTodos.map((t, i) =>
-        i + 1 === stepIndex ? { ...t, status: nextStatus as "pending" | "done" } : t
-      );
+    try {
+      await ipc.updatePlanStepStatus(currentWorkspace, currentTask.id, stepIndex, nextStatus, currentId);
+    } catch (err) {
+      console.error("更新计划步骤状态失败:", err);
       useStore.setState((st) => ({
-        sessionTodos: { ...st.sessionTodos, [currentId]: nextRaw },
+        sessionPlans: {
+          ...st.sessionPlans,
+          [currentId]: (st.sessionPlans[currentId] || []).map((p) =>
+            p.id === currentTask.id ? { ...p, steps: oldSteps } : p
+          ),
+        },
       }));
     }
   };
@@ -686,7 +366,6 @@ export function FloatingTaskPanel() {
       await ipc.switchPlan(currentWorkspace, currentId, planId);
       pushToast("已切换为当前活动方案", "success");
       await loadPlans(currentId);
-      setSelectedTaskId(planId);
     } catch (err) {
       console.error("切换活动方案失败:", err);
       pushToast(`切换方案失败: ${err}`, "error");
@@ -774,11 +453,6 @@ export function FloatingTaskPanel() {
               <span className="font-mono text-[11px]">{doneCnt}/{totalCnt}</span>
             </span>
           )}
-          {timeline.length > 1 && (
-            <span className="font-mono text-[10px] text-ink font-semibold bg-panel3 px-1.5 py-0.5 rounded border border-edge">
-              {currentIndex + 1}/{timeline.length}
-            </span>
-          )}
           {hasCmds && !currentTask && (
             <span className="flex items-center gap-1 text-green-400 font-mono">
               <Terminal size={13} className="shrink-0" />
@@ -799,11 +473,6 @@ export function FloatingTaskPanel() {
           <div className="flex items-center gap-1.5 min-w-0">
             <CheckSquare size={14} className="text-emerald-400 shrink-0" />
             <span className="text-[12px] font-semibold text-ink tracking-tight">任务与计划看板</span>
-            {timeline.length > 0 && (
-              <span className="px-1.5 py-0.2 rounded-full text-[10px] font-mono font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 shrink-0">
-                {timeline.length} 阶段
-              </span>
-            )}
           </div>
           <div className="flex items-center gap-1 shrink-0">
             {currentTask && (currentTask.messageId || currentTask.toolEventId) && (
@@ -845,74 +514,9 @@ export function FloatingTaskPanel() {
           </div>
         </div>
 
-        {/* 第二层：多任务选择器与高对比度独立翻页栏（彻底杜绝与标题挤压重合） */}
-        {hasTasks && (
-          <div className="px-3 py-2 bg-panel3/30 border-b border-edge/60 flex items-center justify-between gap-2 select-none">
-            {/* 任务下拉选择菜单 */}
-            <div className="flex items-center gap-1.5 flex-1 min-w-0 bg-panel border border-edge rounded-lg px-2 py-1 shadow-xs hover:border-accent/40 transition-colors">
-              <span className="shrink-0">
-                {currentTask?.type === "plan" ? (
-                  <span className="text-[10px] px-1 py-0.2 rounded bg-emerald-500/15 text-emerald-400 font-mono font-medium">方案</span>
-                ) : (
-                  <span className="text-[10px] px-1 py-0.2 rounded bg-purple-500/15 text-purple-400 font-mono font-medium">清单</span>
-                )}
-              </span>
-              <select
-                className="bg-transparent text-[11px] font-medium text-ink truncate outline-none cursor-pointer flex-1 min-w-0"
-                value={currentTask?.id ?? ""}
-                onChange={(e) => setSelectedTaskId(e.target.value)}
-                title="选择查看不同轮次的任务清单或方案文档"
-              >
-                {timeline.map((t, idx) => {
-                  const statusLabel =
-                    t.status === "completed" || t.status === "done"
-                      ? "已完成"
-                      : t.status === "in_progress"
-                      ? "执行中"
-                      : t.status === "suspended"
-                      ? "已挂起"
-                      : "待推进";
-                  return (
-                    <option key={t.id} value={t.id} className="bg-panel text-ink py-1">
-                      {idx + 1}. {t.title} ({statusLabel})
-                    </option>
-                  );
-                })}
-              </select>
-            </div>
-
-            {/* 高对比度、独立清晰的上一页/下一页翻页器 */}
-            {timeline.length > 1 && (
-              <div className="flex items-center rounded-lg border border-edge/80 bg-panel shadow-xs shrink-0 overflow-hidden">
-                <button
-                  type="button"
-                  disabled={currentIndex <= 0}
-                  onClick={() => setSelectedTaskId(timeline[currentIndex - 1].id)}
-                  className="p-1.5 text-ink hover:text-accent hover:bg-panel3 disabled:text-inkdim/30 disabled:hover:bg-transparent disabled:cursor-not-allowed cursor-pointer transition-colors"
-                  title="查看上一份任务/方案 (上翻)"
-                >
-                  <ChevronLeft size={13} />
-                </button>
-                <span className="px-2 py-0.5 text-[11px] font-mono text-ink font-semibold border-x border-edge/60 select-none bg-panel2/50">
-                  {currentIndex + 1} / {timeline.length}
-                </span>
-                <button
-                  type="button"
-                  disabled={currentIndex >= timeline.length - 1}
-                  onClick={() => setSelectedTaskId(timeline[currentIndex + 1].id)}
-                  className="p-1.5 text-ink hover:text-accent hover:bg-panel3 disabled:text-inkdim/30 disabled:hover:bg-transparent disabled:cursor-not-allowed cursor-pointer transition-colors"
-                  title="查看下一份任务/方案 (下翻)"
-                >
-                  <ChevronRight size={13} />
-                </button>
-              </div>
-            )}
-          </div>
-        )}
-
         {/* 内容展示区 */}
         <div className="px-3.5 py-2.5 flex flex-col gap-2.5 max-h-[min(70vh,480px)] overflow-y-auto">
-          {/* 当前选中的计划方案卡片 */}
+          {/* 当前计划方案卡片 */}
           {currentTask && currentTask.type === "plan" && (
             <div
               className={`rounded-xl border p-2.5 text-[11.5px] space-y-1.5 transition-all duration-300 ${
@@ -1073,7 +677,7 @@ export function FloatingTaskPanel() {
               <TodoSection
                 todos={currentTask.items}
                 isRunning={isRunning && currentTask.status === "in_progress"}
-                onToggle={handleToggleStep}
+                onToggle={currentTask.type === "plan" ? handleToggleStep : undefined}
               />
             </div>
           )}

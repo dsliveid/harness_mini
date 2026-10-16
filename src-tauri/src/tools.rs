@@ -480,7 +480,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     },
                     "timeout_seconds": {
                         "type": "integer",
-                        "description": "最大等待超时秒数（默认 60 秒，最大 300 秒）"
+                        "description": "最大等待超时秒数（默认 60 秒，最大 900 秒）"
                     }
                 }
             }),
@@ -1838,7 +1838,11 @@ async fn run_command(
         let mut c = tokio::process::Command::new("powershell");
         c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]);
         c.arg(format!(
-            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8; {command}"
+            "$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8;\n\
+             $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8';\n\
+             $PSDefaultParameterValues['*:Encoding'] = 'utf8';\n\
+             {command}\n\
+             if ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }}"
         ));
         c.creation_flags(CREATE_NO_WINDOW);
         c
@@ -2311,6 +2315,8 @@ async fn create_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String>
             &files,
             &steps,
             verification,
+            ctx.message_id.as_deref(),
+            ctx.event_id.as_deref(),
             db_guard.as_deref(),
         )?
     };
@@ -2346,6 +2352,8 @@ async fn update_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String>
             step_updates,
             modified_sections,
             revision_note,
+            ctx.message_id.as_deref(),
+            ctx.event_id.as_deref(),
             db_guard.as_deref(),
         )?
     };
@@ -2364,7 +2372,14 @@ async fn switch_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String>
     let db_guard = state.as_ref().map(|s| s.db.lock().unwrap());
     let db_ref = db_guard.as_deref();
 
-    crate::plan::switch_plan(&ctx.workspace, session_id, plan_id, db_ref)
+    crate::plan::switch_plan(
+        &ctx.workspace,
+        session_id,
+        plan_id,
+        ctx.message_id.as_deref(),
+        ctx.event_id.as_deref(),
+        db_ref,
+    )
 }
 
 async fn read_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
@@ -2479,6 +2494,7 @@ fn build_briefing_packet(
     }
 
     packet.push_str("\n【施工工人准则】：你作为实施工人，请优先对已知目标文件进行手术级精读（read_file 局部 30~50 行）并完成代码修改或验证；严禁脱离蓝图全库漫游！");
+    packet.push_str("\n【分级验证提示】：查验数据请直接用只读命令；代码检查优先用轻量静态检查（如 TS 用 `tsc --noEmit`、Rust 用 `cargo check`、Go 用 `go vet`）；单测需指定精准目标；严禁修改生产源码当作临时探针。");
     packet
 }
 
@@ -2714,7 +2730,7 @@ async fn get_subagent_status_tool(args: &Value, ctx: &ToolCtx) -> Result<String,
 
 async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
-    let timeout_secs = get_u64_arg(args, "timeout_seconds", 60).clamp(5, 300);
+    let timeout_secs = get_u64_arg(args, "timeout_seconds", 60).clamp(5, 900);
     let specified_ids: Option<Vec<String>> = args.get("subagent_ids")
         .or_else(|| args.get("subprocess_ids"))
         .and_then(|v| {

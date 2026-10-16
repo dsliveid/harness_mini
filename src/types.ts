@@ -53,11 +53,6 @@ export interface ApprovalRule {
   createdAt: string;
 }
 
-export interface TodoItem {
-  content: string;
-  status: "pending" | "in_progress" | "done" | string;
-}
-
 export interface PlanMeta {
   id: string;
   title: string;
@@ -86,6 +81,10 @@ export interface PlanSummary {
   total_steps: number;
   completed_steps: number;
   is_active: boolean;
+  /** 归属消息 id：方案由哪条消息触发生成（null = 无归属，老方案文件） */
+  source_message_id?: string | null;
+  /** 归属工具事件 id：方案由哪次工具调用触发生成（null = 无归属） */
+  source_tool_event_id?: string | null;
   steps?: PlanStep[];
   body?: string;
 }

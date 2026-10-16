@@ -2758,6 +2758,28 @@ pub fn list_workspace_plans(
 }
 
 #[tauri::command]
+pub fn backfill_plan_sources(
+    state: State<'_, crate::AppState>,
+    workspace_path: String,
+    session_id: String,
+    include_archived: Option<bool>,
+    apply: Option<bool>,
+) -> Result<crate::plan::PlanBackfillReport, String> {
+    if workspace_path.is_empty() {
+        return Err("工作区路径不能为空".into());
+    }
+    let db = state.db.lock().unwrap();
+    let ws = std::path::Path::new(&workspace_path);
+    crate::plan::backfill_plan_sources(
+        &db,
+        ws,
+        &session_id,
+        include_archived.unwrap_or(false),
+        apply.unwrap_or(false),
+    )
+}
+
+#[tauri::command]
 pub fn switch_plan(
     state: State<'_, crate::AppState>,
     workspace_path: String,
@@ -2769,7 +2791,7 @@ pub fn switch_plan(
     }
     let db = state.db.lock().unwrap();
     let ws = std::path::Path::new(&workspace_path);
-    crate::plan::switch_plan(ws, &session_id, &plan_id, Some(&db))
+    crate::plan::switch_plan(ws, &session_id, &plan_id, None, None, Some(&db))
 }
 
 // ---------- 文件与变更查看器 (File Viewer) commands ----------

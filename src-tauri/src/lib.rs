@@ -459,6 +459,7 @@ pub fn run() {
             commands::read_file_base64,
             commands::get_active_plan,
             commands::list_workspace_plans,
+            commands::backfill_plan_sources,
             commands::switch_plan,
             commands::open_file_viewer,
             commands::get_file_viewer_init_tab,
