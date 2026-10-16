@@ -19,6 +19,7 @@ import {
   Pencil,
   Target,
   Zap,
+  Sparkles,
 } from "./Icons";
 
 function formatTokens(n?: number | null): string {
@@ -26,6 +27,128 @@ function formatTokens(n?: number | null): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 10_000) return `${(n / 1_000).toFixed(1)}k`;
   return n.toLocaleString("zh-CN");
+}
+
+// 斜杠指令统一注册表：菜单项与标签态配置合一。
+// 选中后在输入框首部呈现可删除的标签 Badge，提交时按 buildMessage 生成最终消息（原生融入当前会话）。
+interface SlashCommand {
+  cmd: string;
+  label: string;
+  desc: string;
+  placeholder: string;
+  /** 是否必须填写正文（为空时不发送，保持标签态并提示） */
+  requireBody: boolean;
+  emptyHint: string;
+  buildMessage: (body: string) => string;
+  badgeClass: string;
+  iconClass: string;
+  closeClass: string;
+  badgeTitle: string;
+  Icon: typeof Target;
+}
+
+const BEST_REVIEW_REQUIREMENT =
+  "评审要求：分析在不考虑成本的情况下，当前方案是否为最优。我不希望采用堆叠式的修改，我希望每次改动后能够让程序结构更清晰，功能更稳定。";
+
+const JEV_BADGE = {
+  badgeClass: "bg-amber-500/15 border-amber-500/35 text-amber-300",
+  iconClass: "text-amber-400",
+  closeClass: "hover:bg-amber-500/25 text-amber-400 hover:text-amber-100",
+  Icon: Zap,
+};
+
+const SLASH_COMMANDS: SlashCommand[] = [
+  {
+    cmd: "/goal",
+    label: "/goal <总任务目标>",
+    desc: "发起长任务：自动拆解多阶段路线图并在独立顶栏中自主推进",
+    placeholder: "输入长任务总目标，Enter 发送启动推进，Backspace 删除标签取消…",
+    requireBody: true,
+    emptyHint: "长任务指令已激活，请输入长任务总目标",
+    buildMessage: (body) =>
+      `【长任务目标模式】${body}\n\n请分析并拆解该长任务目标，制定明确的阶段方案（优先调用 create_plan / todo 规划），并立即按步骤推进落实。`,
+    badgeClass: "bg-purple-500/15 border-purple-500/35 text-purple-300",
+    iconClass: "text-purple-400",
+    closeClass: "hover:bg-purple-500/25 text-purple-400 hover:text-purple-100",
+    badgeTitle: "删除标签以取消长任务 (Backspace)",
+    Icon: Target,
+  },
+  {
+    cmd: "/best",
+    label: "/best <需求或方案>",
+    desc: "方案最优性评审：在不考虑成本下评估当前需求/方案是否最优",
+    placeholder: "输入待评审的需求或方案，Enter 发送评审，Backspace 删除标签取消…",
+    requireBody: false,
+    emptyHint: "",
+    buildMessage: (body) =>
+      body
+        ? `【方案最优性评审模式】\n\n请对以下需求/方案进行最优性评审：\n${body}\n\n${BEST_REVIEW_REQUIREMENT}`
+        : `【方案最优性评审模式】\n\n请针对本会话最近的需求或你已提出的方案进行最优性评审。\n\n${BEST_REVIEW_REQUIREMENT}`,
+    badgeClass: "bg-sky-500/15 border-sky-500/35 text-sky-300",
+    iconClass: "text-sky-400",
+    closeClass: "hover:bg-sky-500/25 text-sky-400 hover:text-sky-100",
+    badgeTitle: "删除标签以取消方案评审 (Backspace)",
+    Icon: Sparkles,
+  },
+  {
+    cmd: "/jev:判断",
+    label: "/jev:判断 <判定命题或问题>",
+    desc: "调用决策模型进行二元真伪判定与置信度打分",
+    placeholder: "输入待判定的命题或问题，Enter 执行判定，Backspace 删除标签取消…",
+    requireBody: true,
+    emptyHint: "/jev:判断 指令已激活，请输入待判定的命题或问题",
+    buildMessage: (body) => `/jev:判断 ${body}`,
+    ...JEV_BADGE,
+    badgeTitle: "删除标签以取消判断决策 (Backspace)",
+  },
+  {
+    cmd: "/jev:选择",
+    label: "/jev:选择 <决策问题> 选项: A, B, C",
+    desc: "调用决策模型在多个选项中挑选最优解",
+    placeholder: "输入决策问题与选项（选项: A, B, C），Enter 执行选择，Backspace 删除标签取消…",
+    requireBody: true,
+    emptyHint: "/jev:选择 指令已激活，请输入决策问题与备选项",
+    buildMessage: (body) => `/jev:选择 ${body}`,
+    ...JEV_BADGE,
+    badgeTitle: "删除标签以取消选择决策 (Backspace)",
+  },
+  {
+    cmd: "/jev:评分",
+    label: "/jev:评分 <待评估内容>",
+    desc: "调用决策模型给出 0-100% 量化评分与详细依据",
+    placeholder: "输入待评估内容，Enter 执行评分，Backspace 删除标签取消…",
+    requireBody: true,
+    emptyHint: "/jev:评分 指令已激活，请输入待评估内容",
+    buildMessage: (body) => `/jev:评分 ${body}`,
+    ...JEV_BADGE,
+    badgeTitle: "删除标签以取消评分决策 (Backspace)",
+  },
+];
+
+// 预编译指令令牌匹配正则（按令牌长度降序，避免前缀误配）
+const SLASH_TOKEN_ALT = SLASH_COMMANDS.map((c) => c.cmd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+  .sort((a, b) => b.length - a.length)
+  .join("|");
+const SLASH_TOKEN_RE = new RegExp(`(?:^|[^\\w\\/:])(${SLASH_TOKEN_ALT})($|\\s+)`, "i");
+const SLASH_TOKEN_ONLY_RE = new RegExp(`(${SLASH_TOKEN_ALT})($|\\s+)`, "i");
+const SLASH_AUTO_TAG_RE = new RegExp(`(?:^|[^\\w\\/:])(${SLASH_TOKEN_ALT})\\s+`, "i");
+
+function findSlashCommand(cmd: string): SlashCommand | null {
+  const lower = cmd.toLowerCase();
+  return SLASH_COMMANDS.find((c) => c.cmd.toLowerCase() === lower) ?? null;
+}
+
+// 从文本中剥离行首的斜杠指令令牌，返回命中的指令配置与剩余正文
+function parseSlashCommand(text: string): { cfg: SlashCommand | null; body: string } {
+  const m = text.match(SLASH_TOKEN_RE);
+  if (!m) return { cfg: null, body: text.trim() };
+  const body = text
+    .replace(SLASH_TOKEN_RE, (match) => {
+      const prefix = match.replace(SLASH_TOKEN_ONLY_RE, "");
+      return prefix ? prefix.trimEnd() + " " : "";
+    })
+    .trim();
+  return { cfg: findSlashCommand(m[1]), body };
 }
 
 export function Composer() {
@@ -51,46 +174,18 @@ export function Composer() {
   const [isDragging, setIsDragging] = useState(false);
   const [visionWarningOpen, setVisionWarningOpen] = useState(false);
   const [slashIndex, setSlashIndex] = useState(0);
-  const [isGoalTagActive, setIsGoalTagActive] = useState(false);
+  const [activeCmd, setActiveCmd] = useState<string | null>(null);
   const [cursorPos, setCursorPos] = useState<number | null>(null);
   const [dismissedQuery, setDismissedQuery] = useState<string | null>(null);
-
-  const SLASH_COMMANDS = [
-    {
-      cmd: "/goal",
-      label: "/goal <总任务目标>",
-      desc: "发起长任务：自动拆解多阶段路线图并在独立顶栏中自主推进",
-    },
-    {
-      cmd: "/task",
-      label: "/task <总任务目标>",
-      desc: "发起长任务（/goal 的简写别名）",
-    },
-    {
-      cmd: "/jev:判断",
-      label: "/jev:判断 <判定命题或问题>",
-      desc: "调用决策模型进行二元真伪判定与置信度打分",
-    },
-    {
-      cmd: "/jev:选择",
-      label: "/jev:选择 <决策问题> 选项: A, B, C",
-      desc: "调用决策模型在多个选项中挑选最优解",
-    },
-    {
-      cmd: "/jev:评分",
-      label: "/jev:评分 <待评估内容>",
-      desc: "调用决策模型给出 0-100% 量化评分与详细依据",
-    },
-  ];
 
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const backupDraftRef = useRef<{ text: string; attachments: Attachment[] } | null>(null);
   const prevEditingIdRef = useRef<string | null>(null);
 
-  // 切换会话时重置长任务标签状态
+  // 切换会话时重置标签态指令
   useEffect(() => {
-    setIsGoalTagActive(false);
+    setActiveCmd(null);
   }, [activeId]);
 
   // 同步编辑目标到输入框与附件
@@ -149,11 +244,10 @@ export function Composer() {
   const canSend = !readOnly && !tempBlocked && !uploading && (!editingMessage || !running);
   const hasContent = !!text.trim() || hasAttachments;
 
-  const isGoalCommand =
-    isGoalTagActive || /(?:^|[^\w\/:])\/(goal|task)($|\s+)/i.test(text.trim());
+  const isTagCommand = !!activeCmd || SLASH_TOKEN_RE.test(text.trim());
 
   const slashCtx = useMemo(() => {
-    if (isGoalTagActive) return null;
+    if (activeCmd) return null;
     const pos = cursorPos ?? (taRef.current ? taRef.current.selectionStart : text.length);
     const safePos = Math.max(0, Math.min(pos, text.length));
     const before = text.slice(0, safePos);
@@ -171,7 +265,7 @@ export function Composer() {
       endIndex: slashEndIndex,
       query: fullQuery,
     };
-  }, [isGoalTagActive, text, cursorPos]);
+  }, [activeCmd, text, cursorPos]);
 
   const filteredCommands = useMemo(() => {
     if (!slashCtx) return [];
@@ -188,10 +282,13 @@ export function Composer() {
   }, [slashCtx?.query]);
 
   const showSlashMenu =
-    !isGoalTagActive &&
+    !activeCmd &&
     !!slashCtx &&
     (dismissedQuery === null || slashCtx.query !== dismissedQuery) &&
     filteredCommands.length > 0;
+
+  const activeCommandCfg = activeCmd ? findSlashCommand(activeCmd) : null;
+  const ActiveTagIcon = activeCommandCfg?.Icon ?? null;
 
   const placeholder = editingMessage
     ? "正在编辑最后一条消息，Enter 重新发送，Esc 取消编辑…"
@@ -199,13 +296,13 @@ export function Composer() {
     ? "已合并到原项目，清空临时空间后可继续发送消息"
     : readOnly
     ? "已归档会话为只读，取消归档后可继续对话"
-    : isGoalTagActive
-    ? "输入长任务总目标，Enter 发送启动推进，Backspace 删除标签取消…"
-    : isGoalCommand
-    ? "长任务指令：输入总目标，回车将自动拆解为路线图并自主推进执行…"
+    : activeCommandCfg
+    ? activeCommandCfg.placeholder
+    : isTagCommand
+    ? "斜杠标签指令：输入内容，回车将注入对应提示词并推进执行…"
     : running
     ? "Agent 运行中…输入消息回车将加入待执行列表"
-    : "输入消息，输入 /goal 发起长任务，Enter 发送…";
+    : "输入消息，/goal 发起长任务、/best 评审方案，Enter 发送…";
 
   const resize = () => {
     const ta = taRef.current;
@@ -367,22 +464,18 @@ export function Composer() {
 
     const trimmed = t.trim();
 
-    // 检查是否触发长任务标签模式或者带 /goal /task 的指令（原生融入当前会话）
-    const goalRegex = /(?:^|[^\w\/:])\/(goal|task)($|\s+)/i;
-    const isGoalSlash = isGoalTagActive || goalRegex.test(trimmed);
+    // 解析标签态斜杠指令：优先当前激活的标签，其次解析消息首部的斜杠指令（原生融入当前会话）
+    const parsed = parseSlashCommand(trimmed);
+    const activeCfg = activeCmd ? findSlashCommand(activeCmd) : null;
+    const cfg = activeCfg ?? parsed.cfg;
+    const body = activeCfg ? trimmed : parsed.body;
     let messageToSend = t;
-    if (isGoalSlash) {
-      const goalText = isGoalTagActive
-        ? trimmed
-        : trimmed.replace(goalRegex, (match) => {
-            const prefix = match.replace(/\/(goal|task)($|\s+)/i, "");
-            return prefix ? prefix.trimEnd() + " " : "";
-          }).trim();
-
-      if (!goalText) {
-        setIsGoalTagActive(true);
+    if (cfg) {
+      // 需要正文的指令在留空时不发送，保持标签态并提示用户输入
+      if (cfg.requireBody && !body) {
+        setActiveCmd(cfg.cmd);
         setSessionDraft(targetId, "");
-        pushToast("长任务指令已激活，请输入长任务总目标", "info");
+        pushToast(cfg.emptyHint, "info");
         requestAnimationFrame(() => {
           if (taRef.current) {
             taRef.current.focus();
@@ -390,10 +483,8 @@ export function Composer() {
         });
         return;
       }
-
-      setIsGoalTagActive(false);
-      // 原生融合当前会话，大模型基于内置方案工具直接流式推进
-      messageToSend = `【长任务目标模式】${goalText}\n\n请分析并拆解该长任务目标，制定明确的阶段方案（优先调用 create_plan / todo 规划），并立即按步骤推进落实。`;
+      setActiveCmd(null);
+      messageToSend = cfg.buildMessage(body);
     }
 
     setSessionDraft(targetId, "");
@@ -438,44 +529,26 @@ export function Composer() {
   };
 
   const applySlashCommand = (cmd: string) => {
+    const cfg = findSlashCommand(cmd);
+    if (!cfg) return;
+    // 已选指令保留输入框中其余文本作为正文，标签态仅呈现指令本身
     let remaining = "";
     if (slashCtx) {
       const beforeSlash = text.slice(0, slashCtx.startIndex);
       const afterCommand = text.slice(slashCtx.endIndex);
       remaining = (beforeSlash.trimEnd() + " " + afterCommand.trimStart()).trim();
     } else {
-      const goalRegex = /(?:^|[^\w\/:])\/(goal|task)($|\s+)/i;
-      remaining = text.replace(goalRegex, (match) => {
-        const prefix = match.replace(/\/(goal|task)($|\s+)/i, "");
-        return prefix ? prefix.trimEnd() + " " : "";
-      }).trim();
+      remaining = parseSlashCommand(text).body;
     }
 
-    if (cmd === "/goal" || cmd === "/task") {
-      setIsGoalTagActive(true);
-      setSessionDraft(activeId, remaining);
-      requestAnimationFrame(() => {
-        if (taRef.current) {
-          taRef.current.focus();
-          const len = remaining.length;
-          taRef.current.setSelectionRange(len, len);
-          setCursorPos(len);
-          resize();
-        }
-      });
-      return;
-    }
-
-    const newText = slashCtx
-      ? text.slice(0, slashCtx.startIndex) + `${cmd} ` + text.slice(slashCtx.endIndex)
-      : `${cmd} `;
-    setSessionDraft(activeId, newText);
+    setActiveCmd(cfg.cmd);
+    setSessionDraft(activeId, remaining);
     requestAnimationFrame(() => {
       if (taRef.current) {
         taRef.current.focus();
-        const pos = slashCtx ? slashCtx.startIndex + cmd.length + 1 : newText.length;
-        taRef.current.setSelectionRange(pos, pos);
-        setCursorPos(pos);
+        const len = remaining.length;
+        taRef.current.setSelectionRange(len, len);
+        setCursorPos(len);
         resize();
       }
     });
@@ -506,12 +579,12 @@ export function Composer() {
       }
     }
 
-    // 当长任务标签激活且输入框光标在首位时，按 Backspace 删除标签并取消长任务
-    if (e.key === "Backspace" && isGoalTagActive) {
+    // 当标签激活且输入框光标在首位时，按 Backspace 删除标签并取消该指令
+    if (e.key === "Backspace" && activeCmd) {
       const ta = taRef.current;
       if (ta && ta.selectionStart === 0 && ta.selectionEnd === 0) {
         e.preventDefault();
-        setIsGoalTagActive(false);
+        setActiveCmd(null);
         return;
       }
     }
@@ -665,8 +738,8 @@ export function Composer() {
                     }`}
                   >
                     <div className="flex items-center gap-2">
-                      <div className="p-1 rounded bg-purple-500/10 text-purple-400">
-                        <Target size={13} />
+                      <div className={`p-1 rounded bg-panel2 border border-edge/60 ${item.iconClass}`}>
+                        <item.Icon size={13} />
                       </div>
                       <span className="font-mono font-medium">{item.label}</span>
                     </div>
@@ -693,19 +766,19 @@ export function Composer() {
             <Paperclip size={16} />
           </button>
 
-          {/* Long Task Tag Badge */}
-          {isGoalTagActive && (
-            <div className="shrink-0 flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-purple-500/15 border border-purple-500/35 text-purple-300 text-[12px] font-medium animate-in fade-in zoom-in-95 duration-150 select-none mb-0.5 shadow-xs">
-              <Target size={13} className="shrink-0 text-purple-400 animate-pulse" />
-              <span className="font-mono">/goal</span>
+          {/* Slash Command Tag Badge */}
+          {activeCommandCfg && ActiveTagIcon && (
+            <div className={`shrink-0 flex items-center gap-1.5 px-2.5 py-1 rounded-xl border text-[12px] font-medium animate-in fade-in zoom-in-95 duration-150 select-none mb-0.5 shadow-xs ${activeCommandCfg.badgeClass}`}>
+              <ActiveTagIcon size={13} className={`shrink-0 animate-pulse ${activeCommandCfg.iconClass}`} />
+              <span className="font-mono">{activeCommandCfg.cmd}</span>
               <button
                 type="button"
                 onClick={() => {
-                  setIsGoalTagActive(false);
+                  setActiveCmd(null);
                   if (taRef.current) taRef.current.focus();
                 }}
-                className="p-0.5 rounded-md hover:bg-purple-500/25 text-purple-400 hover:text-purple-100 transition-colors cursor-pointer"
-                title="删除标签以取消长任务 (Backspace)"
+                className={`p-0.5 rounded-md transition-colors cursor-pointer ${activeCommandCfg.closeClass}`}
+                title={activeCommandCfg.badgeTitle}
               >
                 <X size={11} />
               </button>
@@ -729,14 +802,17 @@ export function Composer() {
               const pos = e.target.selectionStart;
               setCursorPos(pos);
 
-              // 用户键入或粘贴 /goal 或 /task 加空格时，自动转为长任务标签
-              const goalWithSpaceRegex = /(?:^|[^\w\/:])\/(goal|task)\s+/i;
-              if (!isGoalTagActive && goalWithSpaceRegex.test(val)) {
-                const remaining = val.replace(goalWithSpaceRegex, (match) => {
-                  const prefix = match.replace(/\/(goal|task)\s+/i, "");
-                  return prefix ? prefix.trimEnd() + " " : "";
-                }).trim();
-                setIsGoalTagActive(true);
+              // 用户键入或粘贴斜杠指令加空格时，自动转为对应标签
+              const autoMatch = val.match(SLASH_AUTO_TAG_RE);
+              const autoCfg = autoMatch ? findSlashCommand(autoMatch[1]) : null;
+              if (!activeCmd && autoCfg) {
+                const remaining = val
+                  .replace(SLASH_AUTO_TAG_RE, (match) => {
+                    const prefix = match.replace(SLASH_TOKEN_ONLY_RE, "");
+                    return prefix ? prefix.trimEnd() + " " : "";
+                  })
+                  .trim();
+                setActiveCmd(autoCfg.cmd);
                 setSessionDraft(activeId, remaining);
                 requestAnimationFrame(() => {
                   if (taRef.current) {

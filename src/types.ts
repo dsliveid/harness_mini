@@ -96,6 +96,29 @@ export interface ActivePlanDetail {
   steps: PlanStep[];
 }
 
+export interface BoardItem {
+  index: number;
+  content: string;
+  status: "pending" | "in_progress" | "done" | string;
+}
+
+export interface CurrentBoard {
+  id: string;
+  board_type: "plan" | "todo";
+  title: string;
+  status: string;
+  items: BoardItem[];
+  total_steps: number;
+  completed_steps: number;
+  progress_pct: number;
+  version?: number;
+  filename?: string;
+  body?: string;
+  message_id?: string;
+  tool_event_id?: string;
+  updated_at: string;
+}
+
 export type TaskType = "plan" | "todo";
 export type TaskStatus = "pending" | "in_progress" | "completed" | "suspended" | "done" | string;
 

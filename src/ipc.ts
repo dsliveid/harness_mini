@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, DataStatus, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult, JevCfg, PlanReviewReport, ToolLogFilter, ToolLogQueryResult, DirectDecisionResult } from "./types";
+import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, CurrentBoard, DataStatus, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult, JevCfg, PlanReviewReport, ToolLogFilter, ToolLogQueryResult, DirectDecisionResult } from "./types";
 
 /**
  * 读请求防重入去重拦截器：
@@ -349,6 +349,8 @@ export const ipc = {
   readFileBase64: (path: string) => invoke<string>("read_file_base64", { path }),
 
   // 任务方案计划中枢 (Plans)
+  getCurrentBoard: (sessionId: string) =>
+    invoke<CurrentBoard | null>("get_current_board", { sessionId }),
   getActivePlan: (sessionId: string) =>
     deduplicatedInvoke<ActivePlanDetail | null>("get_active_plan", { sessionId }),
   listWorkspacePlans: (workspacePath: string, sessionId?: string | null, includeArchived?: boolean) =>

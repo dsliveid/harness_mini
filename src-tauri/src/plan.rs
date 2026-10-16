@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
+use tauri::Emitter;
 
 /// 计划元数据（存储于 Markdown Frontmatter）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -76,6 +77,38 @@ pub struct PlanSummary {
     pub steps: Vec<PlanStep>,
     #[serde(default)]
     pub body: String,
+}
+
+/// 任务与计划单一权威看板步骤条目
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BoardItem {
+    pub index: usize,
+    pub content: String,
+    pub status: String, // "pending" | "in_progress" | "done"
+}
+
+/// 任务与计划单一权威看板实体（后端权威裁决，前端极简傻瓜渲染）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CurrentBoard {
+    pub id: String,
+    pub board_type: String, // "plan" | "todo"
+    pub title: String,
+    pub status: String, // "in_progress" | "completed" | "pending"
+    pub items: Vec<BoardItem>,
+    pub total_steps: usize,
+    pub completed_steps: usize,
+    pub progress_pct: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_event_id: Option<String>,
+    pub updated_at: String,
 }
 
 /// 计划根目录：<workspace>/.harness/plans
@@ -1183,6 +1216,232 @@ pub fn load_active_plan_context(
             total_steps = total_steps,
             steps_text = steps_text
         ))
+    }
+}
+
+// ---------- 方案 B：最新对话权威单一看板推导与广播（Authoritative Board Projection） ----------
+
+#[derive(Debug, Clone)]
+struct LatestTodoRecord {
+    event_id: String,
+    message_id: String,
+    seq: i64,
+    items: Vec<BoardItem>,
+    created_at: String,
+}
+
+/// 查询当前会话中最近一个未被撤回的 Todo 工具事件
+fn query_latest_valid_todo(conn: &rusqlite::Connection, session_id: &str) -> Option<LatestTodoRecord> {
+    use rusqlite::OptionalExtension;
+    let row: Option<(String, String, i64, String, String)> = conn
+        .query_row(
+            "SELECT te.id, m.id, m.seq, te.params_json, te.created_at
+             FROM tool_events te
+             JOIN messages m ON te.message_id = m.id
+             WHERE m.session_id = ?1
+               AND m.reverted_at IS NULL
+               AND te.tool_name = 'todo'
+               AND te.status = 'success'
+             ORDER BY m.seq DESC, te.created_at DESC
+             LIMIT 1",
+            rusqlite::params![session_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+
+    let (event_id, message_id, seq, params_str, created_at) = row?;
+    let val: serde_json::Value = serde_json::from_str(&params_str).ok()?;
+    let arr = val.get("todos")?.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    let mut items = Vec::new();
+    for (idx, it) in arr.iter().enumerate() {
+        let content = it.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+        let status = it.get("status").and_then(|s| s.as_str()).unwrap_or("pending").to_string();
+        items.push(BoardItem {
+            index: idx + 1,
+            content,
+            status,
+        });
+    }
+    Some(LatestTodoRecord {
+        event_id,
+        message_id,
+        seq,
+        items,
+        created_at,
+    })
+}
+
+/// 获取方案归属消息的 seq 序号
+fn get_plan_source_seq(conn: &rusqlite::Connection, meta: &PlanMeta) -> i64 {
+    if let Some(ref mid) = meta.source_message_id {
+        conn.query_row(
+            "SELECT seq FROM messages WHERE id = ?1",
+            rusqlite::params![mid],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+/// 查找当前会话名下最近更新过的一个方案（用于在无 in_progress 活动方案时兜底已结案方案）
+fn find_latest_session_plan(
+    workspace: &Path,
+    session_id: &str,
+) -> Option<(PathBuf, PlanMeta, String)> {
+    let pdir = plans_dir(workspace);
+    if !pdir.exists() {
+        return None;
+    }
+    let entries = fs::read_dir(&pdir).ok()?;
+    let mut session_plans = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
+            if let Ok(content) = fs::read_to_string(&path) {
+                let (meta, body) = parse_frontmatter(&content);
+                if meta.session_id == session_id {
+                    session_plans.push((path, meta, body));
+                }
+            }
+        }
+    }
+    session_plans.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
+    session_plans.into_iter().next()
+}
+
+fn format_plan_board(path: &Path, meta: &PlanMeta, body: &str) -> CurrentBoard {
+    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+    let steps = parse_steps_from_markdown(body);
+    let total = steps.len();
+    let completed = steps.iter().filter(|s| s.status == "done").count();
+    let pct = if total > 0 { (completed * 100 / total) as u8 } else { 0 };
+    let items: Vec<BoardItem> = steps
+        .into_iter()
+        .map(|s| BoardItem {
+            index: s.index,
+            content: s.content,
+            status: s.status,
+        })
+        .collect();
+
+    CurrentBoard {
+        id: meta.id.clone(),
+        board_type: "plan".to_string(),
+        title: if meta.title.trim().is_empty() {
+            "任务计划方案".to_string()
+        } else {
+            meta.title.clone()
+        },
+        status: meta.status.clone(),
+        items,
+        total_steps: total,
+        completed_steps: completed,
+        progress_pct: pct,
+        version: Some(meta.version),
+        filename: Some(filename),
+        body: Some(body.to_string()),
+        message_id: meta.source_message_id.clone(),
+        tool_event_id: meta.source_tool_event_id.clone(),
+        updated_at: meta.updated_at.clone(),
+    }
+}
+
+fn format_todo_board(info: &LatestTodoRecord) -> CurrentBoard {
+    let total = info.items.len();
+    let completed = info.items.iter().filter(|s| s.status == "done").count();
+    let pct = if total > 0 { (completed * 100 / total) as u8 } else { 0 };
+    let all_done = total > 0 && completed == total;
+
+    CurrentBoard {
+        id: format!("todo-{}", info.event_id),
+        board_type: "todo".to_string(),
+        title: "任务清单".to_string(),
+        status: if all_done { "completed".to_string() } else { "in_progress".to_string() },
+        items: info.items.clone(),
+        total_steps: total,
+        completed_steps: completed,
+        progress_pct: pct,
+        version: None,
+        filename: None,
+        body: None,
+        message_id: Some(info.message_id.clone()),
+        tool_event_id: Some(info.event_id.clone()),
+        updated_at: info.created_at.clone(),
+    }
+}
+
+/// 后端权威仲裁当前会话唯一有效的看板
+pub fn derive_current_board(
+    conn: &rusqlite::Connection,
+    workspace: &Path,
+    session_id: &str,
+) -> Option<CurrentBoard> {
+    if session_id.is_empty() || session_id == "draft" || session_id == "DRAFT_ID" {
+        return None;
+    }
+
+    // 1. 查找当前会话绑定的活动方案
+    let active_plan_file = find_plan_file(workspace, session_id, None, Some(conn));
+    let latest_todo_event = query_latest_valid_todo(conn, session_id);
+
+    // 规则 1（场景 1）：若当前会话存在推进中的活动方案（in_progress）
+    if let Some((path, meta, body)) = active_plan_file {
+        if meta.status == "in_progress" {
+            // 只有当最新 Todo 产生在更新的轮次中且该 Todo 尚有未完成项，且不是同轮次伴生 Todo 时，才临时优先展示局部 Todo
+            if let Some(ref todo_info) = latest_todo_event {
+                let is_same_msg = meta.source_message_id.as_deref() == Some(&todo_info.message_id);
+                let has_unfinished = todo_info.items.iter().any(|it| it.status != "done");
+                let plan_seq = get_plan_source_seq(conn, &meta);
+                if !is_same_msg && has_unfinished && todo_info.seq > plan_seq {
+                    return Some(format_todo_board(todo_info));
+                }
+            }
+            // 默认权威展示当前活动方案
+            return Some(format_plan_board(&path, &meta, &body));
+        }
+    }
+
+    // 规则 2（场景 2）：无推进中的活动方案时，比较最新 Todo 与最近结案的 Plan
+    let latest_completed_plan = find_latest_session_plan(workspace, session_id);
+
+    match (latest_todo_event, latest_completed_plan) {
+        (Some(todo_info), Some((path, meta, body))) => {
+            let plan_seq = get_plan_source_seq(conn, &meta);
+            if todo_info.seq >= plan_seq {
+                Some(format_todo_board(&todo_info))
+            } else {
+                Some(format_plan_board(&path, &meta, &body))
+            }
+        }
+        (Some(todo_info), None) => Some(format_todo_board(&todo_info)),
+        (None, Some((path, meta, body))) => Some(format_plan_board(&path, &meta, &body)),
+        (None, None) => None,
+    }
+}
+
+/// 向前端广播最新的权威看板状态
+pub fn emit_board_updated(
+    app: &tauri::AppHandle,
+    db: &rusqlite::Connection,
+    session_id: &str,
+) {
+    if let Ok(Some(session)) = crate::store::get_session(db, session_id) {
+        let ws = Path::new(&session.workspace_path);
+        let board = derive_current_board(db, ws, session_id);
+        let _ = app.emit(
+            "board:updated",
+            serde_json::json!({
+                "sessionId": session_id,
+                "board": board,
+            }),
+        );
     }
 }
 
@@ -2298,6 +2557,72 @@ mod tests {
 
         // 且未退化的 System Prompt 路径：find_plan_file 仍按"本会话 in_progress 最新方案"解析出该文件
         assert!(find_plan_file(ws, sid, None, Some(&conn)).is_some());
+    }
+
+    #[test]
+    fn test_derive_current_board_scenarios() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        let tmp = TempDir::new();
+        let ws = tmp.path();
+        let sid = "session-board-test";
+
+        // 场景 1：第一轮同时产生了 todo 和 plan，plan 优先
+        insert_test_message(&conn, "msg-1", sid, 1);
+        conn.execute(
+            "INSERT INTO tool_events (id, message_id, tool_name, status, params_json, created_at)
+             VALUES (?1, ?2, 'todo', 'success', ?3, '2026-10-16T10:00:00Z')",
+            rusqlite::params![
+                "evt-todo-1",
+                "msg-1",
+                serde_json::json!({
+                    "todos": [
+                        {"content": "临时探索待办", "status": "done"}
+                    ]
+                }).to_string()
+            ],
+        ).unwrap();
+
+        let plan_path = write_legacy_plan(ws, "20261016-auth.md", "plan-auth", "鉴权方案", sid);
+        let mut meta = read_meta(&plan_path).0;
+        meta.source_message_id = Some("msg-1".into());
+        meta.source_tool_event_id = Some("evt-plan-1".into());
+        let content = format_with_frontmatter(&meta, "## 四、分步执行清单\n- [ ] 步骤 1：排查现有鉴权\n- [ ] 步骤 2：重构代码\n");
+        fs::write(&plan_path, content).unwrap();
+
+        // 仲裁：必须返回 plan，而不是第一轮的 todo
+        let board1 = derive_current_board(&conn, ws, sid).expect("应有看板");
+        assert_eq!(board1.board_type, "plan");
+        assert_eq!(board1.id, "plan-auth");
+        assert_eq!(board1.total_steps, 2);
+        assert_eq!(board1.completed_steps, 0);
+
+        // 步骤更新打钩
+        update_plan_step_status(ws, Some(sid), Some("plan-auth"), 1, "done", Some(&conn)).unwrap();
+        let board2 = derive_current_board(&conn, ws, sid).expect("应有看板");
+        assert_eq!(board2.completed_steps, 1);
+        assert_eq!(board2.progress_pct, 50);
+
+        // 场景 2：长任务无活动 plan 时，生成多个 todo，只展示最新一个
+        let sid2 = "session-long-task-todos";
+        insert_test_message(&conn, "msg-t1", sid2, 1);
+        conn.execute(
+            "INSERT INTO tool_events (id, message_id, tool_name, status, params_json, created_at)
+             VALUES ('todo-ev-1', 'msg-t1', 'todo', 'success', ?1, '2026-10-16T10:00:00Z')",
+            rusqlite::params![serde_json::json!({"todos": [{"content": "第1轮任务", "status": "done"}]}).to_string()],
+        ).unwrap();
+
+        insert_test_message(&conn, "msg-t2", sid2, 2);
+        conn.execute(
+            "INSERT INTO tool_events (id, message_id, tool_name, status, params_json, created_at)
+             VALUES ('todo-ev-2', 'msg-t2', 'todo', 'success', ?1, '2026-10-16T10:05:00Z')",
+            rusqlite::params![serde_json::json!({"todos": [{"content": "第2轮任务", "status": "in_progress"}]}).to_string()],
+        ).unwrap();
+
+        let board_todo = derive_current_board(&conn, ws, sid2).expect("应有最新 todo");
+        assert_eq!(board_todo.board_type, "todo");
+        assert_eq!(board_todo.id, "todo-todo-ev-2");
+        assert_eq!(board_todo.items[0].content, "第2轮任务");
     }
 }
 

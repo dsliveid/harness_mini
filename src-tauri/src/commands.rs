@@ -2743,6 +2743,17 @@ pub fn get_active_plan(
 }
 
 #[tauri::command]
+pub fn get_current_board(
+    state: State<'_, crate::AppState>,
+    session_id: String,
+) -> Result<Option<crate::plan::CurrentBoard>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let session = crate::store::get_session(&db, &session_id)?.ok_or("会话不存在")?;
+    let ws = std::path::Path::new(&session.workspace_path);
+    Ok(crate::plan::derive_current_board(&db, ws, &session_id))
+}
+
+#[tauri::command]
 pub fn list_workspace_plans(
     state: State<'_, crate::AppState>,
     workspace_path: String,
@@ -2781,6 +2792,7 @@ pub fn backfill_plan_sources(
 
 #[tauri::command]
 pub fn switch_plan(
+    app: AppHandle,
     state: State<'_, crate::AppState>,
     workspace_path: String,
     session_id: String,
@@ -2791,7 +2803,9 @@ pub fn switch_plan(
     }
     let db = state.db.lock().unwrap();
     let ws = std::path::Path::new(&workspace_path);
-    crate::plan::switch_plan(ws, &session_id, &plan_id, None, None, Some(&db))
+    let res = crate::plan::switch_plan(ws, &session_id, &plan_id, None, None, Some(&db))?;
+    crate::plan::emit_board_updated(&app, &db, &session_id);
+    Ok(res)
 }
 
 // ---------- 文件与变更查看器 (File Viewer) commands ----------
@@ -3280,6 +3294,7 @@ pub fn update_plan_step_status(
                 }
             }
         }
+        crate::plan::emit_board_updated(&app, &db, sid);
     }
 
     Ok(())
@@ -3644,6 +3659,7 @@ pub async fn revert_to_message(
             "path": format!("{}/.harness/memory", ws.to_string_lossy())
         }));
         let _ = app.emit("messages:changed", &serde_json::json!({ "sessionId": session_id }));
+        crate::plan::emit_board_updated(&app, &db, &session_id);
     }
 
     Ok(res)
@@ -3704,6 +3720,7 @@ pub async fn reapply_from_message(
             "path": format!("{}/.harness/memory", ws.to_string_lossy())
         }));
         let _ = app.emit("messages:changed", &serde_json::json!({ "sessionId": session_id }));
+        crate::plan::emit_board_updated(&app, &db, &session_id);
     }
 
     Ok(res)
@@ -3759,6 +3776,9 @@ pub async fn revert_message_turn(
             "path": format!("{}/.harness/memory", ws.to_string_lossy())
         }));
         state.emit("messages:changed", &serde_json::json!({ "sessionId": session_id }));
+        if let Some(app) = state.app.get() {
+            crate::plan::emit_board_updated(app, &db, &session_id);
+        }
     }
 
     Ok(res)
@@ -3813,6 +3833,9 @@ pub async fn reapply_message_turn(
             "path": format!("{}/.harness/memory", ws.to_string_lossy())
         }));
         state.emit("messages:changed", &serde_json::json!({ "sessionId": session_id }));
+        if let Some(app) = state.app.get() {
+            crate::plan::emit_board_updated(app, &db, &session_id);
+        }
     }
 
     Ok(res)

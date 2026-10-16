@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "./ipc";
-import { DRAFT_ID, resolveActiveModel, samePath, sortMessages, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem, type FocusFloatingTarget, type PlanSummary, type IntentAlignmentEvent, type IntentInterventionRequest } from "./types";
+import { DRAFT_ID, resolveActiveModel, samePath, sortMessages, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type CurrentBoard, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem, type FocusFloatingTarget, type PlanSummary, type IntentAlignmentEvent, type IntentInterventionRequest } from "./types";
 
 
 export interface EditingMessageTarget {
@@ -203,6 +203,8 @@ interface Store {
   sessionRules: Record<string, ApprovalRule[]>;
   /** 会话方案计划清单，按会话 id 缓存 */
   sessionPlans: Record<string, PlanSummary[]>;
+  /** 会话单一权威看板（方案或最新待办清单），按会话 id 缓存 */
+  currentBoards: Record<string, CurrentBoard | null>;
   /** 程序数据目录状态；pending=true 时启动拦截对话框等待用户选择 */
   dataStatus: DataStatus | null;
   /** 项目协作者列表，按父会话 ID 缓存 */
@@ -324,6 +326,8 @@ interface Store {
   triggerPlansRefresh: () => void;
   loadPlans: (sessionId?: string) => Promise<void>;
   onSessionPlans: (p: { sessionId: string; activePlanId?: string | null }) => void;
+  loadCurrentBoard: (sessionId?: string) => Promise<void>;
+  onBoardUpdated: (p: { sessionId: string; board: CurrentBoard | null }) => void;
   onProjectsChanged: () => Promise<void>;
   onGrowthProposed: (item: GrowthItem) => void;
   onGrowthStatus: (p: { sessionId: string; status: "idle" | "analyzing" | "proposed"; message?: string; growthId?: string }) => void;
@@ -587,6 +591,7 @@ export const useStore = create<Store>((set, get) => ({
   sessionSettingsId: null,
   sessionRules: {},
   sessionPlans: {},
+  currentBoards: {},
   dataStatus: null,
   collaborators: {},
   activeCollaboratorId: null,
@@ -1152,6 +1157,7 @@ export const useStore = create<Store>((set, get) => ({
     void get().loadSubagents(id);
     void get().fetchActiveTask(id);
     void get().loadPlans(id);
+    void get().loadCurrentBoard(id);
 
     // 5. 切换主会话时，如果分屏中的协作者/子 Agent 不属于当前会话，则关闭分屏
     const curCollabId = get().activeCollaboratorId;
@@ -1730,6 +1736,26 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
+  async loadCurrentBoard(sessionId) {
+    const id = sessionId ?? get().currentId;
+    if (!id || id === DRAFT_ID) return;
+    try {
+      const board = await ipc.getCurrentBoard(id);
+      set((st) => ({
+        currentBoards: { ...st.currentBoards, [id]: board },
+      }));
+    } catch (e) {
+      console.error("加载当前看板失败:", e);
+    }
+  },
+  onBoardUpdated(p) {
+    if (p?.sessionId) {
+      set((st) => ({
+        currentBoards: { ...st.currentBoards, [p.sessionId]: p.board ?? null },
+      }));
+    }
+  },
+
   onRunStatus(p) {
     set((st) => {
       const nextRetry = { ...st.toolRetryStatus };
@@ -1846,6 +1872,7 @@ export const useStore = create<Store>((set, get) => ({
           break;
         }
       }
+      void get().loadCurrentBoard(p.sessionId);
     }
   },
 

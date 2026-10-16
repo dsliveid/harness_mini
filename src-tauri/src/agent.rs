@@ -1831,9 +1831,9 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
 
         let neg_intent = last_user_content.map(contains_negative_code_intent).unwrap_or(false);
 
-        // 识别长任务触发：包含显式指令前缀、/goal 或 /task
+        // 识别长任务触发：包含显式指令前缀或 /goal
         let directly_triggered_goal = last_user_content
-            .map(|c| c.contains("【长任务目标模式】") || c.starts_with("/goal") || c.starts_with("/task"))
+            .map(|c| c.contains("【长任务目标模式】") || c.starts_with("/goal"))
             .unwrap_or(false);
 
         // 或者当前会话曾触发过长任务且仍有处于进行中 (in_progress) 的方案正在推进
@@ -1845,7 +1845,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 && msgs.iter().any(|m| {
                     m.content
                         .as_deref()
-                        .map(|c| c.contains("【长任务目标模式】") || c.starts_with("/goal") || c.starts_with("/task"))
+                        .map(|c| c.contains("【长任务目标模式】") || c.starts_with("/goal"))
                         .unwrap_or(false)
                 })
         } else {
@@ -3134,6 +3134,10 @@ async fn handle_tool_call(
         );
     }
     emit_tool_with(app, session_id, &ev, json!({ "elapsedMs": elapsed }));
+    if matches!(tool_name, "todo" | "create_plan" | "update_plan" | "switch_plan") && status == "success" {
+        let db = state.db.lock().unwrap();
+        crate::plan::emit_board_updated(app, &db, session_id);
+    }
     (status, text)
 }
 
@@ -3206,6 +3210,24 @@ pub fn auto_finish_session_todos(state: &crate::AppState, app: &AppHandle, sessi
             }
         }
     }
+
+    // 检查当前物理方案：若步骤已全部标记为 done，自动结案为 completed
+    if let Ok(Some(sess)) = store::get_session(&db, session_id) {
+        let ws = std::path::Path::new(&sess.workspace_path);
+        if let Some((path, mut meta, body)) = crate::plan::find_plan_file(ws, session_id, None, Some(&db)) {
+            if meta.status == "in_progress" {
+                let steps = crate::plan::parse_steps_from_markdown(&body);
+                if !steps.is_empty() && steps.iter().all(|s| s.status == "done") {
+                    meta.status = "completed".to_string();
+                    meta.updated_at = chrono::Utc::now().to_rfc3339();
+                    let content = crate::plan::format_with_frontmatter(&meta, &body);
+                    let _ = std::fs::write(&path, content);
+                }
+            }
+        }
+    }
+
+    crate::plan::emit_board_updated(app, &db, session_id);
 }
 
 /// 用户手动停止会话时调用：将仍处于 in_progress 的任务重置为 pending 并持久化，同时广播更新
@@ -3259,6 +3281,8 @@ pub fn stop_session_todos(state: &crate::AppState, app: &AppHandle, session_id: 
             }
         }
     }
+
+    crate::plan::emit_board_updated(app, &db, session_id);
 }
 
 fn build_preview(tool_name: &str, args: &Value) -> String {
@@ -4780,7 +4804,7 @@ mod tests {
         let all_enabled = system_prompt(&session, None, &[], "standard");
         assert!(all_enabled.contains("方案先行"));
         assert!(all_enabled.contains("边读边记与强制沉淀 SOP"));
-        assert!(all_enabled.contains("团队协作者优先委派原则"));
+        assert!(all_enabled.contains("团队协同委派原则"));
         assert!(all_enabled.contains("修改文件前必须先用 read_file 读取相关内容"));
         assert!(all_enabled.contains("精益代码研读与克制探索 SOP"));
         assert!(all_enabled.contains("todo 工具列出计划"));
@@ -4801,7 +4825,7 @@ mod tests {
         assert!(!filtered.contains("修改文件前必须先用 read_file 读取相关内容"));
         assert!(!filtered.contains("精益代码研读与克制探索 SOP"));
         assert!(!filtered.contains("首步意图定性与场景化决策 SOP"));
-        assert!(filtered.contains("团队协作者优先委派原则"));
+        assert!(filtered.contains("团队协同委派原则"));
     }
 
     #[test]

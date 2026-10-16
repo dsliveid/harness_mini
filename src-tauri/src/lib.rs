@@ -457,6 +457,7 @@ pub fn run() {
             commands::get_token_stats,
             commands::get_session_active_state,
             commands::read_file_base64,
+            commands::get_current_board,
             commands::get_active_plan,
             commands::list_workspace_plans,
             commands::backfill_plan_sources,
