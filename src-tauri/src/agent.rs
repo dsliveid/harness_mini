@@ -1745,12 +1745,10 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         false
     };
 
-    let specs: Vec<ToolSpec> = tools::tool_specs()
+    let specs: Vec<ToolSpec> = tools::global_registry()
+        .list_specs(session.is_temp, is_subagent)
+        .await
         .into_iter()
-        // 临时空间专用工具仅对临时空间会话下发
-        .filter(|s| session.is_temp || !tools::TEMP_TOOL_NAMES.contains(&s.name))
-        // 递归防爆：子 Agent 自身不下发子 Agent 创建与管理工具
-        .filter(|s| !is_subagent || !tools::SUBAGENT_TOOL_NAMES.contains(&s.name))
         // 工具能力准入：只有具备生图能力的会话才下发 generate_image
         .filter(|s| s.name != "generate_image" || session_has_image_gen)
         // 工具能力准入：只有具备视觉能力的会话才下发 recognize_image
@@ -4273,6 +4271,17 @@ fn system_prompt(
             rule_num += 1;
         }
 
+        if is_sop_enabled("browser_autonomous_testing") {
+            rules.push(format!(
+                "{rule_num}. 【浏览器无头自主测试与免视觉验证 SOP（必须严格遵守）】：\n   \
+                 - 零桌面侵入与后台静默运行：当需要对本地网页服务（如 Web 项目前端、管理后台、SPA 页面）进行功能测试与调试时，**必须默认以无头模式运行（`headless: true`，不要弹出实体窗口抢占桌面）**；所有交互事件均通过 CDP 协议内部派发，严禁依赖任何侵入宿主操作系统的外挂行为；\n   \
+                 - 纯语义感知与免视觉断言原则：全面弃用截图分析（测试流程中无需调用 `browser_screenshot` 或视觉识别）；直接通过 `browser_navigate` 与 `browser_interact` 返回的【可交互元素清单 (@eX)】、【页面数据表格】及【页面提示与通知】进行语义感知与业务结果断言；\n   \
+                 - 登录态自愈与免登保底：底层已集成登录快照预加载与 401 自动重放机制。若项目已录制免登宏，底层将在打开网页前自动预注入 Cookies 与 LocalStorage（0 秒秒级直达已选机构主页），并在 Token 过期（HTTP 401 或跳回登录页）时自动在后台静默重放录制宏刷新凭证；**Agent 严禁在会话中手动搜索密码或猜测凭据**；\n   \
+                 - 探针式自检与自愈闭环：系统已自动截获页面未捕获的 JavaScript 异常与 ≥ 400 的网络请求。测试时若发现 Console 报错或接口失败，必须结合报错信息直接阅读源码定位根因，用 `edit_file` 原地修复后再次在浏览器中自测，直至错误彻底清零且业务数据正常渲染；测试完毕后务必调用 `browser_close` 释放资源。"
+            ));
+            rule_num += 1;
+        }
+
         rules.push(format!(
             "{rule_num}. 【多模态图像感知与识图准则】：\n   \
              - 当需要查看、识别或分析本地图片文件（如 generated_images 目录中的生成图、项目图片资源、设计图、截图、相片等）的内容时，**必须直接调用 `recognize_image(path, prompt)` 工具**；\n   \
@@ -4722,6 +4731,7 @@ mod tests {
         assert!(all_enabled.contains("精益代码研读与克制探索 SOP"));
         assert!(all_enabled.contains("todo 工具列出计划"));
         assert!(all_enabled.contains("首步意图定性与场景化决策质检 SOP"));
+        assert!(all_enabled.contains("浏览器无头自主测试与免视觉验证 SOP"));
 
         let disabled = vec![
             "plan_first".to_string(),
@@ -4730,6 +4740,7 @@ mod tests {
             "safe_code_edit".to_string(),
             "surgical_code_reading".to_string(),
             "intent_alignment_gate".to_string(),
+            "browser_autonomous_testing".to_string(),
         ];
         let filtered = system_prompt(&session, None, &disabled, "standard");
         assert!(!filtered.contains("方案先行"));
@@ -4738,7 +4749,22 @@ mod tests {
         assert!(!filtered.contains("修改文件前必须先用 read_file 读取相关内容"));
         assert!(!filtered.contains("精益代码研读与克制探索 SOP"));
         assert!(!filtered.contains("首步意图定性与场景化决策质检 SOP"));
+        assert!(!filtered.contains("浏览器无头自主测试与免视觉验证 SOP"));
         assert!(filtered.contains("团队协同委派原则"));
+    }
+
+    #[test]
+    fn test_browser_autonomous_testing_sop_in_system_prompt() {
+        let session = Session {
+            workspace_path: "D:\\ws".into(),
+            ..Default::default()
+        };
+        let p = system_prompt(&session, None, &[], "standard");
+        assert!(p.contains("浏览器无头自主测试与免视觉验证 SOP"));
+        assert!(p.contains("headless: true"));
+        assert!(p.contains("免视觉断言原则"));
+        assert!(p.contains("登录态自愈与免登保底"));
+        assert!(p.contains("探针式自检与自愈闭环"));
     }
 
     #[test]

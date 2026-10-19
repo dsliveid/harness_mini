@@ -7,6 +7,7 @@ import { DataDirSection } from "./DataDirSection";
 import { ModalActions, ModalClose } from "./ModalActions";
 import { ModelContextModal } from "./ModelContextModal";
 import { ModelCapabilitySelect } from "./ModelCapabilitySelect";
+import { McpSection } from "./McpSection";
 
 import {
   Cpu,
@@ -34,6 +35,7 @@ import {
   RefreshCw,
   Search,
   X,
+  Server,
 } from "./Icons";
 
 const MODEL_CAP_OPTIONS = [
@@ -43,7 +45,7 @@ const MODEL_CAP_OPTIONS = [
   { id: "decision", label: "决策", Icon: Zap },
 ] as const;
 
-type Tab = "models" | "tools" | "network" | "sop" | "datadir";
+type Tab = "models" | "tools" | "mcp" | "network" | "sop" | "datadir";
 
 const TOOL_TITLES: Record<string, string> = {
   read_file: "读取文件",
@@ -640,6 +642,12 @@ export function SettingsModal() {
               <span className="flex items-center gap-2">
                 <Wrench size={15} />
                 <span>Agent 工具</span>
+              </span>
+            </button>
+            <button className={menuCls(tab === "mcp")} onClick={() => setTab("mcp")}>
+              <span className="flex items-center gap-2">
+                <Server size={15} />
+                <span>MCP 服务</span>
               </span>
             </button>
             <button className={menuCls(tab === "network")} onClick={() => setTab("network")}>
@@ -1435,6 +1443,8 @@ export function SettingsModal() {
                 </section>
               </div>
             )}
+
+            {tab === "mcp" && <McpSection />}
 
             {tab === "network" && (
               <div className="flex flex-col gap-5">

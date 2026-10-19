@@ -1082,6 +1082,22 @@ export interface DataStatus {
   unwritablePath?: string | null;
 }
 
+/** 数据库体积与物理空间统计 */
+export interface DbStats {
+  pageSize: number;
+  pageCount: number;
+  freelistCount: number;
+  fileSizeBytes: number;
+  walSizeBytes: number;
+}
+
+/** 数据库优化收缩结果 */
+export interface OptimizeResult {
+  beforeBytes: number;
+  afterBytes: number;
+  freedBytes: number;
+}
+
 export const DRAFT_ID = "draft";
 
 /** 解析当前生效的厂商 + 模型：激活项失效时回落到第一个有模型的厂商 */
@@ -1856,6 +1872,72 @@ export interface PathInspectResult {
   absPath: string;
   fileName: string;
 }
+
+export interface InteractiveElement {
+  ref_id: string;
+  tag: string;
+  type?: string;
+  name?: string;
+  placeholder?: string;
+  text?: string;
+  value?: string;
+  href?: string;
+}
+
+export interface BrowserDebugState {
+  url: string;
+  title: string;
+  elements: InteractiveElement[];
+  console_errors: string[];
+  network_errors: string[];
+  tables?: string[];
+  notices?: string[];
+}
+
+export interface McpServerConfig {
+  id: string;
+  name: string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface McpToolDefinition {
+  name: string;
+  description?: string;
+  inputSchema: any;
+}
+
+export interface AuthStep {
+  order: number;
+  action: string;
+  selector?: string;
+  value?: string;
+  is_encrypted?: boolean;
+  desc?: string;
+  ms?: number;
+  exclude?: string;
+}
+
+export interface AuthMacro {
+  version: string;
+  project?: string;
+  login_url: string;
+  created_at: string;
+  steps: AuthStep[];
+}
+
+export interface AuthMacroStatus {
+  has_macro: boolean;
+  has_storage_state: boolean;
+  step_count: number;
+  last_updated?: string;
+  login_url?: string;
+}
+
 
 
 

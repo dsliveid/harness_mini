@@ -26,6 +26,7 @@ import { CreateCollaboratorModal } from "./components/CreateCollaboratorModal";
 import { EditCollaboratorModal } from "./components/EditCollaboratorModal";
 import { ModelMatrixModal } from "./components/ModelMatrixModal";
 import { ImageLightboxModal } from "./components/ImageLightboxModal";
+import { BrowserInspector } from "./components/BrowserInspector";
 import { WindowHeader } from "./components/WindowHeader";
 
 import { DRAFT_ID } from "./types";
@@ -127,6 +128,7 @@ export default function App() {
       <EditCollaboratorModal />
       <ModelMatrixModal />
       <ImageLightboxModal />
+      <BrowserInspector />
       <PromptHost />
       <Toasts />
       <DataDirGate />

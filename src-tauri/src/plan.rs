@@ -1230,8 +1230,12 @@ struct LatestTodoRecord {
     created_at: String,
 }
 
-/// 查询当前会话中最近一个未被撤回的 Todo 工具事件
-fn query_latest_valid_todo(conn: &rusqlite::Connection, session_id: &str) -> Option<LatestTodoRecord> {
+/// 查询当前会话在当前轮次（seq >= min_seq）内产生的最新有效 Todo
+fn query_turn_latest_todo(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    min_seq: i64,
+) -> Option<LatestTodoRecord> {
     use rusqlite::OptionalExtension;
     let row: Option<(String, String, i64, String, String)> = conn
         .query_row(
@@ -1239,12 +1243,13 @@ fn query_latest_valid_todo(conn: &rusqlite::Connection, session_id: &str) -> Opt
              FROM tool_events te
              JOIN messages m ON te.message_id = m.id
              WHERE m.session_id = ?1
+               AND m.seq >= ?2
                AND m.reverted_at IS NULL
                AND te.tool_name = 'todo'
                AND te.status = 'success'
              ORDER BY m.seq DESC, te.created_at DESC
              LIMIT 1",
-            rusqlite::params![session_id],
+            rusqlite::params![session_id, min_seq],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()
@@ -1276,6 +1281,64 @@ fn query_latest_valid_todo(conn: &rusqlite::Connection, session_id: &str) -> Opt
     })
 }
 
+/// 查询当前会话在当前轮次（seq >= min_seq）内被激活或创建的有效 Plan
+fn query_turn_active_plan(
+    conn: &rusqlite::Connection,
+    workspace: &Path,
+    session_id: &str,
+    min_seq: i64,
+) -> Option<(PathBuf, PlanMeta, String, i64)> {
+    use rusqlite::OptionalExtension;
+
+    // 1. 查找本轮内最近一次成功的方案类工具事件 (create_plan / update_plan / switch_plan)
+    let row: Option<(String, String, i64)> = conn
+        .query_row(
+            "SELECT te.tool_name, te.params_json, m.seq
+             FROM tool_events te
+             JOIN messages m ON te.message_id = m.id
+             WHERE m.session_id = ?1
+               AND m.seq >= ?2
+               AND m.reverted_at IS NULL
+               AND te.tool_name IN ('create_plan', 'update_plan', 'switch_plan')
+               AND te.status = 'success'
+             ORDER BY m.seq DESC, te.created_at DESC
+             LIMIT 1",
+            rusqlite::params![session_id, min_seq],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+
+    if let Some((_tool_name, params_json, ev_seq)) = row {
+        // 从 params_json 中尝试提取 plan_id
+        let target_plan_id = serde_json::from_str::<serde_json::Value>(&params_json)
+            .ok()
+            .and_then(|v| {
+                v.get("plan_id")
+                    .and_then(|p| p.as_str())
+                    .map(|s| s.to_string())
+            });
+
+        // 尝试定位方案文件
+        if let Some((path, meta, body)) =
+            find_plan_file(workspace, session_id, target_plan_id.as_deref(), Some(conn))
+        {
+            return Some((path, meta, body, ev_seq));
+        }
+    }
+
+    // 2. 如果没有显式工具事件，但当前活动方案本身的 source_message_id 就属于本轮
+    if let Some((path, meta, body)) = find_plan_file(workspace, session_id, None, Some(conn)) {
+        let plan_seq = get_plan_source_seq(conn, &meta);
+        if plan_seq >= min_seq {
+            return Some((path, meta, body, plan_seq));
+        }
+    }
+
+    None
+}
+
 /// 获取方案归属消息的 seq 序号
 fn get_plan_source_seq(conn: &rusqlite::Connection, meta: &PlanMeta) -> i64 {
     if let Some(ref mid) = meta.source_message_id {
@@ -1290,38 +1353,13 @@ fn get_plan_source_seq(conn: &rusqlite::Connection, meta: &PlanMeta) -> i64 {
     }
 }
 
-/// 查找当前会话名下最近更新过的一个方案（用于在无 in_progress 活动方案时兜底已结案方案）
-fn find_latest_session_plan(
-    workspace: &Path,
-    session_id: &str,
-) -> Option<(PathBuf, PlanMeta, String)> {
-    let pdir = plans_dir(workspace);
-    if !pdir.exists() {
-        return None;
-    }
-    let entries = fs::read_dir(&pdir).ok()?;
-    let mut session_plans = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
-            if let Ok(content) = fs::read_to_string(&path) {
-                let (meta, body) = parse_frontmatter(&content);
-                if meta.session_id == session_id {
-                    session_plans.push((path, meta, body));
-                }
-            }
-        }
-    }
-    session_plans.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
-    session_plans.into_iter().next()
-}
-
 fn format_plan_board(path: &Path, meta: &PlanMeta, body: &str) -> CurrentBoard {
     let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
     let steps = parse_steps_from_markdown(body);
     let total = steps.len();
     let completed = steps.iter().filter(|s| s.status == "done").count();
     let pct = if total > 0 { (completed * 100 / total) as u8 } else { 0 };
+    let all_done = total > 0 && completed == total;
     let items: Vec<BoardItem> = steps
         .into_iter()
         .map(|s| BoardItem {
@@ -1331,6 +1369,12 @@ fn format_plan_board(path: &Path, meta: &PlanMeta, body: &str) -> CurrentBoard {
         })
         .collect();
 
+    let board_status = if meta.status == "completed" || (meta.status == "in_progress" && all_done) {
+        "completed".to_string()
+    } else {
+        meta.status.clone()
+    };
+
     CurrentBoard {
         id: meta.id.clone(),
         board_type: "plan".to_string(),
@@ -1339,7 +1383,7 @@ fn format_plan_board(path: &Path, meta: &PlanMeta, body: &str) -> CurrentBoard {
         } else {
             meta.title.clone()
         },
-        status: meta.status.clone(),
+        status: board_status,
         items,
         total_steps: total,
         completed_steps: completed,
@@ -1377,7 +1421,7 @@ fn format_todo_board(info: &LatestTodoRecord) -> CurrentBoard {
     }
 }
 
-/// 后端权威仲裁当前会话唯一有效的看板
+/// 后端权威仲裁当前会话唯一有效的看板（基于对话轮次纯函数投影）
 pub fn derive_current_board(
     conn: &rusqlite::Connection,
     workspace: &Path,
@@ -1387,41 +1431,38 @@ pub fn derive_current_board(
         return None;
     }
 
-    // 1. 查找当前会话绑定的活动方案
-    let active_plan_file = find_plan_file(workspace, session_id, None, Some(conn));
-    let latest_todo_event = query_latest_valid_todo(conn, session_id);
+    // 1. 获取当前会话最新一条未撤回的用户消息序号（当前轮次的起点）
+    let last_user_seq: Option<i64> = conn
+        .query_row(
+            "SELECT seq FROM messages 
+             WHERE session_id = ?1 AND role = 'user' AND reverted_at IS NULL 
+             ORDER BY seq DESC LIMIT 1",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .ok();
 
-    // 规则 1（场景 1）：若当前会话存在推进中的活动方案（in_progress）
-    if let Some((path, meta, body)) = active_plan_file {
-        if meta.status == "in_progress" {
-            // 只有当最新 Todo 产生在更新的轮次中且该 Todo 尚有未完成项，且不是同轮次伴生 Todo 时，才临时优先展示局部 Todo
-            if let Some(ref todo_info) = latest_todo_event {
-                let is_same_msg = meta.source_message_id.as_deref() == Some(&todo_info.message_id);
-                let has_unfinished = todo_info.items.iter().any(|it| it.status != "done");
-                let plan_seq = get_plan_source_seq(conn, &meta);
-                if !is_same_msg && has_unfinished && todo_info.seq > plan_seq {
-                    return Some(format_todo_board(todo_info));
-                }
-            }
-            // 默认权威展示当前活动方案
-            return Some(format_plan_board(&path, &meta, &body));
-        }
-    }
+    // 若会话存在用户消息，以最后一条用户消息的 seq 为本轮视界起点；
+    // 若会话暂无用户消息（例如自动化子任务或测试数据），则以 0 为起点，确保兼容
+    let min_seq = last_user_seq.unwrap_or(0);
 
-    // 规则 2（场景 2）：无推进中的活动方案时，比较最新 Todo 与最近结案的 Plan
-    let latest_completed_plan = find_latest_session_plan(workspace, session_id);
+    // 2. 查询本轮（seq >= min_seq）内产生的最新有效 Todo
+    let latest_turn_todo = query_turn_latest_todo(conn, session_id, min_seq);
 
-    match (latest_todo_event, latest_completed_plan) {
-        (Some(todo_info), Some((path, meta, body))) => {
-            let plan_seq = get_plan_source_seq(conn, &meta);
-            if todo_info.seq >= plan_seq {
+    // 3. 查询本轮（seq >= min_seq）内被激活或更新的有效 Plan
+    let latest_turn_plan = query_turn_active_plan(conn, workspace, session_id, min_seq);
+
+    // 4. 纯函数仲裁：本轮无任务/方案则明确返回 None，浮窗隐去；若有则按来源消息 seq 择新展示
+    match (latest_turn_todo, latest_turn_plan) {
+        (Some(todo_info), Some((path, meta, body, plan_seq))) => {
+            if todo_info.seq > plan_seq {
                 Some(format_todo_board(&todo_info))
             } else {
                 Some(format_plan_board(&path, &meta, &body))
             }
         }
         (Some(todo_info), None) => Some(format_todo_board(&todo_info)),
-        (None, Some((path, meta, body))) => Some(format_plan_board(&path, &meta, &body)),
+        (None, Some((path, meta, body, _))) => Some(format_plan_board(&path, &meta, &body)),
         (None, None) => None,
     }
 }
@@ -2623,6 +2664,36 @@ mod tests {
         assert_eq!(board_todo.board_type, "todo");
         assert_eq!(board_todo.id, "todo-todo-ev-2");
         assert_eq!(board_todo.items[0].content, "第2轮任务");
+
+        // 场景 3：开启新一轮普通用户对话（无任务/方案工具），旧看板自动清空隐去（返回 None）
+        conn.execute(
+            "INSERT INTO messages (id, session_id, seq, role, content, created_at)
+             VALUES ('msg-u2', ?1, 2, 'user', '你好，帮我写个冒泡排序', '2026-10-16T10:10:00Z')",
+            rusqlite::params![sid],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, session_id, seq, role, content, created_at)
+             VALUES ('msg-a2', ?1, 3, 'assistant', '这是冒泡排序代码...', '2026-10-16T10:10:05Z')",
+            rusqlite::params![sid],
+        ).unwrap();
+
+        let board_round2 = derive_current_board(&conn, ws, sid);
+        assert!(board_round2.is_none(), "新一轮对话开启且未产生新任务时，浮窗必须自动返回 None 隐去");
+
+        // 场景 4：撤回第 2 轮对话，自动回退展示第 1 轮有效方案看板
+        conn.execute(
+            "UPDATE messages SET reverted_at = '2026-10-16T10:11:00Z' WHERE session_id = ?1 AND seq >= 2",
+            rusqlite::params![sid],
+        ).unwrap();
+        let board_reverted = derive_current_board(&conn, ws, sid).expect("撤回后应自动回退展示上一轮有效看板");
+        assert_eq!(board_reverted.id, "plan-auth");
+
+        // 场景 5：步骤全部勾选完成时，看板状态自动映射为 completed
+        update_plan_step_status(ws, Some(sid), Some("plan-auth"), 2, "done", Some(&conn)).unwrap();
+        let board_all_done = derive_current_board(&conn, ws, sid).expect("应有看板");
+        assert_eq!(board_all_done.completed_steps, 2);
+        assert_eq!(board_all_done.progress_pct, 100);
+        assert_eq!(board_all_done.status, "completed");
     }
 }
 

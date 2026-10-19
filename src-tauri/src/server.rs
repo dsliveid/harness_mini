@@ -577,9 +577,17 @@ pub async fn dispatch_rpc(
             Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
         }
 
-        // ---- 数据目录状态 ----
+        // ---- 数据目录状态与空间维护 ----
         "get_data_status" => {
             let res = commands::get_data_status(st);
+            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+        }
+        "optimize_database" => {
+            let res = commands::optimize_database(st)?;
+            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+        }
+        "get_database_stats" => {
+            let res = commands::get_database_stats(st)?;
             Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
         }
 

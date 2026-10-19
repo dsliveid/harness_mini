@@ -1,10 +1,12 @@
 mod agent;
 mod approval;
+pub mod browser;
 mod commands;
 mod diffutil;
 mod growth;
 pub mod jev;
 mod llm;
+pub mod mcp;
 pub mod memory;
 mod models;
 mod paths;
@@ -12,6 +14,7 @@ pub mod plan;
 pub mod protocol;
 mod secrets;
 pub mod server;
+pub mod session_bundle;
 pub mod single_instance;
 mod skills;
 pub mod snapshot;
@@ -200,6 +203,8 @@ fn init_real_db(dir: &Path, legacy_dir: Option<&Path>) -> Result<([u8; 32], rusq
     let _ = temp::rebase_temp_storage(&db, dir);
     // 启动时收敛上次崩溃或异常退出的残留状态
     let _ = store::startup_reconcile(&db);
+    // 启动时自愈清理可能残留的孤儿 Bundle 与附件
+    let _ = session_bundle::reconcile_orphan_bundles(&db, dir);
     Ok((master, db))
 }
 
@@ -291,6 +296,17 @@ pub fn run() {
             app.manage(state);
             let handle = app.handle().clone();
             let _ = app.state::<AppState>().app.set(handle);
+
+            // 初始化并加载启用的 MCP Servers
+            let mcp_app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = mcp_app_handle.state::<AppState>();
+                let servers = {
+                    let db = state.db.lock().unwrap();
+                    store::list_mcp_servers(&db).unwrap_or_default()
+                };
+                mcp::global_mcp_manager().reload_from_db(servers).await;
+            });
 
             // 启动本地守护服务（HTTP/WebSocket 网关，供多端连接与离线保活恢复）
             let app_handle = app.handle().clone();
@@ -442,6 +458,8 @@ pub fn run() {
             commands::get_data_status,
             commands::set_data_dir,
             commands::reset_data_dir,
+            commands::optimize_database,
+            commands::get_database_stats,
             commands::exit_app,
             commands::list_growths,
             commands::update_growth_status,
@@ -490,6 +508,21 @@ pub fn run() {
             commands::reapply_turn_file,
             commands::get_turn_diff,
             commands::query_tool_logs,
+            commands::list_mcp_servers,
+            commands::save_mcp_server,
+            commands::delete_mcp_server,
+            commands::test_mcp_server,
+            commands::reload_mcp_servers,
+            commands::get_browser_debug_state,
+            commands::browser_navigate_url,
+            commands::browser_user_interact,
+            commands::browser_capture_screenshot,
+            commands::close_browser_session,
+            commands::get_auth_macro_status,
+            commands::start_browser_recording,
+            commands::get_recorded_browser_steps,
+            commands::stop_browser_recording_and_save,
+            commands::replay_browser_auth_macro,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

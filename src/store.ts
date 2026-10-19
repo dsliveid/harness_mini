@@ -158,6 +158,7 @@ interface Store {
   tempInfo: Record<string, TempInfo>;
   currentProjectId: string | null; // 当前进入的项目（项目视图下发送空对话时落库到该项目）
   messages: Record<string, Message[]>;
+  messagesLoaded: Record<string, boolean>;
   hasMore: Record<string, boolean>;
   queues: Record<string, QueuedItem[]>;
   runStatus: Record<string, "idle" | "running">;
@@ -231,6 +232,9 @@ interface Store {
   /** 外部（如对话卡片）请求聚焦右侧浮窗的特定任务或方案标识 */
   focusFloatingTaskId: string | FocusFloatingTarget | null;
   setFocusFloatingTaskId: (target: string | FocusFloatingTarget | null) => void;
+  /** 网页调试检查器弹窗 */
+  showBrowserInspector: boolean;
+  setShowBrowserInspector: (open: boolean) => void;
 
   bootstrap: () => Promise<void>;
   /** 拉取全局运行中的会话，恢复各会话的“运行中”状态显示（启动/界面刷新后调用） */
@@ -557,6 +561,7 @@ export const useStore = create<Store>((set, get) => ({
   tempInfo: {},
   currentProjectId: null,
   messages: {},
+  messagesLoaded: {},
   hasMore: {},
   queues: {},
   runStatus: {},
@@ -618,6 +623,8 @@ export const useStore = create<Store>((set, get) => ({
   taskCheckpoints: {},
   showTaskDetailModal: false,
   setShowTaskDetailModal: (v) => set({ showTaskDetailModal: v }),
+  showBrowserInspector: false,
+  setShowBrowserInspector: (v) => set({ showBrowserInspector: v }),
 
 
   async bootstrap() {
@@ -1111,10 +1118,14 @@ export const useStore = create<Store>((set, get) => ({
 
       set((st) => ({
         messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], msgs) },
+        messagesLoaded: { ...st.messagesLoaded, [id]: true },
         hasMore: { ...st.hasMore, [id]: msgs.length >= INITIAL_MESSAGES_LIMIT },
       }));
     } catch (e) {
       if (currentToken === latestSelectSessionToken) {
+        set((st) => ({
+          messagesLoaded: { ...st.messagesLoaded, [id]: true },
+        }));
         get().pushToast(String(e));
       }
     }
@@ -2152,9 +2163,13 @@ export const useStore = create<Store>((set, get) => ({
       ipc.getMessages(id, undefined, INITIAL_MESSAGES_LIMIT).then((msgs) => {
         set((st) => ({
           messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], msgs) },
+          messagesLoaded: { ...st.messagesLoaded, [id]: true },
           hasMore: { ...st.hasMore, [id]: msgs.length >= INITIAL_MESSAGES_LIMIT },
         }));
-      }).catch((e) => get().pushToast(String(e)));
+      }).catch((e) => {
+        set((st) => ({ messagesLoaded: { ...st.messagesLoaded, [id]: true } }));
+        get().pushToast(String(e));
+      });
       void get().syncSessionActiveState(id);
     }
   },
@@ -2165,9 +2180,13 @@ export const useStore = create<Store>((set, get) => ({
       ipc.getMessages(id, undefined, INITIAL_MESSAGES_LIMIT).then((msgs) => {
         set((st) => ({
           messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], msgs) },
+          messagesLoaded: { ...st.messagesLoaded, [id]: true },
           hasMore: { ...st.hasMore, [id]: msgs.length >= INITIAL_MESSAGES_LIMIT },
         }));
-      }).catch((e) => get().pushToast(String(e)));
+      }).catch((e) => {
+        set((st) => ({ messagesLoaded: { ...st.messagesLoaded, [id]: true } }));
+        get().pushToast(String(e));
+      });
       void get().syncSessionActiveState(id);
     }
   },

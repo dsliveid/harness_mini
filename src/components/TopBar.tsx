@@ -23,6 +23,7 @@ import {
   Sliders,
   GitBranch,
   Brain,
+  Globe,
 } from "./Icons";
 
 type OpenMenu = "ws" | "mode" | "model" | null;
@@ -50,6 +51,7 @@ export function TopBar() {
   const setDraftContextTokenLimit = useStore((s) => s.setDraftContextTokenLimit);
   const setDraftReasoningEffort = useStore((s) => s.setDraftReasoningEffort);
   const openModelMatrixModal = useStore((s) => s.openModelMatrixModal);
+  const setShowBrowserInspector = useStore((s) => s.setShowBrowserInspector);
 
   const [openMenu, setOpenMenu] = useState<OpenMenu>(null);
   const [openSessionContextModal, setOpenSessionContextModal] = useState(false);
@@ -613,6 +615,16 @@ export function TopBar() {
             </>
           )}
         </div>
+
+        {/* 网页调试控制台入口 */}
+        <button
+          onClick={() => setShowBrowserInspector(true)}
+          className="flex items-center gap-1.5 h-8 px-2.5 rounded-lg text-[12px] shrink-0 border border-edge/60 bg-panel hover:bg-panel3 text-inkdim hover:text-ink transition-colors cursor-pointer"
+          title="打开网页调试工作台（实时视窗、可交互 DOM Ref 树、控制台/网络错误审查与人工接管）"
+        >
+          <Globe size={13} className="text-blue-400" />
+          <span>网页调试</span>
+        </button>
 
         {/* 状态指示（统一 h-8 规格） */}
         <div

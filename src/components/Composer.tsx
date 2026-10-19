@@ -490,6 +490,17 @@ export function Composer() {
     setSessionDraft(targetId, "");
     setPendingAttachments([]);
     requestAnimationFrame(resize);
+
+    // 发起新一轮对话时，即刻重置当前会话的看板状态为 null，实现无缝切轮与旧看板平滑隐去
+    if (targetId && targetId !== DRAFT_ID) {
+      useStore.setState((st) => ({
+        currentBoards: {
+          ...st.currentBoards,
+          [targetId]: null,
+        },
+      }));
+    }
+
     try {
       const st = useStore.getState();
       const isDraftLike = !currentId || currentId === DRAFT_ID;

@@ -125,4 +125,7 @@ export {
   Palette,
   Bug,
   Tag,
+  Monitor,
+  MousePointer,
+  Camera,
 } from "lucide-react";

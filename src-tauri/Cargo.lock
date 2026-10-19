@@ -1512,6 +1512,7 @@ name = "harness-mini"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -1532,6 +1533,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite",
  "tower-http 0.5.2",
  "uuid",
  "walkdir",

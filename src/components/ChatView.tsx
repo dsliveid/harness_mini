@@ -205,8 +205,14 @@ export function ChatView() {
     prevLastUserRef.current = lastUserMsgId;
   }, [lastUserMsgId]);
 
-  // 当切换到一个已有消息历史但本地尚未缓存完毕的会话时，展示轻量 loading，消除空会话卡片闪烁
-  const isInitialLoading = Boolean(currentId && currentId !== DRAFT_ID && msgs.length === 0 && session?.lastMessageAt);
+  // 当切换到一个已有消息历史但本地尚未拉取完毕的会话时，展示轻量 loading，消除空会话卡片闪烁
+  const messagesLoaded = useStore((s) => s.messagesLoaded);
+  const isInitialLoading = Boolean(
+    currentId &&
+    currentId !== DRAFT_ID &&
+    !messagesLoaded[currentId] &&
+    session?.lastMessageAt
+  );
   if (isInitialLoading) {
     return (
       <div className="flex-1 flex items-center justify-center select-none text-inkdim text-[13px] gap-2 animate-in fade-in duration-100">

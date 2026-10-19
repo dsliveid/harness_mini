@@ -7,7 +7,8 @@ pub fn open_db(path: &Path) -> Result<Connection, String> {
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA busy_timeout = 5000;
-         PRAGMA synchronous = NORMAL;",
+         PRAGMA synchronous = NORMAL;
+         PRAGMA auto_vacuum = INCREMENTAL;",
     )
     .map_err(|e| e.to_string())?;
     init_schema(&conn)?;
@@ -214,6 +215,17 @@ fn init(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_snapshots_event ON tool_file_snapshots(tool_event_id);
         CREATE INDEX IF NOT EXISTS idx_snapshots_message ON tool_file_snapshots(message_id);
         CREATE INDEX IF NOT EXISTS idx_snapshots_session ON tool_file_snapshots(session_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS mcp_servers (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          command TEXT NOT NULL,
+          args TEXT NOT NULL,
+          env TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
         "#,
     )
     .map_err(|e| e.to_string())?;
@@ -1883,6 +1895,39 @@ mod tests {
         assert_eq!(snaps_after_u_active[0].file_path, "src/b.rs"); // 后生成的排在前面 (LIFO)
         assert_eq!(snaps_after_u_active[1].file_path, "src/a.rs");
     }
+
+    #[test]
+    fn test_database_maintenance_and_stats() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        // 验证初始统计
+        let stats = get_db_stats(&conn, None).unwrap();
+        assert!(stats.page_size > 0);
+
+        // 插入并删除数据以产生空闲页
+        let s = create_session(&conn, "D:\\workspace", None, "temp_sess", "confirm").unwrap();
+        for i in 0..50 {
+            let _ = new_message(&conn, &s.id, "user", Some(format!("message payload test {}", i)), false).unwrap();
+        }
+        delete_session(&conn, &s.id).unwrap();
+
+        // 验证增量收缩与 VACUUM
+        let _ = reclaim_freelist_pages(&conn, Some(10));
+        let vac_res = vacuum_database(&conn);
+        assert!(vac_res.is_ok());
+    }
+
+    #[test]
+    fn test_tool_event_overflow_truncation() {
+        let text_short = "short output";
+        assert_eq!(sanitize_overflow_text(Some(text_short), 100), Some(text_short.into()));
+
+        let text_huge = "a".repeat(100_000);
+        let sanitized = sanitize_overflow_text(Some(&text_huge), 1000).unwrap();
+        assert!(sanitized.contains("输出内容过长"));
+        assert!(sanitized.len() < 2000);
+    }
 }
 
 pub fn remove_project(conn: &Connection, id: &str) -> Result<(), String> {
@@ -3135,6 +3180,8 @@ pub fn delete_session(conn: &Connection, id: &str) -> Result<(), String> {
     // 会话规则随对话删除一并清理（不残留孤儿规则）
     conn.execute("DELETE FROM session_rules_t WHERE session_id = ?1", params![id])
         .map_err(|e| e.to_string())?;
+    // 会话经验与反思随会话删除一并清理（不残留孤儿经验）
+    let _ = conn.execute("DELETE FROM agent_growths WHERE session_id = ?1", params![id]);
     conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -3799,7 +3846,28 @@ pub fn remove_queued(conn: &Connection, message_id: &str) -> Result<bool, String
 
 // ---------- tool events ----------
 
+/// 防止工具执行的超长输出（如数万行终端日志、超大二进制内容）撑爆 SQLite 页面造成剧烈碎片
+pub fn sanitize_overflow_text(text: Option<&str>, max_bytes: usize) -> Option<String> {
+    text.map(|t| {
+        if t.len() > max_bytes {
+            let mut end = max_bytes;
+            while !t.is_char_boundary(end) && end > 0 {
+                end -= 1;
+            }
+            format!(
+                "{}\n\n[...⚠️ 输出内容过长（共 {} 字符），已截断保存前 {} 字符以保护数据库物理空间稳定 ...]",
+                &t[..end],
+                t.len(),
+                end
+            )
+        } else {
+            t.to_string()
+        }
+    })
+}
+
 pub fn insert_tool_event(conn: &Connection, ev: &ToolEvent) -> Result<(), String> {
+    let sanitized_result = sanitize_overflow_text(ev.result_text.as_deref(), 65536);
     conn.execute(
         "INSERT INTO tool_events(id, message_id, tool_name, tool_call_id, params_json, result_text, status, approval_scope, created_at, subprocess_id)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
@@ -3809,7 +3877,7 @@ pub fn insert_tool_event(conn: &Connection, ev: &ToolEvent) -> Result<(), String
             ev.tool_name,
             ev.tool_call_id,
             serde_json::to_string(&ev.params).map_err(|e| e.to_string())?,
-            ev.result_text,
+            sanitized_result.as_deref().or(ev.result_text.as_deref()),
             ev.status,
             ev.approval_scope,
             ev.created_at,
@@ -3839,6 +3907,7 @@ pub fn update_tool_event_full(
     subprocess_id: Option<&str>,
     params_json: Option<&str>,
 ) -> Result<(), String> {
+    let sanitized_result = sanitize_overflow_text(result_text, 65536);
     conn.execute(
         "UPDATE tool_events SET status = ?2,
             result_text = COALESCE(?3, result_text),
@@ -3846,7 +3915,14 @@ pub fn update_tool_event_full(
             subprocess_id = COALESCE(?5, subprocess_id),
             params_json = COALESCE(?6, params_json)
          WHERE id = ?1",
-        params![id, status, result_text, approval_scope, subprocess_id, params_json],
+        params![
+            id,
+            status,
+            sanitized_result.as_deref().or(result_text),
+            approval_scope,
+            subprocess_id,
+            params_json
+        ],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -5936,4 +6012,139 @@ pub fn query_tool_logs(conn: &Connection, filter: &ToolLogFilter) -> Result<Tool
         total_pages,
     })
 }
+
+// ---------- 物理空间回收与维护 ----------
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DbStats {
+    pub page_size: usize,
+    pub page_count: usize,
+    pub freelist_count: usize,
+    pub file_size_bytes: u64,
+    pub wal_size_bytes: u64,
+}
+
+pub fn get_db_stats(conn: &Connection, db_path: Option<&Path>) -> Result<DbStats, String> {
+    let page_size: usize = conn.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap_or(4096);
+    let page_count: usize = conn.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap_or(0);
+    let freelist_count: usize = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0)).unwrap_or(0);
+    let file_size_bytes = db_path
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .unwrap_or(page_count as u64 * page_size as u64);
+    let wal_size_bytes = db_path
+        .and_then(|p| {
+            let mut wal_path = p.to_path_buf().into_os_string();
+            wal_path.push("-wal");
+            std::fs::metadata(wal_path).ok()
+        })
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    Ok(DbStats {
+        page_size,
+        page_count,
+        freelist_count,
+        file_size_bytes,
+        wal_size_bytes,
+    })
+}
+
+pub fn reclaim_freelist_pages(conn: &Connection, target_pages: Option<usize>) -> Result<usize, String> {
+    let freelist_before: usize = conn
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .unwrap_or(0);
+    if freelist_before == 0 {
+        return Ok(0);
+    }
+    if let Some(pages) = target_pages {
+        let _ = conn.execute(&format!("PRAGMA incremental_vacuum({pages})"), []);
+    } else {
+        let _ = conn.execute("PRAGMA incremental_vacuum", []);
+    }
+    let freelist_after: usize = conn
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .unwrap_or(0);
+    Ok(freelist_before.saturating_sub(freelist_after))
+}
+
+pub fn vacuum_database(conn: &Connection) -> Result<(), String> {
+    conn.execute("VACUUM", []).map_err(|e| format!("VACUUM 执行失败: {e}"))?;
+    let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", []);
+    Ok(())
+}
+
+pub fn list_mcp_servers(conn: &Connection) -> Result<Vec<crate::mcp::McpServerConfig>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, name, command, args, env, enabled, created_at, updated_at FROM mcp_servers ORDER BY created_at ASC")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let command: String = row.get(2)?;
+            let args_raw: String = row.get(3)?;
+            let env_raw: String = row.get(4)?;
+            let enabled: i64 = row.get(5)?;
+            let created_at: String = row.get(6)?;
+            let updated_at: String = row.get(7)?;
+            let args: Vec<String> = serde_json::from_str(&args_raw).unwrap_or_default();
+            let env: std::collections::HashMap<String, String> = serde_json::from_str(&env_raw).unwrap_or_default();
+            Ok(crate::mcp::McpServerConfig {
+                id,
+                name,
+                command,
+                args,
+                env,
+                enabled: enabled != 0,
+                created_at,
+                updated_at,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut list = Vec::new();
+    for r in rows {
+        if let Ok(item) = r {
+            list.push(item);
+        }
+    }
+    Ok(list)
+}
+
+pub fn save_mcp_server(conn: &Connection, cfg: &crate::mcp::McpServerConfig) -> Result<(), String> {
+    let args_raw = serde_json::to_string(&cfg.args).unwrap_or_else(|_| "[]".to_string());
+    let env_raw = serde_json::to_string(&cfg.env).unwrap_or_else(|_| "{}".to_string());
+    conn.execute(
+        r#"INSERT INTO mcp_servers (id, name, command, args, env, enabled, created_at, updated_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+           ON CONFLICT(id) DO UPDATE SET
+             name = excluded.name,
+             command = excluded.command,
+             args = excluded.args,
+             env = excluded.env,
+             enabled = excluded.enabled,
+             updated_at = excluded.updated_at"#,
+        params![
+            cfg.id,
+            cfg.name,
+            cfg.command,
+            args_raw,
+            env_raw,
+            if cfg.enabled { 1 } else { 0 },
+            cfg.created_at,
+            cfg.updated_at
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn delete_mcp_server(conn: &Connection, id: &str) -> Result<bool, String> {
+    let affected = conn
+        .execute("DELETE FROM mcp_servers WHERE id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+    Ok(affected > 0)
+}
+
 

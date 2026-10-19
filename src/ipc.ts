@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, CurrentBoard, DataStatus, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult, JevCfg, PlanReviewReport, ToolLogFilter, ToolLogQueryResult, DirectDecisionResult } from "./types";
+import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, CurrentBoard, DataStatus, DbStats, OptimizeResult, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult, JevCfg, PlanReviewReport, ToolLogFilter, ToolLogQueryResult, DirectDecisionResult, BrowserDebugState, InteractiveElement, McpServerConfig, McpToolDefinition, AuthStep, AuthMacro, AuthMacroStatus } from "./types";
 
 /**
  * 读请求防重入去重拦截器：
@@ -48,10 +48,12 @@ export const ipc = {
   respondIntentIntervention: (id: string, action: string, hint?: string | null) =>
     invoke<void>("respond_intent_intervention", { id, action, hint: hint ?? null }),
 
-  // 数据目录
+  // 数据目录与数据库优化
   getDataStatus: () => deduplicatedInvoke<DataStatus>("get_data_status"),
   setDataDir: (path: string) => invoke<void>("set_data_dir", { path }),
   resetDataDir: () => invoke<void>("reset_data_dir"),
+  optimizeDatabase: () => invoke<OptimizeResult>("optimize_database"),
+  getDatabaseStats: () => deduplicatedInvoke<DbStats>("get_database_stats"),
   exitApp: () => invoke<void>("exit_app"),
 
   listProjects: () => deduplicatedInvoke<Project[]>("list_projects"),
@@ -446,9 +448,49 @@ export const ipc = {
     invoke<ReapplyResult>("reapply_turn_file", { messageId, filePath, force: force ?? null }),
   getTurnDiff: (messageId: string) =>
     invoke<SnapshotFileDiff[]>("get_turn_diff", { messageId }),
+
+  // 网页调试 (Browser Debugging)
+  getBrowserDebugState: (sessionId: string) =>
+    invoke<BrowserDebugState>("get_browser_debug_state", { sessionId }),
+  browserNavigateUrl: (sessionId: string, url: string) =>
+    invoke<BrowserDebugState>("browser_navigate_url", { sessionId, url }),
+  browserUserInteract: (sessionId: string, action: string, x?: number, y?: number, text?: string) =>
+    invoke<void>("browser_user_interact", {
+      sessionId,
+      action,
+      x: x ?? null,
+      y: y ?? null,
+      text: text ?? null,
+    }),
+  browserCaptureScreenshot: (sessionId: string) =>
+    invoke<string>("browser_capture_screenshot", { sessionId }),
+  closeBrowserSession: (sessionId: string) =>
+    invoke<void>("close_browser_session", { sessionId }),
+  getAuthMacroStatus: (sessionId: string) =>
+    invoke<AuthMacroStatus>("get_auth_macro_status", { sessionId }),
+  startBrowserRecording: (sessionId: string) =>
+    invoke<void>("start_browser_recording", { sessionId }),
+  getRecordedBrowserSteps: (sessionId: string) =>
+    invoke<AuthStep[]>("get_recorded_browser_steps", { sessionId }),
+  stopBrowserRecordingAndSave: (sessionId: string, manualSteps?: AuthStep[]) =>
+    invoke<AuthMacro>("stop_browser_recording_and_save", { sessionId, manualSteps: manualSteps ?? null }),
+  replayBrowserAuthMacro: (sessionId: string) =>
+    invoke<void>("replay_browser_auth_macro", { sessionId }),
+
+  // MCP 服务管理 (Model Context Protocol)
+  listMcpServers: () =>
+    invoke<McpServerConfig[]>("list_mcp_servers"),
+  saveMcpServer: (cfg: McpServerConfig) =>
+    invoke<McpToolDefinition[]>("save_mcp_server", { cfg }),
+  deleteMcpServer: (id: string) =>
+    invoke<boolean>("delete_mcp_server", { id }),
+  testMcpServer: (command: string, args: string[], env: Record<string, string>) =>
+    invoke<McpToolDefinition[]>("test_mcp_server", { command, args, env }),
+  reloadMcpServers: () =>
+    invoke<void>("reload_mcp_servers"),
 };
 
-export type { ActivePlanDetail, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Message, Session, SessionActiveState, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport, CollaboratorCreateInput, CollaboratorUpdateInput, SessionCreateInput, SessionModelsUpdateInput, FileTextContent, ViewerTabItem, FileOutlineItem, DiffHunk, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult };
+export type { ActivePlanDetail, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Message, Session, SessionActiveState, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport, CollaboratorCreateInput, CollaboratorUpdateInput, SessionCreateInput, SessionModelsUpdateInput, FileTextContent, ViewerTabItem, FileOutlineItem, DiffHunk, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult, BrowserDebugState, InteractiveElement, McpServerConfig, McpToolDefinition, AuthStep, AuthMacro, AuthMacroStatus };
 
 
 

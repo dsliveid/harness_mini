@@ -417,12 +417,31 @@ pub fn delete_session(state: State<'_, crate::AppState>, app: AppHandle, id: Str
     if is_run_active(&state, &id) {
         agent::stop_session(&app, &id);
     }
-    let parent_id = {
+    let (parent_id, data_dir_opt) = {
         let db = state.db.lock().unwrap();
         let parent_id = store::get_session(&db, &id)?.and_then(|s| s.parent_session_id);
         store::delete_session(&db, &id)?;
-        parent_id
+        let _ = store::reclaim_freelist_pages(&db, None);
+        let data_dir = state.data_dir.lock().unwrap().clone();
+        (parent_id, data_dir)
     };
+
+    // 彻底清除该会话关联的所有物理文件与附件，杜绝孤儿资源留存
+    if let Some(ref dir) = data_dir_opt {
+        let res = crate::session_bundle::SessionResource::new(&id, dir);
+        let _ = res.cleanup_all_external_resources();
+
+        // 异步触发快照孤儿 Blob 垃圾回收
+        let gc_dir = dir.clone();
+        let active_hashes = {
+            let conn = state.db.lock().unwrap();
+            store::collect_active_snapshot_hashes(&conn).unwrap_or_default()
+        };
+        tauri::async_runtime::spawn(async move {
+            let _ = crate::snapshot_gc::gc_orphan_blobs(&gc_dir, &active_hashes, std::time::Duration::from_secs(0)).await;
+        });
+    }
+
     let _ = app.emit("sessions:changed", json!({"deleted": id}));
     if let Some(pid) = parent_id {
         let _ = app.emit("subagents:changed", json!({"parentId": pid}));
@@ -436,9 +455,18 @@ pub fn delete_session(state: State<'_, crate::AppState>, app: AppHandle, id: Str
 pub fn archive_session(state: State<'_, crate::AppState>, app: AppHandle, id: String) -> Result<(), String> {
     // 与删除同一流程：临时空间仍在时禁止归档，须先清空
     ensure_temp_cleared(&state, &id)?;
-    let db = state.db.lock().unwrap();
-    store::set_session_status(&db, &id, "archived")?;
-    drop(db);
+    if is_run_active(&state, &id) {
+        agent::stop_session(&app, &id);
+    }
+    let data_dir_opt = {
+        let db = state.db.lock().unwrap();
+        store::set_session_status(&db, &id, "archived")?;
+        state.data_dir.lock().unwrap().clone()
+    };
+    // 物理冷热隔离：将该会话 Bundle 移入 archives/ 冷存储目录，彻底释放热区
+    if let Some(ref dir) = data_dir_opt {
+        let _ = crate::session_bundle::SessionArchiver::archive_session_bundle(dir, &id);
+    }
     emit_session(&state, &app, &id);
     let _ = app.emit("sessions:changed", json!({"archived": id}));
     Ok(())
@@ -467,9 +495,15 @@ fn ensure_temp_cleared(state: &crate::AppState, id: &str) -> Result<(), String> 
 
 #[tauri::command]
 pub fn unarchive_session(state: State<'_, crate::AppState>, app: AppHandle, id: String) -> Result<(), String> {
-    let db = state.db.lock().unwrap();
-    store::set_session_status(&db, &id, "active")?;
-    drop(db);
+    let data_dir_opt = {
+        let db = state.db.lock().unwrap();
+        store::set_session_status(&db, &id, "active")?;
+        state.data_dir.lock().unwrap().clone()
+    };
+    // 物理恢复：将该会话从 archives/ 冷存储恢复回 sessions/ 活跃区
+    if let Some(ref dir) = data_dir_opt {
+        let _ = crate::session_bundle::SessionArchiver::unarchive_session_bundle(dir, &id);
+    }
     emit_session(&state, &app, &id);
     let _ = app.emit("sessions:changed", json!({"unarchived": id}));
     Ok(())
@@ -608,7 +642,19 @@ pub fn get_messages(
     limit: Option<i64>,
 ) -> Result<Vec<Message>, String> {
     let db = state.db.lock().unwrap();
-    store::get_messages(&db, &session_id, before_seq, limit.unwrap_or(200))
+    let msgs = store::get_messages(&db, &session_id, before_seq, limit.unwrap_or(200))?;
+    if msgs.is_empty() {
+        let data_dir_opt = state.data_dir.lock().unwrap().clone();
+        if let Some(ref data_dir) = data_dir_opt {
+            let bundle = crate::session_bundle::SessionBundle::new(&session_id, data_dir);
+            if bundle.is_archived() {
+                if let Ok(conn) = bundle.open_db_readonly() {
+                    return store::get_messages(&conn, &session_id, before_seq, limit.unwrap_or(200));
+                }
+            }
+        }
+    }
+    Ok(msgs)
 }
 
 #[tauri::command]
@@ -2346,6 +2392,46 @@ pub fn exit_app(app: AppHandle) {
     app.exit(0);
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OptimizeResult {
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+    pub freed_bytes: u64,
+}
+
+/// 手动/定时执行数据库压缩与物理空间回收（VACUUM + WAL 截断）
+#[tauri::command]
+pub fn optimize_database(state: State<'_, crate::AppState>) -> Result<OptimizeResult, String> {
+    let data_dir = state.data_dir.lock().unwrap().clone();
+    let db_path = data_dir.as_ref().map(|d| d.join("harness_mini.db"));
+    let db = state.db.lock().unwrap();
+    let before_stats = store::get_db_stats(&db, db_path.as_deref())?;
+    let before_total = before_stats.file_size_bytes + before_stats.wal_size_bytes;
+
+    store::vacuum_database(&db)?;
+
+    let after_stats = store::get_db_stats(&db, db_path.as_deref())?;
+    let after_total = after_stats.file_size_bytes + after_stats.wal_size_bytes;
+    let freed = before_total.saturating_sub(after_total);
+
+    Ok(OptimizeResult {
+        before_bytes: before_total,
+        after_bytes: after_total,
+        freed_bytes: freed,
+    })
+}
+
+/// 获取当前数据库状态与空间统计信息
+#[tauri::command]
+pub fn get_database_stats(state: State<'_, crate::AppState>) -> Result<store::DbStats, String> {
+    let data_dir = state.data_dir.lock().unwrap().clone();
+    let db_path = data_dir.as_ref().map(|d| d.join("harness_mini.db"));
+    let db = state.db.lock().unwrap();
+    store::get_db_stats(&db, db_path.as_deref())
+}
+
+
 // ---------- 成长演进 (agent_growths) ----------
 
 #[tauri::command]
@@ -4052,6 +4138,257 @@ pub async fn query_tool_logs(
 ) -> Result<crate::models::ToolLogQueryResult, String> {
     let db = state.db.lock().unwrap();
     store::query_tool_logs(&db, &filter)
+}
+
+#[tauri::command]
+pub async fn list_mcp_servers(state: State<'_, crate::AppState>) -> Result<Vec<crate::mcp::McpServerConfig>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    crate::store::list_mcp_servers(&db)
+}
+
+#[tauri::command]
+pub async fn save_mcp_server(
+    cfg: crate::mcp::McpServerConfig,
+    state: State<'_, crate::AppState>,
+) -> Result<Vec<crate::mcp::McpToolDefinition>, String> {
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        crate::store::save_mcp_server(&db, &cfg)?;
+    }
+    crate::mcp::global_mcp_manager().start_server(&cfg).await
+}
+
+#[tauri::command]
+pub async fn delete_mcp_server(
+    id: String,
+    state: State<'_, crate::AppState>,
+) -> Result<bool, String> {
+    crate::mcp::global_mcp_manager().stop_server(&id).await;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    crate::store::delete_mcp_server(&db, &id)
+}
+
+#[tauri::command]
+pub async fn test_mcp_server(
+    command: String,
+    args: Vec<String>,
+    env: std::collections::HashMap<String, String>,
+) -> Result<Vec<crate::mcp::McpToolDefinition>, String> {
+    crate::mcp::global_mcp_manager().test_connection(&command, &args, &env).await
+}
+
+#[tauri::command]
+pub async fn reload_mcp_servers(state: State<'_, crate::AppState>) -> Result<(), String> {
+    let servers = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        crate::store::list_mcp_servers(&db)?
+    };
+    crate::mcp::global_mcp_manager().reload_from_db(servers).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_browser_debug_state(
+    session_id: String,
+) -> Result<crate::browser::BrowserDebugState, String> {
+    let session = crate::browser::global_browser_manager()
+        .get(&session_id)
+        .await
+        .ok_or_else(|| "当前会话暂无活动的浏览器调试实例".to_string())?;
+    session.get_debug_state().await
+}
+
+#[tauri::command]
+pub async fn browser_user_interact(
+    session_id: String,
+    action: String,
+    x: Option<f64>,
+    y: Option<f64>,
+    text: Option<String>,
+) -> Result<(), String> {
+    let session = crate::browser::global_browser_manager()
+        .get(&session_id)
+        .await
+        .ok_or_else(|| "当前会话暂无活动的浏览器调试实例".to_string())?;
+
+    match action.as_str() {
+        "click" => {
+            let px = x.unwrap_or(0.0);
+            let py = y.unwrap_or(0.0);
+            session.user_click(px, py).await
+        }
+        "type" => {
+            let t = text.unwrap_or_default();
+            session.user_type_text(&t).await
+        }
+        _ => Err(format!("不支持的人工交互动作: {action}")),
+    }
+}
+
+#[tauri::command]
+pub async fn browser_navigate_url(
+    state: State<'_, crate::AppState>,
+    session_id: String,
+    url: String,
+) -> Result<crate::browser::BrowserDebugState, String> {
+    let clean_url = url.trim();
+    if clean_url.is_empty() {
+        return Err("URL 不能为空".to_string());
+    }
+    let ws_path = {
+        let db = state.db.lock().unwrap();
+        store::get_session(&db, &session_id)
+            .ok()
+            .flatten()
+            .map(|s| std::path::PathBuf::from(s.workspace_path))
+    };
+    let manager = crate::browser::global_browser_manager();
+    let session = manager.get_or_create(&session_id, true, ws_path).await?;
+    session.navigate(clean_url).await
+}
+
+#[tauri::command]
+pub async fn get_auth_macro_status(
+    state: State<'_, crate::AppState>,
+    session_id: String,
+) -> Result<crate::browser::AuthMacroStatus, String> {
+    let ws_path = {
+        let db = state.db.lock().unwrap();
+        let s = store::get_session(&db, &session_id)?
+            .ok_or_else(|| format!("未找到会话: {session_id}"))?;
+        std::path::PathBuf::from(s.workspace_path)
+    };
+    Ok(crate::browser::auth::get_auth_macro_status(&ws_path))
+}
+
+#[tauri::command]
+pub async fn start_browser_recording(
+    state: State<'_, crate::AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    let ws_path = {
+        let db = state.db.lock().unwrap();
+        let s = store::get_session(&db, &session_id)?
+            .ok_or_else(|| format!("未找到会话: {session_id}"))?;
+        std::path::PathBuf::from(s.workspace_path)
+    };
+    let session = crate::browser::global_browser_manager()
+        .get_or_create(&session_id, true, Some(ws_path))
+        .await?;
+    session.start_recording().await
+}
+
+#[tauri::command]
+pub async fn get_recorded_browser_steps(
+    session_id: String,
+) -> Result<Vec<crate::browser::AuthStep>, String> {
+    let session = crate::browser::global_browser_manager()
+        .get(&session_id)
+        .await
+        .ok_or_else(|| "当前会话暂无活动的浏览器调试实例".to_string())?;
+    session.get_recorded_steps().await
+}
+
+#[tauri::command]
+pub async fn stop_browser_recording_and_save(
+    state: State<'_, crate::AppState>,
+    session_id: String,
+    manual_steps: Option<Vec<crate::browser::AuthStep>>,
+) -> Result<crate::browser::AuthMacro, String> {
+    let (ws_path, master_key) = {
+        let db = state.db.lock().unwrap();
+        let master = *state.master_key.lock().unwrap();
+        let s = store::get_session(&db, &session_id)?
+            .ok_or_else(|| format!("未找到会话: {session_id}"))?;
+        (std::path::PathBuf::from(s.workspace_path), master)
+    };
+
+    let session = crate::browser::global_browser_manager()
+        .get(&session_id)
+        .await
+        .ok_or_else(|| "当前会话暂无活动的浏览器调试实例".to_string())?;
+
+    session.stop_recording().await?;
+
+    let recorded = session.get_recorded_steps().await.unwrap_or_default();
+    let mut steps = manual_steps.unwrap_or_default();
+    if steps.is_empty() {
+        steps = recorded;
+    }
+
+    // 捕获当前的登录终态 (Cookies + LocalStorage) 并持久化为 storage_state.json
+    let storage_state = session.capture_storage_state().await?;
+    crate::browser::auth::save_storage_state(&ws_path, &storage_state)?;
+
+    let current_state = session.get_debug_state().await.ok();
+    let login_url = current_state
+        .map(|s| s.url)
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:8080/#/login".to_string());
+
+    let macro_data = crate::browser::AuthMacro {
+        version: "1.0".to_string(),
+        project: None,
+        login_url,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        steps,
+    };
+
+    crate::browser::auth::save_auth_macro(&ws_path, &macro_data, &master_key)?;
+    Ok(macro_data)
+}
+
+#[tauri::command]
+pub async fn replay_browser_auth_macro(
+    state: State<'_, crate::AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    let (ws_path, master_key) = {
+        let db = state.db.lock().unwrap();
+        let master = *state.master_key.lock().unwrap();
+        let s = store::get_session(&db, &session_id)?
+            .ok_or_else(|| format!("未找到会话: {session_id}"))?;
+        (std::path::PathBuf::from(s.workspace_path), master)
+    };
+
+    let session = crate::browser::global_browser_manager()
+        .get_or_create(&session_id, true, Some(ws_path.clone()))
+        .await?;
+
+    let macro_data = crate::browser::auth::load_auth_macro(&ws_path, &master_key)?
+        .ok_or_else(|| "工作区未检测到已录制的 auth_macro.json，请先录制登录流程".to_string())?;
+
+    session.replay_auth_macro(&macro_data).await?;
+
+    // 更新 storage_state
+    if let Ok(st) = session.capture_storage_state().await {
+        let _ = crate::browser::auth::save_storage_state(&ws_path, &st);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn browser_capture_screenshot(
+    session_id: String,
+) -> Result<String, String> {
+    let session = crate::browser::global_browser_manager()
+        .get(&session_id)
+        .await
+        .ok_or_else(|| "当前会话暂无活动的浏览器调试实例".to_string())?;
+    let raw = session.capture_screenshot().await?;
+    if raw.starts_with("data:") {
+        Ok(raw)
+    } else {
+        Ok(format!("data:image/jpeg;base64,{raw}"))
+    }
+}
+
+#[tauri::command]
+pub async fn close_browser_session(
+    session_id: String,
+) -> Result<(), String> {
+    crate::browser::global_browser_manager().close(&session_id).await;
+    Ok(())
 }
 
 #[cfg(test)]
