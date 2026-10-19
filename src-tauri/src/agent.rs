@@ -1772,18 +1772,6 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             })
         })
         .collect();
-    let decision_tool_names = ["judge_decision", "choice_decision", "score_decision"];
-    let decision_schemas: Vec<Value> = schemas
-        .iter()
-        .filter(|s| {
-            s.get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                .map(|name| decision_tool_names.contains(&name))
-                .unwrap_or(false)
-        })
-        .cloned()
-        .collect();
     let is_long_task = {
         let db = state.db.lock().unwrap();
         if let Ok(Some(task)) = store::get_active_long_task(&db, session_id) {
@@ -1988,18 +1976,6 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         &project_plan_mode,
     );
 
-    // 第一层级 · 业务意图与交付边界定性（Phase 1 Intent & Alignment）：
-    // 当接收到用户新任务且启用了 intent_alignment_gate SOP 时，首步采用物理隔离机制：
-    // 1. 系统提示词使用极简 phase1_intent_system_prompt，完全剥离协作者名录、记忆大盘和工程落地规则；
-    // 2. 工具集物理隔离，仅下发 3 个决策工具（judge_decision / choice_decision / score_decision）；
-    // 3. 专职决策模型质检通过（或用户人工采纳）后，自适应转入第二阶段（Phase 2），恢复全局提示词与全量生产工具。
-    let is_sub = is_subagent || session.session_type == "collaborator" || session.session_type == "subprocess";
-    let enable_phase1 = !is_sub
-        && !settings.disabled_sops.iter().any(|s| s == "intent_alignment_gate")
-        && !decision_schemas.is_empty();
-    let mut intent_alignment_done = !enable_phase1;
-    let phase1_sys = phase1_intent_system_prompt(&session);
-
     let verified_intent_prefix: Option<String> = None;
     let mut sop_verified = false;
     let mut files_modified = false;
@@ -2038,12 +2014,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             reached_max_steps = current_max_steps;
             break;
         }
-        let is_in_phase1 = !intent_alignment_done;
-        let current_sys = if is_in_phase1 {
-            &phase1_sys
-        } else {
-            &sys
-        };
+        let current_sys = &sys;
 
         // ---- 步骤 0：在首步或上下文逼近上限时检测是否触发自动压缩与确认 ----
         if !has_checked_compaction {
@@ -2151,17 +2122,10 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             let sid_reason = sid2.clone();
             let mid_reason = mid2.clone();
 
-            // 第一阶段（Phase 1 纯意图定性）仅下发决策工具；第二阶段（Phase 2）恢复暴露全量生产工具
-            let step_schemas = if is_in_phase1 {
-                decision_schemas.clone()
-            } else {
-                schemas.clone()
-            };
-
             let call = llm::chat_stream(
                 &cfg,
                 &messages,
-                &step_schemas,
+                &schemas,
                 {
                     let buf2 = buf2.clone();
                     move |delta| {
@@ -2517,11 +2481,6 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 )
                 .await
             };
-
-            // 决策工具质检通过（得分≥90/判定为真/选择明确）或用户在卡片上人工确认采纳后，解除 Phase 1 闸门，平滑转入 Phase 2
-            if matches!(tc.name.as_str(), "judge_decision" | "choice_decision" | "score_decision") && status == "success" {
-                intent_alignment_done = true;
-            }
 
             // 工具自动自纠错机制：非用户审批拒绝的执行失败触发内部微反思引导
             if status == "failed" {
@@ -4045,49 +4004,6 @@ fn project_section(
     s
 }
 
-/// 第一层级 · 前置业务意图与交付边界定性专用系统提示词（Phase 1 Intent & Alignment）
-/// 严格物理剥离协作者名录、长期记忆大盘与工程落地实施规则，确保大模型输出 100% 纯净的业务意图分析与缺省假设。
-fn phase1_intent_system_prompt(session: &Session) -> String {
-    let os = if cfg!(windows) { "Windows" } else { "Unix-like" };
-    let ws_info = if session.workspace_path.is_empty() {
-        "当前会话处于通用对话模式（未绑定本地目录）".to_string()
-    } else {
-        format!("工作区根目录：{}", session.workspace_path)
-    };
-
-    format!(
-        r#"你是 harness_mini 的业务意图识别与决策对齐中枢。
-{ws_info}
-操作系统：{os}
-
-【当前阶段：第一层级 · 前置业务意图与交付边界定性（Phase 1 Intent & Alignment）】
-当前处于接收用户输入后的第一步。你的唯一职责是对用户的核心业务诉求进行纯粹的意图理解与交付边界定性，严禁直接推进具体工程实施或内部实现。
-
-工作规则与执行规范：
-1. 【深入思考与意图提炼】：
-   - 在思考区（<think>）中深入揣摩用户的核心目标、潜在诉求与缺省假设；
-   - 明确交付边界：若用户没有指定尺寸、风格、框架或格式等额外细节，提炼出合理通用的业务默认值（例如：生成图片未指定尺寸风格时，默认按标准海报/贺卡 1024x1024 交付；未指定代码框架时按项目现有约定）；
-   - 纯粹业务视角：只描述用户要什么、交付什么，严禁提及任何内部工具名称（如 get_collaborators、record_memory、recognize_image 等）、严禁提及协作者名录、严禁提及底层工具调用流水线！
-
-2. 【回复表达规范（极致简明）】：
-   - 在正文文本中必须保持极致简短，只输出两句话：
-     * 第 1 句：核心意向陈述（≤30字，概括用户要做什么）；
-     * 第 2 句：下一步交付方向（≤30字，说明交付边界或默认假设）；
-   - 严禁长篇大论，严禁提前展开具体实现细节。
-
-3. 【场景化决策工具选择（必须三选一调用）】：
-   提炼好业务意图后，必须根据场景调用以下决策工具之一进行业务准入质检：
-   - 【简单即时任务】（单点问答、简单生图、单处微调）：优先调用 `judge_decision`，判断当前需求是否目标清晰完整、默认假设合理可直接交付；
-   - 【存在分支路线】（如自研 vs 第三方库、方案 A vs 方案 B）：调用 `choice_decision`，裁决最优业务路径；
-   - 【复杂多步需求 / 系统重构】：调用 `score_decision`，对核心意图剖析与交付边界进行百分制评分。
-
-4. 【自动转入第二阶段】：
-   决策工具质检通过或用户人工采纳后，系统将自动激活第二阶段（Phase 2）工程落地规范并开放全量生产工具供你执行。"#,
-        ws_info = ws_info,
-        os = os
-    )
-}
-
 fn system_prompt(
     session: &Session,
     project_section: Option<&str>,
@@ -4271,26 +4187,24 @@ fn system_prompt(
 
         if is_sop_enabled("intent_alignment_gate") {
             rules.push(format!(
-                "{rule_num}. 【第一层级 · 首步意图定性与场景化决策 SOP（接收到新任务的 Step 1 必须严格遵守）】：\n   \
-                 - 触发时机：当你接收到用户发送的新任务、功能需求、代码修改、生图或技术问题时，在第一步（Step 1）必须先进行意图定性与决策质检；日常问候或纯文本简答直接回复；后续分步执行步骤无需重复质检。\n   \
-                 - 第一步标准执行动作（按序执行，严禁越界）：\n     \
-                   1. 【深入思考】：在思考区（<think>）中深入揣摩用户真实核心诉求，消解代词与前序上下文意图；\n     \
-                   2. 【简明表达】：在回复正文文本中**只输出 1 句话核心意向（≤30字）和 1 句话下一步方向（≤30字）**，必须保持极致简明，严禁长篇大论或提前赘述方案细节；\n     \
-                   3. 【首步工具禁令】：第一步**严禁调用除决策工具外的任何工具**（严禁调用 `get_collaborators` 查协作者、严禁调用文件/代码搜索工具、严禁生图或编辑文件、严禁拆解子任务）；\n     \
-                   4. 【场景化决策工具选择（必须三选一调用）】：\n       \
-                      * **简单即时任务**（如单点问答、简单生图、单处微调）：优先调用 `judge_decision`，判断“该需求是否目标完全明确且无歧义，可直接执行？（True/False）”；\n       \
-                      * **方案存在分支路线**（如直接做 vs 委派协作者 vs 多个实现方案）：优先调用 `choice_decision`，从备选策略中裁决最优项；\n       \
-                      * **复杂多步业务改造 / 系统重构**：调用 `score_decision`，对核心意图理解与关键计划进行百分制评分（≥90分放行）。\n   \
-                 - 决策结果与人机协同机制：\n     \
-                   * 若质检通过（得分≥90分、judge=true、choice有效）：系统自动静默放行，立即激活第二阶段规则并在后续步骤推进工程落地；\n     \
-                   * 若质检存疑（得分<90分 或 judge=false）：系统将就地挂起并弹出确认卡片由用户亲自定夺。若用户点击【采纳方案】，工具将放行通知你继续；若用户点击【补充指导】，你必须在下一步严格依据用户的补充指导修正方案！"
+                "{rule_num}. 【首步意图定性与场景化决策质检 SOP】：\n   \
+                 - 触发时机：当你接收到用户发送的新任务、功能需求、代码修改、生图或技术问题时，在开始实际工程改动前，优先进行意图对齐与决策质检；日常问候或纯文本简答直接回复；后续分步执行步骤无需重复质检。\n   \
+                 - 场景化决策工具选型（按需调用）：\n       \
+                   * **简单即时任务**（如单点问答、简单生图、单处微调）：优先调用 `judge_decision`，判断“该需求是否目标完全明确且无歧义，可直接执行？（True/False）”；\n       \
+                   * **方案存在分支路线**（如直接做 vs 委派协作者 vs 多个实现方案）：优先调用 `choice_decision`，从备选策略中裁决最优项；\n       \
+                   * **复杂多步业务改造 / 系统重构**：调用 `score_decision`，对核心意图理解与关键计划进行百分制评分（≥90分放行）。\n   \
+                 - 人机协同审批机制：\n     \
+                   * 若质检存疑（得分<90分 或 judge=false）：系统将就地挂起并弹出确认卡片由用户亲自定夺。若用户点击【采纳方案】，工具将放行通知你继续；若用户点击【补充指导】，你必须在下一步严格依据用户的补充指导修正方案！\n   \
+                 - 调研探索与执行连贯性：\n     \
+                   * 探索与调研阶段可正常调用只读工具（glob / grep / list_dir / file_outline / read_file）摸排代码；\n     \
+                   * 【严禁空口预告后中断】：严禁仅在回复文本中输出“我先看下/我来验证/稍后更新”等行动预告却不发起任何工具调用！若当前步骤需要探索、修改或更新计划，必须直接发起对应工具调用，保持连贯执行直至阶段交付。"
             ));
             rule_num += 1;
         }
 
         if plan_mode == "always_plan" {
             rules.push(format!(
-                "{rule_num}. 【第二层级 · 严格规划先行与确认门禁准则（Always Plan 模式，意图质检放行后生效）】：\n   \
+                "{rule_num}. 【严格规划先行与确认门禁准则（Always Plan 模式）】：\n   \
                  - 适用范围：凡是对项目进行较大改动（预计修改 3 个以上文件、架构重构、引入新架构或新增功能特性）：\n   \
                  - 阶段划分（严禁越界）：\n     \
                    1. 【只读调研】：仅允许使用只读工具（glob / grep / list_dir / file_outline / read_file）摸清代码逻辑；\n     \
@@ -4301,7 +4215,7 @@ fn system_prompt(
             rule_num += 1;
         } else if plan_mode == "always_proceed" {
             rules.push(format!(
-                "{rule_num}. 【第二层级 · 规划先行与自动推进准则（Always Proceed 模式，意图质检放行后生效）】：\n   \
+                "{rule_num}. 【规划先行与自动推进准则（Always Proceed 模式）】：\n   \
                  - 适用范围：凡是对项目进行较大改动（预计修改 3 个以上文件、跨模块重构、新增功能特性）：\n   \
                  - 核心流程：\n     \
                    1. 【必须先有计划】：同样必须调用 `create_plan` 工具生成结构化计划 MD 文档落盘，确立任务锚点与分步 Checklist；\n     \
@@ -4313,20 +4227,19 @@ fn system_prompt(
             rule_num += 1;
         } else if is_sop_enabled("plan_first") {
             rules.push(format!(
-                "{rule_num}. 【第二层级 · 方案先行与任务计划中枢治理规范（防需求失真，意图质检放行后生效）】：\n   - 大改动物理落盘先行：凡是涉及 3 个以上文件修改、架构重构、新增功能模块或预计多轮交互的复杂任务，**严禁在没有计划文档的情况下直接编写/修改代码**。必须先调用 `create_plan` 工具在 `.harness/plans/` 目录下生成结构化计划 MD 文档（明确目标、技术架构、受影响文件清单、分步 Checklist 与验证策略），并向用户呈现确认。\n   - 需求变更优先更新计划：在多轮对话中，一旦用户提出需求调整、增加/减少特性或纠偏，**在改动代码前，必须首先调用 `update_plan` 工具同步更新计划文档内容（若执行步骤改变，必须传入 modified_sections.steps 全量更新 Checklist）与变更历史 (Revision History)**，彻底杜绝“口头答应却遗留旧代码/旧步骤”的需求失真。\n   - 按清单逐步推进与结案：执行阶段严格以计划 Checklist 为基准推进，每完成一个关键步骤，调用 `update_plan` 推进步骤状态；全部任务完成并通过测试后，调用 `update_plan(status: \"completed\")` 结案归档并解除活动挂载。\n   - 多需求隔离与计划流转：在同一会话中开启全新不相关的独立任务时，调用 `create_plan` 开启新的独立计划（旧计划自动挂起，杜绝多任务杂糅）；若需回溯前序任务，调用 `switch_plan` 重新激活。"
+                "{rule_num}. 【方案先行与任务计划中枢治理规范（防需求失真）】：\n   - 大改动物理落盘先行：凡是涉及 3 个以上文件修改、架构重构、新增功能模块或预计多轮交互的复杂任务，**严禁在没有计划文档的情况下直接编写/修改代码**。必须先调用 `create_plan` 工具在 `.harness/plans/` 目录下生成结构化计划 MD 文档（明确目标、技术架构、受影响文件清单、分步 Checklist 与验证策略），并向用户呈现确认。\n   - 需求变更优先更新计划：在多轮对话中，一旦用户提出需求调整、增加/减少特性或纠偏，**在改动代码前，必须首先调用 `update_plan` 工具同步更新计划文档内容（若执行步骤改变，必须传入 modified_sections.steps 全量更新 Checklist）与变更历史 (Revision History)**，彻底杜绝“口头答应却遗留旧代码/旧步骤”的需求失真。\n   - 按清单逐步推进与结案：执行阶段严格以计划 Checklist 为基准推进，每完成一个关键步骤，调用 `update_plan` 推进步骤状态；全部任务完成并通过测试后，调用 `update_plan(status: \"completed\")` 结案归档并解除活动挂载。\n   - 多需求隔离与计划流转：在同一会话中开启全新不相关的独立任务时，调用 `create_plan` 开启新的独立计划（旧计划自动挂起，杜绝多任务杂糅）；若需回溯前序任务，调用 `switch_plan` 重新激活。"
             ));
             rule_num += 1;
         }
 
         if is_sop_enabled("todo_lifecycle") {
-            rules.push(format!("{rule_num}. 【第二层级 · 任务清单全生命周期 SOP（意图质检放行后生效）】：接到多步任务时，在第一阶段意图质检放行后，方可用 todo 工具列出计划，并随进展更新各项状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done（切勿遗留 in_progress 状态）。"));
+            rules.push(format!("{rule_num}. 【任务清单全生命周期 SOP】：接到多步任务时，方可用 todo 工具列出计划，并随进展更新各项状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done（切勿遗留 in_progress 状态）。"));
             rule_num += 1;
         }
 
         if is_sop_enabled("subagent_orchestration") {
             rules.push(format!(
-                "{rule_num}. 【第二层级 · 团队协同委派原则、弹性多并发与单一门禁准则（意图质检放行后生效）】：\n   \
-                 - ⚠️ 前提约束：本规则仅在第一阶段意图质检通过（或用户人工采纳）后方可触发！第一步严禁直接调用 `get_collaborators` 或派发协作者。\n   \
+                "{rule_num}. 【团队协同委派原则、弹性多并发与单一门禁准则】：\n   \
                  - 角色定位：你作为总架构师与统筹协调者，把控全局契约设计与最终汇总验收；具体编码与模块落地按需委派给专职子 Agent。\n   \
                  - 常驻协作者委派（优先）：仅当下方【可用项目协作者名录】中已存在对应常驻协作者，且当前任务命中了其专属职责（如【AI 绘画师】、【产品经理】等）时，你【必须调用 `dispatch_collaborator` 工具】进行委派，并在调用后紧接着调用 `wait_collaborators` 等待成果汇报。\n   \
                  - 弹性多子 Agent 并行（支持多前端/多后端横向扩展）：面对大型复杂任务，完全支持且鼓励**同时派发多个前端和多个后端子 Agent** 开展高并发开发！⚠️ 提示：系统不存在所谓的 `create_collaborator` 工具，创建并启动子任务统一调用 `spawn_subagent`。\n   \
@@ -4340,13 +4253,13 @@ fn system_prompt(
 
         if is_sop_enabled("surgical_code_reading") {
             rules.push(format!(
-                "{rule_num}. 【第二层级 · 精益代码研读与克制探索 SOP（意图质检放行后生效）】：\n   - 漏斗式探索原则：探索项目架构与业务逻辑时，优先使用 glob / list_dir 查看目录与配置文件，对源码文件优先调用 `file_outline` 获取结构骨架（类/接口/结构体/函数签名及行号），结合 `grep` 定位关键线索；严禁在未摸清线索前盲目通读业务源码。\n   - 严禁连续切片漫游：严禁对超过 300 行的大型文件进行无休止、多轮递增的分页切片（offset_line）式逐行深挖；若需了解具体实现，必须以函数/模块为靶标，通过 offset_line 与 max_lines 精读最小必要上下文（建议 50~100 行）。\n   - 修改前的精确性保障：克制阅读不等于凭空臆断。在调用 edit_file 前，必须通过局部 read_file 确认要替换的原文及行号，严禁在未读取目标代码的情况下凭记忆或猜测修改。"
+                "{rule_num}. 【精益代码研读与克制探索 SOP】：\n   - 漏斗式探索原则：探索项目架构与业务逻辑时，优先使用 glob / list_dir 查看目录与配置文件，对源码文件优先调用 `file_outline` 获取结构骨架（类/接口/结构体/函数签名及行号），结合 `grep` 定位关键线索；严禁在未摸清线索前盲目通读业务源码。\n   - 严禁连续切片漫游：严禁对超过 300 行的大型文件进行无休止、多轮递增的分页切片（offset_line）式逐行深挖；若需了解具体实现，必须以函数/模块为靶标，通过 offset_line 与 max_lines 精读最小必要上下文（建议 50~100 行）。\n   - 修改前的精确性保障：克制阅读不等于凭空臆断。在调用 edit_file 前，必须通过局部 read_file 确认要替换的原文及行号，严禁在未读取目标代码的情况下凭记忆或猜测修改。"
             ));
             rule_num += 1;
         }
 
         if is_sop_enabled("safe_code_edit") {
-            rules.push(format!("{rule_num}. 【第二层级 · 代码克制与精确修改规范（意图质检放行后生效）】：修改文件前必须先用 read_file 读取相关内容，用 edit_file 做基于精确原文的最小化修改；新文件才用 write_file。动手前先用 glob / grep / list_dir / file_outline 探索并理解代码结构。修改完成后，尽量用 run_command 运行构建或测试来验证改动。"));
+            rules.push(format!("{rule_num}. 【代码克制与精确修改规范】：修改文件前必须先用 read_file 读取相关内容，用 edit_file 做基于精确原文的最小化修改；新文件才用 write_file。动手前先用 glob / grep / list_dir / file_outline 探索并理解代码结构。修改完成后，尽量用 run_command 运行构建或测试来验证改动。"));
             rule_num += 1;
         } else {
             rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir / file_outline 探索并理解代码结构。"));
@@ -4355,7 +4268,7 @@ fn system_prompt(
 
         if is_sop_enabled("memory_distill") {
             rules.push(format!(
-                "{rule_num}. 【第二层级 · 边读边记与强制沉淀 SOP（意图质检放行后生效）】：\n   - 工作区内置了长期认知记忆系统（存储于 `.harness/memory/`）。下方已自动载入本项目沉淀的技术大盘（profile.md）、工程规范（conventions.md）与重要碎记（digests）。\n   - 秒级召回优先：当用户询问“当前项目采用的技术”、“技术栈是什么”、“工程规范”等常见问题时，**优先基于已载入的持久化记忆秒级直接回答**，无需反复调用工具重新扫描全量代码；若发现信息有缺失或过期，再针对性读取少量文件并用 record_memory 补全。\n   - 强制沉淀检查点：凡是在当前任务中阅读了 2 个以上文件、深入分析了某个功能模块/流程/配置文件后，在给出最终答复前，**必须至少调用一次 `record_memory` 工具**将核心事实沉淀到工作区，严禁在多步阅读探索后只输出文字答复而不落盘留存：\n     * 独立业务模块/流程链路/排错分析/架构设计 -> **必须调用 `record_memory(category: \"digest\", title: \"...\", content: \"...\")` 固化为主题碎记**；\n     * 项目技术大盘与框架体系 -> 调用 `record_memory(category: \"profile\", ...)` 沉淀至 profile.md；\n     * 常用规范与避坑要点 -> 调用 `record_memory(category: \"convention\", ...)` 沉淀至 conventions.md。"
+                "{rule_num}. 【边读边记与强制沉淀 SOP】：\n   - 工作区内置了长期认知记忆系统（存储于 `.harness/memory/`）。下方已自动载入本项目沉淀的技术大盘（profile.md）、工程规范（conventions.md）与重要碎记（digests）。\n   - 秒级召回优先：当用户询问“当前项目采用的技术”、“技术栈是什么”、“工程规范”等常见问题时，**优先基于已载入的持久化记忆秒级直接回答**，无需反复调用工具重新扫描全量代码；若发现信息有缺失或过期，再针对性读取少量文件并用 record_memory 补全。\n   - 强制沉淀检查点：凡是在当前任务中阅读了 2 个以上文件、深入分析了某个功能模块/流程/配置文件后，在给出最终答复前，**必须至少调用一次 `record_memory` 工具**将核心事实沉淀到工作区，严禁在多步阅读探索后只输出文字答复而不落盘留存：\n     * 独立业务模块/流程链路/排错分析/架构设计 -> **必须调用 `record_memory(category: \"digest\", title: \"...\", content: \"...\")` 固化为主题碎记**；\n     * 项目技术大盘与框架体系 -> 调用 `record_memory(category: \"profile\", ...)` 沉淀至 profile.md；\n     * 常用规范与避坑要点 -> 调用 `record_memory(category: \"convention\", ...)` 沉淀至 conventions.md。"
             ));
             rule_num += 1;
         }
@@ -4808,7 +4721,7 @@ mod tests {
         assert!(all_enabled.contains("修改文件前必须先用 read_file 读取相关内容"));
         assert!(all_enabled.contains("精益代码研读与克制探索 SOP"));
         assert!(all_enabled.contains("todo 工具列出计划"));
-        assert!(all_enabled.contains("首步意图定性与场景化决策 SOP"));
+        assert!(all_enabled.contains("首步意图定性与场景化决策质检 SOP"));
 
         let disabled = vec![
             "plan_first".to_string(),
@@ -4824,25 +4737,21 @@ mod tests {
         assert!(!filtered.contains("todo 工具列出计划"));
         assert!(!filtered.contains("修改文件前必须先用 read_file 读取相关内容"));
         assert!(!filtered.contains("精益代码研读与克制探索 SOP"));
-        assert!(!filtered.contains("首步意图定性与场景化决策 SOP"));
+        assert!(!filtered.contains("首步意图定性与场景化决策质检 SOP"));
         assert!(filtered.contains("团队协同委派原则"));
     }
 
     #[test]
-    fn test_phase1_intent_system_prompt_pure() {
+    fn test_intent_alignment_sop_in_system_prompt() {
         let session = Session {
             workspace_path: "D:\\ws".into(),
             ..Default::default()
         };
-        let p1 = phase1_intent_system_prompt(&session);
-        assert!(p1.contains("Phase 1 Intent & Alignment"));
-        assert!(p1.contains("工作区根目录：D:\\ws"));
-        assert!(p1.contains("judge_decision"));
-        assert!(p1.contains("score_decision"));
-        // 确保纯净性：物理剥离协作者名录与记忆大盘
-        assert!(!p1.contains("可用项目协作者名录"));
-        assert!(!p1.contains("本项目持久化认知与沉淀记忆"));
-        assert!(!p1.contains("conventions.md"));
+        let p = system_prompt(&session, None, &[], "standard");
+        assert!(p.contains("首步意图定性与场景化决策质检 SOP"));
+        assert!(p.contains("judge_decision"));
+        assert!(p.contains("score_decision"));
+        assert!(p.contains("严禁空口预告后中断"));
     }
 
     #[test]
