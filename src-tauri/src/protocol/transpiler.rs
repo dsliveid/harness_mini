@@ -135,17 +135,58 @@ pub fn transpile_to_anthropic(messages: &[Value], tools: &[Value]) -> AnthropicP
             "tool" => {
                 // Claude 协议中工具执行结果属于 user 角色的 tool_result block
                 let call_id = m.get("tool_call_id").and_then(|i| i.as_str()).unwrap_or("");
-                let text = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                raw_converted.push(json!({
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": call_id,
-                            "content": text
+                if let Some(text) = m.get("content").and_then(|c| c.as_str()) {
+                    raw_converted.push(json!({
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": call_id,
+                                "content": text
+                            }
+                        ]
+                    }));
+                } else if let Some(parts) = m.get("content").and_then(|c| c.as_array()) {
+                    let mut tool_blocks = Vec::new();
+                    for part in parts {
+                        let p_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        if p_type == "text" {
+                            if let Some(t) = part.get("text").and_then(|s| s.as_str()) {
+                                tool_blocks.push(json!({"type": "text", "text": t}));
+                            }
+                        } else if p_type == "image_url" {
+                            if let Some(url) = part
+                                .get("image_url")
+                                .and_then(|u| u.get("url"))
+                                .and_then(|s| s.as_str())
+                            {
+                                if let Some((mime, b64)) = parse_data_url(url) {
+                                    tool_blocks.push(json!({
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": mime,
+                                            "data": b64
+                                        }
+                                    }));
+                                }
+                            }
                         }
-                    ]
-                }));
+                    }
+                    if tool_blocks.is_empty() {
+                        tool_blocks.push(json!({"type": "text", "text": "..."}));
+                    }
+                    raw_converted.push(json!({
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": call_id,
+                                "content": tool_blocks
+                            }
+                        ]
+                    }));
+                }
             }
             _ => {}
         }
@@ -355,7 +396,17 @@ pub fn transpile_to_responses(messages: &[Value], tools: &[Value]) -> ResponsesP
                 }
             }
             "assistant" => {
-                let text = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                let text = if let Some(s) = m.get("content").and_then(|c| c.as_str()) {
+                    s.to_string()
+                } else if let Some(parts) = m.get("content").and_then(|c| c.as_array()) {
+                    parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    String::new()
+                };
                 if !text.is_empty() {
                     input_items.push(json!({
                         "type": "message",
@@ -393,7 +444,17 @@ pub fn transpile_to_responses(messages: &[Value], tools: &[Value]) -> ResponsesP
             }
             "tool" => {
                 let id = m.get("tool_call_id").and_then(|i| i.as_str()).unwrap_or("");
-                let text = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                let text = if let Some(s) = m.get("content").and_then(|c| c.as_str()) {
+                    s.to_string()
+                } else if let Some(parts) = m.get("content").and_then(|c| c.as_array()) {
+                    parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    String::new()
+                };
                 input_items.push(json!({
                     "type": "function_call_output",
                     "call_id": id,

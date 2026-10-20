@@ -1,7 +1,9 @@
 mod agent;
 mod approval;
+pub mod artifacts;
 pub mod browser;
 mod commands;
+pub mod diagnostics;
 mod diffutil;
 mod growth;
 pub mod jev;
@@ -518,11 +520,17 @@ pub fn run() {
             commands::browser_user_interact,
             commands::browser_capture_screenshot,
             commands::close_browser_session,
-            commands::get_auth_macro_status,
+            commands::browser_user_wheel,
+            commands::browser_scroll_viewport,
+            commands::browser_open_devtools_window,
+            commands::save_auth_contract,
+            commands::get_auth_contract,
+            commands::get_default_auth_distill_system_prompt,
+            commands::distill_auth_contract,
+            commands::execute_browser_auth_pipeline,
             commands::start_browser_recording,
             commands::get_recorded_browser_steps,
-            commands::stop_browser_recording_and_save,
-            commands::replay_browser_auth_macro,
+            commands::stop_browser_recording,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

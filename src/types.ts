@@ -1884,14 +1884,36 @@ export interface InteractiveElement {
   href?: string;
 }
 
+export type PageHealthState =
+  | { type: "Ready" }
+  | { type: "Unauthenticated"; payload: { current_url: string; reason: string } }
+  | { type: "ActionBlocked"; payload: { title: string; description: string } }
+  | { type: "Error"; payload: { code?: number; message: string } };
+
+export interface ViewportInfo {
+  scroll_x: number;
+  scroll_y: number;
+  viewport_width: number;
+  viewport_height: number;
+  total_width: number;
+  total_height: number;
+  current_page: number;
+  total_pages: number;
+  has_more_down: boolean;
+  has_more_up: boolean;
+}
+
 export interface BrowserDebugState {
   url: string;
   title: string;
+  viewport?: ViewportInfo;
+  hidden_elements_count?: number;
   elements: InteractiveElement[];
   console_errors: string[];
   network_errors: string[];
   tables?: string[];
   notices?: string[];
+  page_state?: PageHealthState;
 }
 
 export interface McpServerConfig {
@@ -1922,20 +1944,48 @@ export interface AuthStep {
   exclude?: string;
 }
 
-export interface AuthMacro {
-  version: string;
-  project?: string;
-  login_url: string;
-  created_at: string;
-  steps: AuthStep[];
+export interface AuthAction {
+  step: number;
+  desc?: string;
+  action_type: string; // "select_modal_item" | "click" | "dismiss_notice" | "wait"
+  dialog_title?: string;
+  match_text?: string;
+  selector?: string;
+  confirm_btn?: string;
 }
 
-export interface AuthMacroStatus {
-  has_macro: boolean;
-  has_storage_state: boolean;
-  step_count: number;
-  last_updated?: string;
-  login_url?: string;
+export interface AuthContractCredentials {
+  username: string;
+  password_cipher: string;
+}
+
+export interface AuthContractPostLogin {
+  org_name?: string;
+  actions?: AuthAction[];
+  success_assert_url?: string;
+}
+
+export interface AuthContract {
+  version: string;
+  system_name?: string;
+  login_url: string;
+  credentials: AuthContractCredentials;
+  post_login?: AuthContractPostLogin;
+  updated_at: string;
+}
+
+export interface DistillTrace {
+  provider_name?: string;
+  model_name?: string;
+  system_prompt: string;
+  user_prompt: string;
+  raw_response: string;
+  elapsed_ms: number;
+}
+
+export interface DistillAuthContractResult {
+  contract: AuthContract;
+  trace: DistillTrace;
 }
 
 

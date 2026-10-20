@@ -1,16 +1,33 @@
 pub mod auth;
 pub mod cdp;
+pub mod daemon;
 pub mod detector;
 pub mod dom_script;
+pub mod evaluator;
+pub mod pipeline;
 pub mod session;
+pub mod storage;
+pub mod synthesizer;
 
-pub use auth::{AuthMacro, AuthMacroStatus, AuthStep, CookieData, StorageState};
-pub use session::{BrowserDebugState, BrowserSession};
+pub use daemon::{global_browser_daemon, BrowserDaemon};
+
+pub use auth::{
+    load_auth_contract, save_auth_contract, AuthAction, AuthContract, AuthContractCredentials,
+    AuthContractPostLogin, AuthStep,
+};
+pub use evaluator::{evaluate_page_state, PageHealthState};
+pub use pipeline::execute_auth_pipeline;
+pub use session::{BrowserDebugState, BrowserSession, ViewportInfo};
+pub use synthesizer::{
+    distill_auth_contract, DistillAuthContractResult, DistillTrace,
+    DEFAULT_AUTH_DISTILL_SYSTEM_PROMPT,
+};
 
 use crate::tools::ToolCtx;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
+use tauri::Manager;
 use tokio::sync::RwLock;
 
 pub struct BrowserManager {
@@ -146,7 +163,19 @@ pub async fn browser_navigate(args: &Value, ctx: &ToolCtx) -> Result<String, Str
         Err(e) => {
             // 若导航发生严重异常（如超时或通道断开），清理此异常会话，保障下次自动重试或新操作自动拉起健康实例
             manager.close(&session_key).await;
-            Err(e)
+
+            // 联动前端诊断总线：自动探测目标本地服务状态，辅助 Agent 精准归因
+            let probe_info = match crate::diagnostics::probe_dev_server(url).await {
+                crate::diagnostics::DevServerStatus::CompilationFailed { stage, error_snippet } => {
+                    format!("\n\n> 🛠️ **【本地开发构建诊断】**: 检测到本地 {stage} 服务处于编译报错状态！\n> 错误简述: `{error_snippet}`\n> 请重点检查最新改动的代码文件是否存在语法/导入错误。")
+                }
+                crate::diagnostics::DevServerStatus::NotRunning => {
+                    format!("\n\n> ⚠️ **【本地服务诊断】**: 目标端口当前无法连接，请确认本地开发服务 (如 npm run serve / vite) 是否正在运行。")
+                }
+                _ => String::new(),
+            };
+
+            Err(format!("{e}{probe_info}"))
         }
     }
 }
@@ -213,7 +242,11 @@ pub async fn browser_get_debug_state(ctx: &ToolCtx) -> Result<String, String> {
     }
 }
 
-pub async fn browser_screenshot(ctx: &ToolCtx) -> Result<String, String> {
+pub async fn browser_scroll(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let direction = args.get("direction").and_then(|v| v.as_str());
+    let distance = args.get("distance").and_then(|v| v.as_f64());
+    let target = args.get("target").and_then(|v| v.as_str());
+
     let session_key = get_session_key(ctx);
     let manager = global_browser_manager();
     let session = manager
@@ -221,7 +254,32 @@ pub async fn browser_screenshot(ctx: &ToolCtx) -> Result<String, String> {
         .await
         .ok_or_else(|| "未找到活动的浏览器调试会话，请先调用 browser_navigate 打开网页".to_string())?;
 
-    let b64 = match session.capture_screenshot().await {
+    let res = session.scroll(direction, distance, target).await;
+    match res {
+        Ok(debug_state) => Ok(debug_state.to_markdown()),
+        Err(e) => {
+            if e.contains("channel closed") || e.contains("CDP 连接已断开") {
+                manager.close(&session_key).await;
+            }
+            Err(e)
+        }
+    }
+}
+
+pub async fn browser_screenshot(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let full_page = args
+        .get("full_page")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let session_key = get_session_key(ctx);
+    let manager = global_browser_manager();
+    let session = manager
+        .get(&session_key)
+        .await
+        .ok_or_else(|| "未找到活动的浏览器调试会话，请先调用 browser_navigate 打开网页".to_string())?;
+
+    let b64 = match session.capture_screenshot(full_page).await {
         Ok(data) => data,
         Err(e) => {
             if e.contains("channel closed") || e.contains("CDP 连接已断开") {
@@ -231,30 +289,62 @@ pub async fn browser_screenshot(ctx: &ToolCtx) -> Result<String, String> {
         }
     };
 
-    let rel_path = ".harness/tmp/browser_screenshot.png";
-    let target_file = if ctx.workspace.as_os_str().is_empty() {
-        std::env::temp_dir().join("harness_browser_screenshot.png")
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&b64)
+        .map_err(|e| format!("截图 Base64 解码失败: {e}"))?;
+
+    // 1. 获取宿主环境的数据目录与会话 ID
+    let (data_dir, session_id) = if let Some(host) = &ctx.host {
+        let state = host.app.state::<crate::AppState>();
+        let dd = state
+            .data_dir
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| state.default_data_dir.clone());
+        (dd, host.session_id.clone())
     } else {
-        ctx.workspace.join(rel_path)
+        (std::env::temp_dir().join("harness_mini_data"), session_key.clone())
     };
 
-    if let Some(parent) = target_file.parent() {
+    // 2. 委托资产中台：计算 CAS 内容寻址哈希去重并应用滚动配额管理
+    let artifact = crate::artifacts::ArtifactManager::store_screenshot(
+        &data_dir,
+        &session_id,
+        &bytes,
+        Some("browser"),
+    )
+    .await?;
+
+    let original_str = artifact.original_path.to_string_lossy().replace('\\', "/");
+    let thumb_str = artifact
+        .thumbnail_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| original_str.clone());
+
+    // 3. 同时更新一份快捷文件到工作区，保持向下兼容与调试便捷性
+    let legacy_rel_path = ".harness/tmp/browser_screenshot.png";
+    let legacy_target = if ctx.workspace.as_os_str().is_empty() {
+        std::env::temp_dir().join("harness_browser_screenshot.png")
+    } else {
+        ctx.workspace.join(legacy_rel_path)
+    };
+    if let Some(parent) = legacy_target.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
+    let _ = tokio::fs::write(&legacy_target, &bytes).await;
 
-    use base64::Engine;
-    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&b64) {
-        let _ = tokio::fs::write(&target_file, bytes).await;
-    }
-
-    let approx_kb = (b64.len() * 3) / (4 * 1024);
+    let approx_kb = bytes.len() / 1024;
     Ok(format!(
-        "### 浏览器页面屏幕快照已成功捕获并保存\n\
-         - **本地文件保存路径**: `{rel_path}`\n\
-         - **绝对路径**: `{}`\n\
+        "### 浏览器页面屏幕快照已成功捕获\n\
+         - **资产快照路径**: `{original_str}`\n\
+         - **缩略图路径**: `{thumb_str}`\n\
+         - **内容指纹 (CAS)**: `{}`\n\
          - **图像体积**: ~{approx_kb} KB\n\n\
-         > **注意**：请优先依据 `browser_navigate` 与 `browser_interact` 返回的可交互元素、表格与文本进行纯语义断言；仅在确需排查复杂 CSS 排版或渲染瑕疵时才调用 `recognize_image`。",
-        target_file.to_string_lossy()
+         > **注意**：请优先依据 `browser_navigate` 与 `browser_interact` 返回的可交互元素、表格与文本进行纯语义断言；确需排查复杂 CSS 排版或渲染瑕疵时，请直接调用 `recognize_image(path=\"{original_str}\")`。",
+        artifact.hash
     ))
 }
 
@@ -284,6 +374,47 @@ mod tests {
         assert!(script.contains("@e1"));
         assert!(script.contains("zyt 123"));
         assert!(script.contains("dispatchEvent"));
+    }
+
+    #[test]
+    fn test_build_scroll_script() {
+        use super::dom_script::build_scroll_script;
+        let s_down = build_scroll_script("down", Some(500.0), None);
+        assert!(s_down.contains("scrollBy"));
+        assert!(s_down.contains("500"));
+
+        let s_target = build_scroll_script("down", None, Some("@e12"));
+        assert!(s_target.contains("data-harness-ref"));
+        assert!(s_target.contains("@e12"));
+        assert!(s_target.contains("scrollIntoView"));
+
+        let s_top = build_scroll_script("top", None, None);
+        assert!(s_top.contains("scrollTo"));
+    }
+
+    #[tokio::test]
+    async fn test_browser_daemon_and_context_lifecycle() {
+        let daemon = super::daemon::global_browser_daemon();
+        let cdp = daemon.ensure_running().await;
+        assert!(cdp.is_ok(), "Daemon 应能正常拉起 Chromium 并连接 CDP: {:?}", cdp.err());
+
+        // 1. 测试创建隔离上下文
+        let ctx = daemon.create_context().await;
+        assert!(ctx.is_ok(), "应当成功创建独立的 BrowserContext: {:?}", ctx.err());
+        let context_id = ctx.unwrap();
+
+        // 2. 在该上下文中创建页面 Target
+        let target = daemon.create_target_in_context(Some(&context_id), "about:blank").await;
+        assert!(target.is_ok(), "应当成功在 Context 下创建 Target: {:?}", target.err());
+        let target_id = target.unwrap();
+
+        // 3. 挂载会话
+        let session = daemon.attach_to_target(&target_id).await;
+        assert!(session.is_ok(), "应当成功挂载至 Target 获得 sessionId: {:?}", session.err());
+
+        // 4. 清理 Target 与 Context
+        let _ = daemon.close_target(&target_id).await;
+        let _ = daemon.dispose_context(&context_id).await;
     }
 }
 

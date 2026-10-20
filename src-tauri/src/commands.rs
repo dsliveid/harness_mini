@@ -1823,32 +1823,28 @@ pub async fn run_direct_decision(
             .ok_or_else(|| format!("会话不存在: {session_id}"))?
     };
 
+    let parent_session = if let Some(ref pid) = session.parent_session_id {
+        let db = state.db.lock().unwrap();
+        crate::store::get_session(&db, pid).ok().flatten()
+    } else {
+        None
+    };
+
     let settings = {
         let db = state.db.lock().unwrap();
         let master = state.master_key.lock().unwrap();
         crate::store::get_settings_with_secrets(&db, &master)?
     };
 
-    let resolved = if let (Some(pid), Some(mid)) = (&session.decision_provider_id, &session.decision_model_id) {
-        settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid)).map(|p| (p.clone(), mid.clone()))
-    } else if let (Some(pid), Some(mid)) = (&settings.active_decision_provider_id, &settings.active_decision_model_id) {
-        settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid)).map(|p| (p.clone(), mid.clone()))
-    } else if let (Some(pid), Some(mid)) = (&session.provider_id, &session.model_id) {
-        // 未单独配置决策模型时，严格回落至当前会话的主对话模型
-        settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid)).map(|p| (p.clone(), mid.clone()))
-    } else {
-        None
-    }
-    .or_else(|| {
-        crate::models::resolve_active_model(&settings)
-            .map(|(p, m)| (p.clone(), m.to_string()))
-    });
+    let route = crate::models::resolve_decision_route(
+        Some(&session),
+        parent_session.as_ref(),
+        &settings,
+        None,
+    )?;
 
-    let (provider, model) = resolved.ok_or_else(|| "未找到可用的决策模型，请在设置中配置模型厂商与模型".to_string())?;
-
-    crate::jev::execute_decision(
-        &provider,
-        &model,
+    crate::jev::execute_decision_pipeline(
+        &route,
         &kind,
         &prompt,
         &prompt,
@@ -4248,20 +4244,6 @@ pub async fn browser_navigate_url(
 }
 
 #[tauri::command]
-pub async fn get_auth_macro_status(
-    state: State<'_, crate::AppState>,
-    session_id: String,
-) -> Result<crate::browser::AuthMacroStatus, String> {
-    let ws_path = {
-        let db = state.db.lock().unwrap();
-        let s = store::get_session(&db, &session_id)?
-            .ok_or_else(|| format!("未找到会话: {session_id}"))?;
-        std::path::PathBuf::from(s.workspace_path)
-    };
-    Ok(crate::browser::auth::get_auth_macro_status(&ws_path))
-}
-
-#[tauri::command]
 pub async fn start_browser_recording(
     state: State<'_, crate::AppState>,
     session_id: String,
@@ -4290,11 +4272,25 @@ pub async fn get_recorded_browser_steps(
 }
 
 #[tauri::command]
-pub async fn stop_browser_recording_and_save(
+pub async fn stop_browser_recording(
+    session_id: String,
+) -> Result<Vec<crate::browser::AuthStep>, String> {
+    let session = crate::browser::global_browser_manager()
+        .get(&session_id)
+        .await
+        .ok_or_else(|| "当前会话暂无活动的浏览器调试实例".to_string())?;
+
+    session.stop_recording().await?;
+    session.get_recorded_steps().await
+}
+
+#[tauri::command]
+pub async fn save_auth_contract(
     state: State<'_, crate::AppState>,
     session_id: String,
-    manual_steps: Option<Vec<crate::browser::AuthStep>>,
-) -> Result<crate::browser::AuthMacro, String> {
+    contract: crate::browser::AuthContract,
+    raw_password: Option<String>,
+) -> Result<(), String> {
     let (ws_path, master_key) = {
         let db = state.db.lock().unwrap();
         let master = *state.master_key.lock().unwrap();
@@ -4302,44 +4298,26 @@ pub async fn stop_browser_recording_and_save(
             .ok_or_else(|| format!("未找到会话: {session_id}"))?;
         (std::path::PathBuf::from(s.workspace_path), master)
     };
-
-    let session = crate::browser::global_browser_manager()
-        .get(&session_id)
-        .await
-        .ok_or_else(|| "当前会话暂无活动的浏览器调试实例".to_string())?;
-
-    session.stop_recording().await?;
-
-    let recorded = session.get_recorded_steps().await.unwrap_or_default();
-    let mut steps = manual_steps.unwrap_or_default();
-    if steps.is_empty() {
-        steps = recorded;
-    }
-
-    // 捕获当前的登录终态 (Cookies + LocalStorage) 并持久化为 storage_state.json
-    let storage_state = session.capture_storage_state().await?;
-    crate::browser::auth::save_storage_state(&ws_path, &storage_state)?;
-
-    let current_state = session.get_debug_state().await.ok();
-    let login_url = current_state
-        .map(|s| s.url)
-        .filter(|u| !u.is_empty())
-        .unwrap_or_else(|| "http://127.0.0.1:8080/#/login".to_string());
-
-    let macro_data = crate::browser::AuthMacro {
-        version: "1.0".to_string(),
-        project: None,
-        login_url,
-        created_at: chrono::Utc::now().to_rfc3339(),
-        steps,
-    };
-
-    crate::browser::auth::save_auth_macro(&ws_path, &macro_data, &master_key)?;
-    Ok(macro_data)
+    crate::browser::auth::save_auth_contract(&ws_path, &contract, &master_key, raw_password.as_deref())
 }
 
 #[tauri::command]
-pub async fn replay_browser_auth_macro(
+pub async fn get_auth_contract(
+    state: State<'_, crate::AppState>,
+    session_id: String,
+) -> Result<Option<crate::browser::AuthContract>, String> {
+    let (ws_path, master_key) = {
+        let db = state.db.lock().unwrap();
+        let master = *state.master_key.lock().unwrap();
+        let s = store::get_session(&db, &session_id)?
+            .ok_or_else(|| format!("未找到会话: {session_id}"))?;
+        (std::path::PathBuf::from(s.workspace_path), master)
+    };
+    crate::browser::auth::load_auth_contract(&ws_path, &master_key)
+}
+
+#[tauri::command]
+pub async fn execute_browser_auth_pipeline(
     state: State<'_, crate::AppState>,
     session_id: String,
 ) -> Result<(), String> {
@@ -4355,27 +4333,101 @@ pub async fn replay_browser_auth_macro(
         .get_or_create(&session_id, true, Some(ws_path.clone()))
         .await?;
 
-    let macro_data = crate::browser::auth::load_auth_macro(&ws_path, &master_key)?
-        .ok_or_else(|| "工作区未检测到已录制的 auth_macro.json，请先录制登录流程".to_string())?;
-
-    session.replay_auth_macro(&macro_data).await?;
-
-    // 更新 storage_state
-    if let Ok(st) = session.capture_storage_state().await {
-        let _ = crate::browser::auth::save_storage_state(&ws_path, &st);
+    if let Ok(Some(contract)) = crate::browser::auth::load_auth_contract(&ws_path, &master_key) {
+        crate::browser::pipeline::execute_auth_pipeline(&session, &contract).await?;
+        return Ok(());
     }
-    Ok(())
+
+    Err("当前工作区未检测到有效的 auth_contract.json 登录契约，请先配置凭据".to_string())
+}
+
+#[tauri::command]
+pub fn get_default_auth_distill_system_prompt() -> String {
+    crate::browser::DEFAULT_AUTH_DISTILL_SYSTEM_PROMPT.to_string()
+}
+
+#[tauri::command]
+pub async fn distill_auth_contract(
+    state: State<'_, crate::AppState>,
+    session_id: String,
+    raw_steps: Option<Vec<crate::browser::AuthStep>>,
+    refine_prompt: Option<String>,
+    custom_system_prompt: Option<String>,
+) -> Result<crate::browser::DistillAuthContractResult, String> {
+    let (steps, start_url, end_url) = {
+        let session = crate::browser::global_browser_manager().get(&session_id).await;
+        if let Some(ref sess) = session {
+            let start = sess.get_recording_start_url().await;
+            let end = sess.get_debug_state().await.ok().map(|d| d.url);
+            let steps = if let Some(s) = raw_steps {
+                s
+            } else {
+                sess.get_recorded_steps().await.unwrap_or_default()
+            };
+            (steps, start, end)
+        } else {
+            (raw_steps.unwrap_or_default(), None, None)
+        }
+    };
+
+    let (master_key, cfg, provider_name, model_name) = {
+        let db = state.db.lock().unwrap();
+        let master = *state.master_key.lock().unwrap();
+        let session = store::get_session(&db, &session_id)?
+            .ok_or_else(|| format!("未找到当前会话: {session_id}"))?;
+        let settings = store::get_settings_with_secrets(&db, &master)?;
+
+        let (provider, model_name) = if let (Some(pid), Some(mid)) = (&session.provider_id, &session.model_id) {
+            if let Some(p) = settings.providers.iter().find(|p| &p.id == pid) {
+                (p.clone(), mid.clone())
+            } else if let Some((p, m)) = crate::models::resolve_active_model(&settings) {
+                (p.clone(), m.to_string())
+            } else {
+                return Err("未配置可用的 AI 模型，请先在设置中配置大模型提供商".to_string());
+            }
+        } else if let Some((p, m)) = crate::models::resolve_active_model(&settings) {
+            (p.clone(), m.to_string())
+        } else {
+            return Err("未配置可用的 AI 模型，请先在设置中配置大模型提供商".to_string());
+        };
+
+        let protocol = provider.get_model_protocol(&model_name);
+        let cfg = crate::llm::LlmCfg {
+            base_url: provider.base_url.clone(),
+            api_key: provider.api_key.clone(),
+            model: model_name.clone(),
+            protocol,
+            reasoning_effort: None,
+            proxy_url: settings.proxy_url.clone(),
+            session_id: Some(session_id.clone()),
+        };
+
+        (master, cfg, provider.name.clone(), model_name)
+    };
+
+    crate::browser::distill_auth_contract(
+        &steps,
+        start_url.as_deref(),
+        end_url.as_deref(),
+        custom_system_prompt.as_deref(),
+        refine_prompt.as_deref(),
+        Some(&provider_name),
+        Some(&model_name),
+        &master_key,
+        &cfg,
+    ).await
 }
 
 #[tauri::command]
 pub async fn browser_capture_screenshot(
     session_id: String,
+    full_page: Option<bool>,
 ) -> Result<String, String> {
     let session = crate::browser::global_browser_manager()
         .get(&session_id)
         .await
         .ok_or_else(|| "当前会话暂无活动的浏览器调试实例".to_string())?;
-    let raw = session.capture_screenshot().await?;
+    let raw = session.capture_screenshot(full_page.unwrap_or(false)).await?;
     if raw.starts_with("data:") {
         Ok(raw)
     } else {
@@ -4389,6 +4441,52 @@ pub async fn close_browser_session(
 ) -> Result<(), String> {
     crate::browser::global_browser_manager().close(&session_id).await;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn browser_user_wheel(
+    session_id: String,
+    x: f64,
+    y: f64,
+    delta_x: f64,
+    delta_y: f64,
+) -> Result<(), String> {
+    let session = crate::browser::global_browser_manager()
+        .get(&session_id)
+        .await
+        .ok_or_else(|| "当前会话暂无活动的浏览器调试实例".to_string())?;
+    session.user_wheel(x, y, delta_x, delta_y).await
+}
+
+#[tauri::command]
+pub async fn browser_scroll_viewport(
+    session_id: String,
+    direction: Option<String>,
+    distance: Option<f64>,
+    target: Option<String>,
+) -> Result<crate::browser::BrowserDebugState, String> {
+    let session = crate::browser::global_browser_manager()
+        .get(&session_id)
+        .await
+        .ok_or_else(|| "当前会话暂无活动的浏览器调试实例".to_string())?;
+    session
+        .scroll(
+            direction.as_deref(),
+            distance,
+            target.as_deref(),
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn browser_open_devtools_window(
+    session_id: String,
+) -> Result<(), String> {
+    let session = crate::browser::global_browser_manager()
+        .get(&session_id)
+        .await
+        .ok_or_else(|| "当前会话暂无活动的浏览器调试实例".to_string())?;
+    session.open_devtools_window().await
 }
 
 #[cfg(test)]

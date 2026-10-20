@@ -6,6 +6,7 @@ import { resolveActiveModel, resolveActiveImageModel, resolveActiveVisionModel, 
 import { Markdown } from "./Markdown";
 import { SubprocessBranchTree } from "./SubprocessBranchTree";
 import { SafeImage } from "./SafeImage";
+import { AuthCard } from "./AuthCard";
 import {
   FileText,
   FileEdit,
@@ -1398,8 +1399,16 @@ function VisionRecognizeView({
   const prompt = String(p.prompt || "请详细描述并分析这张图片的内容");
 
   // 从结果中解析出实际目标物理路径与分析正文
-  const pathMatch = ev.resultText?.match(/目标图片:\s*`?([^`\n]+)`?/);
+  const pathMatch = ev.resultText?.match(/(?:\u76ee\u6807\u56fe\u7247|\u76ee\u6807\u6587\u4ef6|\u76ee\u6807):\s*`?([^`\n]+)`?/);
   const displayImagePath = pathMatch ? pathMatch[1].trim() : rawPath;
+
+  const thumbnailPath = useMemo(() => {
+    if (!displayImagePath) return "";
+    if (/[\\/]artifacts[\\/]blobs[\\/]/.test(displayImagePath)) {
+      return displayImagePath.replace(/([\\/])artifacts([\\/])blobs([\\/])/, "$1artifacts$2thumbs$3");
+    }
+    return "";
+  }, [displayImagePath]);
 
   const contentText = useMemo(() => {
     if (!ev.resultText) return "";
@@ -1536,8 +1545,10 @@ function VisionRecognizeView({
               title="点击查看大图"
             >
               <SafeImage
-                src={displayImagePath}
-                alt="目标图片"
+                src={thumbnailPath || displayImagePath}
+                alt="????"
+                loading="lazy"
+                decoding="async"
                 className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200"
               />
               <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
@@ -2214,6 +2225,21 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
       {/* 展开时：若是决策工具，展示专用决策卡片 */}
       {expanded && ["judge_decision", "choice_decision", "score_decision"].includes(ev.toolName) && (
         <DecisionCardView ev={ev} modelInfo={toolModelInfo} />
+      )}
+
+      {/* 浏览器鉴权拦截 HITL 交互卡片 */}
+      {ev.toolName.startsWith("browser_") && ev.resultText && (ev.resultText.includes("鉴权拦截提示") || ev.resultText.includes("未登录或鉴权已失效") || ev.resultText.includes("Unauthenticated")) && (
+        <AuthCard
+          sessionId={currentSessionId || ""}
+          reason={
+            ev.resultText.match(/原因:\s*`?([^`,\n]+)`?/)?.[1] ||
+            "页面处于未登录或鉴权已失效状态"
+          }
+          targetUrl={
+            ev.resultText.match(/当前URL:\s*`?([^`,\n]+)`?/)?.[1] ||
+            ev.params?.url
+          }
+        />
       )}
 
       {expanded && showResult && !["judge_decision", "choice_decision", "score_decision"].includes(ev.toolName) && (

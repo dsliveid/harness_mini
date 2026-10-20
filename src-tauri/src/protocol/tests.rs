@@ -177,6 +177,49 @@ fn test_anthropic_multimodal_image_url_transpile() {
 }
 
 #[test]
+fn test_anthropic_multimodal_tool_result_transpile() {
+    let data_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    let messages = vec![
+        json!({"role": "user", "content": "Check this image"}),
+        json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_img_1",
+                    "type": "function",
+                    "function": {
+                        "name": "recognize_image",
+                        "arguments": "{\"path\":\"assets/logo.png\"}"
+                    }
+                }
+            ]
+        }),
+        json!({
+            "role": "tool",
+            "tool_call_id": "call_img_1",
+            "content": [
+                {"type": "text", "text": "Image loaded successfully"},
+                {"type": "image_url", "image_url": {"url": data_url}}
+            ]
+        })
+    ];
+
+    let payload = transpile_to_anthropic(&messages, &[]);
+    assert_eq!(payload.messages.len(), 3);
+    assert_eq!(payload.messages[2]["role"], "user");
+    let tool_res = &payload.messages[2]["content"][0];
+    assert_eq!(tool_res["type"], "tool_result");
+    assert_eq!(tool_res["tool_use_id"], "call_img_1");
+    let inner_blocks = tool_res["content"].as_array().expect("tool_result should contain content blocks");
+    assert_eq!(inner_blocks[0]["type"], "text");
+    assert_eq!(inner_blocks[0]["text"], "Image loaded successfully");
+    assert_eq!(inner_blocks[1]["type"], "image");
+    assert_eq!(inner_blocks[1]["source"]["type"], "base64");
+    assert_eq!(inner_blocks[1]["source"]["media_type"], "image/png");
+}
+
+#[test]
 fn test_responses_transpile() {
     let messages = vec![
         json!({"role": "system", "content": "Instructions here"}),

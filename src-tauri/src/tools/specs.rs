@@ -144,13 +144,36 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["click", "type", "press_enter", "wait_for_selector"],
+                        "enum": ["click", "type", "press_enter", "wait_for_selector", "scroll"],
                         "description": "交互动作类型：click (点击), type (输入文本), press_enter (回车), wait_for_selector (等待元素)"
                     },
                     "target": {"type": "string", "description": "目标元素 ref 标识符（如 @e1、@e2）或 CSS 选择器"},
                     "value": {"type": "string", "description": "输入文本（type 操作必填，如用户名密码）"}
                 },
                 "required": ["action", "target"]
+            }),
+        },
+        ToolSpec {
+            name: "browser_scroll",
+            description: "滚动当前受控网页视口。支持按方向滚动(down/up/top/bottom)、按指定像素滚动，或直接滚动到指定交互元素(@eX)使其居中。长页面或表格溢出时，优先调用本工具向下滑动探索未展示内容。执行后自动刷新并返回最新视口内的元素与状态。",
+            risk: Risk::Execute,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "direction": {
+                        "type": "string",
+                        "enum": ["down", "up", "top", "bottom", "left", "right"],
+                        "description": "滚动方向：down(向下翻一屏/默认)、up(向上翻一屏)、top(回到顶部)、bottom(直达底部)、left(向左滑)、right(向右滑)"
+                    },
+                    "distance": {
+                        "type": "number",
+                        "description": "滚动的像素距离(px)，默认约为当前视口高度的 80% (约 700px)"
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "目标元素标识符(如 @e35 或 CSS 选择器)，滚动使该元素在视口中居中显示"
+                    }
+                }
             }),
         },
         ToolSpec {
@@ -168,7 +191,12 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             risk: Risk::ReadOnly,
             schema: json!({
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "full_page": {
+                        "type": "boolean",
+                        "description": "是否截取包含完整长页面的全屏截图（默认 false 为当前视口截图）"
+                    }
+                }
             }),
         },
         ToolSpec {

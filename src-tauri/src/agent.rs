@@ -793,33 +793,8 @@ fn resolve_decision_model_for_session(
     session: &crate::models::Session,
     parent_session: Option<&crate::models::Session>,
     settings: &crate::models::SettingsData,
-) -> Option<(crate::models::ProviderCfg, String)> {
-    let dec_pid = session.decision_provider_id.as_deref()
-        .or_else(|| parent_session.and_then(|p| p.decision_provider_id.as_deref()));
-    let dec_mid = session.decision_model_id.as_deref()
-        .or_else(|| parent_session.and_then(|p| p.decision_model_id.as_deref()));
-
-    let main_pid = session.provider_id.as_deref()
-        .or_else(|| parent_session.and_then(|p| p.provider_id.as_deref()));
-    let main_mid = session.model_id.as_deref()
-        .or_else(|| parent_session.and_then(|p| p.model_id.as_deref()));
-
-    if let (Some(pid), Some(mid)) = (dec_pid, dec_mid) {
-        settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid)).map(|p| (p.clone(), mid.to_string()))
-    } else if let (Some(pid), Some(mid)) = (&settings.active_decision_provider_id, &settings.active_decision_model_id) {
-        settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid))
-            .map(|p| (p.clone(), mid.to_string()))
-    } else if let (Some(pid), Some(mid)) = (main_pid, main_mid) {
-        // 未单独配置决策模型时，严格回落至当前会话的主对话模型
-        settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid))
-            .map(|p| (p.clone(), mid.to_string()))
-    } else {
-        None
-    }
-    .or_else(|| {
-        crate::models::resolve_active_model(settings)
-            .map(|(p, m)| (p.clone(), m.to_string()))
-    })
+) -> Option<crate::models::DecisionRoute> {
+    crate::models::resolve_decision_route(Some(session), parent_session, settings, None).ok()
 }
 
 #[allow(dead_code)]
@@ -904,9 +879,10 @@ async fn run_intent_alignment_gate(
     recent_context: &str,
 ) -> Option<(String, String)> {
     let resolved_decision = resolve_decision_model_for_session(session, parent_session, settings);
-    let Some((d_provider, d_model)) = resolved_decision else {
+    let Some(d_route) = resolved_decision else {
         return None;
     };
+    let d_model = d_route.primary_model.clone();
 
     let intervention_id = format!("intent-{}-{}", session_id, uuid::Uuid::new_v4());
     let (tx, mut rx) = tokio::sync::oneshot::channel();
@@ -1042,43 +1018,15 @@ async fn run_intent_alignment_gate(
     ];
 
     let eval_res = tokio::select! {
-        res = async {
-            let primary_res = crate::jev::execute_decision(
-                &d_provider,
-                &d_model,
-                "score",
-                &eval_state,
-                eval_instruction,
-                None,
-                Some(rubric.clone()),
-                settings.effective_proxy_url(),
-            ).await;
-
-            match primary_res {
-                Ok(r) => Ok(r),
-                Err(e) => {
-                    let main_model = crate::models::resolve_active_model(settings);
-                    if let Some((pc, model)) = main_model {
-                        if d_provider.id != pc.id || d_model != model {
-                            crate::jev::execute_decision(
-                                pc,
-                                model,
-                                "score",
-                                &eval_state,
-                                eval_instruction,
-                                None,
-                                Some(rubric),
-                                settings.effective_proxy_url(),
-                            ).await
-                        } else {
-                            Err(e)
-                        }
-                    } else {
-                        Err(e)
-                    }
-                }
-            }
-        } => {
+        res = crate::jev::execute_decision_pipeline(
+            &d_route,
+            "score",
+            &eval_state,
+            eval_instruction,
+            None,
+            Some(rubric),
+            settings.effective_proxy_url(),
+        ) => {
             res
         }
         user_action = &mut rx => {
@@ -1516,7 +1464,9 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 ("judge", remainder)
             };
 
-            if let Some((d_provider, d_model)) = resolve_decision_model_for_session(&session, parent_session.as_ref(), &settings) {
+            if let Some(d_route) = resolve_decision_model_for_session(&session, parent_session.as_ref(), &settings) {
+                let d_provider_name = d_route.primary_provider.name.clone();
+                let d_model = d_route.primary_model.clone();
                 let (options, rubric, clean_prompt) = if kind == "choice" {
                     if let Some(pos) = prompt.find("选项:").or_else(|| prompt.find("选项：")).or_else(|| prompt.find("options:")) {
                         let prefix = prompt[..pos].trim();
@@ -1547,33 +1497,15 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                     (None, None, prompt)
                 };
 
-                let mut res = crate::jev::execute_decision(
-                    &d_provider,
-                    &d_model,
+                let res = crate::jev::execute_decision_pipeline(
+                    &d_route,
                     kind,
                     clean_prompt,
                     clean_prompt,
-                    options.clone(),
-                    rubric.clone(),
+                    options,
+                    rubric,
                     effective_proxy_url.clone(),
                 ).await;
-
-                if res.is_err() && (d_provider.id != pc.id || d_model != model) {
-                    eprintln!(
-                        "/jev: 专职决策模型 ({}/{}) 调用失败，自动回退使用当前主对话模型 ({}/{}) 进行决策...",
-                        d_provider.name, d_model, pc.name, model
-                    );
-                    res = crate::jev::execute_decision(
-                        &pc,
-                        &model,
-                        kind,
-                        clean_prompt,
-                        clean_prompt,
-                        options,
-                        rubric,
-                        effective_proxy_url.clone(),
-                    ).await;
-                }
 
                 let response_text = match res {
                     Ok(r) => {
@@ -1592,7 +1524,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                                     **判定依据**:\n{}",
                                     verdict_str,
                                     r.confidence * 100.0,
-                                    d_provider.name,
+                                    d_provider_name,
                                     d_model,
                                     r.latency_ms,
                                     r.reason
@@ -1608,7 +1540,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                                     **选择理由**:\n{}",
                                     choice_str,
                                     r.confidence * 100.0,
-                                    d_provider.name,
+                                    d_provider_name,
                                     d_model,
                                     r.latency_ms,
                                     r.reason
@@ -1625,7 +1557,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                                     score_val * 100.0,
                                     score_val * 100.0,
                                     r.confidence * 100.0,
-                                    d_provider.name,
+                                    d_provider_name,
                                     d_model,
                                     r.latency_ms,
                                     r.reason
@@ -2538,7 +2470,43 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             // 工具结果作为 tool 消息进入上下文
             let tool_msg = {
                 let db = state.db.lock().unwrap();
-                let r = store::new_message(&db, session_id, "tool", Some(result_text.clone()), false);
+                let tool_attachments = if tc.name == "recognize_image" && status == "success" {
+                    if let Some(start) = result_text.find("<!-- MULTIMODAL_IMAGE_DIRECT:") {
+                        let rest = &result_text[start + "<!-- MULTIMODAL_IMAGE_DIRECT:".len()..];
+                        if let Some(end) = rest.find(" -->") {
+                            let img_path = rest[..end].trim();
+                            let p = std::path::Path::new(img_path);
+                            if let Ok(meta) = std::fs::metadata(p) {
+                                let name = p.file_name().and_then(|f| f.to_str()).unwrap_or("image.png").to_string();
+                                let ext = p.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()).unwrap_or_default();
+                                let mime = match ext.as_str() {
+                                    "jpg" | "jpeg" => "image/jpeg",
+                                    "webp" => "image/webp",
+                                    "gif" => "image/gif",
+                                    "svg" => "image/svg+xml",
+                                    _ => "image/png",
+                                };
+                                Some(vec![crate::models::Attachment {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    name,
+                                    mime_type: mime.to_string(),
+                                    size: meta.len(),
+                                    path: img_path.to_string(),
+                                    is_image: true,
+                                }])
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let r = store::new_message_with_attachments(&db, session_id, "tool", Some(result_text.clone()), tool_attachments, false, None);
                 if let Ok(ref m) = r {
                     let _ = store::set_message_tool_call_id(&db, &m.id, &tc.id);
                 }
@@ -3540,14 +3508,15 @@ fn build_context(
     let max_compacted_seq = compactions.iter().map(|c| c.end_seq).max().unwrap_or(0);
 
     // tool_call_id -> 结果文本
-    let mut tool_results: HashMap<String, String> = HashMap::new();
+    // tool_call_id -> (结果文本, 附件)
+    let mut tool_results: HashMap<String, (String, Option<Vec<crate::models::Attachment>>)> = HashMap::new();
     for m in &msgs {
         if m.reverted_at.is_some() {
             continue;
         }
         if m.role == "tool" {
             if let Some(id) = &m.tool_call_id {
-                tool_results.insert(id.clone(), m.content.clone().unwrap_or_default());
+                tool_results.insert(id.clone(), (m.content.clone().unwrap_or_default(), m.attachments.clone()));
             }
         }
     }
@@ -3664,11 +3633,38 @@ fn build_context(
                         if let Some(arr) = tcs.as_array() {
                             for tc in arr {
                                 let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
-                                let text = tool_results
+                                let (text, atts) = tool_results
                                     .remove(&id)
-                                    .unwrap_or_else(|| "(执行被中断，无结果)".into());
+                                    .unwrap_or_else(|| ("(执行被中断，无结果)".into(), None));
                                 est += estimate_tokens(&text);
-                                out.push(json!({"role": "tool", "tool_call_id": id, "content": text}));
+                                let mut image_parts: Vec<Value> = Vec::new();
+                                if let Some(ref att_list) = atts {
+                                    for att in att_list {
+                                        if att.is_image {
+                                            if let Ok(bytes) = std::fs::read(&att.path) {
+                                                use base64::Engine;
+                                                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                                let mime = if att.mime_type.is_empty() { "image/png" } else { &att.mime_type };
+                                                let data_url = format!("data:{};base64,{}", mime, b64);
+                                                image_parts.push(json!({
+                                                    "type": "image_url",
+                                                    "image_url": {
+                                                        "url": data_url
+                                                    }
+                                                }));
+                                                est += 1000;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if !image_parts.is_empty() {
+                                    let mut parts = vec![json!({"type": "text", "text": text})];
+                                    parts.extend(image_parts);
+                                    out.push(json!({"role": "tool", "tool_call_id": id, "content": parts}));
+                                } else {
+                                    out.push(json!({"role": "tool", "tool_call_id": id, "content": text}));
+                                }
                             }
                         }
                     }
@@ -4275,7 +4271,7 @@ fn system_prompt(
             rules.push(format!(
                 "{rule_num}. 【浏览器无头自主测试与免视觉验证 SOP（必须严格遵守）】：\n   \
                  - 零桌面侵入与后台静默运行：当需要对本地网页服务（如 Web 项目前端、管理后台、SPA 页面）进行功能测试与调试时，**必须默认以无头模式运行（`headless: true`，不要弹出实体窗口抢占桌面）**；所有交互事件均通过 CDP 协议内部派发，严禁依赖任何侵入宿主操作系统的外挂行为；\n   \
-                 - 纯语义感知与免视觉断言原则：全面弃用截图分析（测试流程中无需调用 `browser_screenshot` 或视觉识别）；直接通过 `browser_navigate` 与 `browser_interact` 返回的【可交互元素清单 (@eX)】、【页面数据表格】及【页面提示与通知】进行语义感知与业务结果断言；\n   \
+                 - 纯语义感知与免视觉断言原则：全面弃用截图分析（测试流程中无需调用 `browser_screenshot` 或视觉识别）；直接通过 `browser_navigate` 与 `browser_interact` 返回的【可交互元素清单 (@eX)】、【页面数据表格】及【页面提示与通知】进行语义感知与业务结果断言；面对长页面或表格超出当前视口时，根据返回的视口滚动提示主动调用 `browser_scroll(direction: \"down\")` 进行滚动探索，直至定位目标元素或数据；\n   \
                  - 登录态自愈与免登保底：底层已集成登录快照预加载与 401 自动重放机制。若项目已录制免登宏，底层将在打开网页前自动预注入 Cookies 与 LocalStorage（0 秒秒级直达已选机构主页），并在 Token 过期（HTTP 401 或跳回登录页）时自动在后台静默重放录制宏刷新凭证；**Agent 严禁在会话中手动搜索密码或猜测凭据**；\n   \
                  - 探针式自检与自愈闭环：系统已自动截获页面未捕获的 JavaScript 异常与 ≥ 400 的网络请求。测试时若发现 Console 报错或接口失败，必须结合报错信息直接阅读源码定位根因，用 `edit_file` 原地修复后再次在浏览器中自测，直至错误彻底清零且业务数据正常渲染；测试完毕后务必调用 `browser_close` 释放资源。"
             ));

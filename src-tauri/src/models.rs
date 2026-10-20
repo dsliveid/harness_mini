@@ -564,15 +564,76 @@ pub fn resolve_active_vision_model(settings: &SettingsData) -> Option<(&Provider
     None
 }
 
-/// 解析全局生效的 (决策厂商, 决策模型)：优先全局激活项，若未单独配置决策模型则严格回落到全局主对话模型
-pub fn resolve_active_decision_model(settings: &SettingsData) -> Option<(&ProviderCfg, &str)> {
-    if let (Some(pid), Some(mid)) = (&settings.active_decision_provider_id, &settings.active_decision_model_id) {
-        if let Some(p) = settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid)) {
-            return Some((p, mid.as_str()));
-        }
+/// 决策执行路由配置：封装首选决策模型与兜底主对话模型
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DecisionRoute {
+    pub primary_provider: ProviderCfg,
+    pub primary_model: String,
+    pub fallback: Option<(ProviderCfg, String)>,
+}
+
+/// 全局统一解析决策路由：
+/// - 首选决策模型 (primary)：按 显式指定 > 会话决策模型 > 全局决策模型 > 会话主模型 > 全局主模型 严格解析
+/// - 兜底模型 (fallback)：解析当前会话/全局主对话模型（且必须具备对话能力），若与 primary 相同则置为 None
+pub fn resolve_decision_route(
+    session: Option<&Session>,
+    parent_session: Option<&Session>,
+    settings: &SettingsData,
+    requested_model: Option<&str>,
+) -> Result<DecisionRoute, String> {
+    // 1. 优先解析主对话模型（作为 fallback 候选）
+    let main_pid = session.and_then(|s| s.provider_id.as_deref())
+        .or_else(|| parent_session.and_then(|p| p.provider_id.as_deref()));
+    let main_mid = session.and_then(|s| s.model_id.as_deref())
+        .or_else(|| parent_session.and_then(|p| p.model_id.as_deref()));
+
+    let main_model = if let (Some(pid), Some(mid)) = (main_pid, main_mid) {
+        settings.providers.iter()
+            .find(|p| &p.id == pid && p.models.iter().any(|m| m == mid))
+            .map(|p| (p.clone(), mid.to_string()))
+    } else {
+        None
     }
-    // 未单独配置决策模型时，严格回落到全局主对话模型
-    resolve_active_model(settings)
+    .or_else(|| {
+        resolve_active_model(settings).map(|(p, m)| (p.clone(), m.to_string()))
+    });
+
+    // 2. 解析首选决策模型 (primary)
+    let dec_pid = session.and_then(|s| s.decision_provider_id.as_deref())
+        .or_else(|| parent_session.and_then(|p| p.decision_provider_id.as_deref()));
+    let dec_mid = session.and_then(|s| s.decision_model_id.as_deref())
+        .or_else(|| parent_session.and_then(|p| p.decision_model_id.as_deref()));
+
+    let primary = if let Some(req_m) = requested_model.filter(|s| !s.trim().is_empty()) {
+        settings.providers.iter()
+            .find(|p| p.models.iter().any(|m| m == req_m))
+            .map(|p| (p.clone(), req_m.to_string()))
+            .or_else(|| main_model.as_ref().map(|(p, _)| (p.clone(), req_m.to_string())))
+    } else if let (Some(pid), Some(mid)) = (dec_pid, dec_mid) {
+        settings.providers.iter()
+            .find(|p| &p.id == pid && p.models.iter().any(|m| m == mid))
+            .map(|p| (p.clone(), mid.to_string()))
+    } else if let (Some(pid), Some(mid)) = (&settings.active_decision_provider_id, &settings.active_decision_model_id) {
+        settings.providers.iter()
+            .find(|p| &p.id == pid && p.models.iter().any(|m| m == mid))
+            .map(|p| (p.clone(), mid.to_string()))
+    } else {
+        main_model.clone()
+    };
+
+    let (primary_provider, primary_model) = primary
+        .ok_or_else(|| "未找到可用的决策模型，请在设置中配置模型厂商与模型".to_string())?;
+
+    // 3. 计算 fallback：若与 primary 相同，或者 fallback 不支持对话，则不提供 fallback
+    let fallback = main_model.filter(|(p, m)| {
+        !(p.id == primary_provider.id && m == &primary_model) && p.get_model_protocol(m).is_chat_capable()
+    });
+
+    Ok(DecisionRoute {
+        primary_provider,
+        primary_model,
+        fallback,
+    })
 }
 
 

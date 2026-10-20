@@ -912,6 +912,9 @@ pub async fn execute_decision_with_llm(
         }
         p => p,
     };
+    if !protocol.is_chat_capable() {
+        return Err(format!("模型 [{model}] 协议为 {:?}，不支持通用对话补全，无法执行结构化决策提示词", protocol.as_str()));
+    }
 
     let cfg = crate::llm::LlmCfg {
         base_url: provider.base_url.clone(),
@@ -994,7 +997,82 @@ pub async fn execute_decision_with_llm(
     })
 }
 
-/// 统一决策模型执行入口：优先原生 SystemOne 极速协议，若失败或端点不支持则自动无缝回退至 LLM 结构化提示词模式
+/// 统一决策模型执行调度管道：
+/// 1. 优先调用首选决策模型（若是原生 SystemOne / Jev 则走极速门控接口，否则走通用 LLM 结构化提示词）；
+/// 2. 若首选模型调用失败且配置了不同的兜底主模型（fallback），则自动无缝降级使用兜底模型进行 LLM 结构化提示词决策；
+/// 3. 若无兜底模型或兜底模型亦报错，向外透传详细的结构化错误信息。
+pub async fn execute_decision_pipeline(
+    route: &crate::models::DecisionRoute,
+    kind: &str, // "judge" | "choice" | "score"
+    state: &str,
+    instruction: &str,
+    options: Option<Vec<String>>,
+    rubric: Option<Vec<String>>,
+    proxy_url: Option<String>,
+) -> Result<DecisionExecutionResult, String> {
+    let protocol = route.primary_provider.get_model_protocol(&route.primary_model);
+    let is_typesafe = protocol == crate::models::RequestProtocol::SystemOne
+        || route.primary_provider.base_url.contains("typesafe")
+        || route.primary_provider.base_url.contains("systemone")
+        || route.primary_provider.base_url.contains("opencode.ai/zen")
+        || route.primary_model.to_lowercase().starts_with("jev");
+
+    let primary_res = if is_typesafe {
+        execute_decision_with_systemone(
+            &route.primary_provider,
+            &route.primary_model,
+            kind,
+            state,
+            instruction,
+            options.clone(),
+            rubric.clone(),
+            proxy_url.clone(),
+        ).await
+    } else {
+        execute_decision_with_llm(
+            &route.primary_provider,
+            &route.primary_model,
+            kind,
+            state,
+            instruction,
+            options.clone(),
+            rubric.clone(),
+            proxy_url.clone(),
+        ).await
+    };
+
+    match primary_res {
+        Ok(res) => Ok(res),
+        Err(err) => {
+            if let Some((fb_prov, fb_model)) = &route.fallback {
+                eprintln!(
+                    "专职决策模型 ({}/{}) 调用失败 ({err})，正在自动无缝降级为会话主对话模型 ({}/{}) 进行结构化决策...",
+                    route.primary_provider.name, route.primary_model, fb_prov.name, fb_model
+                );
+                match execute_decision_with_llm(
+                    fb_prov,
+                    fb_model,
+                    kind,
+                    state,
+                    instruction,
+                    options,
+                    rubric,
+                    proxy_url,
+                ).await {
+                    Ok(fb_res) => Ok(fb_res),
+                    Err(fb_err) => Err(format!(
+                        "决策执行失败: 专职模型 [{}/{}] 报错: {err}；降级主模型 [{}/{}] 亦报错: {fb_err}",
+                        route.primary_provider.name, route.primary_model, fb_prov.name, fb_model
+                    )),
+                }
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+/// 兼容老接口：无兜底时直接调用管道
 pub async fn execute_decision(
     provider: &crate::models::ProviderCfg,
     model: &str,
@@ -1005,54 +1083,12 @@ pub async fn execute_decision(
     rubric: Option<Vec<String>>,
     proxy_url: Option<String>,
 ) -> Result<DecisionExecutionResult, String> {
-    let protocol = provider.get_model_protocol(model);
-    let is_typesafe = protocol == crate::models::RequestProtocol::SystemOne
-        || provider.base_url.contains("typesafe")
-        || provider.base_url.contains("systemone")
-        || provider.base_url.contains("opencode.ai/zen")
-        || model.to_lowercase().starts_with("jev");
-
-    if is_typesafe {
-        match execute_decision_with_systemone(
-            provider,
-            model,
-            kind,
-            state,
-            instruction,
-            options.clone(),
-            rubric.clone(),
-            proxy_url.clone(),
-        ).await {
-            Ok(res) => Ok(res),
-            Err(e) => {
-                eprintln!(
-                    "目标端点 ({}) 原生 SystemOne 协议调用失败 ({e})，正在自动无缝降级为通用 LLM 结构化提示词决策模式...",
-                    provider.base_url
-                );
-                execute_decision_with_llm(
-                    provider,
-                    model,
-                    kind,
-                    state,
-                    instruction,
-                    options,
-                    rubric,
-                    proxy_url,
-                ).await
-            }
-        }
-    } else {
-        execute_decision_with_llm(
-            provider,
-            model,
-            kind,
-            state,
-            instruction,
-            options,
-            rubric,
-            proxy_url,
-        ).await
-    }
+    let route = crate::models::DecisionRoute {
+        primary_provider: provider.clone(),
+        primary_model: model.to_string(),
+        fallback: None,
+    };
+    execute_decision_pipeline(&route, kind, state, instruction, options, rubric, proxy_url).await
 }
 
 #[cfg(test)]

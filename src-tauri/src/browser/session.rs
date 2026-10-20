@@ -1,12 +1,11 @@
-use super::auth::{load_storage_state, save_storage_state, AuthMacro, AuthStep, CookieData, StorageState};
+use super::auth::AuthStep;
 use super::cdp::CdpClient;
 use super::detector::detect_chromium_path;
 use super::dom_script::{
-    build_interact_script, EXTRACT_RECORDED_STEPS_SCRIPT, EXTRACT_TREE_SCRIPT, INJECT_RECORDER_SCRIPT,
+    build_interact_script, build_scroll_script, EXTRACT_RECORDED_STEPS_SCRIPT, EXTRACT_TREE_SCRIPT, INJECT_RECORDER_SCRIPT,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,23 +33,93 @@ pub struct InteractiveElement {
     pub href: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ViewportInfo {
+    pub scroll_x: f64,
+    pub scroll_y: f64,
+    pub viewport_width: f64,
+    pub viewport_height: f64,
+    pub total_width: f64,
+    pub total_height: f64,
+    pub current_page: u32,
+    pub total_pages: u32,
+    pub has_more_down: bool,
+    pub has_more_up: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserDebugState {
     pub url: String,
     pub title: String,
+    #[serde(default)]
+    pub viewport: ViewportInfo,
     pub elements: Vec<InteractiveElement>,
+    #[serde(default)]
+    pub hidden_elements_count: usize,
     pub console_errors: Vec<String>,
     pub network_errors: Vec<String>,
     #[serde(default)]
     pub tables: Vec<String>,
     #[serde(default)]
     pub notices: Vec<String>,
+    #[serde(default)]
+    pub dom_overlays: Vec<String>,
+    #[serde(default)]
+    pub page_state: super::evaluator::PageHealthState,
 }
 
 impl BrowserDebugState {
     pub fn to_markdown(&self) -> String {
         let mut md = String::new();
-        md.push_str(&format!("### 当前网页状态\n- **URL**: {}\n- **标题**: {}\n\n", self.url, self.title));
+        md.push_str(&format!("### 当前网页状态\n- **URL**: {}\n- **标题**: {}\n", self.url, self.title));
+
+        let has_critical_error = !self.dom_overlays.is_empty()
+            || self.console_errors.iter().any(|e| e.contains("[Uncaught Exception]") || e.contains("[Console.error]"));
+        if has_critical_error {
+            md.push_str("> 🚨 **【前端运行时异常感知告警】**: 检测到页面渲染异常或未捕获错误，请优先排查下方错误详情！\n\n");
+        }
+
+        let vp = &self.viewport;
+        if vp.total_height > 0.0 {
+            let start_y = vp.scroll_y.round() as u64;
+            let end_y = (vp.scroll_y + vp.viewport_height).min(vp.total_height).round() as u64;
+            let total_y = vp.total_height.round() as u64;
+            md.push_str(&format!(
+                "- **视口范围**: Y: {start_y}px ~ {end_y}px / 总高: {total_y}px (第 {}/{} 屏)\n",
+                vp.current_page, vp.total_pages
+            ));
+            if vp.has_more_down {
+                md.push_str(&format!(
+                    "> 💡 **长页面提示**: 当前视口下方仍有未展示内容（视口外折叠约 {} 个交互元素）。如需继续向下探索，可调用 `browser_scroll(direction=\"down\")`。\n",
+                    self.hidden_elements_count
+                ));
+            } else if vp.current_page > 1 {
+                md.push_str("> ℹ️ **视口状态**: 当前已滑至页面最底部。\n");
+            }
+        }
+        md.push('\n');
+
+        match &self.page_state {
+            super::evaluator::PageHealthState::Unauthenticated { current_url, reason } => {
+                md.push_str(&format!("> ⚠️ **鉴权拦截提示**: 页面处于未登录或鉴权已失效状态 (原因: `{reason}`, 当前URL: `{current_url}`)\n\n"));
+            }
+            super::evaluator::PageHealthState::ActionBlocked { title, description } => {
+                md.push_str(&format!("> ⏸️ **全局阻断提示**: 检测到全局前置弹窗【{title}】({description})\n\n"));
+            }
+            super::evaluator::PageHealthState::Error { code, message } => {
+                md.push_str(&format!("> ❌ **页面异常**: HTTP {:?} - {}\n\n", code, message));
+            }
+            _ => {}
+        }
+
+        if !self.dom_overlays.is_empty() {
+            md.push_str("#### 💥 页面报错遮罩/构建异常 (Error Overlays):\n```text\n");
+            for overlay in &self.dom_overlays {
+                md.push_str(overlay);
+                md.push('\n');
+            }
+            md.push_str("```\n\n");
+        }
 
         if !self.notices.is_empty() {
             md.push_str("#### 页面提示与通知 (Alerts & Notices):\n");
@@ -126,83 +195,158 @@ impl BrowserDebugState {
 }
 
 pub struct BrowserSession {
-    _child: Arc<Mutex<Child>>,
-    temp_dir: PathBuf,
+    _child: Arc<Mutex<Option<Child>>>,
+    profile_dir: Option<PathBuf>,
+    context_id: Option<String>,
     workspace: Arc<Mutex<Option<PathBuf>>>,
     cdp: Arc<CdpClient>,
+    target_id: String,
     target_session_id: String,
+    ws_url: String,
     pub is_recording: Arc<AtomicBool>,
-    storage_injected: Arc<AtomicBool>,
+    pub recording_start_url: Arc<Mutex<Option<String>>>,
     replay_lock: Arc<Mutex<()>>,
 }
 
 impl BrowserSession {
     pub async fn launch(headless: bool, workspace: Option<PathBuf>) -> Result<Self, String> {
+        // 1. 默认无头模式：走全局常驻 BrowserDaemon + BrowserContext 毫秒级轻量沙箱隔离
+        if headless {
+            let daemon = super::daemon::global_browser_daemon();
+            let cdp = daemon.ensure_running().await?;
+            let context_id = daemon.create_context().await?;
+
+            // 在该隔离上下文创建 Target 页面
+            let target_id = daemon.create_target_in_context(Some(&context_id), "about:blank").await?;
+            let target_session_id = daemon.attach_to_target(&target_id).await?;
+
+            // 激活所需领域
+            let sid = Some(target_session_id.as_str());
+            let _ = cdp.send("Page.enable", None, sid, Duration::from_secs(5)).await;
+            let _ = cdp.send("Runtime.enable", None, sid, Duration::from_secs(5)).await;
+            let _ = cdp.send("Network.enable", None, sid, Duration::from_secs(5)).await;
+            let _ = cdp.send("DOM.enable", None, sid, Duration::from_secs(5)).await;
+            let _ = cdp.send("Log.enable", None, sid, Duration::from_secs(5)).await;
+
+            // 激活当前标签页并设置视口，防止后台节流和 0x0 渲染
+            let _ = cdp.send("Target.activateTarget", Some(json!({ "targetId": target_id })), None, Duration::from_secs(5)).await;
+            let _ = cdp.send(
+                "Emulation.setDeviceMetricsOverride",
+                Some(json!({
+                    "width": 1440,
+                    "height": 960,
+                    "deviceScaleFactor": 2,
+                    "mobile": false
+                })),
+                sid,
+                Duration::from_secs(5),
+            ).await;
+
+            // 恢复轻量 storage_state (Cookies)
+            if let Some(ref ws) = workspace {
+                let _ = super::storage::restore_storage_state(&cdp, &target_session_id, ws).await;
+            }
+
+            let ws_url = daemon.get_ws_url().await.unwrap_or_default();
+
+            return Ok(Self {
+                _child: Arc::new(Mutex::new(None)),
+                profile_dir: None,
+                context_id: Some(context_id),
+                workspace: Arc::new(Mutex::new(workspace)),
+                cdp,
+                target_id,
+                target_session_id,
+                ws_url,
+                is_recording: Arc::new(AtomicBool::new(false)),
+                recording_start_url: Arc::new(Mutex::new(None)),
+                replay_lock: Arc::new(Mutex::new(())),
+            });
+        }
+
+        // 2. 有头调试模式 (headless = false)：启动独立实体窗口实例
         let browser_bin = detect_chromium_path()?;
-        let temp_dir = std::env::temp_dir().join(format!("harness_browser_{}", uuid::Uuid::new_v4()));
-        let _ = tokio::fs::create_dir_all(&temp_dir).await;
+        let profile_dir = std::env::temp_dir().join(format!("harness_browser_gui_{}", uuid::Uuid::new_v4()));
+        let _ = tokio::fs::create_dir_all(&profile_dir).await;
 
         let mut cmd = tokio::process::Command::new(browser_bin);
         cmd.arg("--remote-debugging-port=0")
-            .arg(format!("--user-data-dir={}", temp_dir.to_string_lossy()))
+            .arg(format!("--user-data-dir={}", profile_dir.to_string_lossy()))
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
-            .arg("--disable-gpu")
             .arg("--disable-extensions")
             .arg("--disable-sync")
-            .arg("--disable-background-networking")
-            .arg("--disable-component-update")
-            .arg("--disable-default-apps")
             .arg("--proxy-bypass-list=<-loopback>")
-            .arg("--window-size=1280,900");
-
-        if headless {
-            cmd.arg("--headless=new");
-        }
-
-        cmd.arg("about:blank");
+            .arg("--window-size=1440,960")
+            .arg("about:blank");
 
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
-        #[cfg(windows)]
-        {
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            if headless {
-                cmd.creation_flags(CREATE_NO_WINDOW);
-            }
-        }
-
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("启动浏览器进程失败: {e}"))?;
+            .map_err(|e| format!("启动浏览器窗口实例失败: {e}"))?;
+
+        #[cfg(windows)]
+        if let Some(pid) = child.id() {
+            crate::tools::assign_pid_to_job(pid);
+        }
 
         let stderr = child
             .stderr
             .take()
             .ok_or_else(|| "无法获取浏览器 stderr".to_string())?;
 
-        // 读取 stderr 获取 DevTools listening on ws://...
         let mut reader = BufReader::new(stderr).lines();
         let mut ws_url = None;
-
-        let timeout = Duration::from_secs(15);
+        let mut accumulated_stderr = Vec::new();
+        let timeout = Duration::from_secs(12);
         let start = std::time::Instant::now();
 
         while start.elapsed() < timeout {
-            if let Ok(Ok(Some(l))) = tokio::time::timeout(Duration::from_millis(500), reader.next_line()).await {
+            if let Ok(Some(status)) = child.try_wait() {
+                let err_detail = accumulated_stderr.join("\n");
+                return Err(format!(
+                    "浏览器进程异常退出 (ExitCode: {:?})，启动失败！\n输出日志:\n{}",
+                    status.code(),
+                    if err_detail.is_empty() { "无 stderr 输出" } else { &err_detail }
+                ));
+            }
+
+            let active_port_file = profile_dir.join("DevToolsActivePort");
+            if active_port_file.exists() {
+                if let Ok(content) = std::fs::read_to_string(&active_port_file) {
+                    let lines: Vec<&str> = content.lines().collect();
+                    if lines.len() >= 2 {
+                        let port = lines[0].trim();
+                        let path = lines[1].trim();
+                        if !port.is_empty() && !path.is_empty() {
+                            ws_url = Some(format!("ws://127.0.0.1:{port}{path}"));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Ok(Ok(Some(l))) = tokio::time::timeout(Duration::from_millis(100), reader.next_line()).await {
                 if let Some(idx) = l.find("DevTools listening on ws://") {
                     let ws = l[idx + "DevTools listening on ".len()..].trim().to_string();
                     ws_url = Some(ws);
                     break;
                 }
+                accumulated_stderr.push(l);
             }
         }
 
-        let ws_url = ws_url.ok_or_else(|| "等待浏览器 DevTools WebSocket 地址超时".to_string())?;
+        let ws_url = ws_url.ok_or_else(|| {
+            let err_detail = accumulated_stderr.join("\n");
+            format!(
+                "等待浏览器 DevTools WebSocket 地址超时！\n详情:\n{}",
+                if err_detail.is_empty() { "无 stderr 输出" } else { &err_detail }
+            )
+        })?;
 
-        // 异步丢弃 stderr 剩余数据，防止挂起
         tokio::spawn(async move {
             while let Ok(Some(_)) = reader.next_line().await {}
         });
@@ -238,7 +382,6 @@ impl BrowserSession {
                 .to_string()
         };
 
-        // 挂载到 Target 获得 sessionId
         let attach_res = cdp
             .send(
                 "Target.attachToTarget",
@@ -253,35 +396,41 @@ impl BrowserSession {
             .ok_or_else(|| "Target.attachToTarget 未返回 sessionId".to_string())?
             .to_string();
 
-        // 激活所需领域
         let sid = Some(target_session_id.as_str());
         let _ = cdp.send("Page.enable", None, sid, Duration::from_secs(5)).await;
         let _ = cdp.send("Runtime.enable", None, sid, Duration::from_secs(5)).await;
         let _ = cdp.send("Network.enable", None, sid, Duration::from_secs(5)).await;
         let _ = cdp.send("DOM.enable", None, sid, Duration::from_secs(5)).await;
+        let _ = cdp.send("Log.enable", None, sid, Duration::from_secs(5)).await;
 
-        // 激活当前标签页并设置视口，防止后台节流和 0x0 渲染
         let _ = cdp.send("Target.activateTarget", Some(json!({ "targetId": target_id })), None, Duration::from_secs(5)).await;
         let _ = cdp.send(
             "Emulation.setDeviceMetricsOverride",
             Some(json!({
-                "width": 1280,
-                "height": 900,
-                "deviceScaleFactor": 1,
+                "width": 1440,
+                "height": 960,
+                "deviceScaleFactor": 2,
                 "mobile": false
             })),
             sid,
             Duration::from_secs(5),
         ).await;
 
+        if let Some(ref ws) = workspace {
+            let _ = super::storage::restore_storage_state(&cdp, &target_session_id, ws).await;
+        }
+
         Ok(Self {
-            _child: Arc::new(Mutex::new(child)),
-            temp_dir,
+            _child: Arc::new(Mutex::new(Some(child))),
+            profile_dir: Some(profile_dir),
+            context_id: None,
             workspace: Arc::new(Mutex::new(workspace)),
             cdp,
+            target_id,
             target_session_id,
+            ws_url,
             is_recording: Arc::new(AtomicBool::new(false)),
-            storage_injected: Arc::new(AtomicBool::new(false)),
+            recording_start_url: Arc::new(Mutex::new(None)),
             replay_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -299,14 +448,35 @@ impl BrowserSession {
         &self.cdp
     }
 
+    pub fn target_session_id(&self) -> &str {
+        &self.target_session_id
+    }
+
     pub async fn is_alive(&self) -> bool {
         if !self.cdp.is_alive() {
             return false;
         }
+        if self.context_id.is_some() {
+            let check = self
+                .cdp
+                .send(
+                    "Target.getTargetInfo",
+                    Some(json!({ "targetId": self.target_id })),
+                    None,
+                    Duration::from_millis(500),
+                )
+                .await;
+            return check.is_ok();
+        }
+
         let mut child = self._child.lock().await;
-        match child.try_wait() {
-            Ok(None) => true,
-            _ => false,
+        if let Some(ref mut c) = *child {
+            match c.try_wait() {
+                Ok(None) => true,
+                _ => false,
+            }
+        } else {
+            false
         }
     }
 
@@ -337,17 +507,6 @@ impl BrowserSession {
         };
 
         let sid = Some(self.target_session_id.as_str());
-
-        // 0. 日常自主测试：若工作区已固化 storage_state.json 且当前实例尚未注入，自动预注入已选好机构的 Cookies 与 LocalStorage
-        if !self.storage_injected.load(Ordering::SeqCst) {
-            let ws_opt = self.get_workspace().await;
-            if let Some(ref ws) = ws_opt {
-                if let Ok(Some(state)) = load_storage_state(ws) {
-                    let _ = self.inject_storage_state(&state).await;
-                    self.storage_injected.store(true, Ordering::SeqCst);
-                }
-            }
-        }
 
         self.cdp
             .send("Page.navigate", Some(json!({ "url": normalized_url })), sid, Duration::from_secs(30))
@@ -457,6 +616,15 @@ impl BrowserSession {
             }
         }
 
+        let mut dom_overlays = Vec::new();
+        if let Some(arr) = val.get("dom_overlays").and_then(|o| o.as_array()) {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    dom_overlays.push(s.to_string());
+                }
+            }
+        }
+
         let mut tables = Vec::new();
         if let Some(arr) = val.get("tables").and_then(|t| t.as_array()) {
             for item in arr {
@@ -469,7 +637,7 @@ impl BrowserSession {
         let console_errors = {
             let logs = self.cdp.console_logs.lock().await;
             logs.iter()
-                .filter(|l| l.contains("[Console.error]") || l.contains("[Uncaught Exception]"))
+                .filter(|l| l.contains("[Console.error]") || l.contains("[Uncaught Exception]") || l.contains("[Log.error]"))
                 .cloned()
                 .collect()
         };
@@ -479,26 +647,46 @@ impl BrowserSession {
             net.clone()
         };
 
+        let page_state = super::evaluator::evaluate_page_state(self).await;
+
+        let viewport = val
+            .get("viewport")
+            .and_then(|vp| serde_json::from_value::<ViewportInfo>(vp.clone()).ok())
+            .unwrap_or_default();
+
+        let hidden_elements_count = val
+            .get("hidden_elements_count")
+            .and_then(|h| h.as_u64())
+            .unwrap_or(0) as usize;
+
         Ok(BrowserDebugState {
             url,
             title,
+            viewport,
             elements,
+            hidden_elements_count,
             console_errors,
             network_errors,
             tables,
             notices,
+            dom_overlays,
+            page_state,
         })
     }
 
-    pub async fn capture_screenshot(&self) -> Result<String, String> {
+    pub async fn capture_screenshot(&self, full_page: bool) -> Result<String, String> {
         let sid = Some(self.target_session_id.as_str());
+        let mut params = json!({ "format": "jpeg", "quality": 85 });
+        if full_page {
+            params["captureBeyondViewport"] = json!(true);
+        }
         let res = self
             .cdp
             .send(
                 "Page.captureScreenshot",
-                Some(json!({ "format": "jpeg", "quality": 80 })),
+                Some(params),
                 sid,
-                Duration::from_secs(15),
+                Duration::from_secs(20),
             )
             .await?;
 
@@ -506,6 +694,87 @@ impl BrowserSession {
             .and_then(|d| d.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| "截图失败: 未返回图像数据".to_string())
+    }
+
+    pub async fn scroll(
+        &self,
+        direction: Option<&str>,
+        distance: Option<f64>,
+        target: Option<&str>,
+    ) -> Result<BrowserDebugState, String> {
+        let sid = Some(self.target_session_id.as_str());
+        let script = build_scroll_script(direction.unwrap_or("down"), distance, target);
+
+        let eval_res = self
+            .cdp
+            .send(
+                "Runtime.evaluate",
+                Some(json!({
+                    "expression": script,
+                    "returnByValue": true,
+                    "awaitPromise": true
+                })),
+                sid,
+                Duration::from_secs(10),
+            )
+            .await?;
+
+        if let Some(err) = eval_res
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.get("error"))
+            .and_then(|e| e.as_str())
+        {
+            return Err(format!("滚动操作失败: {err}"));
+        }
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        self.get_debug_state().await
+    }
+
+    pub async fn user_wheel(&self, x: f64, y: f64, delta_x: f64, delta_y: f64) -> Result<(), String> {
+        let sid = Some(self.target_session_id.as_str());
+        let params = json!({
+            "type": "mouseWheel",
+            "x": x,
+            "y": y,
+            "deltaX": delta_x,
+            "deltaY": delta_y
+        });
+        self.cdp.send("Input.dispatchMouseEvent", Some(params), sid, Duration::from_secs(5)).await?;
+        Ok(())
+    }
+
+    pub async fn open_devtools_window(&self) -> Result<(), String> {
+        let clean_ws = self.ws_url.trim_start_matches("ws://").trim_start_matches("http://");
+        let host_port = clean_ws.split('/').next().unwrap_or("127.0.0.1");
+
+        let inspector_url = format!(
+            "http://{host_port}/devtools/inspector.html?ws={host_port}/devtools/page/{}",
+            self.target_id
+        );
+
+        #[cfg(windows)]
+        {
+            let res = std::process::Command::new("cmd")
+                .args(["/c", "start", "", &inspector_url])
+                .spawn();
+            if let Err(e) = res {
+                return Err(format!("唤起独立调试窗口失败: {e}"));
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            let res = std::process::Command::new("xdg-open")
+                .arg(&inspector_url)
+                .spawn();
+            if let Err(e) = res {
+                return Err(format!("唤起独立调试窗口失败: {e}"));
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn user_click(&self, x: f64, y: f64) -> Result<(), String> {
@@ -535,211 +804,12 @@ impl BrowserSession {
         Ok(())
     }
 
-    pub async fn capture_storage_state(&self) -> Result<StorageState, String> {
-        let sid = Some(self.target_session_id.as_str());
-
-        // 1. 获取全量 Cookies
-        let cookies_res = self
-            .cdp
-            .send("Network.getCookies", None, sid, Duration::from_secs(10))
-            .await?;
-
-        let mut cookies = Vec::new();
-        if let Some(arr) = cookies_res.get("cookies").and_then(|c| c.as_array()) {
-            for item in arr {
-                if let (Some(name), Some(value), Some(domain), Some(path)) = (
-                    item.get("name").and_then(|n| n.as_str()),
-                    item.get("value").and_then(|v| v.as_str()),
-                    item.get("domain").and_then(|d| d.as_str()),
-                    item.get("path").and_then(|p| p.as_str()),
-                ) {
-                    cookies.push(CookieData {
-                        name: name.to_string(),
-                        value: value.to_string(),
-                        domain: domain.to_string(),
-                        path: path.to_string(),
-                        expires: item.get("expires").and_then(|e| e.as_f64()),
-                        http_only: item.get("httpOnly").and_then(|h| h.as_bool()),
-                        secure: item.get("secure").and_then(|s| s.as_bool()),
-                        same_site: item.get("sameSite").and_then(|s| s.as_str()).map(|s| s.to_string()),
-                    });
-                }
-            }
-        }
-
-        // 2. 提取 LocalStorage
-        let ls_res = self
-            .cdp
-            .send(
-                "Runtime.evaluate",
-                Some(json!({
-                    "expression": r#"(() => {
-                        try {
-                            const res = {};
-                            for (let i = 0; i < localStorage.length; i++) {
-                                const k = localStorage.key(i);
-                                if (k) res[k] = localStorage.getItem(k);
-                            }
-                            return res;
-                        } catch(e) {
-                            return {};
-                        }
-                    })()"#,
-                    "returnByValue": true
-                })),
-                sid,
-                Duration::from_secs(10),
-            )
-            .await?;
-
-        let mut local_storage = HashMap::new();
-        if let Some(obj) = ls_res
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(|v| v.as_object())
-        {
-            for (k, v) in obj {
-                if let Some(s) = v.as_str() {
-                    local_storage.insert(k.clone(), s.to_string());
-                } else {
-                    local_storage.insert(k.clone(), v.to_string());
-                }
-            }
-        }
-
-        // 3. 提取 SessionStorage
-        let ss_res = self
-            .cdp
-            .send(
-                "Runtime.evaluate",
-                Some(json!({
-                    "expression": r#"(() => {
-                        try {
-                            const res = {};
-                            for (let i = 0; i < sessionStorage.length; i++) {
-                                const k = sessionStorage.key(i);
-                                if (k) res[k] = sessionStorage.getItem(k);
-                            }
-                            return res;
-                        } catch(e) {
-                            return {};
-                        }
-                    })()"#,
-                    "returnByValue": true
-                })),
-                sid,
-                Duration::from_secs(10),
-            )
-            .await?;
-
-        let mut session_storage = HashMap::new();
-        if let Some(obj) = ss_res
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(|v| v.as_object())
-        {
-            for (k, v) in obj {
-                if let Some(s) = v.as_str() {
-                    session_storage.insert(k.clone(), s.to_string());
-                } else {
-                    session_storage.insert(k.clone(), v.to_string());
-                }
-            }
-        }
-
-        Ok(StorageState {
-            updated_at: chrono::Utc::now().to_rfc3339(),
-            cookies,
-            local_storage,
-            session_storage: if session_storage.is_empty() { None } else { Some(session_storage) },
-        })
-    }
-
-    pub async fn inject_storage_state(&self, state: &StorageState) -> Result<(), String> {
-        let sid = Some(self.target_session_id.as_str());
-
-        // 1. 注入 Cookies
-        let mut cdp_cookies = Vec::new();
-        for c in &state.cookies {
-            let mut c_val = json!({
-                "name": c.name,
-                "value": c.value,
-                "domain": c.domain,
-                "path": c.path,
-            });
-            if let Some(exp) = c.expires {
-                c_val["expires"] = json!(exp);
-            }
-            if let Some(ho) = c.http_only {
-                c_val["httpOnly"] = json!(ho);
-            }
-            if let Some(sec) = c.secure {
-                c_val["secure"] = json!(sec);
-            }
-            if let Some(ref ss) = c.same_site {
-                c_val["sameSite"] = json!(ss);
-            }
-            cdp_cookies.push(c_val);
-        }
-        if !cdp_cookies.is_empty() {
-            let _ = self
-                .cdp
-                .send(
-                    "Network.setCookies",
-                    Some(json!({ "cookies": cdp_cookies })),
-                    sid,
-                    Duration::from_secs(10),
-                )
-                .await;
-        }
-
-        // 2. 注入 LocalStorage 与 SessionStorage (在每个新文档首行执行)
-        let ls_json = serde_json::to_string(&state.local_storage).unwrap_or_else(|_| "{}".to_string());
-        let ss_json = serde_json::to_string(&state.session_storage.clone().unwrap_or_default())
-            .unwrap_or_else(|_| "{}".to_string());
-
-        let script = format!(
-            r#"(() => {{
-                try {{
-                    const ls = {ls_json};
-                    for (const [k, v] of Object.entries(ls)) {{
-                        try {{ localStorage.setItem(k, v); }} catch(e) {{}}
-                    }}
-                }} catch(e) {{}}
-                try {{
-                    const ss = {ss_json};
-                    for (const [k, v] of Object.entries(ss)) {{
-                        try {{ sessionStorage.setItem(k, v); }} catch(e) {{}}
-                    }}
-                }} catch(e) {{}}
-            }})()"#
-        );
-
-        let _ = self
-            .cdp
-            .send(
-                "Page.addScriptToEvaluateOnNewDocument",
-                Some(json!({ "source": script })),
-                sid,
-                Duration::from_secs(5),
-            )
-            .await;
-
-        let _ = self
-            .cdp
-            .send(
-                "Runtime.evaluate",
-                Some(json!({ "expression": script, "returnByValue": false })),
-                sid,
-                Duration::from_secs(5),
-            )
-            .await;
-
-        Ok(())
-    }
-
     pub async fn start_recording(&self) -> Result<(), String> {
         self.is_recording.store(true, Ordering::SeqCst);
+        if let Ok(state) = self.get_debug_state().await {
+            let mut start_lock = self.recording_start_url.lock().await;
+            *start_lock = Some(state.url);
+        }
         let sid = Some(self.target_session_id.as_str());
 
         // 清空之前的录制缓存
@@ -826,78 +896,13 @@ impl BrowserSession {
         Ok(())
     }
 
-    pub async fn replay_auth_macro(&self, macro_data: &AuthMacro) -> Result<(), String> {
-        let sid = Some(self.target_session_id.as_str());
-
-        // 1. 导航至登录页面
-        self.navigate(&macro_data.login_url).await?;
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-
-        // 2. 依次重放动作
-        for step in &macro_data.steps {
-            match step.action.as_str() {
-                "wait" => {
-                    let ms = step.ms.unwrap_or(1000);
-                    tokio::time::sleep(Duration::from_millis(ms)).await;
-                }
-                "wait_for_url" => {
-                    let exclude = step.exclude.as_deref().unwrap_or("#/login");
-                    let start = std::time::Instant::now();
-                    let timeout = Duration::from_secs(10);
-                    while start.elapsed() < timeout {
-                        let res = self.cdp.send(
-                            "Runtime.evaluate",
-                            Some(json!({ "expression": "window.location.href", "returnByValue": true })),
-                            sid,
-                            Duration::from_secs(5),
-                        ).await;
-                        if let Ok(val) = res {
-                            let curr_url = val.get("result").and_then(|r| r.get("value")).and_then(|v| v.as_str()).unwrap_or("");
-                            if !curr_url.is_empty() && !curr_url.contains(exclude) {
-                                break;
-                            }
-                        }
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                }
-                "click" => {
-                    if let Some(ref target) = step.selector {
-                        self.interact("click", target, None).await?;
-                    }
-                }
-                "type" => {
-                    if let Some(ref target) = step.selector {
-                        self.interact("type", target, step.value.as_deref()).await?;
-                    }
-                }
-                "press_enter" => {
-                    let target = step.selector.as_deref().unwrap_or("body");
-                    self.interact("press_enter", target, None).await?;
-                }
-                _ => {}
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
-
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-        Ok(())
+    pub async fn get_recording_start_url(&self) -> Option<String> {
+        self.recording_start_url.lock().await.clone()
     }
 
     pub async fn check_and_heal_auth(&self, master_key: &[u8; 32]) -> Result<bool, String> {
-        let expired = self.cdp.auth_expired.swap(false, Ordering::SeqCst);
-        let is_login_page = {
-            let res = self.cdp.send(
-                "Runtime.evaluate",
-                Some(json!({ "expression": "window.location.href", "returnByValue": true })),
-                Some(self.target_session_id.as_str()),
-                Duration::from_secs(5),
-            ).await;
-            res.ok()
-                .and_then(|v| v.get("result").and_then(|r| r.get("value")).and_then(|u| u.as_str()).map(|s| s.contains("/login") || s.contains("#/login")))
-                .unwrap_or(false)
-        };
-
-        if !expired && !is_login_page {
+        let state = super::evaluator::evaluate_page_state(self).await;
+        if !matches!(state, super::evaluator::PageHealthState::Unauthenticated { .. }) {
             return Ok(false);
         }
 
@@ -907,24 +912,39 @@ impl BrowserSession {
             None => return Ok(false),
         };
 
-        let macro_data = match super::auth::load_auth_macro(&ws, master_key)? {
-            Some(m) => m,
-            None => return Ok(false),
-        };
-
         let _guard = self.replay_lock.lock().await;
-        self.replay_auth_macro(&macro_data).await?;
 
-        // 提取并更新 storage_state.json
-        if let Ok(new_state) = self.capture_storage_state().await {
-            let _ = save_storage_state(&ws, &new_state);
+        // 使用声明式凭据契约与流水线引擎自愈
+        if let Ok(Some(contract)) = super::auth::load_auth_contract(&ws, master_key) {
+            if let Ok(()) = super::pipeline::execute_auth_pipeline(self, &contract).await {
+                return Ok(true);
+            }
         }
-        Ok(true)
+
+        Ok(false)
     }
 
     pub async fn close(&self) {
-        let mut child = self._child.lock().await;
-        let _ = child.kill().await;
-        let _ = tokio::fs::remove_dir_all(&self.temp_dir).await;
+        // 保存轻量 storage_state (Cookies/LocalStorage)
+        if let Some(ws) = self.get_workspace().await {
+            let _ = super::storage::save_storage_state(&self.cdp, &self.target_session_id, &ws).await;
+        }
+
+        // 若是通过全局 BrowserDaemon 运行的隔离上下文
+        if let Some(ref cid) = self.context_id {
+            let daemon = super::daemon::global_browser_daemon();
+            let _ = daemon.close_target(&self.target_id).await;
+            let _ = daemon.dispose_context(cid).await;
+            return;
+        }
+
+        // 若是独立实体窗口进程
+        let mut child_guard = self._child.lock().await;
+        if let Some(mut child) = child_guard.take() {
+            let _ = child.kill().await;
+        }
+        if let Some(ref p) = self.profile_dir {
+            let _ = tokio::fs::remove_dir_all(p).await;
+        }
     }
 }

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, CurrentBoard, DataStatus, DbStats, OptimizeResult, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult, JevCfg, PlanReviewReport, ToolLogFilter, ToolLogQueryResult, DirectDecisionResult, BrowserDebugState, InteractiveElement, McpServerConfig, McpToolDefinition, AuthStep, AuthMacro, AuthMacroStatus } from "./types";
+import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, CurrentBoard, DataStatus, DbStats, OptimizeResult, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult, JevCfg, PlanReviewReport, ToolLogFilter, ToolLogQueryResult, DirectDecisionResult, BrowserDebugState, ViewportInfo, InteractiveElement, McpServerConfig, McpToolDefinition, AuthStep, DistillTrace, DistillAuthContractResult, PageHealthState, AuthContract, AuthContractCredentials, AuthContractPostLogin, AuthAction } from "./types";
 
 /**
  * 读请求防重入去重拦截器：
@@ -462,20 +462,47 @@ export const ipc = {
       y: y ?? null,
       text: text ?? null,
     }),
-  browserCaptureScreenshot: (sessionId: string) =>
-    invoke<string>("browser_capture_screenshot", { sessionId }),
+  browserCaptureScreenshot: (sessionId: string, fullPage?: boolean) =>
+    invoke<string>("browser_capture_screenshot", { sessionId, fullPage: fullPage ?? null }),
+  browserUserWheel: (sessionId: string, x: number, y: number, deltaX: number, deltaY: number) =>
+    invoke<void>("browser_user_wheel", { sessionId, x, y, deltaX, deltaY }),
+  browserScrollViewport: (sessionId: string, direction?: string, distance?: number, target?: string) =>
+    invoke<BrowserDebugState>("browser_scroll_viewport", {
+      sessionId,
+      direction: direction ?? null,
+      distance: distance ?? null,
+      target: target ?? null,
+    }),
+  browserOpenDevtoolsWindow: (sessionId: string) =>
+    invoke<void>("browser_open_devtools_window", { sessionId }),
   closeBrowserSession: (sessionId: string) =>
     invoke<void>("close_browser_session", { sessionId }),
-  getAuthMacroStatus: (sessionId: string) =>
-    invoke<AuthMacroStatus>("get_auth_macro_status", { sessionId }),
+  saveAuthContract: (sessionId: string, contract: AuthContract, rawPassword?: string) =>
+    invoke<void>("save_auth_contract", { sessionId, contract, rawPassword: rawPassword ?? null }),
+  getAuthContract: (sessionId: string) =>
+    invoke<AuthContract | null>("get_auth_contract", { sessionId }),
+  getDefaultAuthDistillSystemPrompt: () =>
+    invoke<string>("get_default_auth_distill_system_prompt"),
+  distillAuthContract: (
+    sessionId: string,
+    rawSteps?: AuthStep[],
+    refinePrompt?: string,
+    customSystemPrompt?: string
+  ) =>
+    invoke<DistillAuthContractResult>("distill_auth_contract", {
+      sessionId,
+      rawSteps: rawSteps ?? null,
+      refinePrompt: refinePrompt ?? null,
+      customSystemPrompt: customSystemPrompt ?? null,
+    }),
+  executeBrowserAuthPipeline: (sessionId: string) =>
+    invoke<void>("execute_browser_auth_pipeline", { sessionId }),
   startBrowserRecording: (sessionId: string) =>
     invoke<void>("start_browser_recording", { sessionId }),
   getRecordedBrowserSteps: (sessionId: string) =>
     invoke<AuthStep[]>("get_recorded_browser_steps", { sessionId }),
-  stopBrowserRecordingAndSave: (sessionId: string, manualSteps?: AuthStep[]) =>
-    invoke<AuthMacro>("stop_browser_recording_and_save", { sessionId, manualSteps: manualSteps ?? null }),
-  replayBrowserAuthMacro: (sessionId: string) =>
-    invoke<void>("replay_browser_auth_macro", { sessionId }),
+  stopBrowserRecording: (sessionId: string) =>
+    invoke<AuthStep[]>("stop_browser_recording", { sessionId }),
 
   // MCP 服务管理 (Model Context Protocol)
   listMcpServers: () =>
@@ -490,7 +517,7 @@ export const ipc = {
     invoke<void>("reload_mcp_servers"),
 };
 
-export type { ActivePlanDetail, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Message, Session, SessionActiveState, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport, CollaboratorCreateInput, CollaboratorUpdateInput, SessionCreateInput, SessionModelsUpdateInput, FileTextContent, ViewerTabItem, FileOutlineItem, DiffHunk, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult, BrowserDebugState, InteractiveElement, McpServerConfig, McpToolDefinition, AuthStep, AuthMacro, AuthMacroStatus };
+export type { ActivePlanDetail, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Message, Session, SessionActiveState, Project, ProjectLink, RunningSession, Settings, ToolEvent, DataStatus, TempAlloc, TempInfo, MergeSummary, GrowthItem, SkillItem, ProjectSopInfo, TokenStatsReport, CollaboratorCreateInput, CollaboratorUpdateInput, SessionCreateInput, SessionModelsUpdateInput, FileTextContent, ViewerTabItem, FileOutlineItem, DiffHunk, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult, BrowserDebugState, ViewportInfo, InteractiveElement, McpServerConfig, McpToolDefinition, AuthStep, DistillTrace, DistillAuthContractResult, PageHealthState, AuthContract, AuthContractCredentials, AuthContractPostLogin, AuthAction };
 
 
 

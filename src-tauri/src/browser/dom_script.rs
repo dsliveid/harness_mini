@@ -1,6 +1,13 @@
 pub const EXTRACT_TREE_SCRIPT: &str = r#"
 (() => {
-    // 1. 可交互元素提取
+    const vWidth = window.innerWidth || document.documentElement.clientWidth || 1440;
+    const vHeight = window.innerHeight || document.documentElement.clientHeight || 960;
+    const scrollX = window.scrollX || window.pageXOffset || document.documentElement.scrollLeft || 0;
+    const scrollY = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
+    const totalWidth = Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0, vWidth);
+    const totalHeight = Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0, vHeight);
+
+    // 1. 可交互元素提取 (视口内优先提取)
     const selectors = [
         'input', 'textarea', 'select', 'button', 'a[href]',
         '[role="button"]', '[role="checkbox"]', '[role="menuitem"]',
@@ -9,6 +16,7 @@ pub const EXTRACT_TREE_SCRIPT: &str = r#"
     const elements = document.querySelectorAll(selectors.join(','));
     const items = [];
     let count = 0;
+    let hiddenCount = 0;
 
     for (let el of elements) {
         try {
@@ -25,35 +33,85 @@ pub const EXTRACT_TREE_SCRIPT: &str = r#"
             const refId = `@e${count}`;
             el.setAttribute('data-harness-ref', refId);
 
-            const tag = el.tagName.toLowerCase();
-            const type = el.getAttribute('type') || '';
-            const name = el.getAttribute('name') || '';
-            const placeholder = el.getAttribute('placeholder') || '';
-            let text = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ');
-            if (text.length > 60) text = text.slice(0, 60) + '...';
-            const value = el.value !== undefined && el.value !== null ? String(el.value) : '';
-            const href = el.getAttribute('href') || '';
+            // 检查元素是否在当前视口内可见 (In-Viewport)
+            const inViewport = (
+                rect.bottom > 0 &&
+                rect.right > 0 &&
+                rect.top < vHeight &&
+                rect.left < vWidth
+            );
 
-            items.push({
-                ref: refId,
-                tag,
-                type: type || undefined,
-                name: name || undefined,
-                placeholder: placeholder || undefined,
-                text: text || undefined,
-                value: value || undefined,
-                href: href ? href.slice(0, 60) : undefined,
-            });
+            if (inViewport) {
+                if (items.length < 100) {
+                    const tag = el.tagName.toLowerCase();
+                    const type = el.getAttribute('type') || '';
+                    const name = el.getAttribute('name') || '';
+                    const placeholder = el.getAttribute('placeholder') || '';
+                    let text = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ');
+                    if (text.length > 60) text = text.slice(0, 60) + '...';
+                    const value = el.value !== undefined && el.value !== null ? String(el.value) : '';
+                    const href = el.getAttribute('href') || '';
 
-            if (count >= 80) break; // 防止超长 DOM 消耗过多 Token
+                    items.push({
+                        ref: refId,
+                        tag,
+                        type: type || undefined,
+                        name: name || undefined,
+                        placeholder: placeholder || undefined,
+                        text: text || undefined,
+                        value: value || undefined,
+                        href: href ? href.slice(0, 60) : undefined,
+                    });
+                } else {
+                    hiddenCount++;
+                }
+            } else {
+                hiddenCount++;
+            }
         } catch (_) {}
     }
 
-    // 2. 页面通知、警告与空状态提示
+    // 2. 页面通知、警告、空状态以及关键错误遮罩 (Webpack / Vite / UI Error Overlays)
     const notices = [];
+    const dom_overlays = [];
     try {
+        // Webpack Dev Server 编译错误遮罩 (iframe 容器或 Shadow DOM)
+        const webpackOverlay = document.querySelector('#webpack-dev-server-client-overlay');
+        if (webpackOverlay) {
+            let txt = '';
+            if (webpackOverlay.contentDocument) {
+                const div = webpackOverlay.contentDocument.getElementById('webpack-dev-server-client-overlay-div') 
+                         || webpackOverlay.contentDocument.body;
+                txt = div ? (div.innerText || div.textContent || '') : '';
+            } else if (webpackOverlay.shadowRoot) {
+                txt = webpackOverlay.shadowRoot.textContent || '';
+            } else {
+                txt = webpackOverlay.innerText || webpackOverlay.textContent || '';
+            }
+            txt = txt.trim();
+            if (txt) {
+                const item = `[Webpack 编译错误]: ${txt.slice(0, 500)}`;
+                dom_overlays.push(item);
+                notices.push(item);
+            }
+        }
+
+        // Vite 构建错误遮罩
+        const viteOverlay = document.querySelector('vite-error-overlay');
+        if (viteOverlay) {
+            let txt = viteOverlay.shadowRoot ? viteOverlay.shadowRoot.textContent : (viteOverlay.innerText || viteOverlay.textContent);
+            txt = (txt || '').trim();
+            if (txt) {
+                const item = `[Vite 构建错误]: ${txt.slice(0, 500)}`;
+                dom_overlays.push(item);
+                notices.push(item);
+            }
+        }
+
         const noticeSelectors = [
+            '.el-message--error', '.yh-message--error', '.ant-message-error',
             '.el-alert__title', '.el-alert__description', '.el-message__content',
+            '.yh-alert__title', '.yh-alert__description', '.yh-message__content',
             '.ant-alert-message', '.ant-alert-description', '.ant-message-custom-content',
             '.el-empty__description', '.ant-empty-description',
             '.vxe-table--empty-text', '.vxe-table--empty-placeholder',
@@ -63,8 +121,11 @@ pub const EXTRACT_TREE_SCRIPT: &str = r#"
         for (let nel of noticeNodes) {
             let t = (nel.innerText || nel.textContent || '').trim().replace(/\s+/g, ' ');
             if (t && t.length > 0 && !notices.includes(t)) {
+                if (nel.classList.contains('el-message--error') || nel.classList.contains('yh-message--error') || nel.classList.contains('ant-message-error')) {
+                    dom_overlays.push(`[全局错误弹窗]: ${t.slice(0, 200)}`);
+                }
                 notices.push(t.slice(0, 120));
-                if (notices.length >= 6) break;
+                if (notices.length >= 8) break;
             }
         }
     } catch (_) {}
@@ -122,11 +183,28 @@ pub const EXTRACT_TREE_SCRIPT: &str = r#"
         }
     } catch (_) {}
 
+    const totalPages = Math.max(1, Math.ceil(totalHeight / vHeight));
+    const currentPage = Math.min(totalPages, Math.floor(scrollY / vHeight) + 1);
+
     return {
         title: document.title,
         url: window.location.href,
+        viewport: {
+            scroll_x: Math.round(scrollX),
+            scroll_y: Math.round(scrollY),
+            viewport_width: Math.round(vWidth),
+            viewport_height: Math.round(vHeight),
+            total_width: Math.round(totalWidth),
+            total_height: Math.round(totalHeight),
+            current_page: currentPage,
+            total_pages: totalPages,
+            has_more_down: (scrollY + vHeight + 10) < totalHeight,
+            has_more_up: scrollY > 10
+        },
         elements: items,
+        hidden_elements_count: hiddenCount,
         notices: notices,
+        dom_overlays: dom_overlays,
         tables: tables
     };
 })()
@@ -304,8 +382,95 @@ pub fn build_interact_script(action: &str, target: &str, value: Option<&str>) ->
                 return {{ success: !!el, found: !!el }};
             }})()"#
         ),
+        "scroll" => {
+            let dist: Option<f64> = value.and_then(|v| v.parse::<f64>().ok());
+            build_scroll_script("down", dist, if clean_target.is_empty() { None } else { Some(clean_target) })
+        }
         _ => format!(
             r#"(() => ({{ success: false, error: "不支持的操作类型: {action}" }}))()"#
         ),
+    }
+}
+
+pub fn build_scroll_script(direction: &str, distance: Option<f64>, target: Option<&str>) -> String {
+    let clean_target = target.unwrap_or("").trim();
+    let selector = if clean_target.starts_with('@') {
+        format!("[data-harness-ref=\"{clean_target}\"]")
+    } else {
+        clean_target.to_string()
+    };
+    let escaped_selector = selector.replace('"', "\\\"");
+
+    let find_target_fn = r#"
+        const findTarget = (sel) => {
+            if (!sel) return null;
+            if (sel.includes(':has-text(') || sel.includes(':contains(')) {
+                const m = sel.match(/^(.*?):(has-text|contains)\(['"](.*)['"]\)$/);
+                if (m) {
+                    const baseTag = m[1].trim() || '*';
+                    const textToFind = m[3].trim();
+                    const candidates = document.querySelectorAll(baseTag);
+                    for (let el of candidates) {
+                        if ((el.innerText || el.textContent || '').includes(textToFind)) {
+                            return el;
+                        }
+                    }
+                }
+            }
+            return document.querySelector(sel);
+        };
+    "#;
+
+    if !clean_target.is_empty() {
+        format!(
+            r#"(() => {{
+                {find_target_fn}
+                const el = findTarget("{escaped_selector}");
+                if (!el) return {{ success: false, error: "未找到目标元素: {clean_target}" }};
+                el.scrollIntoView({{ behavior: 'instant', block: 'center', inline: 'center' }});
+                return {{ success: true }};
+            }})()"#
+        )
+    } else {
+        let dist_val = distance.unwrap_or(0.0);
+        match direction {
+            "top" => r#"(() => {
+                window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
+                return { success: true };
+            })()"#.to_string(),
+            "bottom" => r#"(() => {
+                const maxScroll = Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0);
+                window.scrollTo({ top: maxScroll, left: 0, behavior: 'instant' });
+                return { success: true };
+            })()"#.to_string(),
+            "up" => format!(
+                r#"(() => {{
+                    const d = {dist_val} > 0 ? {dist_val} : (window.innerHeight * 0.8);
+                    window.scrollBy({{ top: -d, left: 0, behavior: 'instant' }});
+                    return {{ success: true }};
+                }})()"#
+            ),
+            "left" => format!(
+                r#"(() => {{
+                    const d = {dist_val} > 0 ? {dist_val} : (window.innerWidth * 0.8);
+                    window.scrollBy({{ top: 0, left: -d, behavior: 'instant' }});
+                    return {{ success: true }};
+                }})()"#
+            ),
+            "right" => format!(
+                r#"(() => {{
+                    const d = {dist_val} > 0 ? {dist_val} : (window.innerWidth * 0.8);
+                    window.scrollBy({{ top: 0, left: d, behavior: 'instant' }});
+                    return {{ success: true }};
+                }})()"#
+            ),
+            _ => format!(
+                r#"(() => {{
+                    const d = {dist_val} > 0 ? {dist_val} : (window.innerHeight * 0.8);
+                    window.scrollBy({{ top: d, left: 0, behavior: 'instant' }});
+                    return {{ success: true }};
+                }})()"#
+            ),
+        }
     }
 }

@@ -235,6 +235,8 @@ interface Store {
   /** 网页调试检查器弹窗 */
   showBrowserInspector: boolean;
   setShowBrowserInspector: (open: boolean) => void;
+  browserInspectorTab?: "view" | "elements" | "data" | "console" | "network" | "auth";
+  setBrowserInspectorTab: (tab: "view" | "elements" | "data" | "console" | "network" | "auth") => void;
 
   bootstrap: () => Promise<void>;
   /** 拉取全局运行中的会话，恢复各会话的“运行中”状态显示（启动/界面刷新后调用） */
@@ -625,6 +627,8 @@ export const useStore = create<Store>((set, get) => ({
   setShowTaskDetailModal: (v) => set({ showTaskDetailModal: v }),
   showBrowserInspector: false,
   setShowBrowserInspector: (v) => set({ showBrowserInspector: v }),
+  browserInspectorTab: "view",
+  setBrowserInspectorTab: (tab) => set({ browserInspectorTab: tab, showBrowserInspector: true }),
 
 
   async bootstrap() {

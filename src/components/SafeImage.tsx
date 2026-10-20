@@ -55,8 +55,18 @@ export const SafeImage = memo(function SafeImage({
     }
   };
 
-  if (hasError && fallbackIcon) {
-    return <div className={className}>{fallbackIcon}</div>;
+  if (hasError) {
+    if (fallbackIcon) {
+      return <div className={className}>{fallbackIcon}</div>;
+    }
+    return (
+      <div
+        className={`${className || ""} flex flex-col items-center justify-center bg-panel3/80 text-inkdim/70 text-[10.5px] p-2 text-center select-none border border-edge/50 rounded`}
+        title="快照可能已按滚动配额清理或文件不存在"
+      >
+        <span className="opacity-70 font-medium">快照已释放</span>
+      </div>
+    );
   }
 
   return (

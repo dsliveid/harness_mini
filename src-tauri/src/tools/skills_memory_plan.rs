@@ -403,9 +403,12 @@ pub(crate) async fn recognize_image_tool(args: &Value, ctx: &ToolCtx) -> Result<
             p
         } else {
             let data_dir = state.data_dir.lock().unwrap().clone().unwrap_or_else(|| state.default_data_dir.clone());
+            let in_session_artifacts = data_dir.join("sessions").join(session_id).join("artifacts").join(file_path);
             let in_session_gen = data_dir.join("generated_images").join(session_id).join(file_path);
             let in_gen_root = data_dir.join(file_path);
-            if in_session_gen.exists() {
+            if in_session_artifacts.exists() {
+                in_session_artifacts
+            } else if in_session_gen.exists() {
                 in_session_gen
             } else if in_gen_root.exists() {
                 in_gen_root
@@ -457,8 +460,48 @@ pub(crate) async fn recognize_image_tool(args: &Value, ctx: &ToolCtx) -> Result<
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     let data_url = format!("data:{mime};base64,{b64}");
+    let target_display_path = target_path.to_string_lossy().replace('\\', "/");
+    let kb = bytes.len() / 1024;
 
-    // 4. 解析生效视觉模型
+
+
+    // 4. 智能自适应判定：若当前主会话模型自身已原生具备视觉能力 (vision)，且未显式指定委托子模型，
+    // 则直接将高清原图注入多模态上下文，免去冗余的外部二次调用与信息折损。
+    let requested_model = args.get("model").and_then(|v| v.as_str()).map(|s| s.trim()).filter(|s| !s.is_empty());
+    let has_native_vision = if requested_model.is_none() {
+        let session = {
+            let db = state.db.lock().unwrap();
+            crate::store::get_session(&db, session_id)?
+                .ok_or_else(|| format!("会话不存在: {session_id}"))?
+        };
+        let settings = {
+            let db = state.db.lock().unwrap();
+            let master = state.master_key.lock().unwrap();
+            crate::store::get_settings_with_secrets(&db, &master)?
+        };
+        let (pid, mid) = if let (Some(pid), Some(mid)) = (&session.provider_id, &session.model_id) {
+            (Some(pid.clone()), Some(mid.clone()))
+        } else if let Some((p, m)) = crate::models::resolve_active_model(&settings) {
+            (Some(p.id.clone()), Some(m.to_string()))
+        } else {
+            (None, None)
+        };
+        if let (Some(ref p), Some(ref m)) = (pid, mid) {
+            settings.has_capability(Some(p), m, "vision")
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if has_native_vision {
+        return Ok(format!(
+            "👁️ [图像已直接载入并注入多模态视觉上下文]\n- 目标文件: `{target_display_path}`\n- 图像类型: {mime} ({kb} KB)\n- 分析诉求: {prompt}\n\n<!-- MULTIMODAL_IMAGE_DIRECT:{target_display_path} -->\n系统已将该本地图片的高清原图直接注入到当前对话上下文中。作为原生多模态模型，你拥有对该图像的第一视觉直观感知，请直接结合任务要求进行精准分析与推理。"
+        ));
+    }
+
+    // 5. 纯文本模型或指定子模型降级分支：解析生效视觉模型并执行二次调用
     let (provider, model_name) = resolve_vision_model_for_tool(args, ctx)?;
 
     // 5. 构建多模态请求并调用 LLM
@@ -504,10 +547,10 @@ pub(crate) async fn recognize_image_tool(args: &Value, ctx: &ToolCtx) -> Result<
     ))
 }
 
-pub(crate) fn resolve_decision_model_for_tool(
+pub(crate) fn resolve_decision_route_for_tool(
     args: &Value,
     ctx: &ToolCtx,
-) -> Result<(crate::models::ProviderCfg, String), String> {
+) -> Result<crate::models::DecisionRoute, String> {
     let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
     let state = host.app.state::<crate::AppState>();
     let session_id = &host.session_id;
@@ -518,6 +561,13 @@ pub(crate) fn resolve_decision_model_for_tool(
             .ok_or_else(|| format!("会话不存在: {session_id}"))?
     };
 
+    let parent_session = if let Some(ref pid) = session.parent_session_id {
+        let db = state.db.lock().unwrap();
+        crate::store::get_session(&db, pid).ok().flatten()
+    } else {
+        None
+    };
+
     let settings = {
         let db = state.db.lock().unwrap();
         let master = state.master_key.lock().unwrap();
@@ -526,33 +576,11 @@ pub(crate) fn resolve_decision_model_for_tool(
 
     let requested_model = args.get("model").and_then(|v| v.as_str()).map(|s| s.trim()).filter(|s| !s.is_empty());
 
-    let resolved = if let Some(req_m) = requested_model {
-        settings.providers.iter().find(|p| p.models.iter().any(|m| m == req_m))
-            .map(|p| (p.clone(), req_m.to_string()))
-            .or_else(|| crate::models::resolve_active_model(&settings).map(|(p, _)| (p.clone(), req_m.to_string())))
-    } else if let (Some(pid), Some(mid)) = (&session.decision_provider_id, &session.decision_model_id) {
-        settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid))
-            .map(|p| (p.clone(), mid.clone()))
-    } else if let (Some(pid), Some(mid)) = (&settings.active_decision_provider_id, &settings.active_decision_model_id) {
-        settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid))
-            .map(|p| (p.clone(), mid.clone()))
-    } else if let (Some(pid), Some(mid)) = (&session.provider_id, &session.model_id) {
-        // 未单独配置决策模型时，严格回落至当前会话的主对话模型
-        settings.providers.iter().find(|p| &p.id == pid && p.models.iter().any(|m| m == mid))
-            .map(|p| (p.clone(), mid.clone()))
-    } else {
-        None
-    }
-    .or_else(|| {
-        crate::models::resolve_active_model(&settings)
-            .map(|(p, m)| (p.clone(), m.to_string()))
-    });
-
-    resolved.ok_or_else(|| "未找到可用的决策模型，请在设置中配置模型厂商与模型".to_string())
+    crate::models::resolve_decision_route(Some(&session), parent_session.as_ref(), &settings, requested_model)
 }
 
 pub(crate) async fn judge_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
-    let (provider, model) = resolve_decision_model_for_tool(args, ctx)?;
+    let route = resolve_decision_route_for_tool(args, ctx)?;
     let state = args.get("state")
         .or_else(|| args.get("statement"))
         .or_else(|| args.get("understanding"))
@@ -571,9 +599,8 @@ pub(crate) async fn judge_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<S
         default_instruction
     };
 
-    let res = crate::jev::execute_decision(
-        &provider,
-        &model,
+    let res = crate::jev::execute_decision_pipeline(
+        &route,
         "judge",
         state,
         instruction,
@@ -582,13 +609,13 @@ pub(crate) async fn judge_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<S
         ctx.proxy_url.clone(),
     )
     .await
-    .map_err(|e| format!("决策执行失败 [厂商: {} / 模型: {}]: {e}", provider.name, model))?;
+    .map_err(|e| format!("决策执行失败 [厂商: {} / 模型: {}]: {e}", route.primary_provider.name, route.primary_model))?;
 
     let mut val = serde_json::to_value(&res).map_err(|e| e.to_string())?;
     if let Value::Object(ref mut map) = val {
-        map.insert("provider".into(), Value::String(provider.name.clone()));
-        map.insert("providerId".into(), Value::String(provider.id.clone()));
-        map.insert("model".into(), Value::String(model.clone()));
+        map.insert("provider".into(), Value::String(route.primary_provider.name.clone()));
+        map.insert("providerId".into(), Value::String(route.primary_provider.id.clone()));
+        map.insert("model".into(), Value::String(res.model.clone()));
         map.insert("state".into(), Value::String(state.to_string()));
         map.insert("instruction".into(), Value::String(instruction.to_string()));
     }
@@ -597,7 +624,7 @@ pub(crate) async fn judge_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<S
 }
 
 pub(crate) async fn choice_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
-    let (provider, model) = resolve_decision_model_for_tool(args, ctx)?;
+    let route = resolve_decision_route_for_tool(args, ctx)?;
     let state = args.get("state")
         .or_else(|| args.get("understanding"))
         .and_then(|v| v.as_str())
@@ -614,9 +641,8 @@ pub(crate) async fn choice_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<
         .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
         .ok_or("缺少 options 参数或选项格式不正确")?;
 
-    let res = crate::jev::execute_decision(
-        &provider,
-        &model,
+    let res = crate::jev::execute_decision_pipeline(
+        &route,
         "choice",
         state,
         instruction,
@@ -625,13 +651,13 @@ pub(crate) async fn choice_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<
         ctx.proxy_url.clone(),
     )
     .await
-    .map_err(|e| format!("决策执行失败 [厂商: {} / 模型: {}]: {e}", provider.name, model))?;
+    .map_err(|e| format!("决策执行失败 [厂商: {} / 模型: {}]: {e}", route.primary_provider.name, route.primary_model))?;
 
     let mut val = serde_json::to_value(&res).map_err(|e| e.to_string())?;
     if let Value::Object(ref mut map) = val {
-        map.insert("provider".into(), Value::String(provider.name.clone()));
-        map.insert("providerId".into(), Value::String(provider.id.clone()));
-        map.insert("model".into(), Value::String(model.clone()));
+        map.insert("provider".into(), Value::String(route.primary_provider.name.clone()));
+        map.insert("providerId".into(), Value::String(route.primary_provider.id.clone()));
+        map.insert("model".into(), Value::String(res.model.clone()));
         map.insert("options".into(), serde_json::json!(options));
         map.insert("state".into(), Value::String(state.to_string()));
         map.insert("instruction".into(), Value::String(instruction.to_string()));
@@ -641,32 +667,52 @@ pub(crate) async fn choice_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<
 }
 
 pub(crate) async fn score_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
-    let (provider, model) = resolve_decision_model_for_tool(args, ctx)?;
-    
-    let understanding = args.get("understanding").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let plan = args.get("plan").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let state_raw = args.get("state").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let route = resolve_decision_route_for_tool(args, ctx)?;
+    let understanding = args.get("understanding")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let plan = args.get("plan")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let state_raw = args.get("state")
+        .or_else(|| args.get("context"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
 
     let combined_state = if !understanding.is_empty() || !plan.is_empty() {
         let mut s = String::new();
         if !understanding.is_empty() {
-            s.push_str(&format!("【意图理解】\n{}\n\n", understanding));
+            s.push_str(&format!("【核心意图理解】:
+{}
+
+", understanding));
         }
         if !plan.is_empty() {
-            s.push_str(&format!("【交付边界与行动方案】\n{}\n\n", plan));
+            s.push_str(&format!("【执行动作规划】:
+{}
+
+", plan));
         }
         if !state_raw.is_empty() {
-            s.push_str(&format!("【补充背景】\n{}", state_raw));
+            s.push_str(&format!("【上下文背景】:
+{}", state_raw));
         }
         s
     } else if !state_raw.is_empty() {
         state_raw.to_string()
     } else {
-        return Err("缺少 understanding/plan 或 state 参数".into());
+        return Err("缺少待评分内容，请提供 plan / understanding 或 state 参数".to_string());
     };
 
-    let instruction_raw = args.get("instruction").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let default_instruction = "请对该业务意图剖析的精准性、边界约束与缺省假设的合理性进行严格百分制评分。若用户意图把握透彻且业务默认假设清晰合理无过度臆测，给出90分以上；若关键信息严重缺失、存在致命歧义或偏离用户初衷，给出合理扣分与修改建议。";
+    let instruction_raw = args.get("instruction")
+        .or_else(|| args.get("question"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let default_instruction = "请对所提供的任务理解与执行规划进行全面严密的综合评分。打分区间 0 到 100（以 0.0 到 1.0 表示）。要求针对意图准确性、步骤可行性与风险完备性综合评估，并在 reason 中阐述评分理由。";
     let instruction = if !instruction_raw.is_empty() {
         instruction_raw
     } else {
@@ -677,9 +723,8 @@ pub(crate) async fn score_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<S
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect::<Vec<_>>());
 
-    let res = crate::jev::execute_decision(
-        &provider,
-        &model,
+    let res = crate::jev::execute_decision_pipeline(
+        &route,
         "score",
         &combined_state,
         instruction,
@@ -688,16 +733,16 @@ pub(crate) async fn score_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<S
         ctx.proxy_url.clone(),
     )
     .await
-    .map_err(|e| format!("决策执行失败 [厂商: {} / 模型: {}]: {e}", provider.name, model))?;
+    .map_err(|e| format!("决策执行失败 [厂商: {} / 模型: {}]: {e}", route.primary_provider.name, route.primary_model))?;
 
     let score_val = res.score.unwrap_or(0.0);
     let score_pct = (score_val * 100.0).round() as u32;
 
     let mut val = serde_json::to_value(&res).map_err(|e| e.to_string())?;
     if let Value::Object(ref mut map) = val {
-        map.insert("provider".into(), Value::String(provider.name.clone()));
-        map.insert("providerId".into(), Value::String(provider.id.clone()));
-        map.insert("model".into(), Value::String(model.clone()));
+        map.insert("provider".into(), Value::String(route.primary_provider.name.clone()));
+        map.insert("providerId".into(), Value::String(route.primary_provider.id.clone()));
+        map.insert("model".into(), Value::String(res.model.clone()));
         if !understanding.is_empty() {
             map.insert("understanding".into(), Value::String(understanding.to_string()));
         }
@@ -710,4 +755,3 @@ pub(crate) async fn score_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<S
 
     Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| "{}".to_string()))
 }
-
