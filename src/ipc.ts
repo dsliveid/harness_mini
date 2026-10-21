@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, CurrentBoard, DataStatus, DbStats, OptimizeResult, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult, JevCfg, PlanReviewReport, ToolLogFilter, ToolLogQueryResult, DirectDecisionResult, BrowserDebugState, ViewportInfo, InteractiveElement, McpServerConfig, McpToolDefinition, AuthStep, DistillTrace, DistillAuthContractResult, PageHealthState, AuthContract, AuthContractCredentials, AuthContractPostLogin, AuthAction } from "./types";
+import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, CurrentBoard, DataStatus, DbStats, OptimizeResult, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult, JevCfg, PlanReviewReport, ToolLogFilter, ToolLogQueryResult, LlmRequestTrace, DirectDecisionResult, BrowserDebugState, ViewportInfo, InteractiveElement, McpServerConfig, McpToolDefinition, AuthStep, DistillTrace, DistillAuthContractResult, PageHealthState, AuthContract, AuthContractCredentials, AuthContractPostLogin, AuthAction } from "./types";
 
 /**
  * 读请求防重入去重拦截器：
@@ -346,6 +346,8 @@ export const ipc = {
     }),
   queryToolLogs: (filter: ToolLogFilter) =>
     invoke<ToolLogQueryResult>("query_tool_logs", { filter }),
+  getLlmRequestTrace: (messageId: string) =>
+    invoke<LlmRequestTrace | null>("get_llm_request_trace", { messageId }),
   getSessionActiveState: (sessionId: string) =>
     invoke<SessionActiveState>("get_session_active_state", { sessionId }),
   readFileBase64: (path: string) => invoke<string>("read_file_base64", { path }),

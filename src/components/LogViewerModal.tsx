@@ -6,6 +6,7 @@ import type {
   ToolLogItem,
   ToolLogQueryResult,
   TopErrorSummary,
+  LlmRequestTrace,
 } from "../types";
 import {
   X,
@@ -31,6 +32,10 @@ import {
   Bug,
   Zap,
   ShieldAlert,
+  Code,
+  FileText,
+  Globe,
+  Terminal,
 } from "./Icons";
 
 function formatTimestamp(isoStr?: string | null): string {
@@ -167,7 +172,13 @@ export function LogViewerModal() {
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
 
   // 复制提示
-  const [copiedType, setCopiedType] = useState<"params" | "result" | "content" | "reasoning" | null>(null);
+  const [copiedType, setCopiedType] = useState<"params" | "result" | "content" | "reasoning" | "trace" | "systemPrompt" | null>(null);
+
+  // 大模型底层请求快照 Trace 状态
+  const [requestTrace, setRequestTrace] = useState<LlmRequestTrace | null>(null);
+  const [traceLoading, setTraceLoading] = useState<boolean>(false);
+  const [detailTab, setDetailTab] = useState<"result" | "request">("result");
+  const [traceSubTab, setTraceSubTab] = useState<"system" | "messages" | "tools" | "raw">("system");
 
   // 初始化参数应用
   useEffect(() => {
@@ -285,11 +296,65 @@ export function LogViewerModal() {
   }, [show, categoryFilter, selectedProjectId, statusFilter, toolNameFilter, keyword, startDate, endDate, page]);
 
 
+
   // 当前选中的条目
   const selectedItem = useMemo(() => {
     if (!queryResult || !selectedItemId) return null;
     return queryResult.items.find((item) => item.id === selectedItemId) ?? null;
   }, [queryResult, selectedItemId]);
+
+    // 选中的日志条目变更时，按需懒加载其对应的 LLM 底层请求快照
+  useEffect(() => {
+    const targetMsgId = selectedItem?.messageId || (selectedItem?.logType !== "tool" ? selectedItem?.id : null);
+    if (!targetMsgId) {
+      setRequestTrace(null);
+      return;
+    }
+    let cancelled = false;
+    setTraceLoading(true);
+    ipc.getLlmRequestTrace(targetMsgId)
+      .then((trace) => {
+        if (!cancelled) setRequestTrace(trace);
+      })
+      .catch(() => {
+        if (!cancelled) setRequestTrace(null);
+      })
+      .finally(() => {
+        if (!cancelled) setTraceLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedItem?.id, selectedItem?.messageId, selectedItem?.logType]);
+
+  // 解析请求体 JSON
+  const parsedTrace = useMemo(() => {
+    if (!requestTrace?.payloadJson) return null;
+    try {
+      return JSON.parse(requestTrace.payloadJson);
+    } catch {
+      return null;
+    }
+  }, [requestTrace]);
+
+  const traceMessages: any[] = useMemo(() => {
+    if (!parsedTrace?.messages || !Array.isArray(parsedTrace.messages)) return [];
+    return parsedTrace.messages;
+  }, [parsedTrace]);
+
+  const traceSystemPrompt: string = useMemo(() => {
+    const sys = traceMessages.find((m) => m.role === "system");
+    if (!sys) return "";
+    if (typeof sys.content === "string") return sys.content;
+    return JSON.stringify(sys.content, null, 2);
+  }, [traceMessages]);
+
+  const traceTools: any[] = useMemo(() => {
+    if (!parsedTrace?.tools || !Array.isArray(parsedTrace.tools)) return [];
+    return parsedTrace.tools;
+  }, [parsedTrace]);
+
+
 
 
 
@@ -331,7 +396,7 @@ export function LogViewerModal() {
   const topErrors = queryResult?.topErrors ?? [];
   const totalPages = queryResult?.totalPages ?? 1;
 
-  const copyText = async (text: string, type: "params" | "result" | "content" | "reasoning") => {
+  const copyText = async (text: string, type: "params" | "result" | "content" | "reasoning" | "trace" | "systemPrompt") => {
     try {
       await navigator.clipboard.writeText(text);
       setCopiedType(type);
@@ -923,99 +988,59 @@ export function LogViewerModal() {
                       </div>
                     </div>
 
-                    {/* 模型思考过程上下文 (Reasoning Context) */}
-                    {selectedItem.reasoning && (
-                      <div className="bg-panel border border-edge rounded-xl p-3.5 shadow-sm">
-                        <div className="flex items-center justify-between mb-2">
-                          <div className="flex items-center gap-1.5 text-[12px] font-medium text-purple-400">
-                            <Brain size={14} />
-                            <span>
-                              {selectedItem.logType === "tool"
-                                ? "触发本次调用的模型思考过程 (Reasoning Context)"
-                                : "模型深度思考过程 (Reasoning)"}
-                            </span>
-                          </div>
-                          <button
-                            className="text-[11.5px] text-inkdim hover:text-ink flex items-center gap-1 transition-colors cursor-pointer"
-                            onClick={() => copyText(selectedItem.reasoning ?? "", "reasoning")}
-                          >
-                            {copiedType === "reasoning" ? (
-                              <>
-                                <Check size={12} className="text-emerald-400" />
-                                <span className="text-emerald-400">已复制</span>
-                              </>
-                            ) : (
-                              <>
-                                <Copy size={12} />
-                                <span>复制思考</span>
-                              </>
-                            )}
-                          </button>
-                        </div>
-                        <div className="text-[12px] text-inkdim font-mono bg-panel2/80 rounded-lg p-2.5 max-h-48 overflow-y-auto whitespace-pre-wrap leading-relaxed border border-edge/50">
-                          {selectedItem.reasoning}
-                        </div>
-                      </div>
-                    )}
+                    {/* 详情视图维度 Tab 切换 */}
+                    <div className="flex items-center gap-2 border-b border-edge/60 pb-2 shrink-0">
+                      <button
+                        className={`px-3 py-1.5 rounded-lg text-[12px] font-medium transition-colors cursor-pointer flex items-center gap-1.5 ${
+                          detailTab === "result"
+                            ? "bg-accent/15 text-accent border border-accent/20"
+                            : "text-inkdim hover:text-ink hover:bg-panel3"
+                        }`}
+                        onClick={() => setDetailTab("result")}
+                      >
+                        <Wrench size={13} />
+                        <span>执行出入参与响应</span>
+                      </button>
 
-                    {/* 对话消息正文 (当为对话日志时展示) */}
-                    {selectedItem.logType !== "tool" ? (
-                      <div className="bg-panel border border-edge rounded-xl p-4 shadow-sm flex flex-col">
-                        <div className="flex items-center justify-between mb-2">
-                          <div className="flex items-center gap-1.5 text-[12.5px] font-medium text-ink">
-                            <MessageSquare size={14} className="text-accent" />
-                            <span>消息正文内容 (Message Content)</span>
-                          </div>
+                      <button
+                        className={`px-3 py-1.5 rounded-lg text-[12px] font-medium transition-colors cursor-pointer flex items-center gap-1.5 ${
+                          detailTab === "request"
+                            ? "bg-purple-500/15 text-purple-400 border border-purple-500/25 font-semibold"
+                            : "text-inkdim hover:text-ink hover:bg-panel3"
+                        }`}
+                        onClick={() => setDetailTab("request")}
+                      >
+                        <Sparkles size={13} />
+                        <span>大模型底层请求详情 (LLM Request Payload)</span>
+                        {traceLoading ? (
+                          <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
+                        ) : requestTrace ? (
+                          <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+                            已捕获
+                          </span>
+                        ) : null}
+                      </button>
+                    </div>
 
-                          {selectedItem.content && (
-                            <button
-                              className="text-[11.5px] text-inkdim hover:text-ink flex items-center gap-1 transition-colors cursor-pointer"
-                              onClick={() => copyText(selectedItem.content ?? "", "content")}
-                            >
-                              {copiedType === "content" ? (
-                                <>
-                                  <Check size={12} className="text-emerald-400" />
-                                  <span className="text-emerald-400">已复制</span>
-                                </>
-                              ) : (
-                                <>
-                                  <Copy size={12} />
-                                  <span>复制正文</span>
-                                </>
-                              )}
-                            </button>
-                          )}
-                        </div>
-
-                        <pre className="text-[12px] font-mono text-ink bg-panel2 border border-edge rounded-lg p-3 max-h-72 overflow-y-auto whitespace-pre-wrap leading-relaxed">
-                          {selectedItem.content || "[空内容]"}
-                        </pre>
-                      </div>
-                    ) : (
+                    {detailTab === "result" ? (
                       <>
-                        {/* 出参与报错结果 (Result / Error) */}
-                        <div className="bg-panel border border-edge rounded-xl p-4 shadow-sm flex flex-col">
-                          <div className="flex items-center justify-between mb-2">
-                            <div className="flex items-center gap-1.5 text-[12.5px] font-medium text-ink">
-                              {selectedItem.status !== "success" ? (
-                                <>
-                                  <XCircle size={14} className="text-red-400" />
-                                  <span className="text-red-400 font-semibold">执行出参 / 错误原因 (Error / Result)</span>
-                                </>
-                              ) : (
-                                <>
-                                  <CheckCircle2 size={14} className="text-emerald-400" />
-                                  <span>执行结果出参 (Result Output)</span>
-                                </>
-                              )}
-                            </div>
-
-                            {selectedItem.resultText && (
+                        {/* 模型思考过程上下文 (Reasoning Context) */}
+                        {selectedItem.reasoning && (
+                          <div className="bg-panel border border-edge rounded-xl p-3.5 shadow-sm">
+                            <div className="flex items-center justify-between mb-2">
+                              <div className="flex items-center gap-1.5 text-[12px] font-medium text-purple-400">
+                                <Brain size={14} />
+                                <span>
+                                  {selectedItem.logType === "tool"
+                                    ? "触发本次调用的模型思考过程 (Reasoning Context)"
+                                    : "模型深度思考过程 (Reasoning)"}
+                                </span>
+                              </div>
                               <button
                                 className="text-[11.5px] text-inkdim hover:text-ink flex items-center gap-1 transition-colors cursor-pointer"
-                                onClick={() => copyText(selectedItem.resultText ?? "", "result")}
+                                onClick={() => copyText(selectedItem.reasoning ?? "", "reasoning")}
                               >
-                                {copiedType === "result" ? (
+                                {copiedType === "reasoning" ? (
                                   <>
                                     <Check size={12} className="text-emerald-400" />
                                     <span className="text-emerald-400">已复制</span>
@@ -1023,55 +1048,359 @@ export function LogViewerModal() {
                                 ) : (
                                   <>
                                     <Copy size={12} />
-                                    <span>复制出参</span>
+                                    <span>复制思考</span>
                                   </>
                                 )}
                               </button>
-                            )}
+                            </div>
+                            <div className="text-[12px] text-inkdim font-mono bg-panel2/80 rounded-lg p-2.5 max-h-48 overflow-y-auto whitespace-pre-wrap leading-relaxed border border-edge/50">
+                              {selectedItem.reasoning}
+                            </div>
                           </div>
+                        )}
 
-                          <pre
-                            className={`text-[12px] font-mono rounded-lg p-3 max-h-60 overflow-y-auto whitespace-pre-wrap leading-relaxed border ${
-                              selectedItem.status !== "success"
-                                ? "bg-red-500/5 text-red-300 border-red-500/20"
-                                : "bg-panel2 text-ink border-edge"
-                            }`}
-                          >
-                            {selectedItem.resultText || "[无返回内容]"}
-                          </pre>
-                        </div>
+                        {/* 对话消息正文 (当为对话日志时展示) */}
+                        {selectedItem.logType !== "tool" ? (
+                          <div className="bg-panel border border-edge rounded-xl p-4 shadow-sm flex flex-col">
+                            <div className="flex items-center justify-between mb-2">
+                              <div className="flex items-center gap-1.5 text-[12.5px] font-medium text-ink">
+                                <MessageSquare size={14} className="text-accent" />
+                                <span>消息正文内容 (Message Content)</span>
+                              </div>
 
-                        {/* 完整入参 (Input Parameters JSON) */}
-                        <div className="bg-panel border border-edge rounded-xl p-4 shadow-sm flex flex-col">
-                          <div className="flex items-center justify-between mb-2">
-                            <div className="flex items-center gap-1.5 text-[12.5px] font-medium text-ink">
-                              <Wrench size={14} className="text-accent" />
-                              <span>完整调用入参 (Input Params JSON)</span>
+                              {selectedItem.content && (
+                                <button
+                                  className="text-[11.5px] text-inkdim hover:text-ink flex items-center gap-1 transition-colors cursor-pointer"
+                                  onClick={() => copyText(selectedItem.content ?? "", "content")}
+                                >
+                                  {copiedType === "content" ? (
+                                    <>
+                                      <Check size={12} className="text-emerald-400" />
+                                      <span className="text-emerald-400">已复制</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Copy size={12} />
+                                      <span>复制正文</span>
+                                    </>
+                                  )}
+                                </button>
+                              )}
                             </div>
 
-                            <button
-                              className="text-[11.5px] text-inkdim hover:text-ink flex items-center gap-1 transition-colors cursor-pointer"
-                              onClick={() => copyText(JSON.stringify(selectedItem.params, null, 2), "params")}
-                            >
-                              {copiedType === "params" ? (
-                                <>
-                                  <Check size={12} className="text-emerald-400" />
-                                  <span className="text-emerald-400">已复制</span>
-                                </>
-                              ) : (
-                                <>
-                                  <Copy size={12} />
-                                  <span>复制入参 JSON</span>
-                                </>
-                              )}
-                            </button>
+                            <pre className="text-[12px] font-mono text-ink bg-panel2 border border-edge rounded-lg p-3 max-h-72 overflow-y-auto whitespace-pre-wrap leading-relaxed">
+                              {selectedItem.content || "[空内容]"}
+                            </pre>
                           </div>
+                        ) : (
+                          <>
+                            {/* 出参与报错结果 (Result / Error) */}
+                            <div className="bg-panel border border-edge rounded-xl p-4 shadow-sm flex flex-col">
+                              <div className="flex items-center justify-between mb-2">
+                                <div className="flex items-center gap-1.5 text-[12.5px] font-medium text-ink">
+                                  {selectedItem.status !== "success" ? (
+                                    <>
+                                      <XCircle size={14} className="text-red-400" />
+                                      <span className="text-red-400 font-semibold">执行出参 / 错误原因 (Error / Result)</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <CheckCircle2 size={14} className="text-emerald-400" />
+                                      <span>执行结果出参 (Result Output)</span>
+                                    </>
+                                  )}
+                                </div>
 
-                          <pre className="text-[12px] font-mono text-cyan-300 bg-panel2 border border-edge rounded-lg p-3 max-h-64 overflow-y-auto whitespace-pre-wrap leading-relaxed">
-                            {JSON.stringify(selectedItem.params, null, 2)}
-                          </pre>
-                        </div>
+                                {selectedItem.resultText && (
+                                  <button
+                                    className="text-[11.5px] text-inkdim hover:text-ink flex items-center gap-1 transition-colors cursor-pointer"
+                                    onClick={() => copyText(selectedItem.resultText ?? "", "result")}
+                                  >
+                                    {copiedType === "result" ? (
+                                      <>
+                                        <Check size={12} className="text-emerald-400" />
+                                        <span className="text-emerald-400">已复制</span>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Copy size={12} />
+                                        <span>复制出参</span>
+                                      </>
+                                    )}
+                                  </button>
+                                )}
+                              </div>
+
+                              <pre
+                                className={`text-[12px] font-mono rounded-lg p-3 max-h-60 overflow-y-auto whitespace-pre-wrap leading-relaxed border ${
+                                  selectedItem.status !== "success"
+                                    ? "bg-red-500/5 text-red-300 border-red-500/20"
+                                    : "bg-panel2 text-ink border-edge"
+                                }`}
+                              >
+                                {selectedItem.resultText || "[无返回内容]"}
+                              </pre>
+                            </div>
+
+                            {/* 完整入参 (Input Parameters JSON) */}
+                            <div className="bg-panel border border-edge rounded-xl p-4 shadow-sm flex flex-col">
+                              <div className="flex items-center justify-between mb-2">
+                                <div className="flex items-center gap-1.5 text-[12.5px] font-medium text-ink">
+                                  <Wrench size={14} className="text-accent" />
+                                  <span>完整调用入参 (Input Params JSON)</span>
+                                </div>
+
+                                <button
+                                  className="text-[11.5px] text-inkdim hover:text-ink flex items-center gap-1 transition-colors cursor-pointer"
+                                  onClick={() => copyText(JSON.stringify(selectedItem.params, null, 2), "params")}
+                                >
+                                  {copiedType === "params" ? (
+                                    <>
+                                      <Check size={12} className="text-emerald-400" />
+                                      <span className="text-emerald-400">已复制</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Copy size={12} />
+                                      <span>复制入参 JSON</span>
+                                    </>
+                                  )}
+                                </button>
+                              </div>
+
+                              <pre className="text-[12px] font-mono text-cyan-300 bg-panel2 border border-edge rounded-lg p-3 max-h-64 overflow-y-auto whitespace-pre-wrap leading-relaxed">
+                                {JSON.stringify(selectedItem.params, null, 2)}
+                              </pre>
+                            </div>
+                          </>
+                        )}
                       </>
+                    ) : (
+                      /* 大模型底层完整请求报文 (LLM Request Payload 视图) */
+                      <div className="space-y-4">
+                        {traceLoading ? (
+                          <div className="h-40 flex flex-col items-center justify-center text-inkdim text-[12.5px] bg-panel rounded-xl border border-edge">
+                            <RotateCcw size={18} className="animate-spin text-cyan-400 mb-2" />
+                            <span>正在载入底层真实请求快照...</span>
+                          </div>
+                        ) : !requestTrace ? (
+                          <div className="p-6 text-center text-inkdim text-[12.5px] bg-panel rounded-xl border border-dashed border-edge space-y-2">
+                            <Sparkles size={24} className="mx-auto text-inkdim/40 mb-1" />
+                            <div className="text-ink font-medium">当前记录暂无已捕获的 LLM 请求快照</div>
+                            <div className="text-[11.5px] text-inkdim/70 max-w-md mx-auto">
+                              此条日志产生于请求快照追踪功能上线之前，或属于客户端本地通知/非直接大模型交互事件。新发起的 Agent 对话与工具调用将自动在此捕获完整的请求体。
+                            </div>
+                          </div>
+                        ) : (
+                          <>
+                            {/* 请求基础元数据 */}
+                            <div className="bg-panel border border-edge rounded-xl p-3.5 shadow-sm text-[12px]">
+                              <div className="grid grid-cols-2 gap-2 text-inkdim">
+                                <div>
+                                  <span className="text-inkdim/60">请求模型: </span>
+                                  <span className="font-mono text-purple-400 font-semibold">{parsedTrace?.model || requestTrace.model}</span>
+                                </div>
+                                <div className="truncate">
+                                  <span className="text-inkdim/60">模型服务端点: </span>
+                                  <span className="font-mono text-ink text-[11px]">{parsedTrace?.endpoint || requestTrace.endpoint}</span>
+                                </div>
+                                <div>
+                                  <span className="text-inkdim/60">思考级别: </span>
+                                  <span className="font-mono text-ink">{parsedTrace?.reasoning_effort || "默认 (未指定)"}</span>
+                                </div>
+                                <div>
+                                  <span className="text-inkdim/60">捕获时间: </span>
+                                  <span className="font-mono text-ink text-[11px]">{requestTrace.createdAt}</span>
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* 子导航 */}
+                            <div className="flex items-center justify-between border-b border-edge/60 pb-1.5">
+                              <div className="flex items-center gap-1 text-[11.5px]">
+                                <button
+                                  className={`px-2.5 py-1 rounded-md transition-colors cursor-pointer ${
+                                    traceSubTab === "system"
+                                      ? "bg-purple-500/20 text-purple-300 font-medium"
+                                      : "text-inkdim hover:text-ink"
+                                  }`}
+                                  onClick={() => setTraceSubTab("system")}
+                                >
+                                  系统提示词 (System Prompt)
+                                </button>
+                                <button
+                                  className={`px-2.5 py-1 rounded-md transition-colors cursor-pointer ${
+                                    traceSubTab === "messages"
+                                      ? "bg-purple-500/20 text-purple-300 font-medium"
+                                      : "text-inkdim hover:text-ink"
+                                  }`}
+                                  onClick={() => setTraceSubTab("messages")}
+                                >
+                                  上下文消息 ({traceMessages.length})
+                                </button>
+                                <button
+                                  className={`px-2.5 py-1 rounded-md transition-colors cursor-pointer ${
+                                    traceSubTab === "tools"
+                                      ? "bg-purple-500/20 text-purple-300 font-medium"
+                                      : "text-inkdim hover:text-ink"
+                                  }`}
+                                  onClick={() => setTraceSubTab("tools")}
+                                >
+                                  工具声明 ({traceTools.length})
+                                </button>
+                                <button
+                                  className={`px-2.5 py-1 rounded-md transition-colors cursor-pointer ${
+                                    traceSubTab === "raw"
+                                      ? "bg-purple-500/20 text-purple-300 font-medium"
+                                      : "text-inkdim hover:text-ink"
+                                  }`}
+                                  onClick={() => setTraceSubTab("raw")}
+                                >
+                                  完整原始报文 (Raw JSON)
+                                </button>
+                              </div>
+
+                              <button
+                                className="text-[11.5px] text-inkdim hover:text-ink flex items-center gap-1 transition-colors cursor-pointer"
+                                onClick={() => copyText(JSON.stringify(parsedTrace, null, 2), "trace")}
+                              >
+                                {copiedType === "trace" ? (
+                                  <>
+                                    <Check size={12} className="text-emerald-400" />
+                                    <span className="text-emerald-400">已复制请求 JSON</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Copy size={12} />
+                                    <span>复制完整请求</span>
+                                  </>
+                                )}
+                              </button>
+                            </div>
+
+                            {/* 子视图 1：系统提示词 */}
+                            {traceSubTab === "system" && (
+                              <div className="bg-panel border border-edge rounded-xl p-4 shadow-sm space-y-2">
+                                <div className="flex items-center justify-between">
+                                  <span className="text-[12.5px] font-medium text-ink flex items-center gap-1.5">
+                                    <FileText size={14} className="text-purple-400" />
+                                    <span>实际生效的系统提示词 (System Instruction)</span>
+                                  </span>
+                                  <button
+                                    className="text-[11.5px] text-inkdim hover:text-ink flex items-center gap-1 cursor-pointer"
+                                    onClick={() => copyText(traceSystemPrompt, "systemPrompt")}
+                                  >
+                                    {copiedType === "systemPrompt" ? (
+                                      <>
+                                        <Check size={12} className="text-emerald-400" />
+                                        <span className="text-emerald-400">已复制</span>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Copy size={12} />
+                                        <span>复制 System Prompt</span>
+                                      </>
+                                    )}
+                                  </button>
+                                </div>
+                                <pre className="text-[12px] font-mono text-ink bg-panel2 border border-edge rounded-lg p-3 max-h-96 overflow-y-auto whitespace-pre-wrap leading-relaxed">
+                                  {traceSystemPrompt || "[未声明独立 System 消息]"}
+                                </pre>
+                              </div>
+                            )}
+
+                            {/* 子视图 2：上下文消息列表 */}
+                            {traceSubTab === "messages" && (
+                              <div className="space-y-2.5">
+                                {traceMessages.map((m: any, idx: number) => {
+                                  const roleColor =
+                                    m.role === "system"
+                                      ? "text-amber-400 bg-amber-500/10 border-amber-500/20"
+                                      : m.role === "user"
+                                      ? "text-blue-400 bg-blue-500/10 border-blue-500/20"
+                                      : m.role === "assistant"
+                                      ? "text-purple-400 bg-purple-500/10 border-purple-500/20"
+                                      : "text-emerald-400 bg-emerald-500/10 border-emerald-500/20";
+                                  return (
+                                    <div key={idx} className="bg-panel border border-edge rounded-xl p-3 shadow-sm space-y-1.5">
+                                      <div className="flex items-center justify-between">
+                                        <div className="flex items-center gap-2">
+                                          <span className="text-[10.5px] font-mono text-inkdim">#{idx + 1}</span>
+                                          <span className={`text-[11px] font-mono px-2 py-0.5 rounded border font-semibold ${roleColor}`}>
+                                            {m.role}
+                                          </span>
+                                          {m.tool_call_id && (
+                                            <span className="text-[10px] font-mono text-inkdim truncate max-w-[180px]">
+                                              call_id: {m.tool_call_id}
+                                            </span>
+                                          )}
+                                        </div>
+                                      </div>
+
+                                      {/* 正文或内容 */}
+                                      <pre className="text-[11.5px] font-mono text-ink bg-panel2 border border-edge/60 rounded-lg p-2.5 max-h-56 overflow-y-auto whitespace-pre-wrap leading-relaxed">
+                                        {typeof m.content === "string" ? m.content : JSON.stringify(m.content, null, 2)}
+                                      </pre>
+
+                                      {/* 工具调用声明 */}
+                                      {m.tool_calls && (
+                                        <div className="text-[11px] font-mono text-cyan-300 bg-cyan-500/5 border border-cyan-500/20 rounded-lg p-2">
+                                          <div className="font-semibold text-cyan-400 mb-1">包含工具调用请求 (tool_calls):</div>
+                                          <pre className="whitespace-pre-wrap">{JSON.stringify(m.tool_calls, null, 2)}</pre>
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+
+                            {/* 子视图 3：工具声明定义 */}
+                            {traceSubTab === "tools" && (
+                              <div className="space-y-2">
+                                {traceTools.length === 0 ? (
+                                  <div className="text-[12px] text-inkdim bg-panel p-4 rounded-xl border border-edge text-center">
+                                    本次请求未附带任何工具定义
+                                  </div>
+                                ) : (
+                                  traceTools.map((t: any, idx: number) => {
+                                    const fn = t.function || t;
+                                    return (
+                                      <div key={idx} className="bg-panel border border-edge rounded-xl p-3 shadow-sm space-y-1.5">
+                                        <div className="flex items-center justify-between">
+                                          <span className="font-mono text-[12.5px] font-bold text-accent">
+                                            {fn.name}
+                                          </span>
+                                          <span className="text-[10.5px] font-mono text-inkdim">{t.type || "function"}</span>
+                                        </div>
+                                        {fn.description && (
+                                          <div className="text-[12px] text-inkdim leading-relaxed">
+                                            {fn.description}
+                                          </div>
+                                        )}
+                                        {fn.parameters && (
+                                          <pre className="text-[11px] font-mono text-ink/80 bg-panel2 border border-edge/60 rounded-lg p-2 max-h-40 overflow-y-auto whitespace-pre-wrap">
+                                            {JSON.stringify(fn.parameters, null, 2)}
+                                          </pre>
+                                        )}
+                                      </div>
+                                    );
+                                  })
+                                )}
+                              </div>
+                            )}
+
+                            {/* 子视图 4：完整原始报文 */}
+                            {traceSubTab === "raw" && (
+                              <div className="bg-panel border border-edge rounded-xl p-3 shadow-sm space-y-2">
+                                <pre className="text-[11.5px] font-mono text-cyan-300 bg-panel2 border border-edge rounded-lg p-3 max-h-[460px] overflow-y-auto whitespace-pre-wrap leading-relaxed">
+                                  {JSON.stringify(parsedTrace, null, 2)}
+                                </pre>
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </div>
                     )}
                   </>
                 ) : (

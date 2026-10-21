@@ -1597,24 +1597,13 @@ export function SettingsModal() {
                   </div>
 
                   <div className="flex flex-col gap-5 mt-4">
-                    {/* 第一层级 */}
-                    <div className="flex flex-col gap-2">
-                      <div className="flex items-center gap-2 text-[12px] font-semibold text-purple-400 px-0.5">
-                        <span className="w-2 h-2 rounded-full bg-purple-400"></span>
-                        <span>第一层级 · 前置意图定性闸门（新任务 Step 1 专属）</span>
-                        <span className="text-[11px] font-normal text-inkdim">严禁调用业务工具，只输出极简意向+方向，调用决策工具质检</span>
-                      </div>
-                      {AGENT_SOPS.filter((s) => s.phase === 1).map(renderSopItem)}
-                    </div>
-
-                    {/* 第二层级 */}
                     <div className="flex flex-col gap-2 mt-1">
                       <div className="flex items-center gap-2 text-[12px] font-semibold text-blue-400 px-0.5">
                         <span className="w-2 h-2 rounded-full bg-blue-400"></span>
-                        <span>第二层级 · 工程规划与落地执行规范（意图质检放行后生效）</span>
-                        <span className="text-[11px] font-normal text-inkdim">质检通过或人工放行后激活，包含计划制定、协作者委派、代码精读与精确编辑</span>
+                        <span>标准作业程序 (SOP) 与工程落地规范</span>
+                        <span className="text-[11px] font-normal text-inkdim">包含方案先行、任务状态自愈、协作者委派、代码精读与精确编辑</span>
                       </div>
-                      {AGENT_SOPS.filter((s) => s.phase === 2).map(renderSopItem)}
+                      {AGENT_SOPS.map(renderSopItem)}
                     </div>
                   </div>
                 </section>

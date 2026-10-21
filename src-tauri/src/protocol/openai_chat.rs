@@ -19,14 +19,20 @@ pub async fn chat_stream(
     mut on_reasoning: impl FnMut(&str) + Send,
 ) -> Result<LlmResult, String> {
     let url = endpoint(&cfg.base_url);
+    let payload = crate::protocol::transpiler::transpile_to_openai_chat(
+        messages,
+        tools,
+        &cfg.model,
+        cfg.reasoning_effort.as_deref(),
+    );
     let mut body = json!({
         "model": cfg.model,
-        "messages": messages,
+        "messages": payload.messages,
         "stream": true,
         "stream_options": { "include_usage": true },
     });
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(tools.to_vec());
+    if !payload.tools.is_empty() {
+        body["tools"] = Value::Array(payload.tools);
     }
     // 思考程度处理：仅当明确指定且非 "default" 时才传入 reasoning_effort
     if let Some(ref effort) = cfg.reasoning_effort {
@@ -58,8 +64,29 @@ pub async fn chat_stream(
     let mut result = LlmResult::default();
     let mut calls: Vec<Option<ToolCallAcc>> = Vec::new();
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("流读取失败: {e}"))?;
+    let mut is_first_chunk = true;
+    loop {
+        let chunk_timeout = if is_first_chunk {
+            std::time::Duration::from_secs(60) // 首字预填充允许最长 60s
+        } else {
+            std::time::Duration::from_secs(25) // 吐字中途若停顿 25s 判定网络半开挂死
+        };
+
+        let chunk = match tokio::time::timeout(chunk_timeout, stream.next()).await {
+            Ok(Some(c)) => {
+                is_first_chunk = false;
+                c.map_err(|e| format!("流读取失败: {e}"))?
+            }
+            Ok(None) => break,
+            Err(_) => {
+                let reason = if is_first_chunk {
+                    "首字等待超时 (60s 无响应)"
+                } else {
+                    "数据块传输停滞 (25s 无新数据)"
+                };
+                return Err(format!("流读取失败: 网络响应超时（{reason}），远程模型服务停止响应"));
+            }
+        };
         buffer.extend_from_slice(&chunk);
 
         while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {

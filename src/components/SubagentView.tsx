@@ -385,7 +385,7 @@ export function SubagentView({ subagentId }: { subagentId: string }) {
                 key={m.id}
                 msg={m}
                 isLastUser={m.id === lastUserMsgId}
-                streaming={isRunning && m.role === "assistant" && m.id === msgs[msgs.length - 1]?.id}
+                streaming={Boolean(isRunning && m.role === "assistant" && (m.id === msgs[msgs.length - 1]?.id || m.id.startsWith("pending-")))}
                 readOnly={false}
                 running={isRunning}
                 turnMetrics={turnMetricsMap.get(m.id)}

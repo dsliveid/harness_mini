@@ -326,7 +326,7 @@ export function ChatView() {
                 key={m.id}
                 msg={m}
                 isLastUser={m.id === lastUserMsgId}
-                streaming={running && m.role === "assistant" && m.id === msgs[msgs.length - 1]?.id}
+                streaming={Boolean(running && m.role === "assistant" && (m.id === msgs[msgs.length - 1]?.id || m.id.startsWith("pending-")))}
                 readOnly={readOnly}
                 running={running}
                 editBlocked={mergedBoundary != null && m.seq <= mergedBoundary}

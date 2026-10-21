@@ -91,6 +91,17 @@ const SLASH_COMMANDS: SlashCommand[] = [
     Icon: Sparkles,
   },
   {
+    cmd: "/jev:决策",
+    label: "/jev:决策 <意图或方案>",
+    desc: "场景化意图理解与方案决策：自动分析意图并智能调度决策工具（评分/判定/选择）",
+    placeholder: "输入待评估的意图或方案，Enter 自动选择决策工具执行决策，Backspace 删除标签取消…",
+    requireBody: true,
+    emptyHint: "/jev:决策 指令已激活，请输入待评估的意图或方案",
+    buildMessage: (body) => `/jev:决策 ${body}`,
+    ...JEV_BADGE,
+    badgeTitle: "删除标签以取消决策 (Backspace)",
+  },
+  {
     cmd: "/jev:判断",
     label: "/jev:判断 <判定命题或问题>",
     desc: "调用决策模型进行二元真伪判定与置信度打分",
@@ -140,9 +151,10 @@ function findSlashCommand(cmd: string): SlashCommand | null {
 
 // 从文本中剥离行首的斜杠指令令牌，返回命中的指令配置与剩余正文
 function parseSlashCommand(text: string): { cfg: SlashCommand | null; body: string } {
-  const m = text.match(SLASH_TOKEN_RE);
-  if (!m) return { cfg: null, body: text.trim() };
-  const body = text
+  const normalized = text.replace(/^\/jev:\s+决策/i, "/jev:决策");
+  const m = normalized.match(SLASH_TOKEN_RE);
+  if (!m) return { cfg: null, body: normalized.trim() };
+  const body = normalized
     .replace(SLASH_TOKEN_RE, (match) => {
       const prefix = match.replace(SLASH_TOKEN_ONLY_RE, "");
       return prefix ? prefix.trimEnd() + " " : "";

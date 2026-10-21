@@ -289,3 +289,94 @@ fn test_llm_cfg_effective_session_id() {
     assert!(s3.starts_with("sess-"), "Whitespace session id should fallback to auto-generated session id");
 }
 
+
+
+#[test]
+fn test_openai_chat_thinking_mode_auto_heals_missing_reasoning_content() {
+    // 场景：DeepSeek 思考模式下，模型在某轮执行中 0 token 推理直接调工具，缺少 reasoning_content
+    let messages = vec![
+        json!({"role": "user", "content": "Check medical dispute"}),
+        // 轮次 1：模型有思考流
+        json!({
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "Let me search files...",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "glob", "arguments": "{}"}
+            }]
+        }),
+        json!({"role": "tool", "tool_call_id": "call_1", "content": "file1.vue"}),
+        // 轮次 2：模型直接调用工具，无 reasoning_content（0 token 思考）
+        json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_2",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"}
+            }]
+        }),
+        json!({"role": "tool", "tool_call_id": "call_2", "content": "file content..."}),
+    ];
+
+    let payload = transpile_to_openai_chat(&messages, &[], "deepseek-v4.1-flash", Some("high"));
+    assert_eq!(payload.messages.len(), 5);
+
+    // 轮次 1 的 reasoning_content 保持原样
+    assert_eq!(payload.messages[1]["reasoning_content"], "Let me search files...");
+
+    // 轮次 2 原本缺失的 reasoning_content 被自动注入保底空字符串，彻底满足 DeepSeek 上游校验
+    assert_eq!(payload.messages[3]["reasoning_content"], "");
+    assert_eq!(payload.messages[3]["role"], "assistant");
+}
+
+#[test]
+fn test_openai_chat_non_thinking_mode_strips_reasoning_content() {
+    // 场景：历史中存在思考模型留下的 reasoning_content，但在后续切换为标准 gpt-4o（非思考模式）
+    let messages = vec![
+        json!({"role": "user", "content": "Hello"}),
+        json!({
+            "role": "assistant",
+            "content": "Hi",
+            "reasoning_content": "internal thinking chain...",
+            "reasoning": "legacy reasoning field..."
+        }),
+    ];
+
+    let payload = transpile_to_openai_chat(&messages, &[], "gpt-4o", None);
+    assert_eq!(payload.messages.len(), 2);
+    let ast_msg = &payload.messages[1];
+    assert_eq!(ast_msg["content"], "Hi");
+    // 严格剥离 reasoning_content 与 reasoning，防止原生 OpenAI 抛出 400 unexpected property
+    assert!(ast_msg.get("reasoning_content").is_none());
+    assert!(ast_msg.get("reasoning").is_none());
+}
+
+#[test]
+fn test_openai_chat_orphan_tool_call_self_healing() {
+    // 场景：Assistant 发起了 tool_calls，但用户点击了停止并直接发送了新消息
+    let messages = vec![
+        json!({"role": "user", "content": "Do task"}),
+        json!({
+            "role": "assistant",
+            "content": "Calling tool",
+            "tool_calls": [{
+                "id": "call_orphan_chat_1",
+                "type": "function",
+                "function": {"name": "run_command", "arguments": "{}"}
+            }]
+        }),
+        json!({"role": "user", "content": "Never mind, cancel"}),
+    ];
+
+    let payload = transpile_to_openai_chat(&messages, &[], "deepseek-chat", None);
+    // 应当在 user 消息之前自动自愈注入缺失的 tool 占位结果
+    assert_eq!(payload.messages.len(), 4);
+    assert_eq!(payload.messages[2]["role"], "tool");
+    assert_eq!(payload.messages[2]["tool_call_id"], "call_orphan_chat_1");
+    assert_eq!(payload.messages[2]["content"], "(执行被中断，无结果)");
+    assert_eq!(payload.messages[3]["role"], "user");
+    assert_eq!(payload.messages[3]["content"], "Never mind, cancel");
+}

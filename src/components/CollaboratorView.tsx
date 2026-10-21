@@ -743,7 +743,7 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
                 key={m.id}
                 msg={m}
                 isLastUser={m.id === lastUserMsgId}
-                streaming={isRunning && m.role === "assistant" && m.id === msgs[msgs.length - 1]?.id}
+                streaming={Boolean(isRunning && m.role === "assistant" && (m.id === msgs[msgs.length - 1]?.id || m.id.startsWith("pending-")))}
                 readOnly={isSubprocess}
                 running={isRunning}
                 turnMetrics={turnMetricsMap.get(m.id)}

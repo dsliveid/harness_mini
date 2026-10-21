@@ -226,6 +226,19 @@ fn init(conn: &Connection) -> Result<(), String> {
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS llm_requests (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          message_id TEXT NOT NULL,
+          run_id TEXT,
+          model TEXT NOT NULL,
+          endpoint TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_llm_requests_msg ON llm_requests(message_id);
+        CREATE INDEX IF NOT EXISTS idx_llm_requests_session ON llm_requests(session_id);
         "#,
     )
     .map_err(|e| e.to_string())?;
@@ -269,6 +282,8 @@ fn init(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "sessions", "merged_pending", "merged_pending INTEGER NOT NULL DEFAULT 0")?;
     // 旧库迁移：messages 补 reasoning 列（模型思考过程）
     ensure_column(conn, "messages", "reasoning", "reasoning TEXT")?;
+    // 不可变前缀缓存：消息尾部运行时环境附注字段（存储生成时刻的计划与运行时状态，避免污染 System Prompt）
+    ensure_column(conn, "messages", "runtime_anchor", "runtime_anchor TEXT")?;
     // Token 消耗与耗时统计字段
     ensure_column(conn, "messages", "prompt_tokens", "prompt_tokens INTEGER DEFAULT 0")?;
     ensure_column(conn, "messages", "completion_tokens", "completion_tokens INTEGER DEFAULT 0")?;
@@ -1458,6 +1473,7 @@ mod tests {
             is_estimated: None,
             attachments: None,
             reverted_at: None,
+            runtime_anchor: None,
         };
         insert_message(&conn, &m1).unwrap();
 
@@ -1485,6 +1501,7 @@ mod tests {
             is_estimated: None,
             attachments: None,
             reverted_at: None,
+            runtime_anchor: None,
         };
         insert_message(&conn, &m2).unwrap();
 
@@ -1526,6 +1543,7 @@ mod tests {
             is_estimated: None,
             attachments: None,
             reverted_at: None,
+            runtime_anchor: None,
         };
         insert_message(&conn, &m3).unwrap();
 
@@ -1552,6 +1570,7 @@ mod tests {
             is_estimated: None,
             attachments: None,
             reverted_at: None,
+            runtime_anchor: None,
         };
         insert_message(&conn, &m4).unwrap();
 
@@ -1578,6 +1597,7 @@ mod tests {
             is_estimated: None,
             attachments: None,
             reverted_at: None,
+            runtime_anchor: None,
         };
         insert_message(&conn, &m5).unwrap();
 
@@ -3376,6 +3396,7 @@ pub fn new_message_with_attachments(
         is_estimated: None,
         attachments,
         reverted_at: None,
+        runtime_anchor: None,
     };
     insert_message(conn, &m)?;
     Ok(m)
@@ -3535,7 +3556,7 @@ pub fn get_messages(
 ) -> Result<Vec<Message>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens, is_estimated, reverted_at
+            "SELECT id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens, is_estimated, reverted_at, runtime_anchor
              FROM messages WHERE session_id = ?1 AND seq < COALESCE(?2, 9223372036854775807)
              ORDER BY seq DESC LIMIT ?3",
         )
@@ -3553,6 +3574,7 @@ pub fn get_messages(
             let cached: Option<i64> = r.get(17)?;
             let is_est: Option<i64> = r.get(18)?;
             let rev_at: Option<String> = r.get(19)?;
+            let rt_anchor: Option<String> = r.get(20)?;
             Ok(Message {
                 id: r.get(0)?,
                 session_id: session_id.to_string(),
@@ -3576,6 +3598,7 @@ pub fn get_messages(
                 is_estimated: is_est.map(|v| v != 0),
                 attachments: att.and_then(|s| serde_json::from_str(&s).ok()),
                 reverted_at: rev_at,
+                runtime_anchor: rt_anchor,
             })
         })
         .map_err(|e| e.to_string())?
@@ -3650,6 +3673,12 @@ pub fn delete_messages_after(conn: &Connection, session_id: &str, seq: i64) -> R
     )
     .map_err(|e| e.to_string())?;
     conn.execute(
+        "DELETE FROM llm_requests WHERE session_id = ?1 AND message_id IN
+           (SELECT id FROM messages WHERE session_id = ?1 AND seq > ?2)",
+        params![session_id, seq],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
         "DELETE FROM tool_events WHERE message_id IN
            (SELECT id FROM messages WHERE session_id = ?1 AND seq > ?2)",
         params![session_id, seq],
@@ -3715,7 +3744,7 @@ pub fn list_session_compactions(conn: &Connection, session_id: &str) -> Result<V
 pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, String> {
     let opt = conn
         .query_row(
-            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens, is_estimated, reverted_at
+            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens, is_estimated, reverted_at, runtime_anchor
              FROM messages WHERE id = ?1",
             params![id],
             |r| {
@@ -3730,6 +3759,7 @@ pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, Strin
                 let cached: Option<i64> = r.get(18)?;
                 let is_est: Option<i64> = r.get(19)?;
                 let rev_at: Option<String> = r.get(20)?;
+                let rt_anchor: Option<String> = r.get(21)?;
                 Ok(Message {
                     id: r.get(0)?,
                     session_id: r.get(1)?,
@@ -3753,6 +3783,7 @@ pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, Strin
                     is_estimated: is_est.map(|v| v != 0),
                     attachments: att.and_then(|s| serde_json::from_str(&s).ok()),
                     reverted_at: rev_at,
+                    runtime_anchor: rt_anchor,
                 })
             },
         )
@@ -3766,7 +3797,7 @@ pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>, Strin
 pub fn list_queued(conn: &Connection, session_id: &str) -> Result<Vec<Message>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens, is_estimated, reverted_at
+            "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens, is_estimated, reverted_at, runtime_anchor
              FROM messages WHERE session_id = ?1 AND queued = 1 ORDER BY seq ASC",
         )
         .map_err(|e| e.to_string())?;
@@ -3783,6 +3814,7 @@ pub fn list_queued(conn: &Connection, session_id: &str) -> Result<Vec<Message>, 
             let cached: Option<i64> = r.get(18)?;
             let is_est: Option<i64> = r.get(19)?;
             let rev_at: Option<String> = r.get(20)?;
+            let rt_anchor: Option<String> = r.get(21)?;
             Ok(Message {
                 id: r.get(0)?,
                 session_id: r.get(1)?,
@@ -3806,10 +3838,24 @@ pub fn list_queued(conn: &Connection, session_id: &str) -> Result<Vec<Message>, 
                 is_estimated: is_est.map(|v| v != 0),
                 attachments: att.and_then(|s| serde_json::from_str(&s).ok()),
                 reverted_at: rev_at,
+                runtime_anchor: rt_anchor,
             })
         })
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+pub fn update_message_runtime_anchor(
+    conn: &Connection,
+    id: &str,
+    anchor: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE messages SET runtime_anchor = ?1 WHERE id = ?2",
+        params![anchor, id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// 取出最早一条排队消息（queued=0 使其进入对话流），返回该消息
@@ -6148,3 +6194,56 @@ pub fn delete_mcp_server(conn: &Connection, id: &str) -> Result<bool, String> {
 }
 
 
+
+pub fn save_llm_request_trace(
+    conn: &Connection,
+    session_id: &str,
+    message_id: &str,
+    run_id: Option<&str>,
+    model: &str,
+    endpoint: &str,
+    payload_json: &str,
+) -> Result<(), String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let created_at = now();
+    conn.execute(
+        r#"INSERT INTO llm_requests (id, session_id, message_id, run_id, model, endpoint, payload_json, created_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        params![id, session_id, message_id, run_id, model, endpoint, payload_json, created_at],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn get_llm_request_trace(
+    conn: &Connection,
+    message_id: &str,
+) -> Result<Option<LlmRequestTrace>, String> {
+    let mut stmt = conn
+        .prepare(
+            r#"SELECT id, session_id, message_id, run_id, model, endpoint, payload_json, created_at
+               FROM llm_requests
+               WHERE message_id = ?1
+               ORDER BY created_at DESC
+               LIMIT 1"#,
+        )
+        .map_err(|e| e.to_string())?;
+
+    let trace = stmt
+        .query_row(params![message_id], |row| {
+            Ok(LlmRequestTrace {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                message_id: row.get(2)?,
+                run_id: row.get(3)?,
+                model: row.get(4)?,
+                endpoint: row.get(5)?,
+                payload_json: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    Ok(trace)
+}

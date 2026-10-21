@@ -22,6 +22,126 @@ pub struct ResponsesPayload {
     pub tools: Vec<Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiChatPayload {
+    pub messages: Vec<Value>,
+    pub tools: Vec<Value>,
+}
+
+/// 判定目标模型与请求配置是否处于思考/推理模式（Thinking / Reasoning Mode）
+pub fn is_thinking_mode(model: &str, reasoning_effort: Option<&str>) -> bool {
+    if let Some(effort) = reasoning_effort {
+        let trimmed = effort.trim();
+        if !trimmed.is_empty() && trimmed != "default" && trimmed != "none" {
+            return true;
+        }
+    }
+    let lower = model.to_ascii_lowercase();
+    lower.contains("reasoner")
+        || lower.contains("deepseek-r1")
+        || lower.contains("-r1")
+        || lower.contains("qwq")
+        || lower.contains("o1-")
+        || lower.contains("o3-")
+        || lower == "o1"
+        || lower == "o3"
+}
+
+/// 将内部通用消息序列规范化转译为 OpenAI Chat Completions (/chat/completions) 格式：
+/// 1. 思考流字段合规自愈（Reasoning Content Self-Healing）：
+///    - 在 Thinking 模式下（如 DeepSeek R1 / 配置 reasoning_effort），上游网关强制要求 Assistant 消息
+///      必须回传 reasoning_content 字段。若某轮思考内容为空（例如模型 0 token 推理直接调工具），
+///      自动填充保底空字符串 ""，彻底杜绝 400 Bad Request。
+///    - 在非 Thinking 模式下（如原生 gpt-4o 等），自动彻底剔除 reasoning_content 与 reasoning 字段，
+///      防止因包含厂商私有未识别属性被标准网关拒绝（400 unexpected property）。
+/// 2. 孤立 Tool Call 自动自愈（Orphan Tool Call Auto-Healing）：
+///    - 若 Assistant 触发了 tool_calls 但后续因中断缺少 tool 结果，按序自动注入占位结果，维持角色闭合。
+pub fn transpile_to_openai_chat(
+    messages: &[Value],
+    tools: &[Value],
+    model: &str,
+    reasoning_effort: Option<&str>,
+) -> OpenAiChatPayload {
+    let thinking = is_thinking_mode(model, reasoning_effort);
+    let mut sanitized_messages = Vec::with_capacity(messages.len());
+
+    // 保序记录所有待响应的 tool_call_id
+    let mut pending_tool_calls: Vec<String> = Vec::new();
+
+    for msg in messages {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+
+        // 若遇到非 tool 角色，先检查前面是否有未闭合的孤立 tool_call 并闭合
+        if role != "tool" && !pending_tool_calls.is_empty() {
+            for orphan_id in pending_tool_calls.drain(..) {
+                sanitized_messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": orphan_id,
+                    "content": "(执行被中断，无结果)"
+                }));
+            }
+        }
+
+        let mut m = msg.clone();
+        match role {
+            "assistant" => {
+                if let Some(obj) = m.as_object_mut() {
+                    if thinking {
+                        // 思考模式：确保存在 reasoning_content 字符串
+                        let current_reasoning = obj
+                            .get("reasoning_content")
+                            .or_else(|| obj.get("reasoning"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        obj.insert("reasoning_content".to_string(), json!(current_reasoning));
+                        obj.remove("reasoning");
+                    } else {
+                        // 非思考模式：彻底移除厂商私有推理字段，避免原生 OpenAI 严格校验拦截
+                        obj.remove("reasoning_content");
+                        obj.remove("reasoning");
+                    }
+                }
+
+                // 登记 tool_calls，用于孤立调用检测
+                if let Some(tcs) = m.get("tool_calls").and_then(|t| t.as_array()) {
+                    for tc in tcs {
+                        if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+                            if !id.is_empty() && !pending_tool_calls.contains(&id.to_string()) {
+                                pending_tool_calls.push(id.to_string());
+                            }
+                        }
+                    }
+                }
+                sanitized_messages.push(m);
+            }
+            "tool" => {
+                if let Some(id) = m.get("tool_call_id").and_then(|i| i.as_str()) {
+                    pending_tool_calls.retain(|x| x != id);
+                }
+                sanitized_messages.push(m);
+            }
+            _ => {
+                sanitized_messages.push(m);
+            }
+        }
+    }
+
+    // 末尾孤立 tool_calls 闭合
+    for orphan_id in pending_tool_calls {
+        sanitized_messages.push(json!({
+            "role": "tool",
+            "tool_call_id": orphan_id,
+            "content": "(执行被中断，无结果)"
+        }));
+    }
+
+    OpenAiChatPayload {
+        messages: sanitized_messages,
+        tools: tools.to_vec(),
+    }
+}
+
 /// 将内部通用消息序列转译为 Anthropic Claude /v1/messages 格式
 pub fn transpile_to_anthropic(messages: &[Value], tools: &[Value]) -> AnthropicPayload {
     let mut system_parts = Vec::new();

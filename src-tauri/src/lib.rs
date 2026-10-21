@@ -3,6 +3,7 @@ mod approval;
 pub mod artifacts;
 pub mod browser;
 mod commands;
+pub mod context;
 pub mod diagnostics;
 mod diffutil;
 mod growth;
@@ -56,10 +57,6 @@ pub struct RunningCommand {
     pub tx: tokio::sync::oneshot::Sender<()>,
 }
 
-pub struct PendingIntentIntervention {
-    pub session_id: String,
-    pub tx: tokio::sync::oneshot::Sender<crate::models::IntentInterventionDecision>,
-}
 
 pub struct AppState {
     pub db: Mutex<rusqlite::Connection>,
@@ -79,7 +76,6 @@ pub struct AppState {
     pub handles: Mutex<HashMap<String, SessionHandle>>,
     pub approvals: Mutex<HashMap<String, PendingApproval>>,
     pub compactions: Mutex<HashMap<String, PendingCompaction>>,
-    pub intent_interventions: Mutex<HashMap<String, PendingIntentIntervention>>,
     pub running_commands: Mutex<HashMap<String, RunningCommand>>,
     pub app: OnceLock<tauri::AppHandle>,
     pub snapshot: snapshot::SnapshotStore,
@@ -282,7 +278,6 @@ pub fn run() {
                 handles: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
                 compactions: Mutex::new(HashMap::new()),
-                intent_interventions: Mutex::new(HashMap::new()),
                 running_commands: Mutex::new(HashMap::new()),
                 app: OnceLock::new(),
                 data_dir: Mutex::new(data_dir.clone()),
@@ -510,6 +505,7 @@ pub fn run() {
             commands::reapply_turn_file,
             commands::get_turn_diff,
             commands::query_tool_logs,
+            commands::get_llm_request_trace,
             commands::list_mcp_servers,
             commands::save_mcp_server,
             commands::delete_mcp_server,

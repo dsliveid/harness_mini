@@ -139,8 +139,8 @@ pub fn sanitize_slug(name: &str) -> String {
     }
 }
 
-/// 将项目记忆格式化输出，供注入 System Prompt（无 IO 错误，容错处理）
-pub fn load_project_memory(workspace: &Path) -> Option<String> {
+/// 读取项目静态持久化基线记忆（profile.md + conventions.md），供放入纯静态 System Prompt
+pub fn load_static_project_memory(workspace: &Path) -> Option<String> {
     if workspace.as_os_str().is_empty() {
         return None;
     }
@@ -171,8 +171,23 @@ pub fn load_project_memory(workspace: &Path) -> Option<String> {
         }
     }
 
-    // 3. 读取最近高价值的主题碎记 digests（最多提取前 3 篇）
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
+}
+
+/// 读取最近高价值的主题碎记 digests，供放入尾部动态环境附注（避免污染前缀缓存）
+pub fn load_recent_digests(workspace: &Path, max_count: usize) -> Option<String> {
+    if workspace.as_os_str().is_empty() {
+        return None;
+    }
     let dig = digests_dir(workspace);
+    if !dig.exists() {
+        return None;
+    }
+
     if let Ok(entries) = fs::read_dir(&dig) {
         let mut digests = Vec::new();
         for entry in entries.flatten() {
@@ -184,19 +199,30 @@ pub fn load_project_memory(workspace: &Path) -> Option<String> {
                 }
             }
         }
-        // 按更新时间降序
         digests.sort_by(|a, b| b.0.updated_at.cmp(&a.0.updated_at));
-        let top_digests: Vec<_> = digests.into_iter().take(3).collect();
+        let top_digests: Vec<_> = digests.into_iter().take(max_count).collect();
         if !top_digests.is_empty() {
             let mut s = String::from("### 近期边读边记重点沉淀 (digests)\n");
             for (meta, body) in top_digests {
                 let first_line = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
                 s.push_str(&format!("- **{}** ({}): {}\n", meta.title, meta.category, first_line));
             }
-            parts.push(s.trim().to_string());
+            return Some(s.trim().to_string());
         }
     }
 
+    None
+}
+
+/// 将项目记忆格式化输出（兼容老接口）
+pub fn load_project_memory(workspace: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(s) = load_static_project_memory(workspace) {
+        parts.push(s);
+    }
+    if let Some(d) = load_recent_digests(workspace, 3) {
+        parts.push(d);
+    }
     if parts.is_empty() {
         None
     } else {

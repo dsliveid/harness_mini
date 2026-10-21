@@ -568,6 +568,29 @@ pub fn continue_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 提取用户主动发起的 `/jev: 决策 [意图]` 指令
+pub fn extract_jev_intent(raw_text: &str) -> (bool, String) {
+    let trimmed = raw_text.trim();
+    if trimmed.starts_with("/jev:决策")
+        || trimmed.starts_with("/jev: 决策")
+        || trimmed.starts_with("/jev：决策")
+        || trimmed.starts_with("/jev： 决策")
+    {
+        let remainder = if trimmed.starts_with("/jev:决策") {
+            &trimmed["/jev:决策".len()..]
+        } else if trimmed.starts_with("/jev: 决策") {
+            &trimmed["/jev: 决策".len()..]
+        } else if trimmed.starts_with("/jev：决策") {
+            &trimmed["/jev：决策".len()..]
+        } else {
+            &trimmed["/jev： 决策".len()..]
+        }.trim();
+        (true, remainder.to_string())
+    } else {
+        (false, String::new())
+    }
+}
+
 async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String>) {
     let state = app.state::<crate::AppState>();
     let mut last_outcome = RunOutcome::Done;
@@ -788,6 +811,7 @@ fn queued_payload(state: &crate::AppState, session_id: &str) -> Vec<Value> {
         .collect()
 }
 
+#[allow(dead_code)]
 /// 解析会话或全局生效的决策模型 (Jev)，支持子会话动态继承父会话
 fn resolve_decision_model_for_session(
     session: &crate::models::Session,
@@ -824,7 +848,7 @@ fn parse_understanding_and_plan(raw: &str) -> (String, String) {
 /// 提取最近几轮人机对话的关键摘要，用于意图对齐门控进行代词消解与上下文关联
 /// 提取最近几轮人机对话的完整上下文，用于意图对齐门控进行代词消解与选项解析（不截断选项与末尾内容）
 #[allow(dead_code)]
-fn format_recent_context_for_gate(msgs: &[crate::models::Message], trigger_msg_id: Option<&str>) -> String {
+fn format_recent_context_for_decision(msgs: &[crate::models::Message], trigger_msg_id: Option<&str>) -> String {
     let mut relevant = Vec::new();
     let mut count = 0;
     for m in msgs.iter().rev() {
@@ -850,392 +874,6 @@ fn format_recent_context_for_gate(msgs: &[crate::models::Message], trigger_msg_i
     }
     relevant.reverse();
     relevant.join("\n\n")
-}
-
-#[allow(dead_code)]
-fn is_clarification_intent_plan(plan: &str) -> bool {
-    let p = plan.trim();
-    p.contains("澄清")
-        || p.contains("询问")
-        || p.contains("追问")
-        || p.contains("不调用")
-        || p.contains("仅向用户")
-        || p.contains("确认意图")
-        || p.contains("信息严重不足")
-}
-
-/// 日常对话前置意图对齐门控（仅对用户输入做单轮决策，内容极简，<90分由用户采用或输入提示，决不隐藏工具）
-#[allow(dead_code)]
-async fn run_intent_alignment_gate(
-    app: &AppHandle,
-    state: &crate::AppState,
-    session: &crate::models::Session,
-    parent_session: Option<&crate::models::Session>,
-    settings: &crate::models::SettingsData,
-    cfg: &LlmCfg,
-    session_id: &str,
-    run_id: &str,
-    user_message: &str,
-    recent_context: &str,
-) -> Option<(String, String)> {
-    let resolved_decision = resolve_decision_model_for_session(session, parent_session, settings);
-    let Some(d_route) = resolved_decision else {
-        return None;
-    };
-    let d_model = d_route.primary_model.clone();
-
-    let intervention_id = format!("intent-{}-{}", session_id, uuid::Uuid::new_v4());
-    let (tx, mut rx) = tokio::sync::oneshot::channel();
-    {
-        let mut pending = state.intent_interventions.lock().unwrap();
-        pending.retain(|_, v| v.session_id != session_id);
-        pending.insert(intervention_id.clone(), crate::PendingIntentIntervention {
-            session_id: session_id.to_string(),
-            tx,
-        });
-    }
-
-    // 阶段 1：通知前端正在提炼意图
-    let analyzing_event = crate::models::IntentAlignmentEvent {
-        session_id: session_id.to_string(),
-        run_id: run_id.to_string(),
-        user_message: user_message.to_string(),
-        status: "analyzing".into(),
-        current_attempt: 1,
-        max_retries: 1,
-        understanding: String::new(),
-        plan: String::new(),
-        score: 0.0,
-        score_percent: 0,
-        reason: String::new(),
-        attempt: 1,
-        passed: false,
-        history: Vec::new(),
-        intervention_id: Some(intervention_id.clone()),
-        decision_type: Some("score".into()),
-        verdict: None,
-        selected_choice: None,
-    };
-    let _ = app.emit("intent:alignment", &analyzing_event);
-
-    // 1. LLM 极简提炼对用户意图的理解以及关键行动（严格限制字数，简洁明了）
-    let context_block = if recent_context.trim().is_empty() {
-        String::new()
-    } else {
-        format!("【前序对话上下文参考（用于代词消解与选项解析）】:\n{}\n\n", recent_context.trim())
-    };
-    let gen_prompt = format!(
-        "你是一个高智能任务规划分析器。请仔细阅读用户最新发送的消息（参考前序对话上下文以准确解析代词、选项与编号），以极简明确的格式输出两部分内容：\n\
-        1. understanding: 1句话定性概括用户真实核心诉求（严格控制在40字以内）；\n\
-        2. plan: 列出 2~3 点核心关键动作清单（每点不超过25字，严禁冗长流水账）。\n\n\
-        必须且仅以如下 JSON 格式输出，不要输出任何 Markdown 标记或多余说明：\n\
-        {{\"understanding\": \"一句话意图\", \"plan\": \"1. 关键动作一\\n2. 关键动作二\"}}\n\n\
-        {}\
-        【用户消息】：\n{}",
-        context_block,
-        user_message
-    );
-
-    let gen_messages = vec![
-        json!({"role": "system", "content": "你是一个严谨客观的意图理解与任务规划分析器，只输出纯 JSON。"}),
-        json!({"role": "user", "content": gen_prompt}),
-    ];
-
-    let gen_resp = tokio::select! {
-        res = crate::llm::call_simple_completion(cfg, &gen_messages, Some(0.1)) => {
-            res.unwrap_or_default()
-        }
-        user_action = &mut rx => {
-            let mut pending = state.intent_interventions.lock().unwrap();
-            pending.remove(&intervention_id);
-            drop(pending);
-            if let Ok(_decision) = user_action {
-                let skip_event = crate::models::IntentAlignmentEvent {
-                    session_id: session_id.to_string(),
-                    run_id: run_id.to_string(),
-                    user_message: user_message.to_string(),
-                    status: "skipped".into(),
-                    current_attempt: 1,
-                    max_retries: 1,
-                    understanding: user_message.to_string(),
-                    plan: "用户手动跳过前置评估，直接执行。".into(),
-                    score: 1.0,
-                    score_percent: 100,
-                    reason: "用户手动跳过意图对齐".into(),
-                    attempt: 1,
-                    passed: true,
-                    history: Vec::new(),
-                    intervention_id: None,
-                    decision_type: Some("score".into()),
-                    verdict: None,
-                    selected_choice: None,
-                };
-                let _ = app.emit("intent:alignment", &skip_event);
-                return Some((user_message.to_string(), "根据用户指令跳过前置评估，直接执行。".into()));
-            }
-            String::new()
-        }
-    };
-
-    let (extracted_understanding, extracted_plan) = parse_understanding_and_plan(&gen_resp);
-
-    // 阶段 2：通知前端意图已提取，决策模型进行单轮打分
-    let evaluating_event = crate::models::IntentAlignmentEvent {
-        session_id: session_id.to_string(),
-        run_id: run_id.to_string(),
-        user_message: user_message.to_string(),
-        status: "evaluating".into(),
-        current_attempt: 1,
-        max_retries: 1,
-        understanding: extracted_understanding.clone(),
-        plan: extracted_plan.clone(),
-        score: 0.0,
-        score_percent: 0,
-        reason: String::new(),
-        attempt: 1,
-        passed: false,
-        history: Vec::new(),
-        intervention_id: Some(intervention_id.clone()),
-        decision_type: Some("score".into()),
-        verdict: None,
-        selected_choice: None,
-    };
-    let _ = app.emit("intent:alignment", &evaluating_event);
-
-    // 2. 决策模型单轮评估打分
-    let eval_state = format!(
-        "{}\
-        【用户消息】: {}\n\
-        【核心意图】: {}\n\
-        【核心动作】:\n{}",
-        context_block,
-        user_message, extracted_understanding, extracted_plan
-    );
-    let eval_instruction = "请简要评估上述提取的核心意图与动作是否精准契合用户需求。打分区间 0 到 100（以 0.0 到 1.0 表示）。若存在偏差或不明确，请在 reason 中用 1 句话指出具体原因。";
-    let rubric = vec![
-        "90-100: 准确契合用户意图，动作方向明确可行".into(),
-        "0-89: 存在歧义、理解偏差或关键动作遗漏".into(),
-    ];
-
-    let eval_res = tokio::select! {
-        res = crate::jev::execute_decision_pipeline(
-            &d_route,
-            "score",
-            &eval_state,
-            eval_instruction,
-            None,
-            Some(rubric),
-            settings.effective_proxy_url(),
-        ) => {
-            res
-        }
-        user_action = &mut rx => {
-            let mut pending = state.intent_interventions.lock().unwrap();
-            pending.remove(&intervention_id);
-            drop(pending);
-            if let Ok(_decision) = user_action {
-                let skip_event = crate::models::IntentAlignmentEvent {
-                    session_id: session_id.to_string(),
-                    run_id: run_id.to_string(),
-                    user_message: user_message.to_string(),
-                    status: "skipped".into(),
-                    current_attempt: 1,
-                    max_retries: 1,
-                    understanding: extracted_understanding.clone(),
-                    plan: extracted_plan.clone(),
-                    score: 1.0,
-                    score_percent: 100,
-                    reason: "用户手动跳过意图对齐闸门".into(),
-                    attempt: 1,
-                    passed: true,
-                    history: Vec::new(),
-                    intervention_id: None,
-                    decision_type: Some("score".into()),
-                    verdict: None,
-                    selected_choice: None,
-                };
-                let _ = app.emit("intent:alignment", &skip_event);
-                return Some((extracted_understanding, extracted_plan));
-            }
-            Ok(crate::jev::DecisionExecutionResult {
-                verdict: None,
-                choice: None,
-                score: Some(0.95),
-                confidence: 0.9,
-                reason: "跳过评估".into(),
-                latency_ms: 0,
-                model: d_model.clone(),
-            })
-        }
-    };
-
-    // 移除已处理的通道
-    {
-        let mut pending = state.intent_interventions.lock().unwrap();
-        pending.remove(&intervention_id);
-    }
-
-    let (score, reason) = match eval_res {
-        Ok(r) => (r.score.unwrap_or(0.95), r.reason),
-        Err(e) => {
-            eprintln!("意图对齐门控评估异常: {e}");
-            (0.95, "意图评估通过（决策服务暂时不可用，已自动核准执行计划）".to_string())
-        }
-    };
-
-    let score_percent = (score * 100.0).round() as u32;
-    let passed = score_percent >= 90;
-
-    let round_record = crate::models::IntentAlignmentRound {
-        attempt: 1,
-        understanding: extracted_understanding.clone(),
-        plan: extracted_plan.clone(),
-        score,
-        score_percent,
-        critique: reason.clone(),
-        passed,
-        decision_type: Some("score".into()),
-        verdict: None,
-        selected_choice: None,
-    };
-    let rounds = vec![round_record];
-
-    if passed {
-        let pass_event = crate::models::IntentAlignmentEvent {
-            session_id: session_id.to_string(),
-            run_id: run_id.to_string(),
-            user_message: user_message.to_string(),
-            status: "passed".into(),
-            current_attempt: 1,
-            max_retries: 1,
-            understanding: extracted_understanding.clone(),
-            plan: extracted_plan.clone(),
-            score,
-            score_percent,
-            reason: reason.clone(),
-            attempt: 1,
-            passed: true,
-            history: rounds,
-            intervention_id: None,
-            decision_type: Some("score".into()),
-            verdict: None,
-            selected_choice: None,
-        };
-        let _ = app.emit("intent:alignment", &pass_event);
-        return Some((extracted_understanding, extracted_plan));
-    }
-
-    // 单轮评分未达标 (<90分)：直接挂起等待用户二选一（采用该决策 / 输入提示调整方向）
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    {
-        let mut pending = state.intent_interventions.lock().unwrap();
-        pending.retain(|_, v| v.session_id != session_id);
-        pending.insert(intervention_id.clone(), crate::PendingIntentIntervention {
-            session_id: session_id.to_string(),
-            tx,
-        });
-    }
-
-    let intervention_event = crate::models::IntentAlignmentEvent {
-        session_id: session_id.to_string(),
-        run_id: run_id.to_string(),
-        user_message: user_message.to_string(),
-        status: "requires_intervention".into(),
-        current_attempt: 1,
-        max_retries: 1,
-        understanding: extracted_understanding.clone(),
-        plan: extracted_plan.clone(),
-        score,
-        score_percent,
-        reason: reason.clone(),
-        attempt: 1,
-        passed: false,
-        history: rounds.clone(),
-        intervention_id: Some(intervention_id.clone()),
-        decision_type: Some("score".into()),
-        verdict: None,
-        selected_choice: None,
-    };
-    let _ = app.emit("intent:alignment", &intervention_event);
-
-    let intervention_req = crate::models::IntentInterventionRequest {
-        id: intervention_id.clone(),
-        session_id: session_id.to_string(),
-        run_id: run_id.to_string(),
-        user_message: user_message.to_string(),
-        understanding: extracted_understanding.clone(),
-        plan: extracted_plan.clone(),
-        score,
-        critique: reason.clone(),
-        retry_count: 1,
-        rounds: rounds.clone(),
-        plan1: Some(extracted_plan.clone()),
-        plan2: None,
-    };
-    let _ = app.emit("intent:intervention_required", &intervention_req);
-
-    match rx.await {
-        Ok(decision) => {
-            let action = decision.action.as_str();
-            if action == "hint" {
-                let hint = decision.hint.unwrap_or_default();
-                let adjusted_understanding = if !hint.trim().is_empty() {
-                    format!("{}（用户纠偏：{}）", extracted_understanding, hint.trim())
-                } else {
-                    extracted_understanding
-                };
-                let pass_event = crate::models::IntentAlignmentEvent {
-                    session_id: session_id.to_string(),
-                    run_id: run_id.to_string(),
-                    user_message: user_message.to_string(),
-                    status: "passed".into(),
-                    current_attempt: 1,
-                    max_retries: 1,
-                    understanding: adjusted_understanding.clone(),
-                    plan: extracted_plan.clone(),
-                    score: 1.0,
-                    score_percent: 100,
-                    reason: format!("根据用户输入提示调整方向: {}", hint.trim()),
-                    attempt: 1,
-                    passed: true,
-                    history: rounds,
-                    intervention_id: None,
-                    decision_type: Some("score".into()),
-                    verdict: None,
-                    selected_choice: None,
-                };
-                let _ = app.emit("intent:alignment", &pass_event);
-                Some((adjusted_understanding, extracted_plan))
-            } else {
-                // "adopt", "adopt_plan_1", "adopt_plan_2", "skip"
-                let pass_event = crate::models::IntentAlignmentEvent {
-                    session_id: session_id.to_string(),
-                    run_id: run_id.to_string(),
-                    user_message: user_message.to_string(),
-                    status: "passed".into(),
-                    current_attempt: 1,
-                    max_retries: 1,
-                    understanding: extracted_understanding.clone(),
-                    plan: extracted_plan.clone(),
-                    score: 1.0,
-                    score_percent: 100,
-                    reason: "用户人工审批确认采用该决策".into(),
-                    attempt: 1,
-                    passed: true,
-                    history: rounds,
-                    intervention_id: None,
-                    decision_type: Some("score".into()),
-                    verdict: None,
-                    selected_choice: None,
-                };
-                let _ = app.emit("intent:alignment", &pass_event);
-                Some((extracted_understanding, extracted_plan))
-            }
-        }
-        Err(_) => {
-            Some((extracted_understanding, extracted_plan))
-        }
-    }
 }
 
 /// 推理思考模型（如 DeepSeek-R1、QwQ 等）可能将最终答复输出在思考流中，
@@ -1441,156 +1079,6 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         session_id: Some(session_id.to_string()),
     };
 
-    // /jev: 极速决策指令拦截（判断 / 选择 / 评分）
-    if let Some(ref t_msg) = trigger_msg {
-        let raw_text = t_msg.content.as_deref().unwrap_or("").trim();
-        if raw_text.starts_with("/jev:") || raw_text.starts_with("/jev：") {
-            let remainder = if raw_text.starts_with("/jev:") {
-                &raw_text["/jev:".len()..]
-            } else {
-                &raw_text["/jev：".len()..]
-            }.trim();
-
-            let (kind, prompt) = if remainder.starts_with("判断") || remainder.starts_with("judge") {
-                let p = remainder.strip_prefix("判断").or_else(|| remainder.strip_prefix("judge")).unwrap().trim();
-                ("judge", p)
-            } else if remainder.starts_with("选择") || remainder.starts_with("choice") {
-                let p = remainder.strip_prefix("选择").or_else(|| remainder.strip_prefix("choice")).unwrap().trim();
-                ("choice", p)
-            } else if remainder.starts_with("评分") || remainder.starts_with("score") {
-                let p = remainder.strip_prefix("评分").or_else(|| remainder.strip_prefix("score")).unwrap().trim();
-                ("score", p)
-            } else {
-                ("judge", remainder)
-            };
-
-            if let Some(d_route) = resolve_decision_model_for_session(&session, parent_session.as_ref(), &settings) {
-                let d_provider_name = d_route.primary_provider.name.clone();
-                let d_model = d_route.primary_model.clone();
-                let (options, rubric, clean_prompt) = if kind == "choice" {
-                    if let Some(pos) = prompt.find("选项:").or_else(|| prompt.find("选项：")).or_else(|| prompt.find("options:")) {
-                        let prefix = prompt[..pos].trim();
-                        let opt_str = &prompt[pos..];
-                        let opt_content = opt_str.split_once(':').or_else(|| opt_str.split_once('：')).map(|x| x.1).unwrap_or("");
-                        let opts: Vec<String> = opt_content.split(&[',', '，', '\n'][..])
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                        (if opts.is_empty() { None } else { Some(opts) }, None, prefix)
-                    } else {
-                        (None, None, prompt)
-                    }
-                } else if kind == "score" {
-                    if let Some(pos) = prompt.find("量表:").or_else(|| prompt.find("量表：")).or_else(|| prompt.find("rubric:")) {
-                        let prefix = prompt[..pos].trim();
-                        let rub_str = &prompt[pos..];
-                        let rub_content = rub_str.split_once(':').or_else(|| rub_str.split_once('：')).map(|x| x.1).unwrap_or("");
-                        let rubs: Vec<String> = rub_content.split(&['\n', ';', '；'][..])
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                        (None, if rubs.is_empty() { None } else { Some(rubs) }, prefix)
-                    } else {
-                        (None, None, prompt)
-                    }
-                } else {
-                    (None, None, prompt)
-                };
-
-                let res = crate::jev::execute_decision_pipeline(
-                    &d_route,
-                    kind,
-                    clean_prompt,
-                    clean_prompt,
-                    options,
-                    rubric,
-                    effective_proxy_url.clone(),
-                ).await;
-
-                let response_text = match res {
-                    Ok(r) => {
-                        match kind {
-                            "judge" => {
-                                let verdict_str = match r.verdict {
-                                    Some(true) => "✅ 符合 / 真 (True)",
-                                    Some(false) => "❌ 不符合 / 假 (False)",
-                                    None => "⚠️ 无法确定",
-                                };
-                                format!(
-                                    "### ⚖️ Jev 决策判定\n\n\
-                                    - **判断结论**: {}\n\
-                                    - **判定置信度**: {:.1}%\n\
-                                    - **决策模型**: `{}/{}`（耗时 {}ms）\n\n\
-                                    **判定依据**:\n{}",
-                                    verdict_str,
-                                    r.confidence * 100.0,
-                                    d_provider_name,
-                                    d_model,
-                                    r.latency_ms,
-                                    r.reason
-                                )
-                            }
-                            "choice" => {
-                                let choice_str = r.choice.unwrap_or_else(|| "未选定".into());
-                                format!(
-                                    "### 🎯 Jev 决策选择\n\n\
-                                    - **选定方案**: **{}**\n\
-                                    - **选择置信度**: {:.1}%\n\
-                                    - **决策模型**: `{}/{}`（耗时 {}ms）\n\n\
-                                    **选择理由**:\n{}",
-                                    choice_str,
-                                    r.confidence * 100.0,
-                                    d_provider_name,
-                                    d_model,
-                                    r.latency_ms,
-                                    r.reason
-                                )
-                            }
-                            _ => {
-                                let score_val = r.score.unwrap_or(0.0);
-                                format!(
-                                    "### 📊 Jev 决策评分\n\n\
-                                    - **量化得分**: **{:.1}分** ({:.1}%)\n\
-                                    - **评分置信度**: {:.1}%\n\
-                                    - **决策模型**: `{}/{}`（耗时 {}ms）\n\n\
-                                    **评分依据**:\n{}",
-                                    score_val * 100.0,
-                                    score_val * 100.0,
-                                    r.confidence * 100.0,
-                                    d_provider_name,
-                                    d_model,
-                                    r.latency_ms,
-                                    r.reason
-                                )
-                            }
-                        }
-                    }
-                    Err(e) => format!("❌ Jev 决策执行失败: {e}"),
-                };
-
-                let assistant_msg = {
-                    let db = state.db.lock().unwrap();
-                    store::new_message(&db, session_id, "assistant", Some(response_text), false)
-                };
-                if let Ok(msg) = assistant_msg {
-                    let _ = app.emit("message:final", &msg);
-                    let _ = app.emit("messages:changed", json!({"sessionId": session_id}));
-                    return (RunOutcome::Done, Some(msg.id), run_tokens);
-                }
-            } else {
-                let err_text = "❌ 未配置可用的决策模型，请在设置中配置模型厂商与模型并指定决策能力。".to_string();
-                let assistant_msg = {
-                    let db = state.db.lock().unwrap();
-                    store::new_message(&db, session_id, "assistant", Some(err_text), false)
-                };
-                if let Ok(msg) = assistant_msg {
-                    let _ = app.emit("message:final", &msg);
-                    let _ = app.emit("messages:changed", json!({"sessionId": session_id}));
-                    return (RunOutcome::Done, Some(msg.id), run_tokens);
-                }
-            }
-        }
-    }
     let effective_ctx_limit = session.context_token_limit.unwrap_or_else(|| {
         settings.resolve_context_limit(Some(&pc.id), &model)
     });
@@ -1787,124 +1275,46 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             }
         } else {
             match &session.project_id {
-                Some(pid) => build_project_section(&db, pid).unwrap_or(None),
+                Some(pid) => crate::context::build_static_project_section(&db, pid).unwrap_or(None),
                 None => None,
             }
         };
-        let mem_sec = if !session.workspace_path.is_empty() {
-            crate::memory::load_project_memory(std::path::Path::new(&session.workspace_path))
+        let static_mem_sec = if !session.workspace_path.is_empty() {
+            crate::memory::load_static_project_memory(std::path::Path::new(&session.workspace_path))
         } else {
             None
         };
-        let collabs_sec = if !is_subagent {
-            if let Ok(collabs) = store::list_collaborators(&db, session_id) {
-                if !collabs.is_empty() {
-                    let mut text = String::from("## 可用项目协作者名录 (Collaborators)\n你拥有以下常驻专业协作者团队。当用户任务命中某位协作者的【调度触发规则】且该协作者处于空闲状态时，你**必须无条件优先调用 `dispatch_collaborator` 委派**，随后紧接着调用 `wait_collaborators` 获取其成果报告，严禁自行直接执行！\n\n");
-                    for c in collabs {
-                        let is_busy = is_run_active(&state, &c.id);
-                        let role_display = match c.subagent_role.as_deref() {
-                            Some("image_gen") => "AI 绘画师 / 图像生成",
-                            Some("vision") => "视觉感知 / 图像识别",
-                            Some("frontend") => "前端开发",
-                            Some("backend") => "后端开发",
-                            Some("pm") => "产品经理",
-                            Some("pmo") => "项目经理",
-                            Some("testing") => "测试校验",
-                            Some("review") => "代码审阅",
-                            Some("fullstack") => "全栈开发",
-                            Some(r) => r,
-                            None => "专业协作者",
-                        };
-                        let dispatch_rule = c.dispatch_rule.as_deref()
-                            .filter(|s| !s.trim().is_empty())
-                            .unwrap_or_else(|| crate::models::default_dispatch_rule_for_role(c.subagent_role.as_deref().unwrap_or("")));
-                        let model_info = if let Some(ref m) = c.model_id {
-                            format!(" | 对话模型: `{m}`")
-                        } else {
-                            String::new()
-                        };
-                        let image_model_info = if let Some(ref im) = c.image_model_id {
-                            format!(" | 生图模型: `{im}`")
-                        } else {
-                            String::new()
-                        };
-                        text.push_str(&format!(
-                            "### 【{}】(ID: `{}` | 角色: {}{}{})\n- **当前状态**: {}\n- **主进程调度触发规则（命中即委派）**: {}\n- **专业职责设定**: {}\n\n",
-                            c.title,
-                            c.id,
-                            role_display,
-                            model_info,
-                            image_model_info,
-                            if is_busy { "🟡 运行中 (busy)" } else { "🟢 空闲 (idle，可立即委派)" },
-                            dispatch_rule,
-                            c.subagent_task.as_deref().unwrap_or("负责该领域专职工作")
-                        ));
-                    }
-                    Some(text)
-                } else {
-                    None
+        let static_collabs_sec = if !is_subagent {
+            crate::context::build_static_collaborator_section(&db, session_id)
+        } else {
+            None
+        };
+
+        // 提取并冻结当前轮次 User 消息的运行时环境附注 (Layer 4)
+        // 确保动态任务计划、最新知识索引与中断标记只挂载在尾部，且写入后终生不可变以保护前缀缓存
+        let trigger_user_msg = trigger_msg.as_ref().cloned().or_else(|| {
+            msgs.iter().rev().find(|m| m.role == "user").cloned()
+        });
+        if let Some(ref um) = trigger_user_msg {
+            if um.runtime_anchor.is_none() {
+                if let Some(anchor) = crate::context::build_runtime_anchor(&db, &session, um.content.as_deref()) {
+                    let _ = store::update_message_runtime_anchor(&db, &um.id, &anchor);
                 }
-            } else {
-                None
             }
-        } else {
-            None
-        };
-
-        let plan_sec = if !session.workspace_path.is_empty() {
-            crate::plan::load_active_plan_context(
-                std::path::Path::new(&session.workspace_path),
-                session_id,
-                Some(&db),
-            )
-        } else {
-            None
-        };
-
-        let mut parts = Vec::new();
-        if let Some(d) = db_sec {
-            parts.push(d);
-        }
-        if let Some(m) = mem_sec {
-            parts.push(format!("## 本项目持久化认知与沉淀记忆（来自 .harness/memory/，可秒级召回）\n{}", m));
-        }
-        if let Some(p) = plan_sec {
-            parts.push(p);
-        }
-        if let Some(c) = collabs_sec {
-            parts.push(c);
         }
 
-        let last_run_was_interrupted: bool = db
-            .query_row(
-                "SELECT status FROM runs WHERE session_id = ?1 ORDER BY started_at DESC LIMIT 1",
-                rusqlite::params![session_id],
-                |r| r.get::<_, String>(0),
-            )
-            .map(|st| st == "cancelled" || st == "failed" || st == "interrupted")
-            .unwrap_or(false);
+        let sys = crate::context::build_static_system_prompt(
+            &session,
+            &settings.disabled_sops,
+            &effective_plan_mode,
+            db_sec.as_deref(),
+            static_mem_sec.as_deref(),
+            static_collabs_sec.as_deref(),
+        );
 
-        if last_run_was_interrupted {
-            parts.push(
-                "## ⚠️ 断点恢复与进度重对齐提示\n\
-                > 检测到上一轮对话曾被中途停止或异常中断。当前工作区中可能已经实施了部分文件修改或测试。\n\
-                > **重要工作原则**：请在编写新代码前，首先快速核对当前工作区实际已修改的文件与构建状态；若原方案/任务清单中的前序步骤在上一轮已实际完成，请先调用 `update_plan` 推进步骤状态至 done，确保任务清单与实际代码进度严格同步，再继续推进后续任务。"
-                .to_string(),
-            );
-        }
-        let sec = if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join("\n\n"))
-        };
-        (sec, effective_plan_mode, neg_intent)
+        (Some(sys), effective_plan_mode, neg_intent)
     };
-    let sys = system_prompt(
-        &session,
-        project_section.as_deref(),
-        &settings.disabled_sops,
-        &project_plan_mode,
-    );
+    let sys = project_section.unwrap_or_default();
 
     let verified_intent_prefix: Option<String> = None;
     let mut sop_verified = false;
@@ -2051,6 +1461,27 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             let app_reason = app2.clone();
             let sid_reason = sid2.clone();
             let mid_reason = mid2.clone();
+
+            if attempt == 1 {
+                let trace_payload = serde_json::json!({
+                    "model": &cfg.model,
+                    "endpoint": &cfg.base_url,
+                    "reasoning_effort": &cfg.reasoning_effort,
+                    "messages": &messages,
+                    "tools": &schemas,
+                });
+                if let Ok(db) = state.db.lock() {
+                    let _ = store::save_llm_request_trace(
+                        &db,
+                        session_id,
+                        &assistant_id,
+                        Some(run_id),
+                        &cfg.model,
+                        &cfg.base_url,
+                        &trace_payload.to_string(),
+                    );
+                }
+            }
 
             let call = llm::chat_stream(
                 &cfg,
@@ -2506,7 +1937,8 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 } else {
                     None
                 };
-                let r = store::new_message_with_attachments(&db, session_id, "tool", Some(result_text.clone()), tool_attachments, false, None);
+                let normalized_result = crate::context::normalize_tool_output_for_ingress(&tc.name, &result_text);
+                let r = store::new_message_with_attachments(&db, session_id, "tool", Some(normalized_result), tool_attachments, false, None);
                 if let Ok(ref m) = r {
                     let _ = store::set_message_tool_call_id(&db, &m.id, &tc.id);
                 }
@@ -3494,825 +2926,27 @@ async fn check_and_trigger_compaction(
     }
 }
 
-fn build_context(
+pub fn build_context(
     conn: &rusqlite::Connection,
     session_id: &str,
     system: &str,
     token_limit: usize,
 ) -> (Result<Vec<Value>, String>, usize, Option<crate::models::TruncationNotice>) {
-    let msgs = match store::all_messages(conn, session_id) {
-        Ok(m) => m,
-        Err(e) => return (Err(e), 0, None),
-    };
-    let compactions = store::list_session_compactions(conn, session_id).unwrap_or_default();
-    let max_compacted_seq = compactions.iter().map(|c| c.end_seq).max().unwrap_or(0);
-
-    // tool_call_id -> 结果文本
-    // tool_call_id -> (结果文本, 附件)
-    let mut tool_results: HashMap<String, (String, Option<Vec<crate::models::Attachment>>)> = HashMap::new();
-    for m in &msgs {
-        if m.reverted_at.is_some() {
-            continue;
-        }
-        if m.role == "tool" {
-            if let Some(id) = &m.tool_call_id {
-                tool_results.insert(id.clone(), (m.content.clone().unwrap_or_default(), m.attachments.clone()));
-            }
-        }
-    }
-
-    let mut out = vec![json!({"role": "system", "content": system})];
-    let mut est = estimate_tokens(system);
-
-    // 如果存在已压缩的历史，将结构化备忘录作为上下文前置背景注入
-    if max_compacted_seq > 0 && !compactions.is_empty() {
-        let mut summaries = Vec::new();
-        for c in &compactions {
-            summaries.push(format!(
-                "### 历史阶段备忘（第 {} ~ {} 条消息已压缩）\n{}",
-                c.start_seq, c.end_seq, c.summary_markdown.trim()
-            ));
-        }
-        let merged_summary = summaries.join("\n\n---\n\n");
-        let memo_prompt = format!(
-            "【系统历史对话结构化备忘录（以下为前文执行进展与关键信息归纳，已由用户确认并压缩替换早期消息）】:\n{}",
-            merged_summary
-        );
-        est += estimate_tokens(&memo_prompt);
-        out.push(json!({"role": "user", "content": memo_prompt}));
-        let ack = "已掌握前文核心背景、技术约定及历史执行进展，我将在此基础上继续完成后续任务。";
-        est += estimate_tokens(ack);
-        out.push(json!({"role": "assistant", "content": ack}));
-    }
-
-    // 处理未被压缩的消息（严格过滤已被软撤回的消息）
-    for m in &msgs {
-        if m.queued || m.seq <= max_compacted_seq || m.reverted_at.is_some() {
-            continue; // 待执行列表、已压缩历史及已软撤回的消息不作为原始消息进入上下文
-        }
-        match m.role.as_str() {
-            "user" => {
-                let mut text_content = m.content.clone().unwrap_or_default();
-                let mut image_parts: Vec<Value> = Vec::new();
-
-                if let Some(ref atts) = m.attachments {
-                    for att in atts {
-                        if att.is_image {
-                            if let Ok(bytes) = std::fs::read(&att.path) {
-                                use base64::Engine;
-                                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                let mime = if att.mime_type.is_empty() { "image/png" } else { &att.mime_type };
-                                let data_url = format!("data:{};base64,{}", mime, b64);
-                                image_parts.push(json!({
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": data_url
-                                    }
-                                }));
-                                est += 1000;
-                            }
-                        } else {
-                            let file_path = std::path::Path::new(&att.path);
-                            if let Ok(meta) = std::fs::metadata(file_path) {
-                                let size = meta.len();
-                                if size < 50 * 1024 {
-                                    if let Ok(bytes) = std::fs::read(file_path) {
-                                        let is_binary = bytes.iter().take(1024).any(|&b| b == 0);
-                                        if !is_binary {
-                                            let text = String::from_utf8_lossy(&bytes);
-                                            let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("txt");
-                                            text_content.push_str(&format!(
-                                                "\n\n### 📎 附件参考文件: {} (大小: {} 字节)\n```{ext}\n{}\n```",
-                                                att.name, size, text
-                                            ));
-                                            est += estimate_tokens(&text);
-                                            continue;
-                                        }
-                                    }
-                                }
-                                text_content.push_str(&format!(
-                                    "\n\n### 📎 附件参考文件: {} (大小: {} 字节)\n本地物理路径: `{}`",
-                                    att.name, size, att.path
-                                ));
-                            }
-                        }
-                    }
-                }
-
-                est += estimate_tokens(&text_content);
-
-                if !image_parts.is_empty() {
-                    let mut parts = vec![json!({"type": "text", "text": text_content})];
-                    parts.extend(image_parts);
-                    out.push(json!({"role": "user", "content": parts}));
-                } else {
-                    out.push(json!({"role": "user", "content": text_content}));
-                }
-            }
-            "assistant" => {
-                let mut obj = json!({"role": "assistant"});
-                let content = m.content.clone().unwrap_or_default();
-                if let Some(ref r) = m.reasoning {
-                    if !r.trim().is_empty() {
-                        obj["reasoning_content"] = Value::String(r.clone());
-                        est += estimate_tokens(r);
-                    }
-                }
-                match &m.tool_calls {
-                    Some(tcs) if !tcs.is_null() && tcs.as_array().map(|a| !a.is_empty()).unwrap_or(false) => {
-                        if !content.is_empty() {
-                            obj["content"] = Value::String(content.clone());
-                        } else {
-                            obj["content"] = Value::Null;
-                        }
-                        obj["tool_calls"] = tcs.clone();
-                        est += estimate_tokens(&content) + crate::models::estimate_value_tokens(tcs);
-                        out.push(obj);
-
-                        // 紧随其后补齐每个调用的 tool 结果（缺失则合成，避免协议错误）
-                        if let Some(arr) = tcs.as_array() {
-                            for tc in arr {
-                                let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
-                                let (text, atts) = tool_results
-                                    .remove(&id)
-                                    .unwrap_or_else(|| ("(执行被中断，无结果)".into(), None));
-                                est += estimate_tokens(&text);
-                                let mut image_parts: Vec<Value> = Vec::new();
-                                if let Some(ref att_list) = atts {
-                                    for att in att_list {
-                                        if att.is_image {
-                                            if let Ok(bytes) = std::fs::read(&att.path) {
-                                                use base64::Engine;
-                                                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                                let mime = if att.mime_type.is_empty() { "image/png" } else { &att.mime_type };
-                                                let data_url = format!("data:{};base64,{}", mime, b64);
-                                                image_parts.push(json!({
-                                                    "type": "image_url",
-                                                    "image_url": {
-                                                        "url": data_url
-                                                    }
-                                                }));
-                                                est += 1000;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if !image_parts.is_empty() {
-                                    let mut parts = vec![json!({"type": "text", "text": text})];
-                                    parts.extend(image_parts);
-                                    out.push(json!({"role": "tool", "tool_call_id": id, "content": parts}));
-                                } else {
-                                    out.push(json!({"role": "tool", "tool_call_id": id, "content": text}));
-                                }
-                            }
-                        }
-                    }
-                    _ => {
-                        if !content.is_empty() || obj.get("reasoning_content").is_some() {
-                            obj["content"] = Value::String(content.clone());
-                            est += estimate_tokens(&content);
-                            out.push(obj);
-                        }
-                    }
-                }
-            }
-            _ => {} // tool 消息已在上面消费；queued 消息跳过
-        }
-    }
-
-    // ---- 动态上下文感知工具输出瘦身 (Dynamic Context-Aware Tool Result Slimming) ----
-    // 治理策略：
-    // 1. 安全水位（est <= 80% token_limit）：完全不折叠任何工具输出，保障 Agent 跨步骤探索（Gather -> Synthesize）的工作记忆。
-    // 2. 超出水位（est > 80% token_limit）：自远及近，优先瘦身较早历史中 > 2048 字符的工具输出，保护最近工作记忆。
-    // 3. 活跃轮次绝对保护：当前正在等待 LLM 消费的工具结果严禁折叠。
-    let safe_threshold = token_limit * 80 / 100;
-    if est > safe_threshold {
-        struct AssistantToolGroup {
-            assistant_idx: usize,
-            tool_indices: Vec<usize>,
-            is_active: bool,
-        }
-
-        let mut groups: Vec<AssistantToolGroup> = Vec::new();
-        let mut curr_group: Option<AssistantToolGroup> = None;
-
-        for (idx, m) in out.iter().enumerate() {
-            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-            if role == "assistant" {
-                if let Some(g) = curr_group.take() {
-                    groups.push(g);
-                }
-                let has_tools = m
-                    .get("tool_calls")
-                    .and_then(|tc| tc.as_array())
-                    .map(|a| !a.is_empty())
-                    .unwrap_or(false);
-                if has_tools {
-                    curr_group = Some(AssistantToolGroup {
-                        assistant_idx: idx,
-                        tool_indices: Vec::new(),
-                        is_active: false,
-                    });
-                }
-            } else if role == "tool" {
-                if let Some(ref mut g) = curr_group {
-                    g.tool_indices.push(idx);
-                }
-            } else if role == "user" {
-                if let Some(g) = curr_group.take() {
-                    groups.push(g);
-                }
-            }
-        }
-        if let Some(g) = curr_group.take() {
-            groups.push(g);
-        }
-
-        // 标记当前正处于活跃消费状态的最后一组工具调用
-        if let Some(last_g) = groups.last_mut() {
-            if last_g.assistant_idx + last_g.tool_indices.len() + 1 == out.len() {
-                last_g.is_active = true;
-            }
-        }
-
-        // 保护最近的 2 组工具调用作为短期工作记忆（避免上一步刚读完、下一步就看不见）
-        let recent_cutoff = groups.len().saturating_sub(2);
-
-        // 阶段 1：自远及近遍历远期历史工具组
-        for g in groups.iter().take(recent_cutoff) {
-            for &t_idx in &g.tool_indices {
-                if est <= safe_threshold {
-                    break;
-                }
-                let text = out[t_idx].get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                if text.len() > 2048 {
-                    let safe_len = text.char_indices().nth(2048).map(|(i, _)| i).unwrap_or(text.len());
-                    let slimmed = format!(
-                        "{}\n\n...[历史工具输出过长（共 {} 字符），已折叠前序详情以节省上下文空间]...",
-                        &text[..safe_len],
-                        text.len()
-                    );
-                    let old_tokens = estimate_tokens(&text);
-                    let new_tokens = estimate_tokens(&slimmed);
-                    est = est.saturating_sub(old_tokens).saturating_add(new_tokens);
-                    out[t_idx]["content"] = Value::String(slimmed);
-                }
-            }
-            if est <= safe_threshold {
-                break;
-            }
-        }
-
-        // 阶段 2：若折叠完远期历史后仍然超过 token_limit，允许对「近期但非活跃」工具输出折叠（绝对保护 is_active）
-        if est > token_limit {
-            for g in groups.iter().skip(recent_cutoff) {
-                if g.is_active {
-                    continue;
-                }
-                for &t_idx in &g.tool_indices {
-                    if est <= token_limit {
-                        break;
-                    }
-                    let text = out[t_idx].get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    if text.len() > 2048 {
-                        let safe_len = text.char_indices().nth(2048).map(|(i, _)| i).unwrap_or(text.len());
-                        let slimmed = format!(
-                            "{}\n\n...[历史工具输出过长（共 {} 字符），已折叠前序详情以节省上下文空间]...",
-                            &text[..safe_len],
-                            text.len()
-                        );
-                        let old_tokens = estimate_tokens(&text);
-                        let new_tokens = estimate_tokens(&slimmed);
-                        est = est.saturating_sub(old_tokens).saturating_add(new_tokens);
-                        out[t_idx]["content"] = Value::String(slimmed);
-                    }
-                }
-                if est <= token_limit {
-                    break;
-                }
-            }
-        }
-    }
-
-    // 轮次级原子截断防护（Turn-based Atomic Pruning）：
-    // 当即使折叠与压缩后仍超限时，按「完整轮次（Turn）」进行成对丢弃，
-    // 杜绝单条推进破坏 assistant(tool_calls) 与 tool 结果的成对关系导致 400 报错。
-    let mut notice: Option<crate::models::TruncationNotice> = None;
-    if est > token_limit {
-        let est_before = est;
-        let mut user_indices: Vec<usize> = out
-            .iter()
-            .enumerate()
-            .filter(|(idx, m)| *idx > 0 && m.get("role").and_then(|r| r.as_str()) == Some("user"))
-            .map(|(idx, _)| idx)
-            .collect();
-
-        let mut dropped_turns = 0usize;
-        let mut dropped_messages = 0usize;
-        let mut total_dropped_tokens = 0usize;
-        let mut first_preview = String::new();
-
-        while est > token_limit && user_indices.len() > 1 {
-            let turn_start = user_indices[0];
-            let turn_end = user_indices[1];
-            if first_preview.is_empty() {
-                let first_c = out[turn_start].get("content").and_then(|v| v.as_str()).unwrap_or("");
-                first_preview = truncate_preview(first_c, 50);
-            }
-            // 计算被剔除轮次的 token 消耗
-            let dropped_tokens: usize = out[turn_start..turn_end]
-                .iter()
-                .map(|m| {
-                    let c = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                    let tc = m.get("tool_calls").map(crate::models::estimate_value_tokens).unwrap_or(0);
-                    estimate_tokens(c) + tc
-                })
-                .sum();
-            dropped_turns += 1;
-            dropped_messages += turn_end - turn_start;
-            total_dropped_tokens += dropped_tokens;
-
-            est = est.saturating_sub(dropped_tokens);
-            out.drain(turn_start..turn_end);
-
-            // 重新计算 user 索引
-            user_indices = out
-                .iter()
-                .enumerate()
-                .filter(|(idx, m)| *idx > 0 && m.get("role").and_then(|r| r.as_str()) == Some("user"))
-                .map(|(idx, _)| idx)
-                .collect();
-        }
-
-        if dropped_turns > 0 {
-            notice = Some(crate::models::TruncationNotice {
-                id: uuid::Uuid::new_v4().to_string(),
-                session_id: session_id.to_string(),
-                dropped_turns,
-                dropped_messages,
-                dropped_tokens: total_dropped_tokens,
-                token_limit,
-                est_tokens_before: est_before,
-                est_tokens_after: est,
-                first_preview,
-                created_at: chrono::Utc::now().to_rfc3339(),
-            });
-        }
-    }
-
-    // 协议防御：上下文末尾不能以 assistant 消息结束。
-    // 如果末尾是 assistant 消息（例如异常退出残留或历史数据异常），
-    // OpenAI / Claude / DeepSeek 等接口会认为助手已经交付答复，从而直接返回空回复或协议报错。
-    while let Some(last) = out.last() {
-        if last.get("role").and_then(|r| r.as_str()) == Some("assistant") {
-            out.pop();
-        } else {
-            break;
-        }
-    }
-
-    (Ok(out), est, notice)
+    crate::context::build_execution_context(conn, session_id, system, token_limit)
 }
 
-/// 关联条目解析结果：说明必带；对方项目能按路径解析到且已设置自身约束时一并带上
-struct ResolvedLink {
-    name: String,
-    path: String,
-    description: String,
-    constraints: Option<String>,
-}
+#[allow(unused_imports)]
+pub use crate::context::static_system::{
+    build_static_project_section as build_project_section, project_section, ResolvedLink,
+};
 
-/// 解析项目关联条目（只读按路径查找，不创建项目实体）
-fn resolve_links(conn: &rusqlite::Connection, project_id: &str) -> Result<Vec<ResolvedLink>, String> {
-    let mut out = Vec::new();
-    for l in store::list_project_links(conn, project_id)? {
-        let constraints = store::find_project_by_path(conn, &l.path)?
-            .filter(|p| !p.constraints.trim().is_empty())
-            .map(|p| p.constraints);
-        out.push(ResolvedLink {
-            name: store::dir_name_of(&l.path),
-            path: l.path,
-            description: l.description,
-            constraints,
-        });
-    }
-    Ok(out)
-}
-
-/// 组装注入 system prompt 的「项目约束 + 演进经验 + 关联项目」段；全部为空时返回 None（不追加）
-fn build_project_section(
-    conn: &rusqlite::Connection,
-    project_id: &str,
-) -> Result<Option<String>, String> {
-    let proj = store::get_project(conn, project_id)?;
-    let constraints = proj.as_ref().map(|p| p.constraints.clone()).unwrap_or_default();
-    let sop_cmd = proj.as_ref().and_then(|p| {
-        if p.sop_enabled {
-            if let Some(cmd) = p.sop_verify_cmd.as_ref().filter(|s| !s.trim().is_empty()) {
-                Some(cmd.clone())
-            } else if let Some(path) = p.path.as_deref().filter(|s| !s.trim().is_empty()) {
-                let (_, def_cmd) = crate::sop::detect_project_stack(std::path::Path::new(path));
-                if !def_cmd.trim().is_empty() {
-                    Some(def_cmd)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    });
-    let links = resolve_links(conn, project_id)?;
-    let growths = store::list_accepted_growths_for_project(conn, project_id).unwrap_or_default();
-    if !growths.is_empty() {
-        let ids: Vec<String> = growths.iter().map(|g| g.id.clone()).collect();
-        let _ = store::increment_growth_applied_count(conn, &ids);
-    }
-    if constraints.trim().is_empty() && links.is_empty() && growths.is_empty() && sop_cmd.is_none() {
-        return Ok(None);
-    }
-    Ok(Some(project_section(&constraints, &links, &growths, sop_cmd.as_deref())))
-}
-
-/// 纯文本组装（无 IO，便于单测）
-fn project_section(
-    constraints: &str,
-    links: &[ResolvedLink],
-    growths: &[GrowthItem],
-    sop_cmd: Option<&str>,
-) -> String {
-    let mut s = String::new();
-    if !constraints.trim().is_empty() {
-        s.push_str("## 项目约束（必须严格遵守）\n");
-        s.push_str(constraints.trim());
-    }
-    if let Some(cmd) = sop_cmd {
-        if !s.is_empty() {
-            s.push_str("\n\n");
-        }
-        s.push_str("## 交付自检规范（SOP，必须严格遵守）：\n");
-        s.push_str(&format!("- 本项目已开启交付前自检命令：`{cmd}`\n"));
-        s.push_str("- 当你使用 write_file 或 edit_file 新增或修改了代码文件后，系统将在向用户交付前自动执行该自检命令。\n");
-        s.push_str("- 若自检失败，请根据错误输出进行排查和修复，直到自检通过后再交付。\n");
-    }
-    if !growths.is_empty() {
-        if !s.is_empty() {
-            s.push_str("\n\n");
-        }
-        s.push_str("## 项目演进经验（基于往期会话沉淀，必须严格遵守）：\n");
-        for (idx, g) in growths.iter().enumerate() {
-            let cat = match g.category.as_str() {
-                "command_rule" => "命令规范",
-                "code_style" => "代码规范",
-                "build_test" => "构建测试",
-                "pitfall" => "避坑防雷",
-                "workflow" => "工作流",
-                _ => &g.category,
-            };
-            s.push_str(&format!("{}. [{}] {}\n", idx + 1, cat, g.rule_content.trim()));
-        }
-    }
-    if !links.is_empty() {
-        if !s.is_empty() {
-            s.push_str("\n\n");
-        }
-        s.push_str("## 关联项目\n本项目与以下项目存在关联；跨目录引用其代码或需要遵循其目录约定时，按对应条目执行：\n");
-        for l in links {
-            s.push_str(&format!("\n### {}（{}）\n", l.name, l.path));
-            s.push_str(l.description.trim());
-            s.push('\n');
-            if let Some(c) = &l.constraints {
-                s.push_str("\n该项目自身约束（同样必须遵守）：\n");
-                s.push_str(c.trim());
-                s.push('\n');
-            }
-        }
-        // 优先级声明仅在存在本项目约束时有意义，避免悬空引用
-        if !constraints.trim().is_empty() {
-            s.push_str("\n**优先级**：关联项目的目录约定、说明及其自身约束，与上方「项目约束」冲突时，以关联项目为准。");
-        }
-    }
-    s
-}
-
-fn system_prompt(
+pub fn system_prompt(
     session: &Session,
     project_section: Option<&str>,
     disabled_sops: &[String],
     plan_mode: &str,
 ) -> String {
-    let os = if cfg!(windows) { "Windows" } else { "Unix-like" };
-    let is_collab = session.session_type == "collaborator";
-    let is_sub = is_collab || session.session_type == "subprocess" || session.session_type == "subagent" || session.parent_session_id.is_some();
-    let is_sop_enabled = |name: &str| !disabled_sops.iter().any(|s| s == name);
-
-    let base = if session.workspace_path.is_empty() {
-        // 未绑定工作区：纯对话模式
-        format!(
-            r#"你是 harness_mini，一个谨慎、专业的编码助手。当前会话未绑定工作区，处于纯对话模式。
-
-操作系统：{os}
-
-工作规则：
-1. 当前会话没有绑定本地目录，文件与命令类工具（read_file / write_file / edit_file / glob / grep / list_dir / run_command）均不可用，不要尝试调用；相关的问题直接以文字回答或给出建议代码。
-2. 如果用户需要你实际读写文件、执行命令，请提示：在顶栏点击工作区按钮选择目录后再继续。
-3. 全程使用简体中文与用户交流，回答准确、简洁。
-4. 【思考与交付通道分离规范（严禁正文留空）】：若当前模型具备深度思考能力（Thinking/Reasoning），思考过程仅用于你内部的逻辑推导与推演；面向用户的最终回答与结论必须完整输出在正式正文（Content）中，严禁在思考结束后直接停止生成导致正文留空。"#,
-            os = os
-        )
-    } else if is_collab {
-        let role = session.subagent_role.as_deref().unwrap_or("常驻专业协作者");
-        let task = session.subagent_task.as_deref().unwrap_or("");
-        let mut rules = Vec::new();
-        let mut rule_num = 1;
-
-        rules.push(format!("{rule_num}. 专注于履行你的专业角色定位【{role}】，根据用户或主进程指派的目标深入工作。当前工作区根目录为【{}】，所有工具均以该根目录为基准。", session.workspace_path));
-        rule_num += 1;
-
-        if session.subagent_role.as_deref() == Some("image_gen") {
-            rules.push(format!("{rule_num}. 【AI 绘画与图像生成核心职责】：根据用户或主进程的要求，深入理解视觉意图并提炼出画面细节丰富的高质量提示词（包括画质、风格、构图、主体、光影），直接调用 `generate_image` 工具生成图片。图片生成完成后在回复中展示成果并简明汇报。"));
-            rule_num += 1;
-        }
-
-        if session.subagent_role.as_deref() == Some("vision") {
-            rules.push(format!("{rule_num}. 【视觉感知与图像识别核心职责】：根据用户或主进程指派的目标，调用 `recognize_image` 工具深入识别、提取与分析目标图片（支持文字提取、设计稿分析、界面元素审查等），并在回复中给出详尽专业的视觉分析报告。"));
-            rule_num += 1;
-        }
-
-        if is_sop_enabled("plan_first") {
-            rules.push(format!("{rule_num}. 【方案先行与克制改动】：开始实际修改前，优先梳理实现思路。如果包含代码修改，必须先阅读原文并做最小化精确修改。"));
-            rule_num += 1;
-        }
-
-        if is_sop_enabled("memory_distill") {
-            rules.push(format!("{rule_num}. 【边读边记与强制沉淀 SOP】：阅读核心配置文件或深入探索代码后，及时调用 `record_memory` 沉淀高价值技术知识。"));
-            rule_num += 1;
-        }
-
-        if is_sop_enabled("safe_code_edit") {
-            rules.push(format!("{rule_num}. 修改文件前必须先用 read_file 读取相关内容，用 edit_file 做精确修改；新文件用 write_file。"));
-            rule_num += 1;
-            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir / file_outline 探索并理解代码结构。"));
-            rule_num += 1;
-            rules.push(format!("{rule_num}. 修改完成后，尽量用 run_command 运行构建或测试验证改动。"));
-            rule_num += 1;
-        } else {
-            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir / file_outline 探索并理解代码结构。"));
-            rule_num += 1;
-        }
-
-        if is_sop_enabled("surgical_code_reading") {
-            rules.push(format!("{rule_num}. 【精益代码研读与克制探索 SOP（必须严格遵守）】：\n   - 探索业务与代码时遵循漏斗式递进：先用 glob 查目录骨架，对源码文件优先用 file_outline 提取结构大纲与行号，再用 grep 定位关键词；\n   - 严禁对大型文件进行多轮循环分页切片（offset_line）式逐行深挖；\n   - 深入阅读时以函数/局部逻辑为靶标，通过 offset_line 与 max_lines 精读最小必要上下文（建议 50~100 行）；修改前必须局部 read_file 确认原文，严禁盲猜。"));
-            rule_num += 1;
-        }
-
-        rules.push(format!("{rule_num}. 你是一个常驻专家角色，支持与用户或主进程进行持续的多轮交流与迭代修改。"));
-        rule_num += 1;
-
-        rules.push(format!("{rule_num}. 【施工工人准则与计划遵从】：若主进程在简报中提供了明确的目标文件、函数锚点或蓝图，你必须严格遵从，严禁重新设计或随意改动接口签名；若发现原计划有隐患，请在交付回复中列出《计划调整建议》。"));
-        rule_num += 1;
-
-        rules.push(format!(
-            "{rule_num}. 全程使用简体中文交流；每一轮交付成果时，请简明总结完成状态、改动文件及核心技术逻辑（严格控制在 250 字以内），以便系统自动增量汇总汇报给主进程；长篇分析系统会自动落盘为工件，切勿堆砌冗长流水账。"
-        ));
-
-        let rules_text = rules.join("\n");
-        format!(
-            r#"你是 harness_mini 项目中由用户配置的专业常驻协作者 (Collaborator)。
-角色定位：{role}
-职责设定：{task}
-工作区根目录：{path}
-操作系统：{os}
-
-工作规则：
-{rules_text}"#,
-            role = role,
-            task = task,
-            path = session.workspace_path,
-            os = os,
-            rules_text = rules_text
-        )
-    } else if is_sub {
-        let role = session.subagent_role.as_deref().unwrap_or("专职子任务协作 Agent");
-        let task = session.subagent_task.as_deref().unwrap_or("");
-        let mut rules = Vec::new();
-        let mut rule_num = 1;
-
-        rules.push(format!("{rule_num}. 专注于完成上述分配给你的专属任务。当前合法工作区根目录与主会话严格保持完全一致【{}】，所有工具（read_file / write_file / edit_file / glob / grep / list_dir / file_outline / run_command / record_memory / read_memory）均以该根目录为基准。若任务描述中指明了重点关注的子目录或模块，请优先在该目录下展开工作。", session.workspace_path));
-        rule_num += 1;
-
-        rules.push(format!("{rule_num}. 【施工工人准则与架构遵从（必须严格遵守）】：\n   - 若主进程在简报或计划中已为你提供了《实施蓝图》、拟定函数签名或已知目标文件与行号锚点，你作为实施工人，【严禁重新设计接口签名、擅自改动方法名或推翻既定架构】！\n   - 你的核心职责是：使用 read_file 对目标局部进行 30~50 行手术级精读确认原文，严格按照既定蓝图进行精确修改并运行测试验证；\n   - 若在执行中发现计划或方案存在重大隐患，请在最终交付总结中提出《计划调整建议》，交由主进程统筹处理。"));
-        rule_num += 1;
-
-        rules.push(format!("{rule_num}. 【靶标定位与零盲搜守则（必须严格遵守）】：\n   - 主进程已在简报中为你梳理了已知重点文件与上下文图钉；【严禁在全工程范围无目的地使用 glob / grep / list_dir 盲目漫游】；\n   - 直接切入目标文件所在目录或行号展开工作，以最小的步骤和 Token 成本收敛交付。"));
-        rule_num += 1;
-
-        rules.push(format!("{rule_num}. 【快速收敛与步数预算原则（必须严格遵守）】：\n   - 探索与调研类任务建议在 10~15 步内完成收敛并给出总结；\n   - 代码探索阶段优先使用 glob、file_outline 和 grep 进行模式匹配与宏观架构定位，辅以少量关键核心文件的阅读；严禁对大型代码文件进行无休止的分页切片（offset_line）式逐行深挖；\n   - 一旦掌握关键代码位置或排查到核心结论，必须立即收敛，直接整理并输出最终报告，禁止拖延死磕细节。"));
-        rule_num += 1;
-
-        rules.push(format!("{rule_num}. 【严格职责边界原则】：严格局限于分配的角色定位【{role}】和任务目标开展工作，严禁跨界反查工作区内与当前任务职责无关的其他模块（例如前端调研专注前端组件与接口，严禁反查后端源码/数据库，该部分由主进程统筹）。"));
-        rule_num += 1;
-
-        if is_sop_enabled("plan_first") {
-            rules.push(format!("{rule_num}. 【方案先行与克制改动】：在开始实际修改前，优先梳理与分析实现思路。若是分析调研类任务，重点产出结构清晰的分析报告与沉淀；若包含代码修改，必须先阅读原文并做最小化精确修改。"));
-            rule_num += 1;
-        }
-
-        if is_sop_enabled("memory_distill") {
-            rules.push(format!("{rule_num}. 【边读边记与强制沉淀 SOP（必须严格遵守）】：当你阅读分析了核心配置文件（如 pom.xml、package.json、Cargo.toml 等）或深入探索了具体业务模块代码后，在任务交付前**必须至少调用一次 `record_memory` 工具**将核心成果提炼落盘（技术框架体系沉淀至 category: \"profile\"，具体业务链路/功能模块/排错分析沉淀至 category: \"digest\"，工程避坑点沉淀至 category: \"convention\"），严禁完成多步探索后直接文字汇报而不留存持久化记忆。"));
-            rule_num += 1;
-        }
-
-        if is_sop_enabled("safe_code_edit") {
-            rules.push(format!("{rule_num}. 修改文件前必须先用 read_file 读取相关内容，用 edit_file 做基于精确原文的最小化修改；新文件才用 write_file。"));
-            rule_num += 1;
-            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir / file_outline 探索并理解代码结构。"));
-            rule_num += 1;
-            rules.push(format!(
-                "{rule_num}. 【代码调试与分级验证准则（必须严格遵守）】：\n   \
-                 - 探查环境优先用只读命令：若需查看数据库结构/内容或本地状态，必须直接使用只读命令（如 python / sqlite3 / grep / powershell 脚本）；严禁通过修改业务源码或在单测中写临时 SQL 来打印探查外部数据；\n   \
-                 - 允许必要的逻辑调试打印：当单测断言失败、难以断点时，允许在测试函数/用例内临时输出变量排查，验证完毕后必须随手还原，严禁污染生产业务逻辑；\n   \
-                 - 验证分级进行（严禁一改动就跑全量构建）：\n     \
-                   ① 第一级（代码编写中）：优先使用当前语言的【快速语法/类型检查命令】（如 TS/前端用 `npx tsc --noEmit`，Rust/后端用 `cargo check`，Go 用 `go vet` 等），禁止反复触发重度打包；\n     \
-                   ② 第二级（逻辑自测）：针对改动点运行【最小颗粒度的单测用例/测试文件】（严禁无过滤裸跑全局测试套件）；\n     \
-                   ③ 第三级（最终核验）：仅在功能编写完毕准备交付时，才执行一次全量构建或全量测试；\n   \
-                 - 保持修改收敛：若同一错误连续两次未能解决，必须停下重新审视方案设计，禁止无思路地反复尝试编译。"
-            ));
-            rule_num += 1;
-        } else {
-            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir / file_outline 探索并理解代码结构。"));
-            rule_num += 1;
-        }
-
-        if is_sop_enabled("surgical_code_reading") {
-            rules.push(format!("{rule_num}. 【精益代码研读与克制探索 SOP（必须严格遵守）】：\n   - 探索业务与代码时遵循漏斗式递进：先用 glob 查目录骨架，对源码文件优先用 file_outline 提取结构大纲与行号，再用 grep 定位关键词；\n   - 严禁对大型代码文件进行无休止的分页切片（offset_line）式逐行深挖；\n   - 阅读范围必须收敛在最小必要上下文（建议 50~100 行）；修改前必须局部 read_file 确认原文，严禁盲猜。"));
-            rule_num += 1;
-        }
-
-        rules.push(format!("{rule_num}. 严禁再次创建子 Agent，直接使用现有工具高效完成分配的目标。"));
-        rule_num += 1;
-
-        rules.push(format!(
-            "{rule_num}. 全程使用简体中文与用户交流；任务完成后，最终回复必须严格按以下结构化格式汇报成果（四要素总结，字数严格控制在 250 字以内，以便父 Agent 汇聚决策）：\n   - 🎯 任务完成状态（全部完成 / 部分完成 / 遇到阻碍）\n   - 📝 改动的文件清单（请列出准确相对路径）\n   - 💡 核心交付结论与关键技术说明\n   - 🧪 构建与测试验证结果\n⚠️ 提示：长篇技术分析与排查过程系统会自动落地为工件文件，严禁在最终文本回复中输出冗长的思考流水账！"
-        ));
-
-        let rules_text = rules.join("\n");
-        format!(
-            r#"你是 harness_mini 派生出的专业协作子 Agent 进程。
-角色定位：{role}
-主 Agent 分配的专属任务：{task}
-工作区根目录：{path}
-操作系统：{os}
-
-工作规则：
-{rules_text}"#,
-            role = role,
-            task = task,
-            path = session.workspace_path,
-            os = os,
-            rules_text = rules_text
-        )
-    } else {
-        let mut rules = Vec::new();
-        let mut rule_num = 1;
-
-        if is_sop_enabled("intent_alignment_gate") {
-            rules.push(format!(
-                "{rule_num}. 【首步意图定性与场景化决策质检 SOP】：\n   \
-                 - 触发时机：当你接收到用户发送的新任务、功能需求、代码修改、生图或技术问题时，在开始实际工程改动前，优先进行意图对齐与决策质检；日常问候或纯文本简答直接回复；后续分步执行步骤无需重复质检。\n   \
-                 - 场景化决策工具选型（按需调用）：\n       \
-                   * **简单即时任务**（如单点问答、简单生图、单处微调）：优先调用 `judge_decision`，判断“该需求是否目标完全明确且无歧义，可直接执行？（True/False）”；\n       \
-                   * **方案存在分支路线**（如直接做 vs 委派协作者 vs 多个实现方案）：优先调用 `choice_decision`，从备选策略中裁决最优项；\n       \
-                   * **复杂多步业务改造 / 系统重构**：调用 `score_decision`，对核心意图理解与关键计划进行百分制评分（≥90分放行）。\n   \
-                 - 人机协同审批机制：\n     \
-                   * 若质检存疑（得分<90分 或 judge=false）：系统将就地挂起并弹出确认卡片由用户亲自定夺。若用户点击【采纳方案】，工具将放行通知你继续；若用户点击【补充指导】，你必须在下一步严格依据用户的补充指导修正方案！\n   \
-                 - 调研探索与执行连贯性：\n     \
-                   * 探索与调研阶段可正常调用只读工具（glob / grep / list_dir / file_outline / read_file）摸排代码；\n     \
-                   * 【严禁空口预告后中断】：严禁仅在回复文本中输出“我先看下/我来验证/稍后更新”等行动预告却不发起任何工具调用！若当前步骤需要探索、修改或更新计划，必须直接发起对应工具调用，保持连贯执行直至阶段交付。"
-            ));
-            rule_num += 1;
-        }
-
-        if plan_mode == "always_plan" {
-            rules.push(format!(
-                "{rule_num}. 【严格规划先行与确认门禁准则（Always Plan 模式）】：\n   \
-                 - 适用范围：凡是对项目进行较大改动（预计修改 3 个以上文件、架构重构、引入新架构或新增功能特性）：\n   \
-                 - 阶段划分（严禁越界）：\n     \
-                   1. 【只读调研】：仅允许使用只读工具（glob / grep / list_dir / file_outline / read_file）摸清代码逻辑；\n     \
-                   2. 【生成计划】：必须先调用 `create_plan` 工具在 `.harness/plans/` 目录下生成结构化计划 MD 文档；\n     \
-                   3. 【必须停止并等待确认】：**生成计划后，当前轮次严禁调用任何写文件或编辑代码的工具（write_file / edit_file）**！你必须在回复中简明扼要汇报方案核心、涉及文件与分步清单，并明确请用户审阅确认。只有在用户确认计划后，下一轮对话才可开始修改代码。\n   \
-                 - 微小改动（如修改单文件拼写错误、纯问答解释）无需生成计划，可直接处理。"
-            ));
-            rule_num += 1;
-        } else if plan_mode == "always_proceed" {
-            rules.push(format!(
-                "{rule_num}. 【规划先行与自动推进准则（Always Proceed 模式）】：\n   \
-                 - 适用范围：凡是对项目进行较大改动（预计修改 3 个以上文件、跨模块重构、新增功能特性）：\n   \
-                 - 核心流程：\n     \
-                   1. 【必须先有计划】：同样必须调用 `create_plan` 工具生成结构化计划 MD 文档落盘，确立任务锚点与分步 Checklist；\n     \
-                   2. 【自动推进与意图判断】：生成计划后：\n       \
-                      * 若用户在指令中明确说明了“先不改动代码 / 仅出方案 / 暂勿修改 / 先评估”，则生成计划后停止，严禁改动代码；\n       \
-                      * 若用户没有明确说明先不改代码，**生成计划后无需停下来等待用户确认，直接连贯执行计划、调用 edit_file / write_file 编写代码**，按清单逐步推进直至完成并自检！\n   \
-                  - 微小改动（如单文件微调、纯解释）可直接处理。"
-            ));
-            rule_num += 1;
-        } else if is_sop_enabled("plan_first") {
-            rules.push(format!(
-                "{rule_num}. 【方案先行与任务计划中枢治理规范（防需求失真）】：\n   - 大改动物理落盘先行：凡是涉及 3 个以上文件修改、架构重构、新增功能模块或预计多轮交互的复杂任务，**严禁在没有计划文档的情况下直接编写/修改代码**。必须先调用 `create_plan` 工具在 `.harness/plans/` 目录下生成结构化计划 MD 文档（明确目标、技术架构、受影响文件清单、分步 Checklist 与验证策略），并向用户呈现确认。\n   - 需求变更优先更新计划：在多轮对话中，一旦用户提出需求调整、增加/减少特性或纠偏，**在改动代码前，必须首先调用 `update_plan` 工具同步更新计划文档内容（若执行步骤改变，必须传入 modified_sections.steps 全量更新 Checklist）与变更历史 (Revision History)**，彻底杜绝“口头答应却遗留旧代码/旧步骤”的需求失真。\n   - 按清单逐步推进与结案：执行阶段严格以计划 Checklist 为基准推进，每完成一个关键步骤，调用 `update_plan` 推进步骤状态；全部任务完成并通过测试后，调用 `update_plan(status: \"completed\")` 结案归档并解除活动挂载。\n   - 多需求隔离与计划流转：在同一会话中开启全新不相关的独立任务时，调用 `create_plan` 开启新的独立计划（旧计划自动挂起，杜绝多任务杂糅）；若需回溯前序任务，调用 `switch_plan` 重新激活。"
-            ));
-            rule_num += 1;
-        }
-
-        if is_sop_enabled("todo_lifecycle") {
-            rules.push(format!("{rule_num}. 【任务清单全生命周期 SOP】：接到多步任务时，方可用 todo 工具列出计划，并随进展更新各项状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done（切勿遗留 in_progress 状态）。"));
-            rule_num += 1;
-        }
-
-        if is_sop_enabled("subagent_orchestration") {
-            rules.push(format!(
-                "{rule_num}. 【团队协同委派原则、弹性多并发与单一门禁准则】：\n   \
-                 - 角色定位：你作为总架构师与统筹协调者，把控全局契约设计与最终汇总验收；具体编码与模块落地按需委派给专职子 Agent。\n   \
-                 - 常驻协作者委派（优先）：仅当下方【可用项目协作者名录】中已存在对应常驻协作者，且当前任务命中了其专属职责（如【AI 绘画师】、【产品经理】等）时，你【必须调用 `dispatch_collaborator` 工具】进行委派，并在调用后紧接着调用 `wait_collaborators` 等待成果汇报。\n   \
-                 - 弹性多子 Agent 并行（支持多前端/多后端横向扩展）：面对大型复杂任务，完全支持且鼓励**同时派发多个前端和多个后端子 Agent** 开展高并发开发！⚠️ 提示：系统不存在所谓的 `create_collaborator` 工具，创建并启动子任务统一调用 `spawn_subagent`。\n   \
-                 - 领域与文件边界隔离（防冲突红线）：并发派发多个前端/后端时，必须在 `task`、`subpath` 或 `relevant_files` 中为每个子 Agent 明确划定互不正交的战场范围（例如：前端 A 负责页面组件，前端 B 负责数据 Store；后端 A 负责数据库存储，后端 B 负责业务接口），【严禁多个并发子 Agent 修改同一文件的同一代码块】造成覆盖踩踏。\n   \
-                 - 单波宽并发（彻底消灭虚假分批）：契约与数据结构在计划期提前确定；所有支持并行的任务在同一轮次中一次性全部派发，随后紧接着调用【1 次 `wait_subagents`】同时等待汇聚，杜绝人为拆成多批串行等待。\n   \
-                 - 过程免重构，单一结案门禁：子 Agent 交付过程中中枢仅审阅交付清单，严禁在中间阶段反复触发耗时的全工程打包；全量编译构建与回归测试统一延后至所有子任务交付后的【最终验收门禁】一次性执行。\n   \
-                 - ⚠️【反过度委派原则与自决准则 (Anti-Over-Delegation)】：若你在方案规划中已经精确定位了目标文件、具体行数和拟追加的代码/方法（即微小明确的就地修改，如仅改动 1~2 个文件），【严禁派生子 Agent】！直接由你在主会话中调用 `read_file` 确认后用 `edit_file` 一步修改完成，杜绝因过度派发产生的额外上下文与等待开销。"
-            ));
-            rule_num += 1;
-        }
-
-        if is_sop_enabled("surgical_code_reading") {
-            rules.push(format!(
-                "{rule_num}. 【精益代码研读与克制探索 SOP】：\n   - 漏斗式探索原则：探索项目架构与业务逻辑时，优先使用 glob / list_dir 查看目录与配置文件，对源码文件优先调用 `file_outline` 获取结构骨架（类/接口/结构体/函数签名及行号），结合 `grep` 定位关键线索；严禁在未摸清线索前盲目通读业务源码。\n   - 严禁连续切片漫游：严禁对超过 300 行的大型文件进行无休止、多轮递增的分页切片（offset_line）式逐行深挖；若需了解具体实现，必须以函数/模块为靶标，通过 offset_line 与 max_lines 精读最小必要上下文（建议 50~100 行）。\n   - 修改前的精确性保障：克制阅读不等于凭空臆断。在调用 edit_file 前，必须通过局部 read_file 确认要替换的原文及行号，严禁在未读取目标代码的情况下凭记忆或猜测修改。"
-            ));
-            rule_num += 1;
-        }
-
-        if is_sop_enabled("safe_code_edit") {
-            rules.push(format!("{rule_num}. 【代码克制与精确修改规范】：修改文件前必须先用 read_file 读取相关内容，用 edit_file 做基于精确原文的最小化修改；新文件才用 write_file。动手前先用 glob / grep / list_dir / file_outline 探索并理解代码结构。修改完成后，尽量用 run_command 运行构建或测试来验证改动。"));
-            rule_num += 1;
-        } else {
-            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir / file_outline 探索并理解代码结构。"));
-            rule_num += 1;
-        }
-
-        if is_sop_enabled("memory_distill") {
-            rules.push(format!(
-                "{rule_num}. 【边读边记与强制沉淀 SOP】：\n   - 工作区内置了长期认知记忆系统（存储于 `.harness/memory/`）。下方已自动载入本项目沉淀的技术大盘（profile.md）、工程规范（conventions.md）与重要碎记（digests）。\n   - 秒级召回优先：当用户询问“当前项目采用的技术”、“技术栈是什么”、“工程规范”等常见问题时，**优先基于已载入的持久化记忆秒级直接回答**，无需反复调用工具重新扫描全量代码；若发现信息有缺失或过期，再针对性读取少量文件并用 record_memory 补全。\n   - 强制沉淀检查点：凡是在当前任务中阅读了 2 个以上文件、深入分析了某个功能模块/流程/配置文件后，在给出最终答复前，**必须至少调用一次 `record_memory` 工具**将核心事实沉淀到工作区，严禁在多步阅读探索后只输出文字答复而不落盘留存：\n     * 独立业务模块/流程链路/排错分析/架构设计 -> **必须调用 `record_memory(category: \"digest\", title: \"...\", content: \"...\")` 固化为主题碎记**；\n     * 项目技术大盘与框架体系 -> 调用 `record_memory(category: \"profile\", ...)` 沉淀至 profile.md；\n     * 常用规范与避坑要点 -> 调用 `record_memory(category: \"convention\", ...)` 沉淀至 conventions.md。"
-            ));
-            rule_num += 1;
-        }
-
-        if is_sop_enabled("browser_autonomous_testing") {
-            rules.push(format!(
-                "{rule_num}. 【浏览器无头自主测试与免视觉验证 SOP（必须严格遵守）】：\n   \
-                 - 零桌面侵入与后台静默运行：当需要对本地网页服务（如 Web 项目前端、管理后台、SPA 页面）进行功能测试与调试时，**必须默认以无头模式运行（`headless: true`，不要弹出实体窗口抢占桌面）**；所有交互事件均通过 CDP 协议内部派发，严禁依赖任何侵入宿主操作系统的外挂行为；\n   \
-                 - 纯语义感知与免视觉断言原则：全面弃用截图分析（测试流程中无需调用 `browser_screenshot` 或视觉识别）；直接通过 `browser_navigate` 与 `browser_interact` 返回的【可交互元素清单 (@eX)】、【页面数据表格】及【页面提示与通知】进行语义感知与业务结果断言；面对长页面或表格超出当前视口时，根据返回的视口滚动提示主动调用 `browser_scroll(direction: \"down\")` 进行滚动探索，直至定位目标元素或数据；\n   \
-                 - 登录态自愈与免登保底：底层已集成登录快照预加载与 401 自动重放机制。若项目已录制免登宏，底层将在打开网页前自动预注入 Cookies 与 LocalStorage（0 秒秒级直达已选机构主页），并在 Token 过期（HTTP 401 或跳回登录页）时自动在后台静默重放录制宏刷新凭证；**Agent 严禁在会话中手动搜索密码或猜测凭据**；\n   \
-                 - 探针式自检与自愈闭环：系统已自动截获页面未捕获的 JavaScript 异常与 ≥ 400 的网络请求。测试时若发现 Console 报错或接口失败，必须结合报错信息直接阅读源码定位根因，用 `edit_file` 原地修复后再次在浏览器中自测，直至错误彻底清零且业务数据正常渲染；测试完毕后务必调用 `browser_close` 释放资源。"
-            ));
-            rule_num += 1;
-        }
-
-        rules.push(format!(
-            "{rule_num}. 【多模态图像感知与识图准则】：\n   \
-             - 当需要查看、识别或分析本地图片文件（如 generated_images 目录中的生成图、项目图片资源、设计图、截图、相片等）的内容时，**必须直接调用 `recognize_image(path, prompt)` 工具**；\n   \
-             - 严禁调用 `read_file` 读取图片或二进制文件（会报错拦截），严禁编写脚本安装外部 OCR 库；直接使用内置的 `recognize_image` 即可自动调用视觉模型获得深入专业的识别与分析结果。"
-        ));
-        rule_num += 1;
-
-        rules.push(format!(
-            "{rule_num}. 路径基准说明：所有相对路径默认相对于工作区根目录解析。当前工作区为主要开发上下文；若任务明确需要读取、比对或操作工作区外部文件（如系统配置、全局依赖或关联工程），请使用规范的绝对路径，系统会根据权限策略处理。"
-        ));
-        rule_num += 1;
-
-        rules.push(format!("{rule_num}. 不要执行破坏性命令（如递归删除、格式化磁盘等），它们会被强制要求用户确认。"));
-        rule_num += 1;
-
-        rules.push(format!("{rule_num}. 全程使用简体中文与用户交流；最终回复简洁总结：做了什么、改了哪些文件、验证结果如何。若具备深度思考能力（Thinking/Reasoning），思考过程仅用于内部推导与规划，最终面向用户的答复必须且只能输出在正文（Content）中，严禁在正文中留空。"));
-
-        let rules_text = rules.join("\n");
-        format!(
-            r#"你是 harness_mini，一个谨慎、专业的编码 Agent，运行在用户的本地工作区中。
-
-工作区根目录：{path}
-操作系统：{os}
-
-工作规则：
-{rules_text}"#,
-            path = session.workspace_path,
-            os = os,
-            rules_text = rules_text
-        )
-    };
-    match project_section {
-        Some(sec) => format!("{base}\n\n{sec}"),
-        None => base,
-    }
+    crate::context::build_static_system_prompt(session, disabled_sops, plan_mode, project_section, None, None)
 }
 
 fn emit_tool(app: &AppHandle, session_id: &str, ev: &ToolEvent) {
@@ -4726,7 +3360,6 @@ mod tests {
         assert!(all_enabled.contains("修改文件前必须先用 read_file 读取相关内容"));
         assert!(all_enabled.contains("精益代码研读与克制探索 SOP"));
         assert!(all_enabled.contains("todo 工具列出计划"));
-        assert!(all_enabled.contains("首步意图定性与场景化决策质检 SOP"));
         assert!(all_enabled.contains("浏览器无头自主测试与免视觉验证 SOP"));
 
         let disabled = vec![
@@ -4735,8 +3368,7 @@ mod tests {
             "todo_lifecycle".to_string(),
             "safe_code_edit".to_string(),
             "surgical_code_reading".to_string(),
-            "intent_alignment_gate".to_string(),
-            "browser_autonomous_testing".to_string(),
+                        "browser_autonomous_testing".to_string(),
         ];
         let filtered = system_prompt(&session, None, &disabled, "standard");
         assert!(!filtered.contains("方案先行"));
@@ -4744,8 +3376,7 @@ mod tests {
         assert!(!filtered.contains("todo 工具列出计划"));
         assert!(!filtered.contains("修改文件前必须先用 read_file 读取相关内容"));
         assert!(!filtered.contains("精益代码研读与克制探索 SOP"));
-        assert!(!filtered.contains("首步意图定性与场景化决策质检 SOP"));
-        assert!(!filtered.contains("浏览器无头自主测试与免视觉验证 SOP"));
+                assert!(!filtered.contains("浏览器无头自主测试与免视觉验证 SOP"));
         assert!(filtered.contains("团队协同委派原则"));
     }
 
@@ -4764,16 +3395,17 @@ mod tests {
     }
 
     #[test]
-    fn test_intent_alignment_sop_in_system_prompt() {
-        let session = Session {
-            workspace_path: "D:\\ws".into(),
-            ..Default::default()
-        };
-        let p = system_prompt(&session, None, &[], "standard");
-        assert!(p.contains("首步意图定性与场景化决策质检 SOP"));
-        assert!(p.contains("judge_decision"));
-        assert!(p.contains("score_decision"));
-        assert!(p.contains("严禁空口预告后中断"));
+    fn test_jev_intent_command_handling() {
+        let (is_jev, intent) = extract_jev_intent("/jev:决策 重构登录模块方案");
+        assert!(is_jev);
+        assert_eq!(intent, "重构登录模块方案");
+
+        let (is_jev2, intent2) = extract_jev_intent("/jev: 决策 评估数据库迁移");
+        assert!(is_jev2);
+        assert_eq!(intent2, "评估数据库迁移");
+
+        let (is_not, _) = extract_jev_intent("普通对话请求");
+        assert!(!is_not);
     }
 
     #[test]
@@ -5167,19 +3799,12 @@ mod tests {
             },
         ];
 
-        let formatted = format_recent_context_for_gate(&msgs, Some("m3"));
+        let formatted = format_recent_context_for_decision(&msgs, Some("m3"));
         assert!(formatted.contains("请选择：A1 学习理解"));
         assert!(formatted.contains("助手:"));
         assert!(formatted.contains("用户: 你好"));
         assert!(!formatted.contains("用户: A1"));
     }
 
-    #[test]
-    fn test_is_clarification_intent_plan() {
-        assert!(is_clarification_intent_plan("向用户发起澄清询问，不调用任何工具"));
-        assert!(is_clarification_intent_plan("由于信息严重不足，需要先向用户确认意图"));
-        assert!(is_clarification_intent_plan("先追问用户指代的是哪一个模块"));
-        assert!(!is_clarification_intent_plan("调用 view_file 查看代码并编写指南文档"));
-        assert!(!is_clarification_intent_plan("执行重构并调用 cargo test 验证"));
-    }
+    
 }

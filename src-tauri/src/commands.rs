@@ -1794,18 +1794,13 @@ pub fn respond_compaction(
 
 #[tauri::command]
 pub fn respond_intent_intervention(
-    state: State<'_, crate::AppState>,
-    id: String,
-    action: String,
-    hint: Option<String>,
+    _state: State<'_, crate::AppState>,
+    _id: String,
+    _action: String,
+    _hint: Option<String>,
 ) -> Result<(), String> {
-    let pending = state.intent_interventions.lock().unwrap().remove(&id);
-    if let Some(p) = pending {
-        let _ = p.tx.send(crate::models::IntentInterventionDecision { action, hint });
-        Ok(())
-    } else {
-        Err("意图对齐干预请求不存在或已处理".into())
-    }
+    // 门控已彻底下线，保持命令空实现兼容前端旧调用
+    Ok(())
 }
 
 #[tauri::command]
@@ -4134,6 +4129,15 @@ pub async fn query_tool_logs(
 ) -> Result<crate::models::ToolLogQueryResult, String> {
     let db = state.db.lock().unwrap();
     store::query_tool_logs(&db, &filter)
+}
+
+#[tauri::command]
+pub async fn get_llm_request_trace(
+    state: State<'_, crate::AppState>,
+    message_id: String,
+) -> Result<Option<crate::models::LlmRequestTrace>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    crate::store::get_llm_request_trace(&db, &message_id)
 }
 
 #[tauri::command]

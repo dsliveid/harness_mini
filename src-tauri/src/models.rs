@@ -1248,6 +1248,9 @@ pub struct Message {
     /// 软撤回时间戳（若非空表示本消息已被软撤回，排除在上下文组装之外）
     #[serde(default)]
     pub reverted_at: Option<String>,
+    /// 尾部运行时环境附注（任务计划、最新记忆、中断标记，注入在用户消息末尾，终生不可变以保护前缀缓存）
+    #[serde(default)]
+    pub runtime_anchor: Option<String>,
 }
 
 /// 代码文件影子快照条目（与 tool_event_id / message_id 关联）
@@ -1923,4 +1926,17 @@ pub struct ToolLogQueryResult {
     pub page: u32,
     pub page_size: u32,
     pub total_pages: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmRequestTrace {
+    pub id: String,
+    pub session_id: String,
+    pub message_id: String,
+    pub run_id: Option<String>,
+    pub model: String,
+    pub endpoint: String,
+    pub payload_json: String,
+    pub created_at: String,
 }
