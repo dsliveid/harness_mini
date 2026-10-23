@@ -92,6 +92,19 @@ export function extractIntentAlignmentFromReasoning(reasoning?: string | null): 
 
 /** 清洗可能夹带【思考过程汇报】旧版兜底标记的历史正文，精确提取最终交付结论 */
 
+function extractTargetFromPartialArgs(toolName?: string, partialArgs?: string): string | null {
+  if (!partialArgs) return null;
+  const match = partialArgs.match(/["'](?:Path|path|target|Target|CommandLine|command|prompt|query|filename)["']\s*:\s*["']([^"'\\]*(?:\\.[^"'\\]*)*)/i);
+  if (match && match[1]) {
+    try {
+      return JSON.parse(`"${match[1]}"`);
+    } catch {
+      return match[1];
+    }
+  }
+  return null;
+}
+
 export function cleanDeliverableContent(content?: string | null): string {
 
   if (!content) return "";
@@ -709,6 +722,8 @@ export function ExecutionProcessBlock({
   }, [isRunning, steps.length]);
 
   const currentSessionId = useStore((s) => s.currentId);
+  const sessionId = steps[0]?.sessionId || currentSessionId;
+  const activeStep = useStore((s) => (sessionId ? s.activeStepMap[sessionId] : null));
 
   // 解析意图对齐门控事件数据
 
@@ -1014,6 +1029,10 @@ export function ExecutionProcessBlock({
 
                 ? `正在连接模型… ${elapsedSec > 0 ? `(${elapsedSec}s)` : ""}`
 
+                : activeStep?.phase.type === "tool_preparing"
+
+                ? `正在准备 ${activeStep.phase.toolName}...`
+
                 : toolCount === 0 && stepCount === 1
 
                 ? "正在思考与回复…"
@@ -1066,7 +1085,9 @@ export function ExecutionProcessBlock({
 
             <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-400 border border-blue-500/30 animate-pulse shrink-0 font-medium">
 
-              运行中
+              {activeStep?.phase.type === "tool_preparing"
+                ? `准备参数 (${Math.round(((activeStep.phase.bytesReceived || activeStep.phase.bytes_received || 0) / 1024) * 10) / 10} KB)`
+                : "运行中"}
 
             </span>
 
@@ -1199,6 +1220,36 @@ export function ExecutionProcessBlock({
             </div>
 
           ))}
+
+          {isRunning && activeStep?.phase.type === "tool_preparing" && (
+            <div className="relative pl-3 border-l-2 border-blue-500/60 animate-in fade-in duration-200">
+              <div className="flex items-center gap-2.5 py-2 px-3 rounded-xl bg-blue-500/10 border border-blue-500/25 text-[12.5px] text-blue-200">
+                <Loader2 size={14} className="animate-spin text-blue-400 shrink-0" />
+                <div className="flex-1 min-w-0 flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 truncate">
+                    <span className="font-mono font-medium text-blue-300">
+                      {activeStep.phase.toolName}
+                    </span>
+                    <span className="truncate text-inkdim text-[12px]">
+                      {(() => {
+                        const target = extractTargetFromPartialArgs(
+                          activeStep.phase.toolName,
+                          activeStep.phase.partialArgs || activeStep.phase.partial_args
+                        );
+                        return target ? `目标: ${target}` : "正在接收参数...";
+                      })()}
+                    </span>
+                  </div>
+                  <span className="font-mono text-[11px] text-blue-400/90 shrink-0">
+                    {(() => {
+                      const bytes = activeStep.phase.bytesReceived || activeStep.phase.bytes_received || 0;
+                      return bytes > 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${bytes} B`;
+                    })()}
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
 
         </div>
 

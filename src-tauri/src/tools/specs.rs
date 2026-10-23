@@ -622,7 +622,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "generate_image",
-            description: "根据提示词生成图片。当用户要求画图、生成图片、插图、海报、图标等图像时调用。生成的图片将保存至本地并在界面展示。注意：若存在专属图像生成协作者，主进程必须优先委派协作者处理。",
+            description: "根据提示词生成图像或图标。当用户需要绘制图片、插画、LOGO、应用图标、海报等视觉图像时调用。生成的图片将保存至本地并在界面直接展示。严禁编写 Python 脚本（如 PIL/matplotlib）绘制图标或图片，必须直接调用本工具。",
             risk: Risk::Write,
             schema: json!({
                 "type": "object",

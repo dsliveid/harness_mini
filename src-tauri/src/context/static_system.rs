@@ -222,7 +222,7 @@ pub fn build_static_system_prompt(
         rule_num += 1;
 
         if session.subagent_role.as_deref() == Some("image_gen") {
-            rules.push(format!("{rule_num}. 【AI 绘画与图像生成核心职责】：根据用户或主进程的要求，深入理解视觉意图并提炼出画面细节丰富的高质量提示词（包括画质、风格、构图、主体、光影），直接调用 `generate_image` 工具生成图片。图片生成完成后在回复中展示成果并简明汇报。"));
+            rules.push(format!("{rule_num}. 【AI 绘画与图像生成核心职责（严禁编写 Python 脚本）】：根据用户或主进程的要求，深入理解视觉意图并提炼出画面细节丰富的高质量提示词（包括画质、风格、构图、主体、光影），直接调用 `generate_image` 工具生成图片，严禁编写 Python 脚本画图。图片生成完成后在回复中展示成果并简明汇报。"));
             rule_num += 1;
         }
 
@@ -341,6 +341,11 @@ pub fn build_static_system_prompt(
             rule_num += 1;
         }
 
+        rules.push(format!(
+            "{rule_num}. 【视觉生成规范】：若任务涉及绘制图片或图标，直接调用 `generate_image` 工具，严禁编写 Python 脚本（如 PIL/matplotlib）画图；若涉及流程图/架构图，直接输出 Markdown `mermaid` 代码块。"
+        ));
+        rule_num += 1;
+
         rules.push(format!("{rule_num}. 严禁再次创建子 Agent，直接使用现有工具高效完成分配的目标。"));
         rule_num += 1;
 
@@ -449,7 +454,7 @@ pub fn build_static_system_prompt(
         }
 
         rules.push(format!(
-            "{rule_num}. 【多模态图像感知与识图准则】：需要查看、识别或分析本地图片时，直接调用 `recognize_image(path, prompt)` 工具。"
+            "{rule_num}. 【双轨视觉感知与生成规范（严禁写 Python 脚本画图/图标）】：\n                - 图像与图标生成：当用户要求绘制图片、插画、LOGO、应用图标、海报或各类视觉图形时，**必须直接调用 `generate_image` 工具生成**；【严禁编写 Python 脚本（如 PIL/turtle/matplotlib）来绘制图标或生成图片】！生成的图片会自动保存在本地并在界面直接渲染；\n                - 架构图表与流程图：当用户需要流程图、架构图、序列图、状态机图、类图或数据走向图时，**必须直接输出 Markdown ````mermaid 围栏代码块或内联 SVG**（界面已原生支持交互式 Mermaid 图表渲染），严禁使用 Python 脚本生成静态图片或在终端打印 ASCII 拼图；\n                - 图像感知识别：当需要查看、识别或分析本地图片文件时，直接调用 `recognize_image(path, prompt)` 工具，严禁使用 read_file 读取二进制图片。"
         ));
         rule_num += 1;
 

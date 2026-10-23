@@ -15,8 +15,19 @@ pub async fn chat_stream(
     cfg: &LlmCfg,
     messages: &[Value],
     tools: &[Value],
+    on_text: impl FnMut(&str) + Send,
+    on_reasoning: impl FnMut(&str) + Send,
+) -> Result<LlmResult, String> {
+    chat_stream_full(cfg, messages, tools, on_text, on_reasoning, |_| {}).await
+}
+
+pub async fn chat_stream_full(
+    cfg: &LlmCfg,
+    messages: &[Value],
+    tools: &[Value],
     mut on_text: impl FnMut(&str) + Send,
     mut on_reasoning: impl FnMut(&str) + Send,
+    mut on_tool: impl FnMut(crate::llm::ToolCallChunk) + Send,
 ) -> Result<LlmResult, String> {
     let url = endpoint(&cfg.base_url);
     let payload = crate::protocol::transpiler::transpile_to_openai_chat(
@@ -139,6 +150,7 @@ pub async fn chat_stream(
                         calls.push(None);
                     }
                     let slot = &mut calls[idx];
+                    let is_new = slot.is_none();
                     if slot.is_none() {
                         *slot = Some(ToolCallAcc {
                             id: String::new(),
@@ -147,23 +159,35 @@ pub async fn chat_stream(
                         });
                     }
                     let slot = slot.as_mut().unwrap();
+                    let mut id_opt = None;
                     if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
                         slot.id.push_str(id);
+                        id_opt = Some(id);
                     }
+                    let mut name_opt = None;
                     if let Some(name) = tc
                         .get("function")
                         .and_then(|f| f.get("name"))
                         .and_then(|n| n.as_str())
                     {
                         slot.name.push_str(name);
+                        name_opt = Some(name);
                     }
+                    let mut args_opt = None;
                     if let Some(args) = tc
                         .get("function")
                         .and_then(|f| f.get("arguments"))
                         .and_then(|a| a.as_str())
                     {
                         slot.args.push_str(args);
+                        args_opt = Some(args);
                     }
+                    on_tool(crate::llm::ToolCallChunk {
+                        index: idx,
+                        id: id_opt.or(if is_new && !slot.id.is_empty() { Some(&slot.id) } else { None }),
+                        name: name_opt.or(if is_new && !slot.name.is_empty() { Some(&slot.name) } else { None }),
+                        args_delta: args_opt,
+                    });
                 }
             }
         }

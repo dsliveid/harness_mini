@@ -23,8 +23,19 @@ pub async fn chat_stream(
     cfg: &LlmCfg,
     messages: &[Value],
     tools: &[Value],
+    on_text: impl FnMut(&str) + Send,
+    on_reasoning: impl FnMut(&str) + Send,
+) -> Result<LlmResult, String> {
+    chat_stream_full(cfg, messages, tools, on_text, on_reasoning, |_| {}).await
+}
+
+pub async fn chat_stream_full(
+    cfg: &LlmCfg,
+    messages: &[Value],
+    tools: &[Value],
     mut on_text: impl FnMut(&str) + Send,
     mut on_reasoning: impl FnMut(&str) + Send,
+    mut on_tool: impl FnMut(crate::llm::ToolCallChunk) + Send,
 ) -> Result<LlmResult, String> {
     let url = endpoint(&cfg.base_url);
     let payload = transpile_to_anthropic(messages, tools);
@@ -120,9 +131,15 @@ pub async fn chat_stream(
                                 calls.push(None);
                             }
                             calls[idx] = Some(ToolCallAcc {
-                                id,
-                                name,
+                                id: id.clone(),
+                                name: name.clone(),
                                 args: String::new(),
+                            });
+                            on_tool(crate::llm::ToolCallChunk {
+                                index: idx,
+                                id: Some(&id),
+                                name: Some(&name),
+                                args_delta: None,
                             });
                         }
                     }
@@ -155,6 +172,12 @@ pub async fn chat_stream(
                                             call.args.push_str(partial);
                                         }
                                     }
+                                    on_tool(crate::llm::ToolCallChunk {
+                                        index: idx,
+                                        id: None,
+                                        name: None,
+                                        args_delta: Some(partial),
+                                    });
                                 }
                             }
                             _ => {}

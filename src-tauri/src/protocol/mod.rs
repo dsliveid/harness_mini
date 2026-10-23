@@ -26,15 +26,26 @@ pub async fn dispatch_chat_stream(
     on_text: impl FnMut(&str) + Send,
     on_reasoning: impl FnMut(&str) + Send,
 ) -> Result<LlmResult, String> {
+    dispatch_chat_stream_full(cfg, messages, tools, on_text, on_reasoning, |_| {}).await
+}
+
+pub async fn dispatch_chat_stream_full(
+    cfg: &LlmCfg,
+    messages: &[Value],
+    tools: &[Value],
+    on_text: impl FnMut(&str) + Send,
+    on_reasoning: impl FnMut(&str) + Send,
+    on_tool: impl FnMut(crate::llm::ToolCallChunk) + Send,
+) -> Result<LlmResult, String> {
     match cfg.protocol {
         RequestProtocol::ChatCompletions => {
-            openai_chat::chat_stream(cfg, messages, tools, on_text, on_reasoning).await
+            openai_chat::chat_stream_full(cfg, messages, tools, on_text, on_reasoning, on_tool).await
         }
         RequestProtocol::Messages => {
-            anthropic::chat_stream(cfg, messages, tools, on_text, on_reasoning).await
+            anthropic::chat_stream_full(cfg, messages, tools, on_text, on_reasoning, on_tool).await
         }
         RequestProtocol::Response => {
-            openai_responses::chat_stream(cfg, messages, tools, on_text, on_reasoning).await
+            openai_responses::chat_stream_full(cfg, messages, tools, on_text, on_reasoning, on_tool).await
         }
         RequestProtocol::SystemOne => Err(
             "SystemOne 协议为极速结构化决策门控协议（POST /v1/systemone），不支持通用对话补全。\n\

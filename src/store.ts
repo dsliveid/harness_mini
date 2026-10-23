@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "./ipc";
-import { DRAFT_ID, resolveActiveModel, samePath, sortMessages, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type CurrentBoard, type DataStatus, type GrowthItem, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem, type FocusFloatingTarget, type PlanSummary, type IntentAlignmentEvent, type IntentInterventionRequest } from "./types";
+import { DRAFT_ID, resolveActiveModel, samePath, sortMessages, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type CurrentBoard, type DataStatus, type GrowthItem, type ActiveStepState, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem, type FocusFloatingTarget, type PlanSummary, type IntentAlignmentEvent, type IntentInterventionRequest } from "./types";
 
 
 export interface EditingMessageTarget {
@@ -162,6 +162,7 @@ interface Store {
   hasMore: Record<string, boolean>;
   queues: Record<string, QueuedItem[]>;
   runStatus: Record<string, "idle" | "running">;
+  activeStepMap: Record<string, ActiveStepState | null>;
   lastRunOutcome: Record<string, string>;
   approvals: Record<string, ApprovalReq>;
   intentAlignments: Record<string, IntentAlignmentEvent>;
@@ -308,6 +309,9 @@ interface Store {
   // 事件处理
   onMessageDelta: (p: any) => void;
   onMessageReasoningDelta: (p: any) => void;
+  onStepStarted: (p: any) => void;
+  onToolPreparing: (p: any) => void;
+  onToolPreparingDelta: (p: any) => void;
   onMessageFinal: (m: Message) => void;
   onMessageUpdate: (m: Message) => void;
   onToolUpdate: (p: any) => void;
@@ -567,6 +571,7 @@ export const useStore = create<Store>((set, get) => ({
   hasMore: {},
   queues: {},
   runStatus: {},
+  activeStepMap: {},
   lastRunOutcome: {},
   approvals: {},
   intentAlignments: {},
@@ -720,21 +725,16 @@ export const useStore = create<Store>((set, get) => ({
           };
         }
 
+        const nextStepMap = {
+          ...st.activeStepMap,
+          [sessionId]: activeState.activeStep || null,
+        };
+
         const list = st.messages[sessionId] ? [...st.messages[sessionId]] : [];
-        if (
-          activeState.streamingContent ||
-          activeState.streamingReasoning ||
-          (activeState.activeToolEvents && activeState.activeToolEvents.length > 0)
-        ) {
-          const lastMsg = list.length > 0 ? list[list.length - 1] : null;
-          if (
-            lastMsg &&
-            lastMsg.role === "assistant" &&
-            activeState.isRunning &&
-            (!lastMsg.runId || !activeState.activeRunId || lastMsg.runId === activeState.activeRunId) &&
-            (!activeState.currentMessageId || lastMsg.id === activeState.currentMessageId)
-          ) {
-            const updated = { ...lastMsg };
+        if (activeState.currentMessageId && activeState.isRunning) {
+          const idx = list.findIndex((m) => m.id === activeState.currentMessageId);
+          if (idx >= 0) {
+            const updated = { ...list[idx] };
             if (
               activeState.streamingContent &&
               (!updated.content || activeState.streamingContent.length >= updated.content.length)
@@ -750,29 +750,16 @@ export const useStore = create<Store>((set, get) => ({
             if (activeState.activeToolEvents && activeState.activeToolEvents.length > 0) {
               const mergedEvents = [...updated.toolEvents];
               for (const ev of activeState.activeToolEvents) {
-                const idx = mergedEvents.findIndex((e) => e.id === ev.id);
-                if (idx >= 0) {
-                  mergedEvents[idx] = ev;
+                const eIdx = mergedEvents.findIndex((e) => e.id === ev.id);
+                if (eIdx >= 0) {
+                  mergedEvents[eIdx] = ev;
                 } else {
                   mergedEvents.push(ev);
                 }
               }
               updated.toolEvents = mergedEvents;
             }
-            list[list.length - 1] = updated;
-          } else if (activeState.isRunning) {
-            list.push({
-              id: activeState.currentMessageId ?? (activeState.activeRunId ? `active-${activeState.activeRunId}` : `active-${Date.now()}`),
-              sessionId,
-              runId: activeState.activeRunId ?? undefined,
-              seq: Number.MAX_SAFE_INTEGER,
-              role: "assistant",
-              content: activeState.streamingContent || "",
-              reasoning: activeState.streamingReasoning || null,
-              queued: false,
-              createdAt: new Date().toISOString(),
-              toolEvents: activeState.activeToolEvents || [],
-            });
+            list[idx] = updated;
           }
         }
 
@@ -780,6 +767,7 @@ export const useStore = create<Store>((set, get) => ({
           runStatus: nextRunStatus,
           approvals: nextApprovals,
           pendingCompactions: nextCompactions,
+          activeStepMap: nextStepMap,
           messages: { ...st.messages, [sessionId]: list },
         };
       });
@@ -1444,6 +1432,74 @@ export const useStore = create<Store>((set, get) => ({
     });
   },
 
+  onStepStarted(p) {
+    const { sessionId, runId, stepIndex, messageId } = p;
+    set((st) => ({
+      activeStepMap: {
+        ...st.activeStepMap,
+        [sessionId]: {
+          sessionId,
+          runId,
+          stepIndex,
+          messageId,
+          phase: { type: "connecting" },
+          updatedAtMs: Date.now(),
+        },
+      },
+    }));
+  },
+
+  onToolPreparing(p) {
+    const { sessionId, callId, toolName, messageId } = p;
+    set((st) => {
+      const cur = st.activeStepMap[sessionId];
+      return {
+        activeStepMap: {
+          ...st.activeStepMap,
+          [sessionId]: {
+            sessionId,
+            runId: cur?.runId || "",
+            stepIndex: cur?.stepIndex || 0,
+            messageId: messageId || cur?.messageId || "",
+            phase: {
+              type: "tool_preparing",
+              callId,
+              toolName,
+              partialArgs: "",
+              bytesReceived: 0,
+            },
+            updatedAtMs: Date.now(),
+          },
+        },
+      };
+    });
+  },
+
+  onToolPreparingDelta(p) {
+    const { sessionId, delta } = p;
+    set((st) => {
+      const cur = st.activeStepMap[sessionId];
+      if (!cur || cur.phase.type !== "tool_preparing") return st;
+      const prevArgs = cur.phase.partialArgs || cur.phase.partial_args || "";
+      const prevBytes = cur.phase.bytesReceived || cur.phase.bytes_received || 0;
+      const addLen = delta ? delta.length : 0;
+      return {
+        activeStepMap: {
+          ...st.activeStepMap,
+          [sessionId]: {
+            ...cur,
+            phase: {
+              ...cur.phase,
+              partialArgs: prevArgs + (delta || ""),
+              bytesReceived: prevBytes + addLen,
+            },
+            updatedAtMs: Date.now(),
+          },
+        },
+      };
+    });
+  },
+
   onMessageReset(p) {
     set((st) => {
       const list = st.messages[p.sessionId] ?? [];
@@ -1774,6 +1830,7 @@ export const useStore = create<Store>((set, get) => ({
   onRunStatus(p) {
     set((st) => {
       const nextRetry = { ...st.toolRetryStatus };
+      const nextActiveStepMap = p.status === "running" ? st.activeStepMap : { ...st.activeStepMap, [p.sessionId]: null };
       if (p.status === "running") {
         // 新一轮会话启动时，自动清除上一轮残留的已中止或已完结的自纠提示
         if (nextRetry[p.sessionId] && nextRetry[p.sessionId].status !== "retrying") {
@@ -1870,6 +1927,7 @@ export const useStore = create<Store>((set, get) => ({
 
       return {
         runStatus: { ...st.runStatus, [p.sessionId]: p.status === "running" ? "running" : "idle" },
+        activeStepMap: nextActiveStepMap,
         lastRunOutcome: { ...st.lastRunOutcome, [p.sessionId]: p.status },
         sessions: st.sessions.map((s) => (s.id === p.sessionId ? { ...s, lastRunStatus: p.status } : s)),
         toolRetryStatus: nextRetry,

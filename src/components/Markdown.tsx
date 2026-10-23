@@ -10,6 +10,7 @@ import { parseFrontmatter } from "../utils/frontmatter";
 import { FrontmatterCard } from "./FrontmatterCard";
 import { useStore } from "../store";
 import { ipc } from "../ipc";
+import { MermaidBlock } from "./MermaidBlock";
 
 export function resolveMarkdownImagePath(src: string, workspacePath?: string | null): string {
   if (!src || typeof src !== "string") return "";
@@ -233,10 +234,24 @@ export const Markdown = memo(function Markdown({
               </a>
             );
           },
+          pre: ({ children, ...props }) => {
+            const child = Array.isArray(children) ? children[0] : children;
+            if (child && typeof child === "object" && "props" in child) {
+              const className = (child as any).props?.className || "";
+              if (/language-mermaid\b/i.test(className)) {
+                return <>{children}</>;
+              }
+            }
+            return <pre {...props}>{children}</pre>;
+          },
           code: ({ className, children, ...props }) => {
             const match = /language-(\w+)/.exec(className || "");
             const text = String(children).replace(/\n$/, "");
             const isMultiLine = text.includes("\n");
+
+            if (match && match[1].toLowerCase() === "mermaid") {
+              return <MermaidBlock code={text} />;
+            }
 
             // 单行行内代码：若符合文件或目录路径特征，转换为交互式 PathLink
             if (!match && !isMultiLine && isPotentialPath(text)) {

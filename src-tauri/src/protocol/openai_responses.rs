@@ -23,8 +23,19 @@ pub async fn chat_stream(
     cfg: &LlmCfg,
     messages: &[Value],
     tools: &[Value],
+    on_text: impl FnMut(&str) + Send,
+    on_reasoning: impl FnMut(&str) + Send,
+) -> Result<LlmResult, String> {
+    chat_stream_full(cfg, messages, tools, on_text, on_reasoning, |_| {}).await
+}
+
+pub async fn chat_stream_full(
+    cfg: &LlmCfg,
+    messages: &[Value],
+    tools: &[Value],
     mut on_text: impl FnMut(&str) + Send,
     mut on_reasoning: impl FnMut(&str) + Send,
+    mut on_tool: impl FnMut(crate::llm::ToolCallChunk) + Send,
 ) -> Result<LlmResult, String> {
     let url = endpoint(&cfg.base_url);
     let payload = transpile_to_responses(messages, tools);
@@ -117,11 +128,17 @@ pub async fn chat_stream(
                                 .to_string();
                             let idx = calls.len();
                             calls.push(Some(ToolCallAcc {
-                                id: call_id,
-                                name,
+                                id: call_id.clone(),
+                                name: name.clone(),
                                 args: String::new(),
                             }));
                             curr_call_idx = Some(idx);
+                            on_tool(crate::llm::ToolCallChunk {
+                                index: idx,
+                                id: Some(&call_id),
+                                name: Some(&name),
+                                args_delta: None,
+                            });
                         }
                     }
                 }
@@ -143,15 +160,22 @@ pub async fn chat_stream(
                 }
                 "response.function_call_arguments.delta" => {
                     if let Some(delta) = v.get("delta").and_then(|d| d.as_str()) {
-                        if let Some(idx) = curr_call_idx {
-                            if idx < calls.len() {
-                                if let Some(ref mut c) = calls[idx] {
+                        let idx = curr_call_idx.unwrap_or(calls.len().saturating_sub(1));
+                        if let Some(idx_val) = curr_call_idx {
+                            if idx_val < calls.len() {
+                                if let Some(ref mut c) = calls[idx_val] {
                                     c.args.push_str(delta);
                                 }
                             }
                         } else if let Some(last) = calls.last_mut().and_then(|c| c.as_mut()) {
                             last.args.push_str(delta);
                         }
+                        on_tool(crate::llm::ToolCallChunk {
+                            index: idx,
+                            id: None,
+                            name: None,
+                            args_delta: Some(delta),
+                        });
                     }
                 }
                 "response.output_item.done" => {

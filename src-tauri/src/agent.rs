@@ -1419,6 +1419,16 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             }
         };
         last_assistant_id = Some(assistant_id.clone());
+        state.snapshot.transition_to_step(session_id, run_id, _step, &assistant_id);
+        let _ = app.emit(
+            "step:started",
+            json!({
+                "sessionId": session_id,
+                "runId": run_id,
+                "stepIndex": _step,
+                "messageId": assistant_id,
+            }),
+        );
         let app2 = app.clone();
         let sid2 = session_id.to_string();
         let mid2 = assistant_id.clone();
@@ -1483,7 +1493,10 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 }
             }
 
-            let call = llm::chat_stream(
+            let app_tool = app2.clone();
+            let sid_tool = sid2.clone();
+            let mid_tool = mid2.clone();
+            let call = llm::chat_stream_full(
                 &cfg,
                 &messages,
                 &schemas,
@@ -1507,6 +1520,41 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                             "message:reasoning:delta",
                             &json!({"sessionId": sid_reason, "messageId": mid_reason, "delta": delta}),
                         );
+                    }
+                },
+                move |chunk| {
+                    let st = app_tool.state::<crate::AppState>();
+                    if let Some(name) = chunk.name {
+                        if !name.is_empty() {
+                            let call_id = chunk.id.unwrap_or("");
+                            st.snapshot.start_tool_preparing(&sid_tool, call_id, name);
+                            st.emit(
+                                "tool:preparing",
+                                &json!({
+                                    "sessionId": sid_tool,
+                                    "messageId": mid_tool,
+                                    "callId": call_id,
+                                    "toolName": name,
+                                    "index": chunk.index,
+                                }),
+                            );
+                        }
+                    }
+                    if let Some(args) = chunk.args_delta {
+                        if !args.is_empty() {
+                            let call_id = chunk.id.unwrap_or("");
+                            st.snapshot.append_tool_args_delta(&sid_tool, call_id, args);
+                            st.emit(
+                                "tool:preparing_delta",
+                                &json!({
+                                    "sessionId": sid_tool,
+                                    "messageId": mid_tool,
+                                    "callId": call_id,
+                                    "delta": args,
+                                    "index": chunk.index,
+                                }),
+                            );
+                        }
                     }
                 },
             )
@@ -1742,6 +1790,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             let _ = sop_verified;
             let _ = files_modified;
             let _ = code_modified;
+            state.snapshot.finish_step(session_id);
             return (RunOutcome::Done, last_assistant_id, run_tokens);
         }
 
@@ -2234,6 +2283,7 @@ async fn handle_tool_call(
             let _ = store::insert_tool_event(&db, &ev);
         }
     }
+    state.snapshot.start_tool_executing(session_id, tool_call_id, tool_name, &ev.id);
     emit_tool(app, session_id, &ev);
 
     let ev_id = ev.id.clone();

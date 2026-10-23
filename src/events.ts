@@ -14,6 +14,9 @@ export function useAppEvents() {
     const regs: Promise<UnlistenFn>[] = [
       listen<any>("message:delta", (e) => s.onMessageDelta(e.payload)),
       listen<any>("message:reasoning:delta", (e) => s.onMessageReasoningDelta(e.payload)),
+      listen<any>("step:started", (e) => s.onStepStarted(e.payload)),
+      listen<any>("tool:preparing", (e) => s.onToolPreparing(e.payload)),
+      listen<any>("tool:preparing_delta", (e) => s.onToolPreparingDelta(e.payload)),
       listen<any>("message:reset", (e) => s.onMessageReset(e.payload)),
       listen<any>("run:retry", (e) => s.onRunRetry(e.payload)),
       listen<Message>("message:final", (e) => s.onMessageFinal(e.payload as Message)),

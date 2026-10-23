@@ -1740,6 +1740,23 @@ export interface TokenStatsReport {
   bySession: SessionTokenStats[];
 }
 
+export type StepPhase =
+  | { type: "idle" }
+  | { type: "connecting" }
+  | { type: "thinking"; reasoning: string }
+  | { type: "tool_preparing"; callId?: string; call_id?: string; toolName?: string; tool_name?: string; partialArgs?: string; partial_args?: string; bytesReceived?: number; bytes_received?: number }
+  | { type: "tool_executing"; callId?: string; call_id?: string; toolName?: string; tool_name?: string; eventId?: string; event_id?: string }
+  | { type: "delivering"; content: string };
+
+export interface ActiveStepState {
+  sessionId: string;
+  runId: string;
+  stepIndex: number;
+  messageId: string;
+  phase: StepPhase;
+  updatedAtMs: number;
+}
+
 export interface SessionActiveState {
   sessionId: string;
   isRunning: boolean;
@@ -1750,6 +1767,7 @@ export interface SessionActiveState {
   activeToolEvents: ToolEvent[];
   pendingApproval: ApprovalReq | null;
   pendingCompaction: CompactionReq | null;
+  activeStep?: ActiveStepState | null;
 }
 
 // ---------- 文件与变更查看器类型 ----------

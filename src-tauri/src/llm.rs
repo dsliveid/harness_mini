@@ -37,6 +37,14 @@ pub struct ToolCallAcc {
     pub args: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ToolCallChunk<'a> {
+    pub index: usize,
+    pub id: Option<&'a str>,
+    pub name: Option<&'a str>,
+    pub args_delta: Option<&'a str>,
+}
+
 #[derive(Default)]
 pub struct LlmResult {
     pub content: String,
@@ -120,7 +128,18 @@ pub async fn chat_stream(
     on_text: impl FnMut(&str) + Send,
     on_reasoning: impl FnMut(&str) + Send,
 ) -> Result<LlmResult, String> {
-    crate::protocol::dispatch_chat_stream(cfg, messages, tools, on_text, on_reasoning).await
+    chat_stream_full(cfg, messages, tools, on_text, on_reasoning, |_| {}).await
+}
+
+pub async fn chat_stream_full(
+    cfg: &LlmCfg,
+    messages: &[Value],
+    tools: &[Value],
+    on_text: impl FnMut(&str) + Send,
+    on_reasoning: impl FnMut(&str) + Send,
+    on_tool: impl FnMut(ToolCallChunk) + Send,
+) -> Result<LlmResult, String> {
+    crate::protocol::dispatch_chat_stream_full(cfg, messages, tools, on_text, on_reasoning, on_tool).await
 }
 
 pub fn finish(mut result: LlmResult, calls: &mut Vec<Option<ToolCallAcc>>) -> LlmResult {

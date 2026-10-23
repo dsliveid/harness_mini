@@ -127,6 +127,24 @@ impl AppState {
                     }
                 }
             }
+            "tool:preparing" => {
+                if let (Some(sid), Some(cid), Some(tname)) = (
+                    payload.get("sessionId").and_then(|v| v.as_str()),
+                    payload.get("callId").and_then(|v| v.as_str()),
+                    payload.get("toolName").and_then(|v| v.as_str()),
+                ) {
+                    self.snapshot.start_tool_preparing(sid, cid, tname);
+                }
+            }
+            "tool:preparing_delta" => {
+                if let (Some(sid), Some(cid), Some(delta)) = (
+                    payload.get("sessionId").and_then(|v| v.as_str()),
+                    payload.get("callId").and_then(|v| v.as_str()),
+                    payload.get("delta").and_then(|v| v.as_str()),
+                ) {
+                    self.snapshot.append_tool_args_delta(sid, cid, delta);
+                }
+            }
             "tool:update" => {
                 if let (Some(sid), Some(ev_val)) = (
                     payload.get("sessionId").and_then(|v| v.as_str()),
