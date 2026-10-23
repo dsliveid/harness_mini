@@ -75,25 +75,22 @@ pub async fn chat_stream_full(
     let mut result = LlmResult::default();
     let mut calls: Vec<Option<ToolCallAcc>> = Vec::new();
 
-    let mut is_first_chunk = true;
+    let mut has_received_token = false;
     loop {
-        let chunk_timeout = if is_first_chunk {
-            std::time::Duration::from_secs(60) // 首字预填充允许最长 60s
+        let chunk_timeout = if !has_received_token {
+            std::time::Duration::from_secs(120) // 首字/首Token预填充与推理深度推演允许最长 120s（避免长上下文或握手包提前击穿超时）
         } else {
-            std::time::Duration::from_secs(25) // 吐字中途若停顿 25s 判定网络半开挂死
+            std::time::Duration::from_secs(60)  // 吐字中途若停顿 60s 判定网络半开挂死
         };
 
         let chunk = match tokio::time::timeout(chunk_timeout, stream.next()).await {
-            Ok(Some(c)) => {
-                is_first_chunk = false;
-                c.map_err(|e| format!("流读取失败: {e}"))?
-            }
+            Ok(Some(c)) => c.map_err(|e| format!("流读取失败: {e}"))?,
             Ok(None) => break,
             Err(_) => {
-                let reason = if is_first_chunk {
-                    "首字等待超时 (60s 无响应)"
+                let reason = if !has_received_token {
+                    "首字等待超时 (120s 无响应)"
                 } else {
-                    "数据块传输停滞 (25s 无新数据)"
+                    "数据块传输停滞 (60s 无新数据)"
                 };
                 return Err(format!("流读取失败: 网络响应超时（{reason}），远程模型服务停止响应"));
             }
@@ -125,6 +122,7 @@ pub async fn chat_stream_full(
             let Some(delta) = choices.get(0).and_then(|c| c.get("delta")) else { continue };
             if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
                 if !text.is_empty() {
+                    has_received_token = true;
                     result.content.push_str(text);
                     on_text(text);
                 }
@@ -136,12 +134,14 @@ pub async fn chat_stream_full(
                 .and_then(|c| c.as_str())
             {
                 if !text.is_empty() {
+                    has_received_token = true;
                     result.reasoning.push_str(text);
                     on_reasoning(text);
                 }
             }
             if let Some(tcs) = delta.get("tool_calls").and_then(|c| c.as_array()) {
                 for tc in tcs {
+                    has_received_token = true;
                     let idx = tc
                         .get("index")
                         .and_then(|i| i.as_u64())
