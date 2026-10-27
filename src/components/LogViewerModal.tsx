@@ -55,6 +55,15 @@ function formatTimestamp(isoStr?: string | null): string {
   }
 }
 
+function formatDate(d: Date): string {
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function getTodayDateString(): string {
+  return formatDate(new Date());
+}
+
 function statusBadge(item: ToolLogItem) {
   if (item.logType === "user") {
     return (
@@ -158,10 +167,10 @@ export function LogViewerModal() {
   const [page, setPage] = useState<number>(1);
   const pageSize = 30;
 
-  // 日期范围筛选
-  const [datePreset, setDatePreset] = useState<"all" | "today" | "7d" | "30d" | "custom">("all");
-  const [startDate, setStartDate] = useState<string>("");
-  const [endDate, setEndDate] = useState<string>("");
+  // 日期范围筛选 (默认查询今天的日志)
+  const [datePreset, setDatePreset] = useState<"all" | "today" | "7d" | "30d" | "custom">("today");
+  const [startDate, setStartDate] = useState<string>(() => getTodayDateString());
+  const [endDate, setEndDate] = useState<string>(() => getTodayDateString());
 
   // 视图模式：'stream' (明细流) | 'clusters' (同款异常聚类)
   const [activeTab, setActiveTab] = useState<"stream" | "clusters">("stream");
@@ -180,7 +189,7 @@ export function LogViewerModal() {
   const [detailTab, setDetailTab] = useState<"result" | "request">("result");
   const [traceSubTab, setTraceSubTab] = useState<"system" | "messages" | "tools" | "raw">("system");
 
-  // 初始化参数应用
+  // 初始化参数应用 (进入日志查询时)
   useEffect(() => {
     if (show) {
       if (initialFilter) {
@@ -188,9 +197,16 @@ export function LogViewerModal() {
         if (initialFilter.projectId) setSelectedProjectId(initialFilter.projectId);
         if (initialFilter.status) setStatusFilter(initialFilter.status);
         if (initialFilter.toolName) setToolNameFilter(initialFilter.toolName);
-        if (initialFilter.startDate) setStartDate(initialFilter.startDate);
-        if (initialFilter.endDate) setEndDate(initialFilter.endDate);
-        if (initialFilter.startDate || initialFilter.endDate) setDatePreset("custom");
+        if (initialFilter.startDate || initialFilter.endDate) {
+          setStartDate(initialFilter.startDate ?? "");
+          setEndDate(initialFilter.endDate ?? "");
+          setDatePreset("custom");
+        } else {
+          const todayStr = getTodayDateString();
+          setStartDate(todayStr);
+          setEndDate(todayStr);
+          setDatePreset("today");
+        }
         if (initialFilter.keyword) {
           setKeyword(initialFilter.keyword);
           setSearchInput(initialFilter.keyword);
@@ -198,7 +214,16 @@ export function LogViewerModal() {
       } else {
         setStatusFilter("all");
         setCategoryFilter("all");
+        setSelectedProjectId("all");
+        setToolNameFilter("all");
+        setKeyword("");
+        setSearchInput("");
+        const todayStr = getTodayDateString();
+        setStartDate(todayStr);
+        setEndDate(todayStr);
+        setDatePreset("today");
       }
+      setPage(1);
     }
   }, [show, initialFilter]);
 
@@ -206,8 +231,6 @@ export function LogViewerModal() {
   const handleDatePreset = (preset: "all" | "today" | "7d" | "30d") => {
     setDatePreset(preset);
     const now = new Date();
-    const pad = (n: number) => n.toString().padStart(2, "0");
-    const formatDate = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 
     if (preset === "all") {
       setStartDate("");
@@ -778,7 +801,7 @@ export function LogViewerModal() {
                 {(startDate || endDate) && (
                   <div className="text-[11px] text-accent/80 flex items-center gap-1">
                     <span>
-                      已过滤区间: {startDate || "最早"} ~ {endDate || "今天"}
+                      已过滤区间: {startDate && endDate && startDate === endDate ? startDate : `${startDate || "最早"} ~ ${endDate || "今天"}`}
                     </span>
                   </div>
                 )}
