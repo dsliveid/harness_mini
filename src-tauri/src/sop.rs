@@ -105,6 +105,7 @@ pub async fn run_verify_cmd(
     };
 
     cmd.current_dir(workspace)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);

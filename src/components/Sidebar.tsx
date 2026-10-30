@@ -498,21 +498,51 @@ export function Sidebar() {
                     <Plus size={14} strokeWidth={2} />
                   </button>
                 </div>
-                {!groupCollapsed.chats &&
-                  ungrouped.map((s) => (
-                    <SessionRow
-                      key={s.id}
-                      s={s}
-                      indent={false}
-                      isSelected={currentId === s.id}
-                      isRunning={runStatus[s.id] === "running"}
-                      isMenuOpen={menuFor === s.id}
-                      onSelect={selectSession}
-                      onToggleMenu={handleToggleMenu}
-                      onCloseMenu={handleCloseMenu}
-                      menuItems={menuFor === s.id ? sessionMenu(s) : EMPTY_MENU}
-                    />
-                  ))}
+                {!groupCollapsed.chats && (() => {
+                  const isUngroupedMore = !!expandedMore["__ungrouped__"];
+                  const hasMoreUngrouped = ungrouped.length > 5;
+                  const displayUngrouped = hasMoreUngrouped && !isUngroupedMore ? ungrouped.slice(0, 5) : ungrouped;
+                  return (
+                    <>
+                      {displayUngrouped.map((s) => (
+                        <SessionRow
+                          key={s.id}
+                          s={s}
+                          indent={false}
+                          isSelected={currentId === s.id}
+                          isRunning={runStatus[s.id] === "running"}
+                          isMenuOpen={menuFor === s.id}
+                          onSelect={selectSession}
+                          onToggleMenu={handleToggleMenu}
+                          onCloseMenu={handleCloseMenu}
+                          menuItems={menuFor === s.id ? sessionMenu(s) : EMPTY_MENU}
+                        />
+                      ))}
+                      {hasMoreUngrouped && (
+                        !isUngroupedMore ? (
+                          <div
+                            className="flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] text-inkdim hover:text-ink hover:bg-panel2 cursor-pointer mr-2 ml-2 select-none transition-colors"
+                            title={`共 ${ungrouped.length} 条对话，点击展开全部`}
+                            onClick={() => setExpandedMore((prev) => ({ ...prev, ["__ungrouped__"]: true }))}
+                          >
+                            <ChevronDown size={12} className="text-inkdim" />
+                            <span>更多</span>
+                            <span className="text-[11px] text-inkdim">({ungrouped.length})</span>
+                          </div>
+                        ) : (
+                          <div
+                            className="flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] text-inkdim hover:text-ink hover:bg-panel2 cursor-pointer mr-2 ml-2 select-none transition-colors"
+                            title="收起对话"
+                            onClick={() => setExpandedMore((prev) => ({ ...prev, ["__ungrouped__"]: false }))}
+                          >
+                            <ChevronUp size={12} className="text-inkdim" />
+                            <span>收起</span>
+                          </div>
+                        )
+                      )}
+                    </>
+                  );
+                })()}
               </div>
             )}
           </>

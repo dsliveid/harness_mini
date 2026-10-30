@@ -1,14 +1,10 @@
-use super::auth::AuthStep;
 use super::cdp::CdpClient;
 use super::detector::detect_chromium_path;
-use super::dom_script::{
-    build_interact_script, build_scroll_script, EXTRACT_RECORDED_STEPS_SCRIPT, EXTRACT_TREE_SCRIPT, INJECT_RECORDER_SCRIPT,
-};
+use super::dom_script::{build_interact_script, build_scroll_script, EXTRACT_TREE_SCRIPT};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -203,9 +199,6 @@ pub struct BrowserSession {
     target_id: String,
     target_session_id: String,
     ws_url: String,
-    pub is_recording: Arc<AtomicBool>,
-    pub recording_start_url: Arc<Mutex<Option<String>>>,
-    replay_lock: Arc<Mutex<()>>,
 }
 
 impl BrowserSession {
@@ -228,24 +221,21 @@ impl BrowserSession {
             let _ = cdp.send("DOM.enable", None, sid, Duration::from_secs(5)).await;
             let _ = cdp.send("Log.enable", None, sid, Duration::from_secs(5)).await;
 
-            // 激活当前标签页并设置视口，防止后台节流和 0x0 渲染
+            // 激活当前标签页并设置视口，开启焦点模拟，防止后台节流和 0x0 渲染
             let _ = cdp.send("Target.activateTarget", Some(json!({ "targetId": target_id })), None, Duration::from_secs(5)).await;
+            let _ = cdp.send("Page.bringToFront", None, sid, Duration::from_secs(5)).await;
+            let _ = cdp.send("Emulation.setFocusEmulationEnabled", Some(json!({ "enabled": true })), sid, Duration::from_secs(5)).await;
             let _ = cdp.send(
                 "Emulation.setDeviceMetricsOverride",
                 Some(json!({
                     "width": 1440,
                     "height": 960,
-                    "deviceScaleFactor": 2,
+                    "deviceScaleFactor": 1,
                     "mobile": false
                 })),
                 sid,
                 Duration::from_secs(5),
             ).await;
-
-            // 恢复轻量 storage_state (Cookies)
-            if let Some(ref ws) = workspace {
-                let _ = super::storage::restore_storage_state(&cdp, &target_session_id, ws).await;
-            }
 
             let ws_url = daemon.get_ws_url().await.unwrap_or_default();
 
@@ -258,9 +248,6 @@ impl BrowserSession {
                 target_id,
                 target_session_id,
                 ws_url,
-                is_recording: Arc::new(AtomicBool::new(false)),
-                recording_start_url: Arc::new(Mutex::new(None)),
-                replay_lock: Arc::new(Mutex::new(())),
             });
         }
 
@@ -404,21 +391,19 @@ impl BrowserSession {
         let _ = cdp.send("Log.enable", None, sid, Duration::from_secs(5)).await;
 
         let _ = cdp.send("Target.activateTarget", Some(json!({ "targetId": target_id })), None, Duration::from_secs(5)).await;
+        let _ = cdp.send("Page.bringToFront", None, sid, Duration::from_secs(5)).await;
+        let _ = cdp.send("Emulation.setFocusEmulationEnabled", Some(json!({ "enabled": true })), sid, Duration::from_secs(5)).await;
         let _ = cdp.send(
             "Emulation.setDeviceMetricsOverride",
             Some(json!({
                 "width": 1440,
                 "height": 960,
-                "deviceScaleFactor": 2,
+                "deviceScaleFactor": 1,
                 "mobile": false
             })),
             sid,
             Duration::from_secs(5),
         ).await;
-
-        if let Some(ref ws) = workspace {
-            let _ = super::storage::restore_storage_state(&cdp, &target_session_id, ws).await;
-        }
 
         Ok(Self {
             _child: Arc::new(Mutex::new(Some(child))),
@@ -429,9 +414,6 @@ impl BrowserSession {
             target_id,
             target_session_id,
             ws_url,
-            is_recording: Arc::new(AtomicBool::new(false)),
-            recording_start_url: Arc::new(Mutex::new(None)),
-            replay_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -508,22 +490,51 @@ impl BrowserSession {
 
         let sid = Some(self.target_session_id.as_str());
 
+        // 1. 关键：在导航发起之前提前恢复 StorageState (Cookies + addScriptToEvaluateOnNewDocument)
+        // 这样首行业务 JS 执行时即具备完整鉴权凭证，彻底避免未登录闪烁与二次重定向
+        if let Some(ref ws) = *self.workspace.lock().await {
+            let _ = super::storage::restore_storage_state(&self.cdp, &self.target_session_id, ws, Some(&normalized_url)).await;
+        }
+
+        // 2. 发起页面导航
         self.cdp
             .send("Page.navigate", Some(json!({ "url": normalized_url })), sid, Duration::from_secs(30))
             .await?;
 
-        // 等待单页应用初始化加载 (Vue/React 挂载)
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // 3. 智能就绪等待 (Smart Readiness Wait)：
+        // 轮询等待 document.readyState === 'complete'，并确保 SPA 框架完成挂载
+        let wait_start = std::time::Instant::now();
+        let max_wait = Duration::from_millis(3500);
+        let min_wait = Duration::from_millis(500);
 
-        // 若处于录制模式，确保新页面自动载入录制探针
-        if self.is_recording.load(Ordering::SeqCst) {
-            let _ = self.cdp.send(
+        while wait_start.elapsed() < max_wait {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if wait_start.elapsed() < min_wait {
+                continue;
+            }
+
+            let check_res = self.cdp.send(
                 "Runtime.evaluate",
-                Some(json!({ "expression": INJECT_RECORDER_SCRIPT, "returnByValue": false })),
+                Some(json!({
+                    "expression": "document.readyState === 'complete'",
+                    "returnByValue": true
+                })),
                 sid,
-                Duration::from_secs(5),
+                Duration::from_millis(500),
             ).await;
+
+            if let Ok(val) = check_res {
+                if val.get("result").and_then(|r| r.get("value")).and_then(|v| v.as_bool()) == Some(true) {
+                    // readyState 已 complete，再缓冲 300ms 供 Vue/React 组件树完成初始 mount
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    break;
+                }
+            }
         }
+
+        // 4. 确保窗口激活与焦点模拟
+        let _ = self.cdp.send("Page.bringToFront", None, sid, Duration::from_secs(2)).await;
+        let _ = self.cdp.send("Emulation.setFocusEmulationEnabled", Some(json!({ "enabled": true })), sid, Duration::from_secs(2)).await;
 
         self.get_debug_state().await
     }
@@ -779,6 +790,19 @@ impl BrowserSession {
 
     pub async fn user_click(&self, x: f64, y: f64) -> Result<(), String> {
         let sid = Some(self.target_session_id.as_str());
+
+        // 1. 确保页面获得窗口前台焦点 (Focus Emulation)
+        let _ = self.cdp.send("Emulation.setFocusEmulationEnabled", Some(json!({ "enabled": true })), sid, Duration::from_secs(2)).await;
+
+        // 2. 模拟真实光标移动 (mouseMoved) 触发 hover / active 态
+        let move_evt = json!({
+            "type": "mouseMoved",
+            "x": x,
+            "y": y
+        });
+        let _ = self.cdp.send("Input.dispatchMouseEvent", Some(move_evt), sid, Duration::from_secs(3)).await;
+
+        // 3. 模拟鼠标左键按下 (mousePressed)
         let press = json!({
             "type": "mousePressed",
             "x": x,
@@ -787,6 +811,11 @@ impl BrowserSession {
             "clickCount": 1
         });
         self.cdp.send("Input.dispatchMouseEvent", Some(press), sid, Duration::from_secs(5)).await?;
+
+        // 真实人类物理按压微延迟 35ms，确保框架事件监听器可靠捕获完整点击动作
+        tokio::time::sleep(Duration::from_millis(35)).await;
+
+        // 4. 模拟鼠标左键抬起 (mouseReleased)
         let release = json!({
             "type": "mouseReleased",
             "x": x,
@@ -794,141 +823,107 @@ impl BrowserSession {
             "button": "left"
         });
         self.cdp.send("Input.dispatchMouseEvent", Some(release), sid, Duration::from_secs(5)).await?;
+
+        // 5. 智能聚焦双重兜底 (Dual-Guaranteed Focus)：
+        // 若坐标下命中输入控件（如 input / textarea / contenteditable 或 UI 组件库包装层），显式触发 focus() 获得光标
+        let focus_script = format!(
+            r#"(() => {{
+                try {{
+                    const el = document.elementFromPoint({x}, {y});
+                    if (!el) return false;
+                    const isInput = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable;
+                    if (isInput) {{
+                        el.focus();
+                        return true;
+                    }}
+                    const innerInput = el.querySelector('input:not([type="hidden"]), textarea, [contenteditable="true"]');
+                    if (innerInput) {{
+                        innerInput.focus();
+                        return true;
+                    }}
+                    const parentInput = el.closest('label, .el-input, .ant-input-affix-wrapper, .n-input, .t-input, .arco-input-wrapper');
+                    if (parentInput) {{
+                        const inp = parentInput.querySelector('input:not([type="hidden"]), textarea');
+                        if (inp) {{
+                            inp.focus();
+                            return true;
+                        }}
+                    }}
+                    return false;
+                }} catch (e) {{
+                    return false;
+                }}
+            }})()"#
+        );
+        let _ = self.cdp.send(
+            "Runtime.evaluate",
+            Some(json!({
+                "expression": focus_script,
+                "returnByValue": true
+            })),
+            sid,
+            Duration::from_secs(2),
+        ).await;
+
         Ok(())
     }
 
     pub async fn user_type_text(&self, text: &str) -> Result<(), String> {
         let sid = Some(self.target_session_id.as_str());
+
+        // 1. 确保页面获得焦点
+        let _ = self.cdp.send("Emulation.setFocusEmulationEnabled", Some(json!({ "enabled": true })), sid, Duration::from_secs(2)).await;
+
+        // 2. 若当前 activeElement 不是有效输入框，尝试自动聚焦当前视口内首个可见输入框
+        let ensure_focus_script = r#"(() => {
+            const active = document.activeElement;
+            if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) {
+                return true;
+            }
+            const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([disabled]), textarea:not([disabled])'));
+            for (let inp of inputs) {
+                const rect = inp.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0 && rect.top < window.innerHeight && rect.bottom > 0) {
+                    inp.focus();
+                    return true;
+                }
+            }
+            return false;
+        })()"#;
+        let _ = self.cdp.send(
+            "Runtime.evaluate",
+            Some(json!({ "expression": ensure_focus_script, "returnByValue": true })),
+            sid,
+            Duration::from_secs(2),
+        ).await;
+
+        // 3. 调用 CDP 输入文字
         let params = json!({ "text": text });
         self.cdp.send("Input.insertText", Some(params), sid, Duration::from_secs(5)).await?;
-        Ok(())
-    }
 
-    pub async fn start_recording(&self) -> Result<(), String> {
-        self.is_recording.store(true, Ordering::SeqCst);
-        if let Ok(state) = self.get_debug_state().await {
-            let mut start_lock = self.recording_start_url.lock().await;
-            *start_lock = Some(state.url);
-        }
-        let sid = Some(self.target_session_id.as_str());
-
-        // 清空之前的录制缓存
-        let _ = self
-            .cdp
-            .send(
-                "Runtime.evaluate",
-                Some(json!({
-                    "expression": "window.__harness_recorded_steps = []; window.__harness_recorder_installed = false;",
-                    "returnByValue": false
-                })),
-                sid,
-                Duration::from_secs(5),
-            )
-            .await;
-
-        // 注册到后续导航
-        let _ = self
-            .cdp
-            .send(
-                "Page.addScriptToEvaluateOnNewDocument",
-                Some(json!({ "source": INJECT_RECORDER_SCRIPT })),
-                sid,
-                Duration::from_secs(5),
-            )
-            .await;
-
-        // 立即在当前页面注入监听器
-        let _ = self
-            .cdp
-            .send(
-                "Runtime.evaluate",
-                Some(json!({ "expression": INJECT_RECORDER_SCRIPT, "returnByValue": false })),
-                sid,
-                Duration::from_secs(5),
-            )
-            .await;
-
-        Ok(())
-    }
-
-    pub async fn get_recorded_steps(&self) -> Result<Vec<AuthStep>, String> {
-        let sid = Some(self.target_session_id.as_str());
-        let res = self
-            .cdp
-            .send(
-                "Runtime.evaluate",
-                Some(json!({
-                    "expression": EXTRACT_RECORDED_STEPS_SCRIPT,
-                    "returnByValue": true
-                })),
-                sid,
-                Duration::from_secs(5),
-            )
-            .await?;
-
-        let mut steps = Vec::new();
-        if let Some(arr) = res.get("result").and_then(|r| r.get("value")).and_then(|v| v.as_array()) {
-            for (idx, item) in arr.iter().enumerate() {
-                let action = item.get("action").and_then(|a| a.as_str()).unwrap_or("click").to_string();
-                let selector = item.get("selector").and_then(|s| s.as_str()).map(|s| s.to_string());
-                let value = item.get("value").and_then(|v| v.as_str()).map(|s| s.to_string());
-                let is_encrypted = item.get("is_encrypted").and_then(|b| b.as_bool());
-                let desc = item.get("desc").and_then(|d| d.as_str()).map(|d| d.to_string());
-                let order = item.get("order").and_then(|o| o.as_u64()).map(|o| o as usize).unwrap_or(idx + 1);
-
-                steps.push(AuthStep {
-                    order,
-                    action,
-                    selector,
-                    value,
-                    is_encrypted,
-                    desc,
-                    ms: None,
-                    exclude: None,
-                });
+        // 4. 派发 input 与 change 事件，确保 Vue 3 / React 的响应式受控表单 (v-model) 彻底同步
+        let sync_script = r#"(() => {
+            const active = document.activeElement;
+            if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
+                active.dispatchEvent(new Event('input', { bubbles: true }));
+                active.dispatchEvent(new Event('change', { bubbles: true }));
             }
-        }
-        Ok(steps)
-    }
+        })()"#;
+        let _ = self.cdp.send(
+            "Runtime.evaluate",
+            Some(json!({ "expression": sync_script, "returnByValue": false })),
+            sid,
+            Duration::from_secs(2),
+        ).await;
 
-    pub async fn stop_recording(&self) -> Result<(), String> {
-        self.is_recording.store(false, Ordering::SeqCst);
         Ok(())
-    }
-
-    pub async fn get_recording_start_url(&self) -> Option<String> {
-        self.recording_start_url.lock().await.clone()
-    }
-
-    pub async fn check_and_heal_auth(&self, master_key: &[u8; 32]) -> Result<bool, String> {
-        let state = super::evaluator::evaluate_page_state(self).await;
-        if !matches!(state, super::evaluator::PageHealthState::Unauthenticated { .. }) {
-            return Ok(false);
-        }
-
-        let ws_opt = self.get_workspace().await;
-        let ws = match ws_opt {
-            Some(w) => w,
-            None => return Ok(false),
-        };
-
-        let _guard = self.replay_lock.lock().await;
-
-        // 使用声明式凭据契约与流水线引擎自愈
-        if let Ok(Some(contract)) = super::auth::load_auth_contract(&ws, master_key) {
-            if let Ok(()) = super::pipeline::execute_auth_pipeline(self, &contract).await {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
     }
 
     pub async fn close(&self) {
-        // 保存轻量 storage_state (Cookies/LocalStorage)
-        if let Some(ws) = self.get_workspace().await {
-            let _ = super::storage::save_storage_state(&self.cdp, &self.target_session_id, &ws).await;
-        }
+        // 保存全量 storage_state (Cookies/LocalStorage/SessionStorage)
+        let ws = self.get_workspace().await.unwrap_or_default();
+        let curr_url = self.get_debug_state().await.ok().map(|d| d.url);
+        let _ = super::storage::save_storage_state(&self.cdp, &self.target_session_id, &ws, curr_url.as_deref()).await;
 
         // 若是通过全局 BrowserDaemon 运行的隔离上下文
         if let Some(ref cid) = self.context_id {
@@ -941,6 +936,10 @@ impl BrowserSession {
         // 若是独立实体窗口进程
         let mut child_guard = self._child.lock().await;
         if let Some(mut child) = child_guard.take() {
+            #[cfg(windows)]
+            if let Some(pid) = child.id() {
+                crate::tools::kill_process_tree(pid);
+            }
             let _ = child.kill().await;
         }
         if let Some(ref p) = self.profile_dir {

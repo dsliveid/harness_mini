@@ -4,12 +4,10 @@ import { useStore } from "../store";
 import {
   ShieldAlert,
   ShieldCheck,
-  Play,
   Monitor,
-  KeyRound,
+  Database,
   Loader2,
   RefreshCw,
-  ExternalLink,
 } from "./Icons";
 
 interface AuthCardProps {
@@ -20,28 +18,32 @@ interface AuthCardProps {
 }
 
 export function AuthCard({ sessionId, targetUrl, reason, onHealed }: AuthCardProps) {
-  const [runningPipeline, setRunningPipeline] = useState(false);
+  const [restoring, setRestoring] = useState(false);
   const [healed, setHealed] = useState(false);
   const pushToast = useStore((s) => s.pushToast);
   const setBrowserInspectorTab = useStore((s) => s.setBrowserInspectorTab);
 
-  const handleRunPipeline = async () => {
-    if (!sessionId || runningPipeline) return;
-    setRunningPipeline(true);
+  const handleRestoreStorageState = async () => {
+    if (!sessionId || restoring) return;
+    setRestoring(true);
     try {
-      pushToast("正在启动受控浏览器并执行声明式免登流水线...", "info");
-      await ipc.executeBrowserAuthPipeline(sessionId);
-      setHealed(true);
-      pushToast("登录流水线执行成功，页面鉴权已就绪", "success");
-      onHealed?.();
+      pushToast("正在尝试从本地持久化快照注入登录态凭据...", "info");
+      const ok = await ipc.restoreBrowserStorageState(sessionId);
+      if (ok) {
+        setHealed(true);
+        pushToast("登录态快照注入成功，页面已重载", "success");
+        onHealed?.();
+      } else {
+        pushToast("未找到当前站点的登录态快照，请点击下方按钮在视窗内首次登录并固化", "warning");
+      }
     } catch (err: any) {
-      pushToast(`流水线执行未成功: ${err}`, "error");
+      pushToast(`快照注入失败: ${err}`, "error");
     } finally {
-      setRunningPipeline(false);
+      setRestoring(false);
     }
   };
 
-  const handleOpenInspector = (tab: "view" | "auth") => {
+  const handleOpenInspector = (tab: "view" | "storage") => {
     setBrowserInspectorTab(tab);
   };
 
@@ -56,7 +58,7 @@ export function AuthCard({ sessionId, targetUrl, reason, onHealed }: AuthCardPro
           )}
           <div>
             <div className="font-semibold text-ink flex items-center gap-2">
-              <span>{healed ? "鉴权自愈已完成" : "浏览器鉴权拦截 (Auth Gateway)"}</span>
+              <span>{healed ? "登录态恢复已完成" : "浏览器鉴权拦截 (StorageState Gateway)"}</span>
               {healed ? (
                 <span className="text-[10.5px] px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 font-normal">
                   Ready · 鉴权就绪
@@ -69,8 +71,8 @@ export function AuthCard({ sessionId, targetUrl, reason, onHealed }: AuthCardPro
             </div>
             <div className="text-[11.5px] text-inkdim mt-0.5">
               {reason
-                ? `页面处于未鉴权态 (检测原因: ${reason})`
-                : "目标页面检测到未登录重定向或 Token 失效，请选择自动流水线或人工协助。"}
+                ? `页面处于未登录态 (检测原因: ${reason})`
+                : "目标页面检测到未登录重定向或 Token 失效，可一键注入已固化快照或打开视窗人工完成首次登录。"}
               {targetUrl && (
                 <span className="ml-1 font-mono text-ink/80 text-[11px]">[{targetUrl}]</span>
               )}
@@ -81,16 +83,16 @@ export function AuthCard({ sessionId, targetUrl, reason, onHealed }: AuthCardPro
 
       <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-edge/40">
         <button
-          onClick={handleRunPipeline}
-          disabled={runningPipeline}
-          className="px-3 py-1.5 rounded-lg bg-accent text-white font-medium text-[11.5px] flex items-center gap-1.5 hover:bg-accent/90 disabled:opacity-50 transition-colors cursor-pointer shadow-xs"
+          onClick={handleRestoreStorageState}
+          disabled={restoring}
+          className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium text-[11.5px] flex items-center gap-1.5 disabled:opacity-50 transition-colors cursor-pointer shadow-xs"
         >
-          {runningPipeline ? (
+          {restoring ? (
             <Loader2 size={13} className="animate-spin" />
           ) : (
-            <Play size={13} />
+            <RefreshCw size={13} />
           )}
-          <span>{runningPipeline ? "正在自愈登录..." : "⚡ 执行免登流水线"}</span>
+          <span>{restoring ? "正在恢复登录态..." : "🔄 注入登录态快照"}</span>
         </button>
 
         <button
@@ -98,15 +100,15 @@ export function AuthCard({ sessionId, targetUrl, reason, onHealed }: AuthCardPro
           className="px-3 py-1.5 rounded-lg border border-edge bg-panel hover:bg-panel3 text-ink text-[11.5px] font-medium flex items-center gap-1.5 transition-colors cursor-pointer"
         >
           <Monitor size={13} className="text-blue-400" />
-          <span>🚀 立即协助登录 (打开视窗)</span>
+          <span>🚀 视窗协助登录</span>
         </button>
 
         <button
-          onClick={() => handleOpenInspector("auth")}
+          onClick={() => handleOpenInspector("storage")}
           className="px-3 py-1.5 rounded-lg border border-edge bg-panel hover:bg-panel3 text-inkdim hover:text-ink text-[11.5px] flex items-center gap-1.5 transition-colors cursor-pointer"
         >
-          <KeyRound size={13} className="text-amber-400" />
-          <span>⚙️ 配置凭据契约</span>
+          <Database size={13} className="text-emerald-400" />
+          <span>💾 登录态快照管理</span>
         </button>
       </div>
     </div>

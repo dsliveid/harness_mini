@@ -66,6 +66,7 @@ pub(crate) async fn dispatch_static(
         "run_skill" => skills_memory_plan::run_skill_tool(args, ctx, on_partial).await,
         "record_memory" => skills_memory_plan::record_memory_tool(args, ctx).await,
         "read_memory" => skills_memory_plan::read_memory_tool(args, ctx).await,
+        "compact_context" => skills_memory_plan::compact_context_tool(args, ctx).await,
         "create_plan" => skills_memory_plan::create_plan_tool(args, ctx).await,
         "update_plan" => skills_memory_plan::update_plan_tool(args, ctx).await,
         "switch_plan" => skills_memory_plan::switch_plan_tool(args, ctx).await,

@@ -1,26 +1,18 @@
-pub mod auth;
 pub mod cdp;
 pub mod daemon;
 pub mod detector;
 pub mod dom_script;
 pub mod evaluator;
-pub mod pipeline;
 pub mod session;
 pub mod storage;
-pub mod synthesizer;
 
 pub use daemon::{global_browser_daemon, BrowserDaemon};
-
-pub use auth::{
-    load_auth_contract, save_auth_contract, AuthAction, AuthContract, AuthContractCredentials,
-    AuthContractPostLogin, AuthStep,
-};
 pub use evaluator::{evaluate_page_state, PageHealthState};
-pub use pipeline::execute_auth_pipeline;
 pub use session::{BrowserDebugState, BrowserSession, ViewportInfo};
-pub use synthesizer::{
-    distill_auth_contract, DistillAuthContractResult, DistillTrace,
-    DEFAULT_AUTH_DISTILL_SYSTEM_PROMPT,
+pub use storage::{
+    clear_storage_state, ensure_gitignore_entries, get_storage_state_path,
+    get_storage_state_summary, restore_storage_state, save_storage_state,
+    storage_filename_for_url, StorageState, StorageStateSummary,
 };
 
 use crate::tools::ToolCtx;
@@ -118,14 +110,6 @@ fn get_session_key(ctx: &ToolCtx) -> String {
         .unwrap_or_else(|| "default_browser_session".to_string())
 }
 
-fn get_master_key(ctx: &ToolCtx) -> Option<[u8; 32]> {
-    use tauri::Manager;
-    let host = ctx.host.as_ref()?;
-    let state = host.app.try_state::<crate::AppState>()?;
-    let lock = state.master_key.lock().ok()?;
-    Some(*lock)
-}
-
 pub async fn browser_navigate(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let url = args
         .get("url")
@@ -149,17 +133,7 @@ pub async fn browser_navigate(args: &Value, ctx: &ToolCtx) -> Result<String, Str
 
     let res = session.navigate(url).await;
     match res {
-        Ok(debug_state) => {
-            // 401 或路由退回登录态自愈机制
-            if let Some(master) = get_master_key(ctx) {
-                if let Ok(true) = session.check_and_heal_auth(&master).await {
-                    if let Ok(healed_state) = session.navigate(url).await {
-                        return Ok(healed_state.to_markdown());
-                    }
-                }
-            }
-            Ok(debug_state.to_markdown())
-        }
+        Ok(debug_state) => Ok(debug_state.to_markdown()),
         Err(e) => {
             // 若导航发生严重异常（如超时或通道断开），清理此异常会话，保障下次自动重试或新操作自动拉起健康实例
             manager.close(&session_key).await;
@@ -202,17 +176,7 @@ pub async fn browser_interact(args: &Value, ctx: &ToolCtx) -> Result<String, Str
 
     let res = session.interact(action, target, value).await;
     match res {
-        Ok(debug_state) => {
-            // 检查交互后是否触发接口 401 或退回 login 页，如有则自动后台自愈
-            if let Some(master) = get_master_key(ctx) {
-                if let Ok(true) = session.check_and_heal_auth(&master).await {
-                    if let Ok(healed_state) = session.get_debug_state().await {
-                        return Ok(healed_state.to_markdown());
-                    }
-                }
-            }
-            Ok(debug_state.to_markdown())
-        }
+        Ok(debug_state) => Ok(debug_state.to_markdown()),
         Err(e) => {
             if e.contains("channel closed") || e.contains("CDP 连接已断开") {
                 manager.close(&session_key).await;

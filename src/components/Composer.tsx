@@ -91,6 +91,23 @@ const SLASH_COMMANDS: SlashCommand[] = [
     Icon: Sparkles,
   },
   {
+    cmd: "/compact",
+    label: "/compact [可选聚焦重点]",
+    desc: "提炼并压缩当前上下文历史：生成结构化技术备忘录并替换早期对话，释放 Token 空间",
+    placeholder: "可选输入需重点保留的技术细节或约束，Enter 触发压缩，Backspace 删除标签取消…",
+    requireBody: false,
+    emptyHint: "",
+    buildMessage: (body) =>
+      body
+        ? `请调用 compact_context 工具压缩当前上下文历史，重点关注：${body}`
+        : "请调用 compact_context 工具压缩当前上下文历史，提炼技术备忘录并释放 Token 空间",
+    badgeClass: "bg-emerald-500/15 border-emerald-500/35 text-emerald-300",
+    iconClass: "text-emerald-400",
+    closeClass: "hover:bg-emerald-500/25 text-emerald-400 hover:text-emerald-100",
+    badgeTitle: "删除标签以取消压缩指令 (Backspace)",
+    Icon: Sparkles,
+  },
+  {
     cmd: "/jev:决策",
     label: "/jev:决策 <意图或方案>",
     desc: "场景化意图理解与方案决策：自动分析意图并智能调度决策工具（评分/判定/选择）",
@@ -171,6 +188,35 @@ export function Composer() {
   const running = useStore((s) => (s.currentId ? s.runStatus[s.currentId] === "running" : false));
   const readOnly = useStore((s) => s.readOnly);
   const session = useStore((s) => (s.currentId && s.currentId !== DRAFT_ID ? s.sessions.find((x) => x.id === s.currentId) ?? null : null));
+  const msgs = useStore((s) => (s.currentId ? s.messages[s.currentId] ?? [] : []));
+  const tokenStats = useMemo(() => {
+    let total = 0;
+    let prompt = 0;
+    let completion = 0;
+    let cached = 0;
+    for (const msg of msgs) {
+      const tt = msg.totalTokens ?? (msg.usage?.totalTokens || (msg.usage?.inputEst || 0) + (msg.usage?.outputEst || 0)) ?? 0;
+      const pt = msg.promptTokens ?? (msg.usage?.promptTokens || msg.usage?.inputEst) ?? 0;
+      const ct = msg.completionTokens ?? (msg.usage?.completionTokens || msg.usage?.outputEst) ?? 0;
+      const ckt = msg.cachedTokens ?? (msg.usage?.cachedTokens || msg.usage?.promptCacheHitTokens || msg.usage?.cacheReadInputTokens) ?? 0;
+      total += Number(tt) || 0;
+      prompt += Number(pt) || 0;
+      completion += Number(ct) || 0;
+      cached += Number(ckt) || 0;
+    }
+    const finalTotal = Math.max(total, Number(session?.totalTokens) || 0);
+    const finalPrompt = Math.max(prompt, Number(session?.promptTokens) || 0);
+    const finalCached = Math.max(cached, Number(session?.cachedTokens) || 0);
+    const finalCompletion = Math.max(completion, Number(session?.completionTokens) || 0);
+    const cacheHitRate = finalPrompt > 0 ? Math.round((finalCached / finalPrompt) * 1000) / 10 : (session?.cacheHitRate ?? 0);
+    return {
+      totalTokens: finalTotal,
+      promptTokens: finalPrompt,
+      completionTokens: finalCompletion,
+      cachedTokens: finalCached,
+      cacheHitRate,
+    };
+  }, [msgs, session?.totalTokens, session?.promptTokens, session?.completionTokens, session?.cachedTokens, session?.cacheHitRate]);
   const draft = useStore((s) => s.draft);
   const tempInfo = useStore((s) => s.tempInfo);
   const fallbackModel = useStore((s) => s.settings.activeModelId || s.settings.activeModel || "");
@@ -482,6 +528,63 @@ export function Composer() {
     const cfg = activeCfg ?? parsed.cfg;
     const body = activeCfg ? trimmed : parsed.body;
     let messageToSend = t;
+    if (cfg?.cmd === "/goal") {
+      const goalBody = (body || "").trim();
+      if (!goalBody) {
+        setActiveCmd(cfg.cmd);
+        setSessionDraft(targetId, "");
+        pushToast(cfg.emptyHint, "info");
+        requestAnimationFrame(() => {
+          if (taRef.current) {
+            taRef.current.focus();
+          }
+        });
+        return;
+      }
+      setActiveCmd(null);
+      setSessionDraft(targetId, "");
+      setPendingAttachments([]);
+      requestAnimationFrame(resize);
+
+      try {
+        const st = useStore.getState();
+        const isDraftLike = !currentId || currentId === DRAFT_ID;
+        const draft = st.draft;
+        let targetSessionId = currentId;
+
+        if (isDraftLike || !targetSessionId) {
+          const s = await ipc.createSession({
+            workspacePath: draft?.workspacePath ?? undefined,
+            projectId: draft?.projectId ?? st.currentProjectId ?? undefined,
+            title: `长任务: ${goalBody.slice(0, 20)}`,
+            accessMode: draft?.accessMode ?? undefined,
+            contextTokenLimit: draft?.contextTokenLimit ?? undefined,
+            temp: draft?.temp ?? undefined,
+            providerId: draft?.providerId ?? undefined,
+            modelId: draft?.modelId ?? undefined,
+            imageProviderId: draft?.imageProviderId ?? undefined,
+            imageModelId: draft?.imageModelId ?? undefined,
+            visionProviderId: draft?.visionProviderId ?? undefined,
+            visionModelId: draft?.visionModelId ?? undefined,
+            decisionProviderId: draft?.decisionProviderId ?? undefined,
+            decisionModelId: draft?.decisionModelId ?? undefined,
+            reasoningEffort: draft?.reasoningEffort ?? undefined,
+          });
+          targetSessionId = s.id;
+          st.onSessionUpdate(s);
+          await st.selectSession(s.id);
+        }
+
+        // 启动长任务核心引擎，并在主界面激活 TaskBar
+        await st.startLongTask(targetSessionId, goalBody);
+      } catch (e) {
+        pushToast(`启动长任务失败: ${e}`, "error");
+        setSessionDraft(targetId, t);
+        setPendingAttachments(sendingAttachments);
+      }
+      return;
+    }
+
     if (cfg) {
       // 需要正文的指令在留空时不发送，保持标签态并提示用户输入
       if (cfg.requireBody && !body) {
@@ -948,29 +1051,29 @@ export function Composer() {
             <button
               type="button"
               className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-[11px] transition-all group font-mono cursor-pointer border ${
-                (session.totalTokens ?? 0) > 0
+                tokenStats.totalTokens > 0
                   ? "bg-panel2/80 hover:bg-panel3 border-edge/80 hover:border-amber-400/40 text-ink shadow-xs"
                   : "hover:bg-panel2 text-inkdim hover:text-ink border-transparent hover:border-edge/50"
               }`}
               onClick={() => setShowTokenStatsModal(true)}
-              title={`该会话累计消耗: ${(session.totalTokens ?? 0).toLocaleString()} tokens\n输入: ${(session.promptTokens ?? 0).toLocaleString()}${(session.cachedTokens ?? 0) > 0 ? ` (缓存命中: ${(session.cachedTokens ?? 0).toLocaleString()} · ${(session.cacheHitRate ?? 0).toFixed(1)}%)` : ""} · 输出: ${(session.completionTokens ?? 0).toLocaleString()}\n点击打开 Token 消耗统计看板`}
+              title={`该会话累计消耗: ${tokenStats.totalTokens.toLocaleString()} tokens\n输入: ${tokenStats.promptTokens.toLocaleString()}${tokenStats.cachedTokens > 0 ? ` (缓存命中: ${tokenStats.cachedTokens.toLocaleString()} · ${tokenStats.cacheHitRate.toFixed(1)}%)` : ""} · 输出: ${tokenStats.completionTokens.toLocaleString()}\n点击打开 Token 消耗统计看板`}
             >
               <Coins
                 size={12}
                 className={
-                  (session.totalTokens ?? 0) > 0
+                  tokenStats.totalTokens > 0
                     ? "text-amber-400 group-hover:scale-110 transition-transform shrink-0"
                     : "text-inkdim group-hover:text-amber-400 transition-colors shrink-0"
                 }
               />
-              <span className={(session.totalTokens ?? 0) > 0 ? "font-medium text-ink" : "text-inkdim"}>
-                {formatTokens(session.totalTokens ?? 0)}
+              <span className={tokenStats.totalTokens > 0 ? "font-medium text-ink" : "text-inkdim"}>
+                {formatTokens(tokenStats.totalTokens)}
               </span>
               <span className="text-[10px] text-inkdim">tokens</span>
-              {(session.cacheHitRate ?? 0) > 0 && (
+              {tokenStats.cacheHitRate > 0 && (
                 <span className="px-1 py-0.2 rounded text-[9.5px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20 inline-flex items-center gap-0.5">
                   <Zap size={9} className="shrink-0" />
-                  <span>{(session.cacheHitRate ?? 0).toFixed(1)}%</span>
+                  <span>{tokenStats.cacheHitRate.toFixed(1)}%</span>
                 </span>
               )}
             </button>

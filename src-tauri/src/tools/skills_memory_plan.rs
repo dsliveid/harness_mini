@@ -755,3 +755,38 @@ pub(crate) async fn score_decision_tool(args: &Value, ctx: &ToolCtx) -> Result<S
 
     Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| "{}".to_string()))
 }
+
+
+pub(crate) async fn compact_context_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let focus = args.get("focus").and_then(|v| v.as_str());
+    let host = ctx
+        .host
+        .as_ref()
+        .ok_or("宿主上下文不可用，无法调用 compact_context")?;
+    let app = &host.app;
+    let session_id = &host.session_id;
+    let state = app.state::<crate::AppState>();
+
+    let cfg = {
+        let db = state.db.lock().unwrap();
+        let master = state.master_key.lock().unwrap();
+        let settings = crate::store::get_settings_with_secrets(&db, &master)?;
+        crate::context::resolve_session_llm_cfg(&db, &settings, session_id)?
+    };
+
+    let compacted = crate::context::propose_and_execute_compaction(
+        app,
+        &state,
+        session_id,
+        &cfg,
+        focus,
+        true,
+    )
+    .await?;
+
+    if compacted {
+        Ok("已成功提炼并应用前序历史对话的上下文压缩备忘录。早期消息已被结构化备忘录安全替换，释放了可观的 Token 空间。后续交互将以此备忘录为基准继续执行。".into())
+    } else {
+        Ok("用户跳过了本次上下文压缩请求，历史消息保持完整原样。".into())
+    }
+}

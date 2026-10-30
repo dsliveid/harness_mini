@@ -295,6 +295,11 @@ pub async fn dispatch_rpc(
             let res = commands::list_sessions(st)?;
             Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
         }
+        "get_session" => {
+            let session_id = params.get("sessionId").or_else(|| params.get("session_id")).and_then(|v| v.as_str()).ok_or("缺少 sessionId")?.to_string();
+            let res = commands::get_session(st, session_id)?;
+            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+        }
         "list_archived" => {
             let res = commands::list_archived(st)?;
             Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
@@ -487,6 +492,17 @@ pub async fn dispatch_rpc(
             let final_summary = params.get("finalSummary").and_then(|v| v.as_str()).unwrap_or("").to_string();
             commands::respond_compaction(st, app.clone(), event_id, approved, final_summary)?;
             Ok(Value::Null)
+        }
+        "trigger_compaction" => {
+            let session_id = params.get("sessionId").and_then(|v| v.as_str()).ok_or("缺少 sessionId")?.to_string();
+            let focus = params.get("focus").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let res = commands::trigger_compaction(st, app.clone(), session_id, focus).await?;
+            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+        }
+        "get_context_viewport" => {
+            let session_id = params.get("sessionId").and_then(|v| v.as_str()).ok_or("缺少 sessionId")?.to_string();
+            let res = commands::get_context_viewport(st, session_id)?;
+            Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
         }
         "list_session_compactions" => {
             let session_id = params.get("sessionId").and_then(|v| v.as_str()).ok_or("缺少 sessionId")?.to_string();

@@ -225,12 +225,15 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
     // 3. 中止 Agent 循环任务
     let aborted_run = {
         let handles = state.handles.lock().unwrap();
-        let Some(h) = handles.get(session_id) else { return };
-        let run = h.active_run.lock().unwrap().take();
-        if let Some(jh) = h.abort.lock().unwrap().take() {
-            jh.abort();
+        if let Some(h) = handles.get(session_id) {
+            let run = h.active_run.lock().unwrap().take();
+            if let Some(jh) = h.abort.lock().unwrap().take() {
+                jh.abort();
+            }
+            run
+        } else {
+            None
         }
-        run
     };
     if let Some(run_id) = aborted_run {
         // 用户主动停止任务：收尾残留的 in_progress 任务为 pending，避免界面继续转圈
@@ -239,7 +242,7 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
         // 避免停止后数据库里留下永久“运行中”的 run（运行状态恢复以数据库为准）
         {
             let db = state.db.lock().unwrap();
-            let _ = store::fail_open_runs(&db, session_id);
+            let _ = store::cancel_open_runs(&db, session_id);
             if let Ok(events) = store::fail_open_tool_events(&db, session_id) {
                 drop(db);
                 for ev in events {
@@ -263,23 +266,26 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
     }
 
     // 4. 若当前会话关联活跃长任务，协同中止长任务，将其运行中的子任务标记为 interrupted
+    // （保护：若长任务已由 task 模块显式置为 paused 或 cancelled，绝不逆向篡改覆盖）
     {
         let db = state.db.lock().unwrap();
         if let Ok(Some(mut lt)) = store::get_active_long_task(&db, session_id) {
-            crate::task::set_control(&lt.id, true);
-            let _ = store::update_long_task_status(&db, &lt.id, "interrupted");
-            if let Some(cur_idx) = crate::task::get_next_subtask_index(&lt) {
-                if lt.subtasks[cur_idx].status == "running"
-                    || lt.subtasks[cur_idx].status == "verifying"
-                    || lt.subtasks[cur_idx].status == "in_progress"
-                {
-                    lt.subtasks[cur_idx].status = "interrupted".to_string();
+            if lt.status != "paused" && lt.status != "cancelled" && lt.status != "completed" {
+                crate::task::set_control(&lt.id, true);
+                let _ = store::update_long_task_status(&db, &lt.id, "interrupted");
+                if let Some(cur_idx) = crate::task::get_next_subtask_index(&lt) {
+                    if lt.subtasks[cur_idx].status == "running"
+                        || lt.subtasks[cur_idx].status == "verifying"
+                        || lt.subtasks[cur_idx].status == "in_progress"
+                    {
+                        lt.subtasks[cur_idx].status = "interrupted".to_string();
+                    }
                 }
+                lt.status = "interrupted".to_string();
+                lt.updated_at = store::now();
+                let _ = store::update_long_task(&db, &lt);
+                let _ = app.emit("task:update", &lt);
             }
-            lt.status = "interrupted".to_string();
-            lt.updated_at = store::now();
-            let _ = store::update_long_task(&db, &lt);
-            let _ = app.emit("task:update", &lt);
         }
     }
 
@@ -382,6 +388,17 @@ pub fn restart_all_subagents(app: &AppHandle, parent_session_id: &str) -> Result
 /// 重试会话的最后一步（回滚本轮所有后续输出，级联清理本轮子任务，重新触发回复）
 pub fn retry_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
     let state = app.state::<crate::AppState>();
+
+    // 长任务防护：若当前会话绑定了活跃的长任务，阻止在主会话直接触发单轮 retry
+    {
+        let db = state.db.lock().unwrap();
+        if let Ok(Some(lt)) = store::get_latest_long_task(&db, session_id) {
+            if lt.status != "completed" && lt.status != "cancelled" {
+                return Err("长任务推进中，请在长任务面板或顶栏中进行管理或回滚到检查点".into());
+            }
+        }
+    }
+
     // 先停止当前运行
     stop_session_ext(app, session_id, false);
 
@@ -476,11 +493,31 @@ pub fn retry_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
 /// 继续推进会话（承接上一步未完成内容或工具结果，自动恢复未完成的子任务与长任务）
 pub fn continue_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
     let state = app.state::<crate::AppState>();
+
+    // 0. 若当前会话关联长任务，全权委托给长任务调度引擎管理，坚决不启动主会话 Agent 轮次
+    {
+        let db = state.db.lock().unwrap();
+        if let Ok(Some(lt)) = store::get_latest_long_task(&db, session_id) {
+            if lt.status == "interrupted" || lt.status == "failed" || lt.status == "paused" {
+                drop(db);
+                crate::task::resume_long_task(app, &lt.id)?;
+                return Ok(());
+            } else if lt.status == "running" {
+                // 长任务调度引擎已在后台运行中，直接返回避免并发冲突
+                return Ok(());
+            } else if lt.status == "cancelled" {
+                return Err("长任务已终止。如需继续执行，请重新发起长任务。".into());
+            } else if lt.status == "completed" {
+                return Err("长任务已全部达成。".into());
+            }
+        }
+    }
+
     if is_run_active(&state, session_id) {
         return Err("当前会话正在运行中，无需继续".into());
     }
 
-    // 1. 自动协同恢复关联的未完成子任务/子进程
+    // 1. 普通模式：自动协同恢复关联的未完成子任务/子进程
     let subs_to_resume = {
         let db = state.db.lock().unwrap();
         let subs = store::list_subagents(&db, session_id).unwrap_or_default();
@@ -493,18 +530,7 @@ pub fn continue_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
         let _ = restart_subagent(app, &sub_id);
     }
 
-    // 2. 自动协同恢复关联的未完成长任务
-    {
-        let db = state.db.lock().unwrap();
-        if let Ok(Some(lt)) = store::get_active_long_task(&db, session_id) {
-            if lt.status == "interrupted" || lt.status == "failed" || lt.status == "paused" {
-                drop(db);
-                let _ = crate::task::resume_long_task(app, &lt.id);
-            }
-        }
-    }
-
-    // 3. 为主会话准备触发消息
+    // 2. 为主会话准备触发消息
     let (trigger_id, new_msg) = {
         let db = state.db.lock().unwrap();
         // 清理末尾悬挂的报错系统消息
@@ -667,6 +693,18 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
                 let _ = store::update_message_turn_duration(&db, aid, run_duration_ms);
                 if let Ok(Some(m)) = store::get_message(&db, aid) {
                     let _ = app.emit("message:final", &m);
+                }
+            }
+
+            // 实时广播：会话 Token 已在 finish_run 中聚合更新，第一时间向前端推送最新的会话状态（支持底栏实时刷新）
+            if let Ok(Some(updated_session)) = store::get_session(&db, &session_id) {
+                let _ = app.emit("session:update", &updated_session);
+                let _ = app.emit("session:updated", &updated_session);
+                if let Some(ref pid) = updated_session.parent_session_id {
+                    if let Ok(Some(parent_session)) = store::get_session(&db, pid) {
+                        let _ = app.emit("session:update", &parent_session);
+                        let _ = app.emit("session:updated", &parent_session);
+                    }
                 }
             }
         }
@@ -1642,6 +1680,29 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         run_tokens.completion_tokens += parsed_usage.completion_tokens;
         run_tokens.total_tokens += parsed_usage.total_tokens;
         run_tokens.cached_tokens += parsed_usage.cached_tokens;
+
+        // 单步实时增量持久化 Token（自动递归累加至父会话）并即刻广播给前端
+        {
+            let db = state.db.lock().unwrap();
+            let _ = store::increment_session_tokens(
+                &db,
+                session_id,
+                parsed_usage.prompt_tokens,
+                parsed_usage.completion_tokens,
+                parsed_usage.total_tokens,
+                parsed_usage.cached_tokens,
+            );
+            if let Ok(Some(current_sess)) = store::get_session(&db, session_id) {
+                let _ = app.emit("session:update", &current_sess);
+                let _ = app.emit("session:updated", &current_sess);
+                if let Some(ref pid) = current_sess.parent_session_id {
+                    if let Ok(Some(parent_sess)) = store::get_session(&db, pid) {
+                        let _ = app.emit("session:update", &parent_sess);
+                        let _ = app.emit("session:updated", &parent_sess);
+                    }
+                }
+            }
+        }
 
         let usage = json!({
             "promptTokens": parsed_usage.prompt_tokens,
@@ -2787,193 +2848,12 @@ async fn check_and_trigger_compaction(
     state: &crate::AppState,
     session_id: &str,
     cfg: &crate::llm::LlmCfg,
-    sys: &str,
-    token_limit: usize,
+    _sys: &str,
+    _token_limit: usize,
 ) -> bool {
-    let (need_compact, candidate_msgs, candidate_tokens) = {
-        let db = state.db.lock().unwrap();
-        let compactions = store::list_session_compactions(&db, session_id).unwrap_or_default();
-        let max_compacted_seq = compactions.iter().map(|c| c.end_seq).max().unwrap_or(0);
-        let msgs = store::all_messages(&db, session_id).unwrap_or_default();
-        let uncompacted: Vec<_> = msgs
-            .into_iter()
-            .filter(|m| !m.queued && m.seq > max_compacted_seq)
-            .collect();
-
-        // 寻找最后一个 user 消息（当前活跃轮次起点）
-        let last_user_idx = uncompacted.iter().rposition(|m| m.role == "user");
-        if let Some(idx) = last_user_idx {
-            // 至少有 2 条往期消息（即至少存在 1 轮前序已完成的对话）
-            if idx >= 2 {
-                let candidate = uncompacted[..idx].to_vec();
-                let tokens: usize = candidate
-                    .iter()
-                    .map(|m| {
-                        estimate_tokens(m.content.as_deref().unwrap_or(""))
-                            + m.tool_calls.as_ref().map(crate::models::estimate_value_tokens).unwrap_or(0)
-                    })
-                    .sum();
-                let est_total = estimate_tokens(sys) + tokens;
-                // 当总消耗达到上限的 75% 或候选历史消耗较大时触发自动压缩
-                let trigger = est_total >= token_limit * 75 / 100 || tokens >= token_limit / 2;
-                (trigger, candidate, tokens)
-            } else {
-                (false, vec![], 0)
-            }
-        } else {
-            (false, vec![], 0)
-        }
-    };
-
-    if !need_compact || candidate_msgs.is_empty() {
-        return false;
-    }
-
-    // 格式化待压缩的历史对话文本
-    let mut history_str = String::new();
-    for m in &candidate_msgs {
-        let role_name = match m.role.as_str() {
-            "user" => "【用户】",
-            "assistant" => "【助手】",
-            "tool" => "【工具返回】",
-            _ => "【系统】",
-        };
-        let c = m.content.as_deref().unwrap_or("");
-        if !c.is_empty() {
-            let truncated = if c.len() > 800 {
-                let safe_len = c.char_indices().nth(800).map(|(i, _)| i).unwrap_or(c.len());
-                format!("{}...[已截断]", &c[..safe_len])
-            } else {
-                c.to_string()
-            };
-            history_str.push_str(&format!("{role_name}: {truncated}\n\n"));
-        }
-    }
-
-    let summary_prompt = format!(
-        r#"你是一个专业的编码项目备忘助手。请将以下对话历史进行结构化精炼总结，提炼为一份高质量 Markdown 格式的上下文备忘录。
-该备忘录将在后续对话中替换这段历史，帮助你与用户保持关键记忆。
-
-待压缩的对话历史：
----
-{}
----
-
-请严格按以下结构输出 Markdown（语言简洁干练，重点保留技术决策与代码变更，剔除无用寒暄）：
-### 🎯 任务背景与核心目标
-（简要说明用户最初的诉求与技术背景）
-### 🔑 关键技术决策与约定
-（架构设计、技术选型、接口约定或不可违背的约束）
-### 📁 涉及文件与修改记录
-（已读取、创建或编辑的文件列表及主要变更点）
-### 📌 历史遗留与注意事项
-（之前步骤中发现的坑、未决问题或后续需要注意的事项）"#,
-        history_str
-    );
-
-    // 调用 LLM 生成初版 Markdown 摘要
-    let summary_messages = vec![
-        json!({"role": "system", "content": "你是一个严谨客观的技术项目总结助手，擅长提取代码开发对话中的关键事实。"}),
-        json!({"role": "user", "content": summary_prompt}),
-    ];
-
-    let summary_res = crate::llm::chat_stream(
-        cfg,
-        &summary_messages,
-        &[],
-        |_| {},
-        |_| {},
-    )
-    .await;
-
-    let initial_summary = match summary_res {
-        Ok(r) if !r.content.trim().is_empty() => r.content,
-        _ => return false,
-    };
-
-    let event_id = uuid::Uuid::new_v4().to_string();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-
-    let start_seq = candidate_msgs.first().map(|m| m.seq).unwrap_or(0);
-    let end_seq = candidate_msgs.last().map(|m| m.seq).unwrap_or(0);
-    let start_preview = truncate_preview(candidate_msgs.first().and_then(|m| m.content.as_deref()).unwrap_or(""), 40);
-    let end_preview = truncate_preview(candidate_msgs.last().and_then(|m| m.content.as_deref()).unwrap_or(""), 40);
-
-    let timeout_secs = 30u64;
-
-    let req = crate::models::CompactionRequest {
-        event_id: event_id.clone(),
-        session_id: session_id.to_string(),
-        start_seq,
-        end_seq,
-        start_preview,
-        end_preview,
-        message_count: candidate_msgs.len(),
-        tokens_before: candidate_tokens,
-        summary: initial_summary.clone(),
-        timeout_seconds: timeout_secs,
-    };
-
-    state.compactions.lock().unwrap().insert(
-        event_id.clone(),
-        crate::PendingCompaction {
-            session_id: session_id.to_string(),
-            tx,
-        },
-    );
-
-    state.snapshot.set_pending_compaction(session_id, Some(req.clone()));
-    state.emit("compaction:request", &req);
-
-    // 等待用户在前端查看、补充并确认（默认阻塞等待 30 秒；若 30 秒无操作，则自动应用压缩并继续后续流程）
-    let decision = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
-        Ok(Ok(d)) => {
-            state.snapshot.set_pending_compaction(session_id, None);
-            d
-        }
-        _ => {
-            // 超时 30 秒无操作：从待处理 map 中移除，触发超时事件以通知前端（通知保持展示供查阅，但不提供继续执行按钮）
-            state.compactions.lock().unwrap().remove(&event_id);
-            state.snapshot.set_pending_compaction(session_id, None);
-            state.emit(
-                "compaction:timeout",
-                &serde_json::json!({
-                    "eventId": event_id,
-                    "sessionId": session_id,
-                    "autoApplied": true,
-                }),
-            );
-            crate::models::CompactionDecision {
-                approved: true,
-                final_summary: initial_summary.clone(),
-            }
-        }
-    };
-
-    if decision.approved {
-        let final_markdown = if decision.final_summary.trim().is_empty() {
-            initial_summary
-        } else {
-            decision.final_summary
-        };
-        let compaction = crate::models::SessionCompaction {
-            id: uuid::Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            start_seq,
-            end_seq,
-            summary_markdown: final_markdown,
-            tokens_before: candidate_tokens,
-            created_at: chrono::Utc::now().to_rfc3339(),
-        };
-        {
-            let db = state.db.lock().unwrap();
-            let _ = store::create_session_compaction(&db, &compaction);
-        }
-        let _ = app.emit("compaction:applied", &compaction);
-        true
-    } else {
-        false
-    }
+    crate::context::propose_and_execute_compaction(app, state, session_id, cfg, None, false)
+        .await
+        .unwrap_or(false)
 }
 
 pub fn build_context(

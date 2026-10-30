@@ -4,6 +4,7 @@ import { ipc } from "../ipc";
 import {
   type CurrentBoard,
   type ToolEvent,
+  type LongTask,
   DRAFT_ID,
 } from "../types";
 import { Markdown } from "./Markdown";
@@ -20,6 +21,8 @@ import {
   X,
   RotateCcw,
   ClipboardList,
+  Target,
+  Eye,
 } from "./Icons";
 
 /** 从当前会话消息中提取所有正在执行的 run_command 工具事件 */
@@ -88,6 +91,159 @@ function TodoSection({
             </span>
           </div>
         ))}
+      </div>
+    </div>
+  );
+}
+
+function LongTaskSection({
+  task,
+  activeSideId,
+  onOpenSubagent,
+  onOpenDetailModal,
+}: {
+  task: LongTask;
+  activeSideId: string | null;
+  onOpenSubagent: (subId: string) => void;
+  onOpenDetailModal: () => void;
+}) {
+  const subtasks = task.subtasks || [];
+  const done = subtasks.filter((s) => s.status === "completed").length;
+  const total = subtasks.length;
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+
+  return (
+    <div className="flex flex-col gap-2">
+      {/* 标题与状态 */}
+      <div className="rounded-xl border p-2.5 text-[11.5px] space-y-1.5 bg-purple-500/10 border-purple-500/20">
+        <div className="flex items-center justify-between gap-1.5">
+          <span className="font-semibold text-purple-400 truncate flex-1 min-w-0 inline-flex items-center gap-1.5" title={task.goal}>
+            <Target size={13} className="shrink-0" />
+            <span className="truncate">{task.goal}</span>
+          </span>
+          <span
+            className={`text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0 ${
+              task.status === "completed"
+                ? "bg-green-500/20 text-green-300"
+                : task.status === "paused" || task.status === "interrupted"
+                ? "bg-amber-500/20 text-amber-300"
+                : task.status === "failed"
+                ? "bg-red-500/20 text-red-300"
+                : "bg-blue-500/20 text-blue-300"
+            }`}
+          >
+            {task.status === "completed"
+              ? "已达成"
+              : task.status === "paused"
+              ? "已暂停"
+              : task.status === "interrupted"
+              ? "已中断"
+              : task.status === "failed"
+              ? "遇阻"
+              : "推进中"}
+          </span>
+        </div>
+
+        {/* 阶段进度条 */}
+        <div className="flex items-center gap-2 text-[11px] text-inkdim pt-0.5">
+          <span className="font-mono text-[10px]">{done}/{total} 阶段</span>
+          <div className="flex-1 h-1.5 bg-panel3 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-gradient-to-r from-purple-500 to-indigo-400 rounded-full transition-all duration-300"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+          <span className="font-mono text-[10px]">{pct}%</span>
+        </div>
+      </div>
+
+      {/* 阶段步骤列表（可点击跳转查看透明子进程） */}
+      <div className="flex flex-col gap-1 max-h-[220px] overflow-y-auto pr-1">
+        {subtasks.map((sub) => {
+          const isDone = sub.status === "completed";
+          const isRunning = sub.status === "in_progress" || sub.status === "verifying";
+          const isFailed = sub.status === "failed";
+          const isCurrentActiveSide = !!sub.id && activeSideId === sub.id;
+          const hasRealSession = !!sub.id && !sub.id.startsWith("sub-replan") && !sub.id.startsWith("sub-");
+
+          return (
+            <div
+              key={sub.id || sub.index}
+              onClick={() => {
+                if (hasRealSession) {
+                  onOpenSubagent(sub.id);
+                }
+              }}
+              className={`group flex items-start gap-1.5 text-[12px] leading-snug p-1.5 rounded-lg border transition-all ${
+                hasRealSession ? "cursor-pointer" : ""
+              } ${
+                isCurrentActiveSide
+                  ? "bg-accent/15 border-accent/60 text-ink shadow-xs ring-1 ring-accent/30"
+                  : "bg-panel2/60 hover:bg-panel2/90 border-edge/60 text-ink"
+              }`}
+              title={hasRealSession ? "点击在分屏中透明查看本阶段沙箱执行过程" : undefined}
+            >
+              <span className="shrink-0 mt-0.5">
+                {isDone ? (
+                  <CheckCircle2 size={13} className="text-green-400" />
+                ) : isRunning ? (
+                  <Loader2 size={13} className="text-blue-400 animate-spin" />
+                ) : isFailed ? (
+                  <X size={13} className="text-red-400" />
+                ) : (
+                  <Circle size={13} className="text-inkdim/50 group-hover:text-inkdim" />
+                )}
+              </span>
+
+              <div className="flex-1 min-w-0 flex flex-col gap-0.5">
+                <div className="flex items-center justify-between gap-1">
+                  <span className={`font-medium truncate ${isDone ? "text-inkdim line-through" : "text-ink"}`}>
+                    {sub.index}. {sub.title}
+                  </span>
+                  {sub.verifyCommand && (
+                    <span className="text-[9px] px-1 py-0.2 rounded bg-panel3 text-inkdim font-mono shrink-0" title={`验证: ${sub.verifyCommand}`}>
+                      门禁
+                    </span>
+                  )}
+                </div>
+                {sub.description && (
+                  <p className="text-[11px] text-inkdim line-clamp-1">
+                    {sub.description}
+                  </p>
+                )}
+              </div>
+
+              {hasRealSession && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onOpenSubagent(sub.id);
+                  }}
+                  className={`shrink-0 p-1 rounded-md transition-colors cursor-pointer ${
+                    isCurrentActiveSide ? "text-accent bg-accent/20" : "text-inkdim hover:text-ink hover:bg-panel3"
+                  }`}
+                  title="在分屏查看子进程"
+                >
+                  <Eye size={12} />
+                </button>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* 底部详细看板入口 */}
+      <div className="flex items-center justify-between text-[11px] text-inkdim pt-1 border-t border-edge/60">
+        <span className="text-[10px]">透明沙箱执行</span>
+        <button
+          type="button"
+          onClick={onOpenDetailModal}
+          className="text-purple-400 hover:text-purple-300 font-medium hover:underline cursor-pointer flex items-center gap-1"
+        >
+          <span>查看完整路线图与检查点</span>
+          <ChevronRight size={11} />
+        </button>
       </div>
     </div>
   );
@@ -180,6 +336,12 @@ export function FloatingTaskPanel() {
   const pushToast = useStore((s) => s.pushToast);
   const focusFloatingTaskId = useStore((s) => s.focusFloatingTaskId);
   const setFocusFloatingTaskId = useStore((s) => s.setFocusFloatingTaskId);
+  const activeTask = useStore((s) => (s.currentId ? s.activeTasks[s.currentId] ?? null : null));
+  const setActiveCollaboratorId = useStore((s) => s.setActiveCollaboratorId);
+  const activeCollaboratorId = useStore((s) => s.activeCollaboratorId);
+  const activeSubprocessId = useStore((s) => s.activeSubprocessId);
+  const activeSideId = activeCollaboratorId || activeSubprocessId;
+  const setShowTaskDetailModal = useStore((s) => s.setShowTaskDetailModal);
 
   const [collapsed, setCollapsed] = useState(false);
   const [showPlanModal, setShowPlanModal] = useState(false);
@@ -279,13 +441,16 @@ export function FloatingTaskPanel() {
 
   const hasTasks = !!currentBoard && currentBoard.items.length > 0;
   const hasCmds = runningCmds.length > 0;
+  const hasLongTask = !!activeTask && !!activeTask.subtasks && activeTask.subtasks.length > 0 && activeTask.status !== "cancelled";
 
-  if (!currentId || currentId === DRAFT_ID || (!hasTasks && !hasCmds)) return null;
+  if (!currentId || currentId === DRAFT_ID || (!hasTasks && !hasCmds && !hasLongTask)) return null;
 
   // 收起态：靠右吸附抽屉标签
   if (collapsed) {
     const doneCnt = currentBoard ? currentBoard.completed_steps : 0;
     const totalCnt = currentBoard ? currentBoard.total_steps : 0;
+    const longDoneCnt = activeTask ? (activeTask.subtasks || []).filter((s) => s.status === "completed").length : 0;
+    const longTotalCnt = activeTask ? (activeTask.subtasks || []).length : 0;
     return (
       <div className="absolute top-3 right-0 z-20 select-none">
         <button
@@ -297,6 +462,12 @@ export function FloatingTaskPanel() {
             size={13}
             className="text-inkdim group-hover:text-accent transition-transform duration-150 group-hover:-translate-x-0.5 shrink-0"
           />
+          {hasLongTask && (
+            <span className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-purple-500/15 text-purple-400 inline-flex items-center gap-1">
+              <Target size={11} className="shrink-0" />
+              <span>长任务</span>
+            </span>
+          )}
           {currentBoard?.board_type === "plan" && (
             <span
               className={`text-[10px] px-1.5 py-0.5 rounded font-medium inline-flex items-center gap-1 ${
@@ -330,7 +501,13 @@ export function FloatingTaskPanel() {
               <span className="font-mono text-[11px]">{doneCnt}/{totalCnt}</span>
             </span>
           )}
-          {hasCmds && !currentBoard && (
+          {longTotalCnt > 0 && !currentBoard && (
+            <span className="flex items-center gap-1 font-medium text-purple-400">
+              <Target size={12} />
+              <span className="font-mono text-[11px]">{longDoneCnt}/{longTotalCnt}</span>
+            </span>
+          )}
+          {hasCmds && !currentBoard && !hasLongTask && (
             <span className="flex items-center gap-1 text-green-400 font-mono">
               <Terminal size={13} className="shrink-0" />
               <span>{runningCmds.length} 进程</span>
@@ -348,10 +525,19 @@ export function FloatingTaskPanel() {
         {/* 第一层：面板总控栏（标题、定位出处、刷新、收起） */}
         <div className="flex items-center justify-between px-3.5 py-2.5 border-b border-edge bg-panel/60">
           <div className="flex items-center gap-1.5 min-w-0">
-            <CheckSquare size={14} className="text-emerald-400 shrink-0" />
+            {hasLongTask && !currentBoard ? (
+              <Target size={14} className="text-purple-400 shrink-0" />
+            ) : (
+              <CheckSquare size={14} className="text-emerald-400 shrink-0" />
+            )}
             <span className="text-[12px] font-semibold text-ink tracking-tight truncate">
-              任务与计划看板
+              {hasLongTask && !currentBoard ? "长任务阶段看板" : "任务与计划看板"}
             </span>
+            {hasLongTask && (
+              <span className="text-[10px] px-1.5 py-0.2 rounded font-mono font-medium shrink-0 bg-purple-500/15 text-purple-400 border border-purple-500/20">
+                长任务
+              </span>
+            )}
             {currentBoard && (
               <span
                 className={`text-[10px] px-1.5 py-0.2 rounded font-mono font-medium shrink-0 ${
@@ -406,6 +592,19 @@ export function FloatingTaskPanel() {
 
         {/* 内容展示区 */}
         <div className="px-3.5 py-2.5 flex flex-col gap-2.5 max-h-[min(70vh,480px)] overflow-y-auto">
+          {/* 长任务卡片与阶段分步 */}
+          {hasLongTask && activeTask && (
+            <LongTaskSection
+              task={activeTask}
+              activeSideId={activeSideId}
+              onOpenSubagent={(subId) => setActiveCollaboratorId(activeCollaboratorId === subId ? null : subId)}
+              onOpenDetailModal={() => setShowTaskDetailModal(true)}
+            />
+          )}
+
+          {/* 分隔线 */}
+          {hasLongTask && (currentBoard || hasCmds) && <div className="border-t border-edge" />}
+
           {/* 方案标题与状态卡片 */}
           {currentBoard && currentBoard.board_type === "plan" && (
             <div

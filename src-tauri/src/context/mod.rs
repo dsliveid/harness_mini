@@ -1,8 +1,13 @@
+pub mod governance;
 pub mod ingress_normalizer;
 pub mod message_stream;
 pub mod static_system;
 pub mod tail_anchor;
 
+pub use governance::{
+    evaluate_context_viewport, propose_and_execute_compaction, resolve_session_context_limit,
+    resolve_session_llm_cfg, ContextViewport,
+};
 pub use ingress_normalizer::normalize_tool_output_for_ingress;
 pub use message_stream::{assemble_execution_context, ExecutionContext};
 pub use static_system::{

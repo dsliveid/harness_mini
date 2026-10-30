@@ -307,6 +307,20 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 }
             }),
         },
+        ToolSpec {
+            name: "compact_context",
+            description: "主动压缩当前会话的上下文历史。当对话轮次过多、上下文负载过高，或者用户明确指示压缩/总结上下文时调用该工具。系统将把先前的历史消息总结为结构化备忘录并替换早期消息，以释放大量 Token 空间。支持传入 focus 参数指明需要重点保留的技术细节。",
+            risk: Risk::ReadOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "focus": {
+                        "type": "string",
+                        "description": "可选的总结侧重方向或需重点保留的技术约束（如：重点保留数据库表设计与 API 规范）"
+                    }
+                }
+            }),
+        },
         // ---------- 任务方案计划中枢工具集 (.harness/plans/) ----------
         ToolSpec {
             name: "create_plan",

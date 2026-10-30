@@ -33,6 +33,7 @@ export function ChatView() {
   const currentGrowthStatus = useStore((s) => (s.currentId ? s.growthStatus[s.currentId] : null));
   const currentSopStatus = useStore((s) => (s.currentId ? s.sopStatus[s.currentId] : null));
   const compactions = useStore((s) => (s.currentId ? s.sessionCompactions[s.currentId] : undefined)) ?? EMPTY_COMPACTIONS;
+  const activeTasks = useStore((s) => s.activeTasks);
   const lastRunOutcome = useStore((s) => (s.currentId ? s.lastRunOutcome[s.currentId] : undefined));
   const retryTurn = useStore((s) => s.retryTurn);
   const continueTurn = useStore((s) => s.continueTurn);
@@ -50,6 +51,20 @@ export function ChatView() {
   const lastMsg = msgs[msgs.length - 1];
   const isInterruptedOrFailed = useMemo(() => {
     if (running || !currentId || msgs.length === 0) return false;
+    // 0. 长任务防护：如果当前会话关联的长任务已完成 (completed) 或主动取消 (cancelled)，或在推进/暂停中，绝不展示异常恢复条
+    const activeTask = activeTasks[currentId];
+    if (activeTask) {
+      if (activeTask.status === "completed" || activeTask.status === "cancelled") {
+        return false;
+      }
+      if (activeTask.status !== "failed" && activeTask.status !== "interrupted") {
+        return false;
+      }
+    }
+    // 若末尾消息明确为长任务达成提示，兜底绝不展示异常恢复条
+    if (lastMsg?.content?.includes("长任务全部子任务已顺利达成")) {
+      return false;
+    }
     // 1. 核心依据：以持久化或实时事件广播的真实执行终态为准
     if (
       lastRunOutcome === "cancelled" ||
@@ -87,7 +102,7 @@ export function ChatView() {
       }
     }
     return false;
-  }, [running, currentId, msgs.length, lastRunOutcome, lastMsg]);
+  }, [running, currentId, msgs.length, lastRunOutcome, lastMsg, activeTasks]);
 
   const isMaxStepsStopped = useMemo(() => {
     if (!lastMsg) return false;

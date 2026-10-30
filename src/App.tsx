@@ -18,6 +18,7 @@ import { Toasts } from "./components/Toasts";
 import { TokenStatsModal } from "./components/TokenStatsModal";
 import { LogViewerModal } from "./components/LogViewerModal";
 import { TopBar } from "./components/TopBar";
+import { TaskBar } from "./components/TaskBar";
 import { TaskDetailModal } from "./components/TaskDetailModal";
 import { CollaboratorBar } from "./components/CollaboratorBar";
 import { CollaboratorView } from "./components/CollaboratorView";
@@ -84,6 +85,7 @@ export default function App() {
         >
           <TopBar />
           <CollaboratorBar />
+          <TaskBar />
           <ChatView />
           <PendingQueue />
           <div className="relative">

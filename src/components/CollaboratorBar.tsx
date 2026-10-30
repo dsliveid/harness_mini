@@ -6,6 +6,7 @@ import {
   Loader2,
   CheckCircle2,
   AlertCircle,
+  Pause,
   Layout,
   Server,
   ClipboardList,
@@ -109,7 +110,22 @@ export function CollaboratorBar() {
   const runStatus = useStore((s) => s.runStatus);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // 状态追踪与 2.5 秒优雅退场机制
+  // 绑定当前会话的长任务上下文（若存在）
+  const activeTasks = useStore((s) => s.activeTasks);
+  const currentTask = currentId && currentId !== DRAFT_ID ? activeTasks[currentId] ?? null : null;
+
+  // 判定属于当前活跃长任务的阶段实体（通过 ID 或 Title 精准锚定）
+  const taskSubtaskIds = useMemo(() => {
+    if (!currentTask) return new Set<string>();
+    return new Set((currentTask.subtasks || []).map((s) => s.id));
+  }, [currentTask]);
+
+  const taskSubtaskTitles = useMemo(() => {
+    if (!currentTask) return new Set<string>();
+    return new Set((currentTask.subtasks || []).map((s) => s.title));
+  }, [currentTask]);
+
+  // 状态追踪与 2.5 秒优雅退场机制（仅作用于非长任务的普通瞬时子代理）
   const prevStatusesRef = useRef<Map<string, string>>(new Map());
   const [exitingSubtaskIds, setExitingSubtaskIds] = useState<Set<string>>(new Set());
   const timerMapRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
@@ -156,13 +172,37 @@ export function CollaboratorBar() {
     }
   }, [rawSubprocesses]);
 
-  // 筛选活跃展示的子任务：未完成的，或者处于 2.5 秒成果展示过渡期的
+  // 筛选展示的子任务：运行中、暂停中、异常态保持可见；完成态赋予 2.5s 过渡后优雅退场隐藏；已取消且空闲的不展示
   const activeSubprocesses = useMemo(() => {
     return rawSubprocesses.filter((sub) => {
-      if (sub.status !== "completed") return true;
-      return exitingSubtaskIds.has(sub.id);
+      // 1. 当前正在右侧分屏查看的子任务实体保持展示
+      if (sub.id === activeSubprocessId) {
+        return true;
+      }
+
+      // 2. 运行中、暂停中或异常/中断态的子任务保持展示，供用户实时观测与干预
+      if (
+        runStatus[sub.id] === "running" ||
+        sub.status === "paused" ||
+        sub.status === "interrupted" ||
+        sub.status === "failed"
+      ) {
+        return true;
+      }
+
+      // 3. 完成态子任务（无论是否属于长任务）：赋予 2.5 秒成果展示过渡期后优雅退场隐藏，保持顶栏清爽
+      if (sub.status === "completed") {
+        return exitingSubtaskIds.has(sub.id);
+      }
+
+      // 4. 普通已取消且非运行中的子任务不展示
+      if (sub.status === "cancelled") {
+        return false;
+      }
+
+      return false;
     });
-  }, [rawSubprocesses, exitingSubtaskIds]);
+  }, [rawSubprocesses, activeSubprocessId, runStatus, exitingSubtaskIds]);
 
   if (!currentId) {
     return null;
@@ -270,11 +310,12 @@ export function CollaboratorBar() {
           <div className="h-4 w-px bg-edge/70 shrink-0 mx-0.5" />
         )}
 
-        {/* 2. 派生动态子任务列表（完成时 2.5s 优雅退场） */}
+        {/* 2. 派生动态子任务/长任务阶段列表 */}
         {activeSubprocesses.map((sub) => {
           const isRunning = runStatus[sub.id] === "running";
           const isActive = activeSubprocessId === sub.id || activeCollaboratorId === sub.id;
           const isExiting = sub.status === "completed" && exitingSubtaskIds.has(sub.id);
+          const isPaused = sub.status === "paused";
           const roleInfo = getSubtaskBadge(sub.subagentRole);
 
           return (
@@ -289,26 +330,34 @@ export function CollaboratorBar() {
                   ? "bg-accent/15 border-accent/60 text-ink shadow-sm ring-1 ring-accent/30"
                   : isExiting
                   ? "bg-emerald-500/10 border-emerald-500/35 text-emerald-400 shadow-xs animate-in fade-in duration-200"
+                  : isPaused
+                  ? "bg-amber-500/10 hover:bg-amber-500/20 border-amber-500/30 text-amber-400"
                   : "bg-panel2/70 hover:bg-panel2 border-edge text-inkdim hover:text-ink"
               }`}
-              title={`[派生子任务]\n名称: ${sub.title}\n角色: ${roleInfo.label}\n状态: ${
+              title={`[长任务阶段 / 子任务]\n名称: ${sub.title}\n角色: ${roleInfo.label}\n状态: ${
                 isRunning
                   ? "运行中"
+                  : isPaused
+                  ? "已暂停"
                   : sub.status === "completed"
-                  ? "已完成 (即将退出)"
+                  ? isExiting
+                    ? "已完成 (即将退出)"
+                    : "已完成"
                   : sub.status === "failed"
                   ? "执行异常"
                   : sub.status === "cancelled" || sub.status === "interrupted"
-                  ? "已中止"
+                  ? "已终止"
                   : "待推进"
               }`}
             >
-              <span className={`shrink-0 ${isExiting ? "text-emerald-400" : "text-accent/80 group-hover:text-accent"}`}>
+              <span className={`shrink-0 ${isExiting ? "text-emerald-400" : isPaused ? "text-amber-400" : "text-accent/80 group-hover:text-accent"}`}>
                 <roleInfo.Icon size={12} />
               </span>
               <span className="truncate font-medium flex-1 text-[11.5px] max-w-[65px]">{sub.title}</span>
               {isRunning ? (
                 <Loader2 size={11} className="shrink-0 animate-spin text-accent" />
+              ) : isPaused ? (
+                <Pause size={11} className="shrink-0 text-amber-400" />
               ) : sub.status === "completed" ? (
                 <CheckCircle2 size={11} className="shrink-0 text-emerald-400 animate-in zoom-in-75 duration-200" />
               ) : sub.status === "failed" ? (

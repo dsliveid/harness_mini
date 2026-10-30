@@ -1622,6 +1622,14 @@ pub struct TruncationNotice {
     pub created_at: String,
 }
 
+/// 交互轮次消息分页
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagesPage {
+    pub messages: Vec<Message>,
+    pub has_more: bool,
+}
+
 /// 工具结果上限
 pub const TOOL_RESULT_LIMIT: usize = 32 * 1024;
 
@@ -1832,6 +1840,10 @@ pub struct TaskSubItem {
     pub error: Option<String>,
     pub verify_command: Option<String>,
     pub verify_output: Option<String>,
+    #[serde(default)]
+    pub wave: usize,
+    #[serde(default)]
+    pub scope_path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -1846,6 +1858,14 @@ pub struct LongTask {
     pub subtasks: Vec<TaskSubItem>,
     pub max_budget_tokens: Option<u64>,
     pub total_tokens_used: u64,
+    #[serde(default)]
+    pub cached_tokens_used: u64,
+    #[serde(default)]
+    pub cache_hit_rate: f64,
+    #[serde(default)]
+    pub prompt_tokens_used: u64,
+    #[serde(default)]
+    pub completion_tokens_used: u64,
     pub current_step: usize,
     pub max_steps: usize,
     pub created_at: String,

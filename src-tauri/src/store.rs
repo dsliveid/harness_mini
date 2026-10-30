@@ -127,6 +127,19 @@ fn init(conn: &Connection) -> Result<(), String> {
           ended_at TEXT
         );
 
+        -- 权威单一事实源约束：runs 状态变更时自动对齐 sessions.last_run_status，消灭应用层漏改/误改
+        CREATE TRIGGER IF NOT EXISTS trg_runs_status_sync_insert
+        AFTER INSERT ON runs
+        BEGIN
+            UPDATE sessions SET last_run_status = NEW.status WHERE id = NEW.session_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_runs_status_sync_update
+        AFTER UPDATE OF status ON runs
+        BEGIN
+            UPDATE sessions SET last_run_status = NEW.status WHERE id = NEW.session_id;
+        END;
+
         CREATE TABLE IF NOT EXISTS session_kv (
           session_id TEXT NOT NULL,
           key TEXT NOT NULL,
@@ -324,10 +337,21 @@ fn init(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "tool_events", "subprocess_id", "subprocess_id TEXT")?;
     ensure_column(conn, "messages", "reverted_at", "reverted_at TEXT")?;
     ensure_column(conn, "tool_file_snapshots", "reverted_at", "reverted_at TEXT")?;
+    // 持久化 session 级别 Token 累计与最新运行状态
+    ensure_column(conn, "sessions", "total_tokens", "total_tokens INTEGER DEFAULT 0")?;
+    ensure_column(conn, "sessions", "prompt_tokens", "prompt_tokens INTEGER DEFAULT 0")?;
+    ensure_column(conn, "sessions", "completion_tokens", "completion_tokens INTEGER DEFAULT 0")?;
+    ensure_column(conn, "sessions", "cached_tokens", "cached_tokens INTEGER DEFAULT 0")?;
+    ensure_column(conn, "sessions", "last_run_status", "last_run_status TEXT")?;
+
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_trigger_tool ON sessions(trigger_tool_event_id)", []);
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_forked_from ON sessions(forked_from_session_id)", []);
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_tool_events_subprocess ON tool_events(subprocess_id)", []);
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id)", []);
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_status_parent ON sessions(status, parent_session_id)", []);
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id, started_at DESC, id DESC)", []);
     let _ = backfill_message_tokens(conn);
+    let _ = backfill_session_tokens_and_last_runs(conn);
     Ok(())
 }
 
@@ -426,6 +450,89 @@ fn backfill_message_tokens(conn: &Connection) -> Result<(), String> {
                     params![id, pt as i64, ct as i64, tt as i64, dur as i64],
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+/// 兼容旧库：回填 sessions 表的 token 统计与 last_run_status（仅首次迁移执行）
+fn backfill_session_tokens_and_last_runs(conn: &Connection) -> Result<(), String> {
+    let migrated: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'migration_session_tokens_v1'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+    if migrated.is_some() {
+        return Ok(());
+    }
+
+    // 1. 先计算每个会话自身的 tokens
+    let _ = conn.execute(
+        "UPDATE sessions SET             total_tokens = COALESCE((SELECT SUM(m.total_tokens) FROM messages m WHERE m.session_id = sessions.id), 0),             prompt_tokens = COALESCE((SELECT SUM(m.prompt_tokens) FROM messages m WHERE m.session_id = sessions.id), 0),             completion_tokens = COALESCE((SELECT SUM(m.completion_tokens) FROM messages m WHERE m.session_id = sessions.id), 0),             cached_tokens = COALESCE((SELECT SUM(m.cached_tokens) FROM messages m WHERE m.session_id = sessions.id), 0)",
+        [],
+    );
+
+    // 2. 将子任务（subprocess、subagent、collaborator）的 token 向上累加到父会话
+    let _ = conn.execute(
+        "UPDATE sessions          SET             total_tokens = total_tokens + COALESCE((                 SELECT SUM(child.total_tokens) FROM sessions child WHERE child.parent_session_id = sessions.id             ), 0),             prompt_tokens = prompt_tokens + COALESCE((                 SELECT SUM(child.prompt_tokens) FROM sessions child WHERE child.parent_session_id = sessions.id             ), 0),             completion_tokens = completion_tokens + COALESCE((                 SELECT SUM(child.completion_tokens) FROM sessions child WHERE child.parent_session_id = sessions.id             ), 0),             cached_tokens = cached_tokens + COALESCE((                 SELECT SUM(child.cached_tokens) FROM sessions child WHERE child.parent_session_id = sessions.id             ), 0)          WHERE id IN (SELECT DISTINCT parent_session_id FROM sessions WHERE parent_session_id IS NOT NULL AND parent_session_id != '')",
+        [],
+    );
+
+    // 3. 回填 last_run_status
+    let _ = conn.execute(
+        "UPDATE sessions SET last_run_status = (             SELECT status FROM runs WHERE runs.session_id = sessions.id ORDER BY started_at DESC, id DESC LIMIT 1         ) WHERE last_run_status IS NULL",
+        [],
+    );
+
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO settings(key, value) VALUES('migration_session_tokens_v1', 'done')",
+        [],
+    );
+
+    Ok(())
+}
+
+/// 增量累加会话 Token 统计，若为子任务则递归累加至父会话
+pub fn increment_session_tokens(
+    conn: &Connection,
+    session_id: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    cached_tokens: u64,
+) -> Result<(), String> {
+    if prompt_tokens == 0 && completion_tokens == 0 && total_tokens == 0 && cached_tokens == 0 {
+        return Ok(());
+    }
+
+    conn.execute(
+        "UPDATE sessions SET             prompt_tokens = COALESCE(prompt_tokens, 0) + ?2,             completion_tokens = COALESCE(completion_tokens, 0) + ?3,             total_tokens = COALESCE(total_tokens, 0) + ?4,             cached_tokens = COALESCE(cached_tokens, 0) + ?5          WHERE id = ?1",
+        params![
+            session_id,
+            prompt_tokens as i64,
+            completion_tokens as i64,
+            total_tokens as i64,
+            cached_tokens as i64
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    let parent_id: Option<String> = conn
+        .query_row(
+            "SELECT parent_session_id FROM sessions WHERE id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None)
+        .flatten();
+
+    if let Some(pid) = parent_id {
+        if !pid.is_empty() && pid != session_id {
+            increment_session_tokens(conn, &pid, prompt_tokens, completion_tokens, total_tokens, cached_tokens)?;
         }
     }
     Ok(())
@@ -2087,6 +2194,20 @@ pub fn delete_project_link(conn: &Connection, id: &str) -> Result<(), String> {
 // ---------- sessions ----------
 
 fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
+    let tt = r.get::<_, Option<i64>>(36)?.map(|v| v as u64);
+    let pt = r.get::<_, Option<i64>>(37)?.map(|v| v as u64);
+    let ct = r.get::<_, Option<i64>>(38)?.map(|v| v as u64);
+    let cached = r.get::<_, Option<i64>>(39)?.map(|v| v as u64);
+    let cache_hit_rate = if let (Some(p), Some(c)) = (pt, cached) {
+        if p > 0 {
+            Some(((c as f64 / p as f64) * 1000.0).round() / 10.0)
+        } else {
+            Some(0.0)
+        }
+    } else {
+        Some(0.0)
+    };
+
     Ok(Session {
         id: r.get(0)?,
         title: r.get(1)?,
@@ -2103,11 +2224,11 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         source_workspace: r.get(12)?,
         merged_seq: r.get(13)?,
         merged_pending: r.get::<_, i64>(14)? != 0,
-        total_tokens: None,
-        prompt_tokens: None,
-        completion_tokens: None,
-        cached_tokens: None,
-        cache_hit_rate: None,
+        total_tokens: tt,
+        prompt_tokens: pt,
+        completion_tokens: ct,
+        cached_tokens: cached,
+        cache_hit_rate,
         parent_session_id: r.get(15)?,
         session_type: r.get::<_, Option<String>>(16)?.unwrap_or_else(|| "main".into()),
         subagent_role: r.get(17)?,
@@ -2128,8 +2249,8 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         forked_from_session_id: r.get(32)?,
         forked_from_message_id: r.get(33)?,
         reasoning_effort: r.get(34)?,
-        last_run_status: None,
         max_steps: r.get::<_, Option<i64>>(35).ok().flatten().map(|v| v as u32),
+        last_run_status: r.get(40)?,
     })
 }
 
@@ -2140,135 +2261,17 @@ const SESSION_COLS: &str =
      last_reported_msg_id, auto_report, trigger_tool_event_id, provider_id, model_id, \
      dispatch_rule, image_provider_id, image_model_id, vision_provider_id, vision_model_id, \
      decision_provider_id, decision_model_id, \
-     forked_from_session_id, forked_from_message_id, reasoning_effort, max_steps";
-
-fn attach_session_tokens(conn: &Connection, sessions: &mut [Session]) -> Result<(), String> {
-    if sessions.is_empty() {
-        return Ok(());
-    }
-    let mut stmt = conn
-        .prepare(
-            "SELECT session_id, \
-                    COALESCE(SUM(total_tokens), 0), \
-                    COALESCE(SUM(prompt_tokens), 0), \
-                    COALESCE(SUM(completion_tokens), 0), \
-                    COALESCE(SUM(cached_tokens), 0) \
-             FROM messages \
-             GROUP BY session_id",
-        )
-        .map_err(|e| e.to_string())?;
-    let map: std::collections::HashMap<String, (u64, u64, u64, u64)> = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                (
-                    r.get::<_, i64>(1)? as u64,
-                    r.get::<_, i64>(2)? as u64,
-                    r.get::<_, i64>(3)? as u64,
-                    r.get::<_, i64>(4)? as u64,
-                ),
-            ))
-        })
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    for s in sessions.iter_mut() {
-        if let Some((tt, pt, ct, cached)) = map.get(&s.id) {
-            s.total_tokens = Some(*tt);
-            s.prompt_tokens = Some(*pt);
-            s.completion_tokens = Some(*ct);
-            s.cached_tokens = Some(*cached);
-            s.cache_hit_rate = Some(if *pt > 0 {
-                ((*cached as f64 / *pt as f64) * 1000.0).round() / 10.0
-            } else {
-                0.0
-            });
-        } else {
-            s.total_tokens = Some(0);
-            s.prompt_tokens = Some(0);
-            s.completion_tokens = Some(0);
-            s.cached_tokens = Some(0);
-            s.cache_hit_rate = Some(0.0);
-        }
-    }
-    Ok(())
-}
-
-fn attach_session_last_runs(conn: &Connection, sessions: &mut [Session]) -> Result<(), String> {
-    if sessions.is_empty() {
-        return Ok(());
-    }
-    let mut stmt = conn
-        .prepare(
-            "SELECT session_id, status FROM (
-                SELECT session_id, status, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY started_at DESC, id DESC) as rn
-                FROM runs
-            ) WHERE rn = 1",
-        )
-        .map_err(|e| e.to_string())?;
-    let map: std::collections::HashMap<String, String> = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    for s in sessions.iter_mut() {
-        s.last_run_status = map.get(&s.id).cloned();
-    }
-    Ok(())
-}
+     forked_from_session_id, forked_from_message_id, reasoning_effort, max_steps, \
+     total_tokens, prompt_tokens, completion_tokens, cached_tokens, last_run_status";
 
 pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>, String> {
-    let mut s = conn
-        .query_row(
-            &format!("SELECT {SESSION_COLS} FROM sessions WHERE id = ?1"),
-            params![id],
-            row_to_session,
-        )
-        .optional()
-        .map_err(|e| e.to_string())?;
-
-    if let Some(ref mut session) = s {
-        session.last_run_status = get_last_run_status(conn, id);
-
-        let tokens: Option<(u64, u64, u64, u64)> = conn
-            .query_row(
-                "SELECT COALESCE(SUM(total_tokens), 0), \
-                        COALESCE(SUM(prompt_tokens), 0), \
-                        COALESCE(SUM(completion_tokens), 0), \
-                        COALESCE(SUM(cached_tokens), 0) \
-                 FROM messages WHERE session_id = ?1",
-                params![id],
-                |r| Ok((
-                    r.get::<_, i64>(0)? as u64,
-                    r.get::<_, i64>(1)? as u64,
-                    r.get::<_, i64>(2)? as u64,
-                    r.get::<_, i64>(3)? as u64,
-                )),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-
-        if let Some((tt, pt, ct, cached)) = tokens {
-            session.total_tokens = Some(tt);
-            session.prompt_tokens = Some(pt);
-            session.completion_tokens = Some(ct);
-            session.cached_tokens = Some(cached);
-            session.cache_hit_rate = Some(if pt > 0 {
-                ((cached as f64 / pt as f64) * 1000.0).round() / 10.0
-            } else {
-                0.0
-            });
-        } else {
-            session.total_tokens = Some(0);
-            session.prompt_tokens = Some(0);
-            session.completion_tokens = Some(0);
-            session.cached_tokens = Some(0);
-            session.cache_hit_rate = Some(0.0);
-        }
-    }
-    Ok(s)
+    conn.query_row(
+        &format!("SELECT {SESSION_COLS} FROM sessions WHERE id = ?1"),
+        params![id],
+        row_to_session,
+    )
+    .optional()
+    .map_err(|e| e.to_string())
 }
 
 pub fn list_sessions(conn: &Connection, status: &str) -> Result<Vec<Session>, String> {
@@ -2280,10 +2283,7 @@ pub fn list_sessions(conn: &Connection, status: &str) -> Result<Vec<Session>, St
     let rows = stmt
         .query_map(params![status], row_to_session)
         .map_err(|e| e.to_string())?;
-    let mut sessions = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
-    attach_session_tokens(conn, &mut sessions)?;
-    attach_session_last_runs(conn, &mut sessions)?;
-    Ok(sessions)
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
 pub fn list_subagents(conn: &Connection, parent_session_id: &str) -> Result<Vec<Session>, String> {
@@ -2295,10 +2295,7 @@ pub fn list_subagents(conn: &Connection, parent_session_id: &str) -> Result<Vec<
     let rows = stmt
         .query_map(params![parent_session_id], row_to_session)
         .map_err(|e| e.to_string())?;
-    let mut sessions = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
-    attach_session_tokens(conn, &mut sessions)?;
-    attach_session_last_runs(conn, &mut sessions)?;
-    Ok(sessions)
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
 pub fn list_collaborators(conn: &Connection, parent_session_id: &str) -> Result<Vec<Session>, String> {
@@ -2310,10 +2307,7 @@ pub fn list_collaborators(conn: &Connection, parent_session_id: &str) -> Result<
     let rows = stmt
         .query_map(params![parent_session_id], row_to_session)
         .map_err(|e| e.to_string())?;
-    let mut sessions = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
-    attach_session_tokens(conn, &mut sessions)?;
-    attach_session_last_runs(conn, &mut sessions)?;
-    Ok(sessions)
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
 pub fn list_subprocesses(conn: &Connection, parent_session_id: &str) -> Result<Vec<Session>, String> {
@@ -2325,10 +2319,7 @@ pub fn list_subprocesses(conn: &Connection, parent_session_id: &str) -> Result<V
     let rows = stmt
         .query_map(params![parent_session_id], row_to_session)
         .map_err(|e| e.to_string())?;
-    let mut sessions = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
-    attach_session_tokens(conn, &mut sessions)?;
-    attach_session_last_runs(conn, &mut sessions)?;
-    Ok(sessions)
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
 /// 查询父会话下的所有衍生子会话（包含 subprocess、subagent、collaborator）
@@ -2341,10 +2332,7 @@ pub fn list_all_child_sessions(conn: &Connection, parent_session_id: &str) -> Re
     let rows = stmt
         .query_map(params![parent_session_id], row_to_session)
         .map_err(|e| e.to_string())?;
-    let mut sessions = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
-    attach_session_tokens(conn, &mut sessions)?;
-    attach_session_last_runs(conn, &mut sessions)?;
-    Ok(sessions)
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
 
@@ -3548,6 +3536,102 @@ pub fn update_message_tool_calls(
     Ok(())
 }
 
+/// 交互轮次语义消息分页：以用户发言 (role = 'user') 为轮次边界加载完整上下文
+pub fn get_session_turns(
+    conn: &Connection,
+    session_id: &str,
+    before_seq: Option<i64>,
+    turns: u32,
+) -> Result<MessagesPage, String> {
+    let upper_seq = before_seq.unwrap_or(i64::MAX);
+    let turns_limit = if turns == 0 { 2 } else { turns };
+    let offset = turns_limit.saturating_sub(1);
+
+    // 寻找第 turns 轮 user 消息的下界 seq
+    let min_user_seq: Option<i64> = conn
+        .query_row(
+            "SELECT seq FROM messages              WHERE session_id = ?1 AND role = 'user' AND seq < ?2              ORDER BY seq DESC LIMIT 1 OFFSET ?3",
+            params![session_id, upper_seq, offset],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    let (lower_seq, has_more) = if let Some(seq) = min_user_seq {
+        let more_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE session_id = ?1 AND seq < ?2)",
+                params![session_id, seq],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        (seq, more_exists)
+    } else {
+        (0, false)
+    };
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id,                     queued, usage_json, created_at, prompt_tokens, completion_tokens,                     total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens,                     is_estimated, reverted_at, runtime_anchor              FROM messages              WHERE session_id = ?1 AND seq >= ?2 AND seq < ?3              ORDER BY seq ASC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let mut msgs: Vec<Message> = stmt
+        .query_map(params![session_id, lower_seq, upper_seq], |r| {
+            let tc: Option<String> = r.get(6)?;
+            let usage: Option<String> = r.get(9)?;
+            let pt: Option<i64> = r.get(11)?;
+            let ct: Option<i64> = r.get(12)?;
+            let tt: Option<i64> = r.get(13)?;
+            let dur: Option<i64> = r.get(14)?;
+            let turn_dur: Option<i64> = r.get(15)?;
+            let att: Option<String> = r.get(16)?;
+            let cached: Option<i64> = r.get(17)?;
+            let is_est: Option<i64> = r.get(18)?;
+            let rev_at: Option<String> = r.get(19)?;
+            let rt_anchor: Option<String> = r.get(20)?;
+            Ok(Message {
+                id: r.get(0)?,
+                session_id: session_id.to_string(),
+                run_id: r.get(1)?,
+                seq: r.get(2)?,
+                role: r.get(3)?,
+                content: r.get(4)?,
+                reasoning: r.get(5)?,
+                tool_calls: tc.and_then(|s| serde_json::from_str(&s).ok()),
+                tool_call_id: r.get(7)?,
+                queued: r.get::<_, i64>(8)? != 0,
+                usage: usage.and_then(|s| serde_json::from_str(&s).ok()),
+                created_at: r.get(10)?,
+                tool_events: vec![],
+                duration_ms: dur.map(|v| v as u64),
+                turn_duration_ms: turn_dur.map(|v| v as u64),
+                prompt_tokens: pt.map(|v| v as u64),
+                completion_tokens: ct.map(|v| v as u64),
+                total_tokens: tt.map(|v| v as u64),
+                cached_tokens: cached.map(|v| v as u64),
+                is_estimated: is_est.map(|v| v != 0),
+                attachments: att.and_then(|s| serde_json::from_str(&s).ok()),
+                reverted_at: rev_at,
+                runtime_anchor: rt_anchor,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+    let mut events_map = tool_events_for_batch(conn, &ids)?;
+    for m in msgs.iter_mut() {
+        m.tool_events = events_map.remove(&m.id).unwrap_or_default();
+    }
+
+    Ok(MessagesPage {
+        messages: msgs,
+        has_more,
+    })
+}
+
 pub fn get_messages(
     conn: &Connection,
     session_id: &str,
@@ -4004,6 +4088,10 @@ pub fn create_run(conn: &Connection, session_id: &str, trigger_message_id: Optio
         params![id, session_id, trigger_message_id, now()],
     )
     .map_err(|e| e.to_string())?;
+    let _ = conn.execute(
+        "UPDATE sessions SET last_run_status = 'running' WHERE id = ?1",
+        params![session_id],
+    );
     Ok(id)
 }
 
@@ -4031,17 +4119,51 @@ pub fn finish_run(
         ],
     )
     .map_err(|e| e.to_string())?;
+
+    let session_id: Option<String> = conn
+        .query_row("SELECT session_id FROM runs WHERE id = ?1", params![id], |r| r.get(0))
+        .optional()
+        .unwrap_or(None);
+
+    if let Some(sid) = session_id {
+        let _ = conn.execute(
+            "UPDATE sessions SET last_run_status = ?2 WHERE id = ?1",
+            params![sid, status],
+        );
+    }
     Ok(())
 }
 
 /// 会话退出运行循环时兜底：把该会话残留的 running 状态 run 标记为 interrupted
 /// （如 stop 中止任务未走到 finish_run、或异常退出留下的记录），避免状态永远漂在“运行中”
 pub fn fail_open_runs(conn: &Connection, session_id: &str) -> Result<(), String> {
-    conn.execute(
+    let affected = conn.execute(
         "UPDATE runs SET status = 'interrupted', ended_at = ?2 WHERE session_id = ?1 AND status = 'running'",
         params![session_id, now()],
     )
     .map_err(|e| e.to_string())?;
+    if affected > 0 {
+        let _ = conn.execute(
+            "UPDATE sessions SET last_run_status = 'interrupted' WHERE id = ?1",
+            params![session_id],
+        );
+    }
+    Ok(())
+}
+
+/// 用户主动中止会话时收尾：把该会话残留的 running 状态 run 标记为 cancelled
+pub fn cancel_open_runs(conn: &Connection, session_id: &str) -> Result<(), String> {
+    let affected = conn.execute(
+        "UPDATE runs SET status = 'cancelled', ended_at = ?2 WHERE session_id = ?1 AND status = 'running'",
+        params![session_id, now()],
+    )
+    .map_err(|e| e.to_string())?;
+    if affected > 0 {
+        let _ = conn.execute(
+            "UPDATE sessions SET last_run_status = 'cancelled' WHERE id = ?1",
+            params![session_id],
+        );
+    }
     Ok(())
 }
 
@@ -4105,6 +4227,10 @@ pub fn cleanup_orphaned_running_states(conn: &Connection) -> Result<(), String> 
         params![now()],
     )
     .map_err(|e| e.to_string())?;
+    let _ = conn.execute(
+        "UPDATE sessions SET last_run_status = 'interrupted' WHERE last_run_status = 'running'",
+        [],
+    );
     conn.execute(
         "UPDATE tool_events SET status = 'failed', result_text = COALESCE(result_text, '[应用重启，未完成的命令已终止]') WHERE status IN ('running', 'pending_approval')",
         [],
@@ -4780,7 +4906,7 @@ pub fn get_token_stats(
         .filter_map(|r| r.ok())
         .collect();
 
-    // 4. 会话排行 (Top 50)
+    // 4. 会话排行 (Top 50) - 仅展示主会话，子任务消耗自动归集到父会话
     let session_query = format!(
         "SELECT 
             s.id,
@@ -4795,8 +4921,9 @@ pub fn get_token_stats(
             MAX(m.created_at) as last_msg
          FROM sessions s
          LEFT JOIN projects p ON p.id = s.project_id
-         JOIN messages m ON m.session_id = s.id
-         WHERE m.role = 'assistant' {date_filter_sql} {proj_filter_sql}
+         JOIN messages m ON (m.session_id = s.id OR m.session_id IN (SELECT child.id FROM sessions child WHERE child.parent_session_id = s.id))
+         WHERE (s.parent_session_id IS NULL OR s.parent_session_id = '')
+           AND m.role = 'assistant' {date_filter_sql} {proj_filter_sql}
          GROUP BY s.id
          HAVING tt > 0
          ORDER BY tt DESC
@@ -4877,6 +5004,51 @@ pub fn create_long_task(conn: &Connection, task: &LongTask) -> Result<(), String
     Ok(())
 }
 
+fn row_to_long_task(conn: &Connection, r: &rusqlite::Row) -> rusqlite::Result<LongTask> {
+    let sess_id: String = r.get(1)?;
+    let subtasks_str: String = r.get(6)?;
+    let subtasks: Vec<TaskSubItem> = serde_json::from_str(&subtasks_str).unwrap_or_default();
+    let budget_tok: Option<i64> = r.get(7)?;
+    let total_tok: i64 = r.get(8)?;
+    let cur_step: i64 = r.get(9)?;
+    let max_s: i64 = r.get(10)?;
+    let cur_sub_idx: i64 = r.get(5)?;
+
+    let (sess_tot, sess_prompt, sess_comp, sess_cached): (u64, u64, u64, u64) = conn
+        .query_row(
+            "SELECT COALESCE(total_tokens, 0), COALESCE(prompt_tokens, 0), COALESCE(completion_tokens, 0), COALESCE(cached_tokens, 0) FROM sessions WHERE id = ?1",
+            params![&sess_id],
+            |sr| Ok((sr.get(0)?, sr.get(1)?, sr.get(2)?, sr.get(3)?)),
+        )
+        .unwrap_or((0, 0, 0, 0));
+    let final_total = (total_tok as u64).max(sess_tot);
+    let cache_rate = if sess_prompt > 0 {
+        ((sess_cached as f64 / sess_prompt as f64) * 1000.0).round() / 10.0
+    } else {
+        0.0
+    };
+
+    Ok(LongTask {
+        id: r.get(0)?,
+        session_id: sess_id,
+        workspace_path: r.get(2)?,
+        goal: r.get(3)?,
+        status: r.get(4)?,
+        current_subtask_index: cur_sub_idx as usize,
+        subtasks,
+        max_budget_tokens: budget_tok.map(|b| b as u64),
+        total_tokens_used: final_total,
+        cached_tokens_used: sess_cached,
+        cache_hit_rate: cache_rate,
+        prompt_tokens_used: sess_prompt,
+        completion_tokens_used: sess_comp,
+        current_step: cur_step as usize,
+        max_steps: max_s as usize,
+        created_at: r.get(11)?,
+        updated_at: r.get(12)?,
+    })
+}
+
 pub fn get_long_task(conn: &Connection, id: &str) -> Result<Option<LongTask>, String> {
     let mut stmt = conn
         .prepare(
@@ -4888,30 +5060,27 @@ pub fn get_long_task(conn: &Connection, id: &str) -> Result<Option<LongTask>, St
         .map_err(|e| e.to_string())?;
 
     let res = stmt
-        .query_row(params![id], |r| {
-            let subtasks_str: String = r.get(6)?;
-            let subtasks: Vec<TaskSubItem> = serde_json::from_str(&subtasks_str).unwrap_or_default();
-            let budget_tok: Option<i64> = r.get(7)?;
-            let total_tok: i64 = r.get(8)?;
-            let cur_step: i64 = r.get(9)?;
-            let max_s: i64 = r.get(10)?;
-            let cur_sub_idx: i64 = r.get(5)?;
-            Ok(LongTask {
-                id: r.get(0)?,
-                session_id: r.get(1)?,
-                workspace_path: r.get(2)?,
-                goal: r.get(3)?,
-                status: r.get(4)?,
-                current_subtask_index: cur_sub_idx as usize,
-                subtasks,
-                max_budget_tokens: budget_tok.map(|b| b as u64),
-                total_tokens_used: total_tok as u64,
-                current_step: cur_step as usize,
-                max_steps: max_s as usize,
-                created_at: r.get(11)?,
-                updated_at: r.get(12)?,
-            })
-        })
+        .query_row(params![id], |r| row_to_long_task(conn, r))
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    Ok(res)
+}
+
+pub fn get_latest_long_task(conn: &Connection, session_id: &str) -> Result<Option<LongTask>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, workspace_path, goal, status,
+                    current_subtask_index, subtasks_json, max_budget_tokens,
+                    total_tokens_used, current_step, max_steps, created_at, updated_at
+             FROM long_tasks
+             WHERE session_id = ?1
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let res = stmt
+        .query_row(rusqlite::params![session_id], |r| row_to_long_task(conn, r))
         .optional()
         .map_err(|e| e.to_string())?;
 
@@ -4931,30 +5100,7 @@ pub fn get_active_long_task(conn: &Connection, session_id: &str) -> Result<Optio
         .map_err(|e| e.to_string())?;
 
     let res = stmt
-        .query_row(params![session_id], |r| {
-            let subtasks_str: String = r.get(6)?;
-            let subtasks: Vec<TaskSubItem> = serde_json::from_str(&subtasks_str).unwrap_or_default();
-            let budget_tok: Option<i64> = r.get(7)?;
-            let total_tok: i64 = r.get(8)?;
-            let cur_step: i64 = r.get(9)?;
-            let max_s: i64 = r.get(10)?;
-            let cur_sub_idx: i64 = r.get(5)?;
-            Ok(LongTask {
-                id: r.get(0)?,
-                session_id: r.get(1)?,
-                workspace_path: r.get(2)?,
-                goal: r.get(3)?,
-                status: r.get(4)?,
-                current_subtask_index: cur_sub_idx as usize,
-                subtasks,
-                max_budget_tokens: budget_tok.map(|b| b as u64),
-                total_tokens_used: total_tok as u64,
-                current_step: cur_step as usize,
-                max_steps: max_s as usize,
-                created_at: r.get(11)?,
-                updated_at: r.get(12)?,
-            })
-        })
+        .query_row(params![session_id], |r| row_to_long_task(conn, r))
         .optional()
         .map_err(|e| e.to_string())?;
 
@@ -5095,8 +5241,12 @@ pub fn startup_reconcile(conn: &Connection) -> Result<(), String> {
     let current_time = now();
     // 1. 批量收敛残留的 running runs 为 interrupted
     let _ = conn.execute(
-        "UPDATE runs SET status = 'interrupted', finished_at = ?1 WHERE status = 'running'",
+        "UPDATE runs SET status = 'interrupted', ended_at = ?1 WHERE status = 'running'",
         params![current_time],
+    );
+    let _ = conn.execute(
+        "UPDATE sessions SET last_run_status = 'interrupted' WHERE last_run_status = 'running'",
+        [],
     );
 
     // 2. 批量收敛残留的 running tool_events 为 failed

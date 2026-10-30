@@ -3,16 +3,13 @@ import { useStore } from "../store";
 import { DRAFT_ID } from "../types";
 import {
   Target,
-  Loader2,
   Pause,
   Play,
   Square,
-  CheckCircle2,
-  AlertCircle,
-  Sparkles,
-  List,
   X,
   Clock,
+  Zap,
+  Coins,
 } from "./Icons";
 
 export function TaskBar() {
@@ -22,9 +19,6 @@ export function TaskBar() {
   const pauseLongTask = useStore((s) => s.pauseLongTask);
   const resumeLongTask = useStore((s) => s.resumeLongTask);
   const cancelLongTask = useStore((s) => s.cancelLongTask);
-  const setShowTaskDetailModal = useStore((s) => s.setShowTaskDetailModal);
-  const continueTurn = useStore((s) => s.continueTurn);
-  const runStatus = useStore((s) => s.runStatus);
 
   const [elapsed, setElapsed] = useState(0);
 
@@ -75,96 +69,19 @@ export function TaskBar() {
       ? 15
       : 0;
 
-  const curSub =
-    subtasks[task.currentSubtaskIndex] ??
-    (subtasks.length > 0 ? subtasks[subtasks.length - 1] : null);
-
-  const getStatusBadge = () => {
-    switch (task.status) {
-      case "planning":
-        return (
-          <span className="flex items-center gap-1 text-amber-400 font-medium">
-            <Sparkles size={13} className="animate-pulse" />
-            <span>规划拆解中</span>
-          </span>
-        );
-      case "running":
-        return (
-          <span className="flex items-center gap-1 text-purple-400 font-medium">
-            <Loader2 size={13} className="animate-spin" />
-            <span>自主推进中</span>
-          </span>
-        );
-      case "paused":
-        return (
-          <span className="flex items-center gap-1 text-amber-400 font-medium">
-            <Pause size={13} />
-            <span>已暂停</span>
-          </span>
-        );
-      case "interrupted":
-        return (
-          <span className="flex items-center gap-1 text-amber-400 font-medium animate-pulse">
-            <AlertCircle size={13} />
-            <span>已中断 · 待恢复</span>
-          </span>
-        );
-      case "failed":
-        return (
-          <span className="flex items-center gap-1 text-red-400 font-medium">
-            <AlertCircle size={13} />
-            <span>执行遇阻</span>
-          </span>
-        );
-      case "completed":
-        return (
-          <span className="flex items-center gap-1 text-emerald-400 font-medium">
-            <CheckCircle2 size={13} />
-            <span>任务已达成</span>
-          </span>
-        );
-      default:
-        return (
-          <span className="flex items-center gap-1 text-inkdim font-medium">
-            <span>{task.status}</span>
-          </span>
-        );
-    }
-  };
-
   const isRunning = task.status === "running";
 
   return (
-    <div className="h-10 border-b border-edge/80 bg-panel/75 backdrop-blur px-3 flex items-center gap-3 select-none shrink-0 text-[12px] shadow-sm animate-in fade-in slide-in-from-top-1 duration-200">
-      {/* 状态徽章与标识 */}
-      <div className="flex items-center gap-2 shrink-0 pr-2 border-r border-edge/60">
-        <div className="p-1 rounded bg-purple-500/10 text-purple-400 border border-purple-500/20">
+    <div
+      className="h-10 border-b border-edge/80 bg-panel/75 backdrop-blur px-3 flex items-center gap-3 select-none shrink-0 text-[12px] shadow-sm overflow-hidden animate-in fade-in slide-in-from-top-1 duration-200"
+      title={`长任务总目标: ${task.goal}`}
+    >
+      {/* 1. 进度条 */}
+      <div className="flex items-center gap-2 flex-1 min-w-[120px]">
+        <div className="p-1 rounded bg-purple-500/10 text-purple-400 border border-purple-500/20 shrink-0">
           <Target size={13} />
         </div>
-        {getStatusBadge()}
-      </div>
-
-      {/* 任务目标与当前子任务 */}
-      <div className="flex items-center gap-2 min-w-0 max-w-[280px] shrink-0">
-        <span
-          className="font-medium text-ink truncate max-w-[140px]"
-          title={`总目标: ${task.goal}`}
-        >
-          {task.goal}
-        </span>
-        {curSub && (
-          <span
-            className="px-1.5 py-0.5 rounded bg-panel2 border border-edge text-[11px] text-inkdim truncate max-w-[130px]"
-            title={`当前阶段 [${curSub.index}/${totalCount}]: ${curSub.title}`}
-          >
-            [{curSub.index}/${totalCount}] {curSub.title}
-          </span>
-        )}
-      </div>
-
-      {/* 紧凑型进度条 */}
-      <div className="flex items-center gap-2 flex-1 min-w-[120px] max-w-[320px]">
-        <div className="flex-1 h-1.5 bg-panel3 rounded-full overflow-hidden border border-edge/40">
+        <div className="flex-1 h-2 bg-panel3 rounded-full overflow-hidden border border-edge/40 min-w-[40px]">
           <div
             className={`h-full rounded-full transition-all duration-500 ${
               task.status === "completed"
@@ -179,34 +96,52 @@ export function TaskBar() {
           />
         </div>
         <span className="text-[11px] font-mono text-inkdim shrink-0">
-          {totalCount > 0 ? `${completedCount}/${totalCount} (${pct}%)` : "准备中"}
+          {totalCount > 0 ? `${completedCount}/${totalCount} (${pct}%)` : task.status === "planning" ? "拆解中" : "准备中"}
         </span>
       </div>
 
-      {/* 耗时与 Token 统计 */}
-      <div className="flex items-center gap-2.5 text-[11px] text-inkdim shrink-0 ml-auto pr-1">
-        {elapsed > 0 && (
-          <span className="flex items-center gap-1 font-mono">
-            <Clock size={12} className="text-inkdim/70" />
-            {formatSeconds(elapsed)}
+      {/* 2. 消耗时间 */}
+      <div className="flex items-center gap-1 font-mono text-[11px] text-inkdim shrink-0" title="已消耗时间">
+        <Clock size={12} className="text-inkdim/70" />
+        <span>{formatSeconds(elapsed)}</span>
+      </div>
+
+      {/* 3. tokens & 缓存命中率 */}
+      <div
+        className="flex items-center gap-1.5 shrink-0"
+        title={`长任务累计消耗: ${(task.totalTokensUsed ?? 0).toLocaleString()} tokens${
+          (task.promptTokensUsed ?? 0) > 0 || (task.completionTokensUsed ?? 0) > 0
+            ? `\n输入: ${(task.promptTokensUsed ?? 0).toLocaleString()}${
+                (task.cachedTokensUsed ?? 0) > 0
+                  ? ` (缓存命中: ${(task.cachedTokensUsed ?? 0).toLocaleString()} · ${(task.cacheHitRate ?? 0).toFixed(1)}%)`
+                  : ""
+              } · 输出: ${(task.completionTokensUsed ?? 0).toLocaleString()}`
+            : ""
+        }`}
+      >
+        <span className="px-1.5 py-0.5 rounded bg-panel2 border border-edge/60 text-[10px] font-mono text-inkdim inline-flex items-center gap-1">
+          <Coins size={10} className="text-amber-400/80 shrink-0" />
+          <span>
+            {(task.totalTokensUsed ?? 0) >= 1000
+              ? `${((task.totalTokensUsed ?? 0) / 1000).toFixed(1)}k tokens`
+              : `${task.totalTokensUsed ?? 0} tokens`}
           </span>
-        )}
-        {task.totalTokensUsed > 0 && (
-          <span className="px-1.5 py-0.5 rounded bg-panel2 border border-edge/60 text-[10px] font-mono">
-            {task.totalTokensUsed >= 1000
-              ? `${(task.totalTokensUsed / 1000).toFixed(1)}k tokens`
-              : `${task.totalTokensUsed} tokens`}
+        </span>
+        {(task.cacheHitRate ?? 0) > 0 && (
+          <span className="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20 inline-flex items-center gap-1">
+            <Zap size={10} className="shrink-0" />
+            <span>{(task.cacheHitRate ?? 0).toFixed(1)}%</span>
           </span>
         )}
       </div>
 
-      {/* 控制操作按钮组 */}
+      {/* 4. 暂停 / 恢复 */}
       <div className="flex items-center gap-1.5 shrink-0">
         {isRunning ? (
           <button
             onClick={() => pauseLongTask(task.id)}
             title="暂停当前长任务"
-            className="flex items-center gap-1 px-2 py-1 rounded-md bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30 transition-colors cursor-pointer text-[11px]"
+            className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30 transition-colors cursor-pointer text-[11px]"
           >
             <Pause size={12} />
             <span>暂停</span>
@@ -215,18 +150,16 @@ export function TaskBar() {
           <button
             onClick={async () => {
               await resumeLongTask(task.id);
-              if (currentId && runStatus[currentId] !== "running") {
-                void continueTurn(currentId);
-              }
             }}
-            title={`一键恢复推进未完成长任务并协同恢复主会话: ${curSub ? curSub.title : task.goal}`}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/35 transition-all font-medium cursor-pointer text-[11px] shadow-xs"
+            title="恢复推进长任务"
+            className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/35 transition-all font-medium cursor-pointer text-[11px] shadow-xs"
           >
             <Play size={12} fill="currentColor" />
-            <span>恢复长任务</span>
+            <span>恢复</span>
           </button>
         )}
 
+        {/* 5. 终止 */}
         {task.status !== "completed" && (
           <button
             onClick={() => cancelLongTask(task.id)}
@@ -237,16 +170,6 @@ export function TaskBar() {
             <span>终止</span>
           </button>
         )}
-
-        {/* 展开详细看板按钮 */}
-        <button
-          onClick={() => setShowTaskDetailModal(true)}
-          title="展开任务路线图与阶段检查点"
-          className="flex items-center gap-1 px-2 py-1 rounded-md bg-panel2 hover:bg-panel3 text-inkdim hover:text-ink border border-edge transition-colors cursor-pointer text-[11px]"
-        >
-          <List size={12} />
-          <span>任务看板</span>
-        </button>
 
         {task.status === "completed" && (
           <button

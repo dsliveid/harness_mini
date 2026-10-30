@@ -186,7 +186,25 @@ export function ContextUsageGauge({ session, className = "" }: ContextUsageGauge
 
   const [openModal, setOpenModal] = useState(false);
   const [showTooltip, setShowTooltip] = useState(false);
+  const [compacting, setCompacting] = useState(false);
   const closeTimerRef = useRef<number | null>(null);
+
+  const handleManualCompact = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!session?.id) return;
+    setCompacting(true);
+    try {
+      pushToast("正在调用模型提炼上下文备忘录...");
+      const res = await ipc.triggerCompaction(session.id);
+      if (res) {
+        pushToast("上下文压缩已成功应用");
+      }
+    } catch (e) {
+      pushToast(`压缩失败: ${e}`);
+    } finally {
+      setCompacting(false);
+    }
+  };
 
   const info = useMemo(() => {
     return computeContextUsage(
@@ -402,6 +420,22 @@ export function ContextUsageGauge({ session, className = "" }: ContextUsageGauge
               </span>
             </div>
           </div>
+
+          {/* 手动触发压缩入口 */}
+          {session && (
+            <div className="mt-2.5 pt-2 border-t border-edge/30">
+              <button
+                type="button"
+                disabled={compacting}
+                onClick={handleManualCompact}
+                className="w-full py-1.5 px-3 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-300 font-medium flex items-center justify-center gap-1.5 transition-colors cursor-pointer text-[11px] disabled:opacity-50"
+                title="将早期已完成的对话历史精炼为技术备忘录，释放上下文空间"
+              >
+                <Sparkles size={12} className={compacting ? "animate-spin text-emerald-400" : "text-emerald-400"} />
+                <span>{compacting ? "正在提炼备忘录..." : "立即提炼压缩上下文"}</span>
+              </button>
+            </div>
+          )}
 
           {/* 底部点击引导 */}
           <div

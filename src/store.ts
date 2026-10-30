@@ -236,8 +236,8 @@ interface Store {
   /** 网页调试检查器弹窗 */
   showBrowserInspector: boolean;
   setShowBrowserInspector: (open: boolean) => void;
-  browserInspectorTab?: "view" | "elements" | "data" | "console" | "network" | "auth";
-  setBrowserInspectorTab: (tab: "view" | "elements" | "data" | "console" | "network" | "auth") => void;
+  browserInspectorTab?: "view" | "elements" | "data" | "console" | "network" | "storage" | "auth";
+  setBrowserInspectorTab: (tab: "view" | "elements" | "data" | "console" | "network" | "storage" | "auth") => void;
 
   bootstrap: () => Promise<void>;
   /** 拉取全局运行中的会话，恢复各会话的“运行中”状态显示（启动/界面刷新后调用） */
@@ -1103,15 +1103,15 @@ export const useStore = create<Store>((set, get) => ({
     }));
     localStorage.setItem(LAST_SESSION_KEY, id);
 
-    // 2. 首屏轻量分页拉取（从 200 精简为 INITIAL_MESSAGES_LIMIT = 30）
+    // 2. 交互轮次语义分页：默认只拉取最后 2 轮对话
     try {
-      const msgs = await ipc.getMessages(id, undefined, INITIAL_MESSAGES_LIMIT);
+      const page = await ipc.getSessionTurns(id, undefined, 2);
       if (currentToken !== latestSelectSessionToken) return;
 
       set((st) => ({
-        messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], msgs) },
+        messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], page.messages) },
         messagesLoaded: { ...st.messagesLoaded, [id]: true },
-        hasMore: { ...st.hasMore, [id]: msgs.length >= INITIAL_MESSAGES_LIMIT },
+        hasMore: { ...st.hasMore, [id]: page.hasMore },
       }));
     } catch (e) {
       if (currentToken === latestSelectSessionToken) {
@@ -1126,11 +1126,15 @@ export const useStore = create<Store>((set, get) => ({
 
     // 3. 并行拉取其他辅助状态并单次聚合提交，消除连续触发的频繁 re-render
     void Promise.allSettled([
+      ipc.getSession(id),
       ipc.listQueued(id),
       isTemp ? ipc.getTempInfo(id) : Promise.resolve(null),
       ipc.listGrowths(undefined, "proposed"),
-    ]).then(([qRes, tempRes, growthsRes]) => {
+    ]).then(([sessRes, qRes, tempRes, growthsRes]) => {
       if (currentToken !== latestSelectSessionToken) return;
+      if (sessRes.status === "fulfilled" && sessRes.value) {
+        get().onSessionUpdate(sessRes.value);
+      }
       set((st) => {
         const next: Partial<Store> = {};
         if (qRes.status === "fulfilled" && Array.isArray(qRes.value)) {
@@ -1218,10 +1222,10 @@ export const useStore = create<Store>((set, get) => ({
     if (msgs.length === 0) return;
     const oldest = msgs[0].seq;
     try {
-      const earlier = await ipc.getMessages(id, oldest, LOAD_MORE_LIMIT);
+      const page = await ipc.getSessionTurns(id, oldest, 2);
       set((st) => ({
-        messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], earlier) },
-        hasMore: { ...st.hasMore, [id]: earlier.length >= LOAD_MORE_LIMIT },
+        messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], page.messages) },
+        hasMore: { ...st.hasMore, [id]: page.hasMore },
       }));
     } catch (e) {
       get().pushToast(String(e));
@@ -1524,126 +1528,8 @@ export const useStore = create<Store>((set, get) => ({
     set((st) => {
       const list = st.messages[m.sessionId] ?? [];
       const updatedList = upsertMessage(list, m);
-
-      // 同步更新所属会话的累计 token
-      let nextSessions = st.sessions;
-      const sIdx = st.sessions.findIndex((x) => x.id === m.sessionId);
-      if (sIdx >= 0) {
-        let total = 0;
-        let prompt = 0;
-        let completion = 0;
-        let cached = 0;
-        for (const msg of updatedList) {
-          const tt = msg.totalTokens ?? (msg.usage?.totalTokens || (msg.usage?.inputEst || 0) + (msg.usage?.outputEst || 0)) ?? 0;
-          const pt = msg.promptTokens ?? (msg.usage?.promptTokens || msg.usage?.inputEst) ?? 0;
-          const ct = msg.completionTokens ?? (msg.usage?.completionTokens || msg.usage?.outputEst) ?? 0;
-          const ckt = msg.cachedTokens ?? (msg.usage?.cachedTokens || msg.usage?.promptCacheHitTokens || msg.usage?.cacheReadInputTokens) ?? 0;
-          total += Number(tt) || 0;
-          prompt += Number(pt) || 0;
-          completion += Number(ct) || 0;
-          cached += Number(ckt) || 0;
-        }
-        const hitRate = prompt > 0 ? Math.round((cached / prompt) * 1000) / 10 : 0;
-        nextSessions = st.sessions.slice();
-        nextSessions[sIdx] = {
-          ...st.sessions[sIdx],
-          totalTokens: total,
-          promptTokens: prompt,
-          completionTokens: completion,
-          cachedTokens: cached,
-          cacheHitRate: hitRate,
-        };
-      }
-
-      // 同步更新所属子 Agent 会话的累计 token
-      let nextSubagents = st.subagents;
-      let foundParentId: string | null = null;
-      for (const [pid, subList] of Object.entries(st.subagents)) {
-        if (subList.some((s) => s.id === m.sessionId)) {
-          foundParentId = pid;
-          break;
-        }
-      }
-      if (foundParentId) {
-        let subTotal = 0;
-        let subPrompt = 0;
-        let subCompletion = 0;
-        let subCached = 0;
-        for (const msg of updatedList) {
-          const tt = msg.totalTokens ?? (msg.usage?.totalTokens || (msg.usage?.inputEst || 0) + (msg.usage?.outputEst || 0)) ?? 0;
-          const pt = msg.promptTokens ?? (msg.usage?.promptTokens || msg.usage?.inputEst) ?? 0;
-          const ct = msg.completionTokens ?? (msg.usage?.completionTokens || msg.usage?.outputEst) ?? 0;
-          const ckt = msg.cachedTokens ?? (msg.usage?.cachedTokens || msg.usage?.promptCacheHitTokens || msg.usage?.cacheReadInputTokens) ?? 0;
-          subTotal += Number(tt) || 0;
-          subPrompt += Number(pt) || 0;
-          subCompletion += Number(ct) || 0;
-          subCached += Number(ckt) || 0;
-        }
-        const subHitRate = subPrompt > 0 ? Math.round((subCached / subPrompt) * 1000) / 10 : 0;
-        nextSubagents = {
-          ...st.subagents,
-          [foundParentId]: (st.subagents[foundParentId] ?? []).map((s) =>
-            s.id === m.sessionId
-              ? {
-                  ...s,
-                  totalTokens: subTotal,
-                  promptTokens: subPrompt,
-                  completionTokens: subCompletion,
-                  cachedTokens: subCached,
-                  cacheHitRate: subHitRate,
-                }
-              : s
-          ),
-        };
-      }
-
-      // 同步更新所属临时子进程列表的累计 token
-      let nextSubprocesses = st.subprocesses;
-      let foundSubprocParentId: string | null = null;
-      for (const [pid, subList] of Object.entries(st.subprocesses)) {
-        if (subList.some((s) => s.id === m.sessionId)) {
-          foundSubprocParentId = pid;
-          break;
-        }
-      }
-      if (foundSubprocParentId) {
-        let subTotal = 0;
-        let subPrompt = 0;
-        let subCompletion = 0;
-        let subCached = 0;
-        for (const msg of updatedList) {
-          const tt = msg.totalTokens ?? (msg.usage?.totalTokens || (msg.usage?.inputEst || 0) + (msg.usage?.outputEst || 0)) ?? 0;
-          const pt = msg.promptTokens ?? (msg.usage?.promptTokens || msg.usage?.inputEst) ?? 0;
-          const ct = msg.completionTokens ?? (msg.usage?.completionTokens || msg.usage?.outputEst) ?? 0;
-          const ckt = msg.cachedTokens ?? (msg.usage?.cachedTokens || msg.usage?.promptCacheHitTokens || msg.usage?.cacheReadInputTokens) ?? 0;
-          subTotal += Number(tt) || 0;
-          subPrompt += Number(pt) || 0;
-          subCompletion += Number(ct) || 0;
-          subCached += Number(ckt) || 0;
-        }
-        const subHitRate = subPrompt > 0 ? Math.round((subCached / subPrompt) * 1000) / 10 : 0;
-        nextSubprocesses = {
-          ...st.subprocesses,
-          [foundSubprocParentId]: (st.subprocesses[foundSubprocParentId] ?? []).map((s) =>
-            s.id === m.sessionId
-              ? {
-                  ...s,
-                  totalTokens: subTotal,
-                  promptTokens: subPrompt,
-                  completionTokens: subCompletion,
-                  cachedTokens: subCached,
-                  cacheHitRate: subHitRate,
-                }
-              : s
-          ),
-        };
-      }
-
       return {
         messages: { ...st.messages, [m.sessionId]: updatedList },
-        sessions: nextSessions,
-        subagents: nextSubagents,
-        subprocesses: nextSubprocesses,
       };
     });
   },
@@ -1938,6 +1824,7 @@ export const useStore = create<Store>((set, get) => ({
     });
 
     if (p.status !== "running") {
+      void get().refreshSessions();
       for (const [pid, list] of Object.entries(get().subprocesses)) {
         if (list.some((s) => s.id === p.sessionId)) {
           void get().loadSubprocesses(pid);
@@ -1992,7 +1879,7 @@ export const useStore = create<Store>((set, get) => ({
         }
       }
 
-      if (parentId || s.sessionType === "subagent" || s.sessionType === "subprocess") {
+      if (parentId || s.sessionType === "subagent" || s.sessionType === "subprocess" || s.sessionType === "collaborator") {
         if (!parentId) return st;
         const existingSubagents = st.subagents[parentId] ?? [];
         const nextSubagents = existingSubagents.some((x) => x.id === s.id)
@@ -2004,9 +1891,15 @@ export const useStore = create<Store>((set, get) => ({
           ? existingSubprocs.map((x) => (x.id === s.id ? { ...x, ...s } : x))
           : [...existingSubprocs, s];
 
+        const existingCollabs = st.collaborators[parentId] ?? [];
+        const nextCollabs = existingCollabs.some((x) => x.id === s.id)
+          ? existingCollabs.map((x) => (x.id === s.id ? { ...x, ...s } : x))
+          : [...existingCollabs, s];
+
         return {
           subagents: { ...st.subagents, [parentId]: nextSubagents },
           subprocesses: { ...st.subprocesses, [parentId]: nextSubprocs },
+          collaborators: { ...st.collaborators, [parentId]: nextCollabs },
         };
       }
 
@@ -2222,11 +2115,11 @@ export const useStore = create<Store>((set, get) => ({
   setActiveSubprocessId(id: string | null) {
     set({ activeSubprocessId: id, activeCollaboratorId: null, activeSubagentId: id });
     if (id) {
-      ipc.getMessages(id, undefined, INITIAL_MESSAGES_LIMIT).then((msgs) => {
+      ipc.getSessionTurns(id, undefined, 2).then((page) => {
         set((st) => ({
-          messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], msgs) },
+          messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], page.messages) },
           messagesLoaded: { ...st.messagesLoaded, [id]: true },
-          hasMore: { ...st.hasMore, [id]: msgs.length >= INITIAL_MESSAGES_LIMIT },
+          hasMore: { ...st.hasMore, [id]: page.hasMore },
         }));
       }).catch((e) => {
         set((st) => ({ messagesLoaded: { ...st.messagesLoaded, [id]: true } }));
@@ -2239,11 +2132,11 @@ export const useStore = create<Store>((set, get) => ({
   setActiveCollaboratorId(id: string | null) {
     set({ activeCollaboratorId: id, activeSubagentId: id, activeSubprocessId: null });
     if (id) {
-      ipc.getMessages(id, undefined, INITIAL_MESSAGES_LIMIT).then((msgs) => {
+      ipc.getSessionTurns(id, undefined, 2).then((page) => {
         set((st) => ({
-          messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], msgs) },
+          messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], page.messages) },
           messagesLoaded: { ...st.messagesLoaded, [id]: true },
-          hasMore: { ...st.hasMore, [id]: msgs.length >= INITIAL_MESSAGES_LIMIT },
+          hasMore: { ...st.hasMore, [id]: page.hasMore },
         }));
       }).catch((e) => {
         set((st) => ({ messagesLoaded: { ...st.messagesLoaded, [id]: true } }));
@@ -2690,10 +2583,10 @@ export const useStore = create<Store>((set, get) => ({
   setActiveSubagentId(id: string | null) {
     set({ activeSubagentId: id });
     if (id) {
-      ipc.getMessages(id, undefined, INITIAL_MESSAGES_LIMIT).then((msgs) => {
+      ipc.getSessionTurns(id, undefined, 2).then((page) => {
         set((st) => ({
-          messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], msgs) },
-          hasMore: { ...st.hasMore, [id]: msgs.length >= INITIAL_MESSAGES_LIMIT },
+          messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], page.messages) },
+          hasMore: { ...st.hasMore, [id]: page.hasMore },
         }));
       }).catch((e) => get().pushToast(String(e)));
       void get().syncSessionActiveState(id);
@@ -2928,6 +2821,37 @@ export const useStore = create<Store>((set, get) => ({
 
   async pauseLongTask(taskId) {
     try {
+      const cur = get().currentId;
+      if (cur) {
+        set((st) => {
+          const existing = st.activeTasks[cur];
+          const updatedTask = existing
+            ? {
+                ...existing,
+                status: "paused" as const,
+                subtasks: (existing.subtasks || []).map((s) =>
+                  s.status === "running" || s.status === "in_progress" || s.status === "verifying"
+                    ? { ...s, status: "paused" }
+                    : s
+                ),
+              }
+            : undefined;
+
+          const updatedSubprocesses = { ...st.subprocesses };
+          if (updatedSubprocesses[cur]) {
+            updatedSubprocesses[cur] = updatedSubprocesses[cur].map((p) =>
+              p.status === "running" || p.status === "in_progress" ? { ...p, status: "paused" } : p
+            );
+          }
+
+          return {
+            runStatus: { ...st.runStatus, [cur]: "idle" },
+            lastRunOutcome: { ...st.lastRunOutcome, [cur]: "idle" },
+            activeTasks: updatedTask ? { ...st.activeTasks, [cur]: updatedTask } : st.activeTasks,
+            subprocesses: updatedSubprocesses,
+          };
+        });
+      }
       await ipc.pauseLongTask(taskId);
       get().pushToast("长任务已暂停", "warning");
     } catch (e: any) {
@@ -2937,6 +2861,19 @@ export const useStore = create<Store>((set, get) => ({
 
   async resumeLongTask(taskId) {
     try {
+      const cur = get().currentId;
+      if (cur) {
+        set((st) => {
+          const existing = st.activeTasks[cur];
+          const updatedTask = existing
+            ? { ...existing, status: "running" as const }
+            : undefined;
+          return {
+            runStatus: { ...st.runStatus, [cur]: "running" },
+            activeTasks: updatedTask ? { ...st.activeTasks, [cur]: updatedTask } : st.activeTasks,
+          };
+        });
+      }
       const task = await ipc.resumeLongTask(taskId);
       set((st) => ({
         activeTasks: { ...st.activeTasks, [task.sessionId]: task },
@@ -2952,6 +2889,13 @@ export const useStore = create<Store>((set, get) => ({
   async cancelLongTask(taskId) {
     try {
       await ipc.cancelLongTask(taskId);
+      const cur = get().currentId;
+      if (cur) {
+        set((st) => ({
+          runStatus: { ...st.runStatus, [cur]: "idle" },
+          lastRunOutcome: { ...st.lastRunOutcome, [cur]: "cancelled" },
+        }));
+      }
       get().pushToast("长任务已终止", "info");
     } catch (e: any) {
       get().pushToast(`终止长任务失败: ${e}`, "error");

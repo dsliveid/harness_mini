@@ -19,6 +19,8 @@ import {
   Terminal,
   ChevronDown,
   ChevronRight,
+  Eye,
+  Zap,
 } from "./Icons";
 import { Markdown } from "./Markdown";
 
@@ -33,6 +35,7 @@ export function TaskDetailModal() {
   const fetchTaskCheckpoints = useStore((s) => s.fetchTaskCheckpoints);
   const rollbackToCheckpoint = useStore((s) => s.rollbackToCheckpoint);
   const updateTaskSubtasks = useStore((s) => s.updateTaskSubtasks);
+  const setActiveCollaboratorId = useStore((s) => s.setActiveCollaboratorId);
 
   // 本地交互编辑状态
   const [editingSubtaskId, setEditingSubtaskId] = useState<string | null>(null);
@@ -307,6 +310,20 @@ export function TaskDetailModal() {
                                       : "等待中"}
                                   </span>
 
+                                  {sub.id.startsWith("sub-") && (
+                                    <button
+                                      onClick={() => {
+                                        setActiveCollaboratorId(sub.id);
+                                        setShow(false);
+                                      }}
+                                      title="在右侧分屏查看该子任务的详细执行与工具卡片"
+                                      className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-indigo-400 hover:text-indigo-300 hover:bg-indigo-500/15 border border-indigo-500/30 transition-colors cursor-pointer"
+                                    >
+                                      <Eye size={11} />
+                                      <span>查看流程</span>
+                                    </button>
+                                  )}
+
                                   {canEdit && (
                                     <div className="flex items-center gap-1 ml-1">
                                       <button
@@ -475,8 +492,23 @@ export function TaskDetailModal() {
         </div>
 
         {/* Footer */}
-        <div className="px-5 py-3 border-t border-edge bg-panel flex items-center justify-between shrink-0 text-[11px] text-inkdim">
-          <span>总消耗 Tokens: {task.totalTokensUsed}</span>
+        <div className="px-5 py-3 border-t border-edge bg-panel flex items-center justify-between shrink-0 text-[11px] text-inkdim font-mono">
+          <div className="flex items-center gap-2">
+            <span>
+              总消耗 Tokens: <strong className="text-ink font-semibold">{task.totalTokensUsed.toLocaleString()}</strong>
+              {(task.promptTokensUsed != null && task.promptTokensUsed > 0) && (
+                <span className="text-inkdim ml-1">
+                  (输入: {task.promptTokensUsed.toLocaleString()} · 输出: {(task.completionTokensUsed ?? 0).toLocaleString()})
+                </span>
+              )}
+            </span>
+            {(task.cacheHitRate ?? 0) > 0 && (
+              <span className="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/10 text-cyan-400 font-medium border border-cyan-500/20 inline-flex items-center gap-1">
+                <Zap size={10} className="shrink-0" />
+                <span>缓存命中 {(task.cachedTokensUsed ?? 0).toLocaleString()} ({(task.cacheHitRate ?? 0).toFixed(1)}%)</span>
+              </span>
+            )}
+          </div>
           <button
             onClick={() => setShow(false)}
             className="px-3.5 py-1 rounded-lg bg-panel2 hover:bg-panel3 text-ink border border-edge transition-colors cursor-pointer"
