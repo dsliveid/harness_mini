@@ -436,6 +436,8 @@ export const ipc = {
     invoke<LongTask>("resume_long_task", { taskId }),
   cancelLongTask: (taskId: string) =>
     invoke<void>("cancel_long_task", { taskId }),
+  completeLongTask: (taskId: string, summary?: string | null, evidence?: string | null) =>
+    invoke<LongTask>("complete_long_task", { taskId, summary: summary ?? null, evidence: evidence ?? null }),
   getActiveTask: (sessionId: string) =>
     invoke<LongTask | null>("get_active_task", { sessionId }),
   listTaskCheckpoints: (taskId: string) =>

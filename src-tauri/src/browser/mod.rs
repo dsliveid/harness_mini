@@ -379,6 +379,7 @@ mod tests {
         // 4. 清理 Target 与 Context
         let _ = daemon.close_target(&target_id).await;
         let _ = daemon.dispose_context(&context_id).await;
+        daemon.stop().await;
     }
 }
 

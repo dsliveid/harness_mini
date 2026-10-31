@@ -790,3 +790,69 @@ pub(crate) async fn compact_context_tool(args: &Value, ctx: &ToolCtx) -> Result<
         Ok("用户跳过了本次上下文压缩请求，历史消息保持完整原样。".into())
     }
 }
+
+pub(crate) async fn control_long_task_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .ok_or("缺少 action 参数（可选: start, pause, complete）")?;
+    let reason = args
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .ok_or("缺少 reason 参数（请提供操作理由说明）")?;
+    let evidence = args.get("evidence").and_then(|v| v.as_str());
+
+    let host = ctx
+        .host
+        .as_ref()
+        .ok_or("缺少 host 上下文，无法执行 control_long_task")?;
+    let app = &host.app;
+    let session_id = &host.session_id;
+
+    match action {
+        "start" => {
+            // 防递归/防套娃保护：若当前会话已有正在运行或规划中的长任务，严禁重复启动
+            if let Ok(Some(existing)) = crate::task::get_active_task(app, session_id) {
+                if existing.status == "running" || existing.status == "planning" {
+                    return Err(format!(
+                        "当前会话已处于运行中的长任务守护模式（ID: {}），严禁递归重复启动守护进程。",
+                        existing.id
+                    ));
+                }
+            }
+            let goal = args.get("goal").and_then(|v| v.as_str()).unwrap_or(reason);
+            let max_budget_tokens = args.get("max_budget_tokens").and_then(|v| v.as_u64());
+            let task = crate::task::start_long_task(
+                app.clone(),
+                session_id.clone(),
+                goal.to_string(),
+                max_budget_tokens,
+            )?;
+            Ok(format!(
+                "✅ 已成功启动长任务自主守护推进进程！\n任务 ID: {}\n总目标: {}\n守护进程已在后台实时建立波次管道并启动监控。",
+                task.id, task.goal
+            ))
+        }
+        "pause" => {
+            crate::task::pause_long_task_by_session(app, session_id, Some(reason))?;
+            Ok(format!(
+                "⏸️ 长任务守护进程已成功安全挂起！\n挂起原因: {}\n系统已即时冻结所有运行中子任务与后台推进，等待后续人工裁决或恢复指令。",
+                reason
+            ))
+        }
+        "complete" => {
+            let task = crate::task::complete_long_task_by_session(app, session_id, Some(reason), evidence)?;
+            Ok(format!(
+                "🎉 **长任务总目标已圆满达成并宣告结案！**\n总目标: {}\n结案说明: {}\n验收证据: {}\n右侧看板与系统落地方案已全量同步为完成状态，检查点已成功归档。",
+                task.goal,
+                reason,
+                evidence.unwrap_or("已通过实测自检验证")
+            ))
+        }
+        _ => Err(format!(
+            "不支持的 action 类型: {}。仅支持 start, pause, complete",
+            action
+        )),
+    }
+}
+

@@ -162,8 +162,7 @@ pub(crate) async fn run_command(
         c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]);
         c.arg(format!(
             "$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8;\n\
-             $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8';\n\
-             $PSDefaultParameterValues['*:Encoding'] = 'utf8';\n\
+             $PSDefaultParameterValues = @{{ 'Out-File:Encoding' = 'utf8'; '*:Encoding' = 'utf8' }};\n\
              {command}\n\
              if ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }}"
         ));

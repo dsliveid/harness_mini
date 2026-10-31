@@ -203,8 +203,9 @@ export function CollaboratorView({ collaboratorId }: { collaboratorId: string })
     const finalTotal = Math.max(total, Number(collab?.totalTokens) || 0);
     const finalPrompt = Math.max(prompt, Number(collab?.promptTokens) || 0);
     const finalCompletion = Math.max(completion, Number(collab?.completionTokens) || 0);
-    const finalCached = Math.max(cached, Number(collab?.cachedTokens) || 0);
-    const cacheHitRate = finalPrompt > 0 ? Math.round((finalCached / finalPrompt) * 1000) / 10 : 0;
+    const finalCached = Math.min(finalPrompt, Math.max(cached, Number(collab?.cachedTokens) || 0));
+    const rawRate = finalPrompt > 0 ? Math.round((finalCached / finalPrompt) * 1000) / 10 : 0;
+    const cacheHitRate = Math.min(100, Math.max(0, rawRate));
 
     return {
       totalTokens: finalTotal,

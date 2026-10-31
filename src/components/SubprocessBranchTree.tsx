@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useRef, useLayoutEffect, useCallback } fr
 import { useStore } from "../store";
 import { ipc } from "../ipc";
 import {
+  FileText,
   Loader2,
   CheckCircle2,
   AlertCircle,
@@ -240,6 +241,13 @@ export function SubprocessBranchTree({
   singleSubId?: string;
 }) {
   const currentParentId = useStore((s) => s.currentId);
+  const currentWorkspace = useStore(
+    (s) =>
+      s.sessions.find((x) => x.id === s.currentId)?.workspacePath ||
+      s.draft?.workspacePath ||
+      s.settings.lastWorkspacePath ||
+      ""
+  );
   const allSubprocesses = useStore((s) => s.subprocesses);
   const allSubagents = useStore((s) => s.subagents);
   const subprocesses = useMemo(
@@ -576,6 +584,71 @@ export function SubprocessBranchTree({
           })}
         </div>
       </div>
+
+      {/* 任务知识交接文档卡片（单独独立展示，单行高度，仅保留查看按钮） */}
+      {items.length > 0 && (
+        <div className="mt-3 pt-2.5 border-t border-edge/30 space-y-1.5">
+          <div className="flex items-center justify-between text-[11px] text-inkdim px-0.5 select-none">
+            <span className="flex items-center gap-1.5 font-medium text-ink">
+              <FileText size={11} className="text-blue-400" />
+              <span>任务知识交接文档 {items.length > 1 ? `(${items.length})` : ""}</span>
+            </span>
+            <span className="text-[10px] text-inkdim/70">只读查阅 · 点击在右侧抽屉打开</span>
+          </div>
+          <div className="rounded-lg border border-indigo-500/20 bg-panel3/30 overflow-hidden divide-y divide-edge/30">
+            {items.map((it, idx) => {
+              const cleanId = (it.sub?.id || it.subId || "").replace(/-/g, "_");
+              const pathMatch = it.ev?.resultText?.replace(/\\/g, "/").match(/(?:\.harness\/subtasks\/)([^`\s\n"'<>]*_knowledge\.md)/i);
+              const relPath = pathMatch ? `.harness/subtasks/${pathMatch[1]}` : `.harness/subtasks/${cleanId}_knowledge.md`;
+              const absPath = currentWorkspace
+                ? `${currentWorkspace.replace(/\\/g, "/").replace(/\/$/, "")}/${relPath.replace(/^\//, "")}`
+                : relPath;
+              const fileName = relPath.split("/").pop() || `${cleanId}_knowledge.md`;
+              const roleMeta = ROLE_INFO[it.role] || { label: it.role || "协作助手", Icon: Bot, color: "text-indigo-400 bg-indigo-500/10", border: "border-indigo-500/30" };
+
+              return (
+                <div
+                  key={it.subId || idx}
+                  className="flex items-center justify-between gap-2 px-3 py-1.5 hover:bg-panel3/70 transition-colors text-[11.5px]"
+                >
+                  <div className="flex items-center gap-2 min-w-0 flex-1">
+                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium border flex items-center gap-1 shrink-0 ${roleMeta.color} ${roleMeta.border}`}>
+                      <roleMeta.Icon size={10} className="shrink-0" />
+                      <span>{roleMeta.label}</span>
+                    </span>
+                    <span className="font-medium text-ink truncate max-w-[160px] sm:max-w-[220px]" title={it.title}>
+                      {it.title}
+                    </span>
+                    <span className="font-mono text-[10.5px] text-inkdim/60 truncate hidden sm:inline" title={relPath}>
+                      {relPath}
+                    </span>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      ipc.openFileViewer({
+                        id: `file:${absPath}`,
+                        type: "file",
+                        title: `任务交接书: ${fileName}`,
+                        path: absPath,
+                        workspacePath: currentWorkspace,
+                        sessionId: currentParentId || undefined,
+                      });
+                    }}
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-blue-500/15 hover:bg-blue-500/25 text-blue-400 border border-blue-500/30 text-[11px] font-medium transition-colors shrink-0 cursor-pointer shadow-xs"
+                    title={`在右侧独立抽屉中查看任务知识交接文档 (${fileName})`}
+                  >
+                    <FileText size={10} />
+                    <span>查看交接书</span>
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* 底部提示 */}
       <div className="mt-3 pt-2 border-t border-edge/30 text-[11px] text-inkdim flex items-center justify-between">

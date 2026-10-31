@@ -23,6 +23,9 @@ import {
   ClipboardList,
   Target,
   Eye,
+  Pause,
+  Play,
+  Square,
 } from "./Icons";
 
 /** 从当前会话消息中提取所有正在执行的 run_command 工具事件 */
@@ -100,47 +103,96 @@ function LongTaskSection({
   task,
   activeSideId,
   onOpenSubagent,
-  onOpenDetailModal,
 }: {
   task: LongTask;
   activeSideId: string | null;
   onOpenSubagent: (subId: string) => void;
-  onOpenDetailModal: () => void;
 }) {
+  const pauseLongTask = useStore((s) => s.pauseLongTask);
+  const resumeLongTask = useStore((s) => s.resumeLongTask);
+  const cancelLongTask = useStore((s) => s.cancelLongTask);
+  const [acting, setActing] = useState(false);
+
   const subtasks = task.subtasks || [];
   const done = subtasks.filter((s) => s.status === "completed").length;
   const total = subtasks.length;
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  const isRunning = task.status === "running" || task.status === "planning";
+  const isPaused = task.status === "paused" || task.status === "interrupted";
+  const isFailed = task.status === "failed";
+  const isCompleted = task.status === "completed";
+
+  const handlePause = async () => {
+    if (acting) return;
+    setActing(true);
+    try {
+      await pauseLongTask(task.id);
+    } finally {
+      setActing(false);
+    }
+  };
+
+  const handleResume = async () => {
+    if (acting) return;
+    setActing(true);
+    try {
+      await resumeLongTask(task.id);
+    } finally {
+      setActing(false);
+    }
+  };
+
+  const handleCancel = async () => {
+    if (acting) return;
+    setActing(true);
+    try {
+      await cancelLongTask(task.id);
+    } finally {
+      setActing(false);
+    }
+  };
 
   return (
     <div className="flex flex-col gap-2">
-      {/* 标题与状态 */}
-      <div className="rounded-xl border p-2.5 text-[11.5px] space-y-1.5 bg-purple-500/10 border-purple-500/20">
+      {/* 标题与调度器核心控制区 */}
+      <div className="rounded-xl border p-2.5 text-[11.5px] space-y-2 bg-purple-500/10 border-purple-500/20 shadow-xs">
         <div className="flex items-center justify-between gap-1.5">
           <span className="font-semibold text-purple-400 truncate flex-1 min-w-0 inline-flex items-center gap-1.5" title={task.goal}>
             <Target size={13} className="shrink-0" />
             <span className="truncate">{task.goal}</span>
           </span>
           <span
-            className={`text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0 ${
-              task.status === "completed"
-                ? "bg-green-500/20 text-green-300"
-                : task.status === "paused" || task.status === "interrupted"
-                ? "bg-amber-500/20 text-amber-300"
-                : task.status === "failed"
-                ? "bg-red-500/20 text-red-300"
-                : "bg-blue-500/20 text-blue-300"
+            className={`text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0 flex items-center gap-1 ${
+              isCompleted
+                ? "bg-green-500/20 text-green-300 border border-green-500/30"
+                : isPaused
+                ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
+                : isFailed
+                ? "bg-red-500/20 text-red-300 border border-red-500/30"
+                : "bg-blue-500/20 text-blue-300 border border-blue-500/30 animate-pulse"
             }`}
           >
-            {task.status === "completed"
-              ? "已达成"
-              : task.status === "paused"
-              ? "已暂停"
-              : task.status === "interrupted"
-              ? "已中断"
-              : task.status === "failed"
-              ? "遇阻"
-              : "推进中"}
+            {isCompleted ? (
+              <>
+                <CheckCircle2 size={11} className="text-green-400" />
+                <span>已达成</span>
+              </>
+            ) : isPaused ? (
+              <>
+                <Pause size={10} className="text-amber-400" />
+                <span>已暂停</span>
+              </>
+            ) : isFailed ? (
+              <>
+                <X size={10} className="text-red-400" />
+                <span>遇阻</span>
+              </>
+            ) : (
+              <>
+                <Loader2 size={10} className="animate-spin text-blue-400" />
+                <span>推进中</span>
+              </>
+            )}
           </span>
         </div>
 
@@ -154,6 +206,60 @@ function LongTaskSection({
             />
           </div>
           <span className="font-mono text-[10px]">{pct}%</span>
+        </div>
+
+        {/* 调度器控制按钮栏 (Scheduler Controls) */}
+        <div className="flex items-center justify-between gap-1.5 pt-1 border-t border-purple-500/20">
+          <div className="flex items-center gap-1.5">
+            {isRunning && (
+              <button
+                type="button"
+                disabled={acting}
+                onClick={handlePause}
+                className="inline-flex items-center gap-1 px-2 py-0.8 rounded bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 text-[11px] font-medium border border-amber-500/30 transition-colors cursor-pointer disabled:opacity-50"
+                title="暂停长任务调度器（等待人工检查或恢复）"
+              >
+                <Pause size={11} />
+                <span>暂停调度</span>
+              </button>
+            )}
+            {(isPaused || isFailed) && (
+              <button
+                type="button"
+                disabled={acting}
+                onClick={handleResume}
+                className="inline-flex items-center gap-1 px-2.5 py-0.8 rounded bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 text-[11px] font-medium border border-emerald-500/40 transition-colors cursor-pointer shadow-xs disabled:opacity-50"
+                title="启动/恢复长任务调度推进"
+              >
+                <Play size={11} className="fill-emerald-300/40" />
+                <span>{isFailed ? "重试推进" : "启动/继续推进"}</span>
+              </button>
+            )}
+            {!isCompleted && (
+              <button
+                type="button"
+                disabled={acting}
+                onClick={handleCancel}
+                className="inline-flex items-center gap-1 px-2 py-0.8 rounded bg-red-500/10 hover:bg-red-500/20 text-red-300 text-[11px] font-medium border border-red-500/25 transition-colors cursor-pointer disabled:opacity-50"
+                title="终止长任务"
+              >
+                <Square size={10} className="fill-red-300/30" />
+                <span>终止任务</span>
+              </button>
+            )}
+          </div>
+
+          <div className="text-[10px] text-inkdim font-mono">
+            {isRunning ? (
+              <span className="text-blue-400">调度中</span>
+            ) : isPaused ? (
+              <span className="text-amber-400">已挂起</span>
+            ) : isFailed ? (
+              <span className="text-red-400">异常待查</span>
+            ) : (
+              <span className="text-green-400">全部完成</span>
+            )}
+          </div>
         </div>
       </div>
 
@@ -233,17 +339,12 @@ function LongTaskSection({
         })}
       </div>
 
-      {/* 底部详细看板入口 */}
+      {/* 底部信息 */}
       <div className="flex items-center justify-between text-[11px] text-inkdim pt-1 border-t border-edge/60">
-        <span className="text-[10px]">透明沙箱执行</span>
-        <button
-          type="button"
-          onClick={onOpenDetailModal}
-          className="text-purple-400 hover:text-purple-300 font-medium hover:underline cursor-pointer flex items-center gap-1"
-        >
-          <span>查看完整路线图与检查点</span>
-          <ChevronRight size={11} />
-        </button>
+        <span className="text-[10px]">计划驱动 · 守护推进</span>
+        <span className="text-[10px] text-purple-400/80 font-mono">
+          {pct === 100 ? "全部完成" : `正在执行第 ${done + 1}/${total} 步`}
+        </span>
       </div>
     </div>
   );
@@ -341,7 +442,6 @@ export function FloatingTaskPanel() {
   const activeCollaboratorId = useStore((s) => s.activeCollaboratorId);
   const activeSubprocessId = useStore((s) => s.activeSubprocessId);
   const activeSideId = activeCollaboratorId || activeSubprocessId;
-  const setShowTaskDetailModal = useStore((s) => s.setShowTaskDetailModal);
 
   const [collapsed, setCollapsed] = useState(false);
   const [showPlanModal, setShowPlanModal] = useState(false);
@@ -598,7 +698,6 @@ export function FloatingTaskPanel() {
               task={activeTask}
               activeSideId={activeSideId}
               onOpenSubagent={(subId) => setActiveCollaboratorId(activeCollaboratorId === subId ? null : subId)}
-              onOpenDetailModal={() => setShowTaskDetailModal(true)}
             />
           )}
 

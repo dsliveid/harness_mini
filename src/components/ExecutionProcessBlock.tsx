@@ -375,6 +375,10 @@ export function groupTimelineItems(
 
               reasoning: null,
 
+              toolEvents: [],
+
+              toolCalls: [],
+
               turnToolEvents: allTurnToolEvents,
 
               revertedAt: turnRevertedAt,
@@ -433,6 +437,10 @@ export function groupTimelineItems(
 
               reasoning: null,
 
+              toolEvents: [],
+
+              toolCalls: [],
+
               turnToolEvents: singleMsg.toolEvents,
 
               revertedAt: turnRevertedAt,
@@ -483,6 +491,10 @@ export function groupTimelineItems(
 
               reasoning: null,
 
+              toolEvents: [],
+
+              toolCalls: [],
+
               revertedAt: turnRevertedAt,
 
             },
@@ -508,6 +520,10 @@ export function groupTimelineItems(
               ...singleMsg,
 
               content: cleanSingle,
+
+              toolEvents: [],
+
+              toolCalls: [],
 
               revertedAt: turnRevertedAt,
 

@@ -2200,7 +2200,7 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
     let cached = r.get::<_, Option<i64>>(39)?.map(|v| v as u64);
     let cache_hit_rate = if let (Some(p), Some(c)) = (pt, cached) {
         if p > 0 {
-            Some(((c as f64 / p as f64) * 1000.0).round() / 10.0)
+            Some((((c as f64 / p as f64) * 1000.0).round() / 10.0).clamp(0.0, 100.0))
         } else {
             Some(0.0)
         }
@@ -4747,7 +4747,7 @@ pub fn get_token_stats(
         total_tokens: tot_tt as u64,
         total_cached_tokens: tot_cached as u64,
         overall_cache_hit_rate: if tot_pt > 0 {
-            ((tot_cached as f64 / tot_pt as f64) * 1000.0).round() / 10.0
+            (((tot_cached as f64 / tot_pt as f64) * 1000.0).round() / 10.0).clamp(0.0, 100.0)
         } else {
             0.0
         },
@@ -4756,7 +4756,7 @@ pub fn get_token_stats(
         today_tokens: today_tt as u64,
         today_cached_tokens: today_cached as u64,
         today_cache_hit_rate: if today_pt > 0 {
-            ((today_cached as f64 / today_pt as f64) * 1000.0).round() / 10.0
+            (((today_cached as f64 / today_pt as f64) * 1000.0).round() / 10.0).clamp(0.0, 100.0)
         } else {
             0.0
         },
@@ -4816,7 +4816,7 @@ pub fn get_token_stats(
         let pt = stats.0;
         let cached = stats.3;
         let rate = if pt > 0 {
-            ((cached as f64 / pt as f64) * 1000.0).round() / 10.0
+            (((cached as f64 / pt as f64) * 1000.0).round() / 10.0).clamp(0.0, 100.0)
         } else {
             0.0
         };
@@ -4840,7 +4840,7 @@ pub fn get_token_stats(
             let pt = stats.0;
             let cached = stats.3;
             let rate = if pt > 0 {
-                ((cached as f64 / pt as f64) * 1000.0).round() / 10.0
+                (((cached as f64 / pt as f64) * 1000.0).round() / 10.0).clamp(0.0, 100.0)
             } else {
                 0.0
             };
@@ -4888,7 +4888,7 @@ pub fn get_token_stats(
             let cached: i64 = r.get(4)?;
             let mc: i64 = r.get(5)?;
             let rate = if pt > 0 {
-                ((cached as f64 / pt as f64) * 1000.0).round() / 10.0
+                (((cached as f64 / pt as f64) * 1000.0).round() / 10.0).clamp(0.0, 100.0)
             } else {
                 0.0
             };
@@ -4944,7 +4944,7 @@ pub fn get_token_stats(
             let mc: i64 = r.get(8)?;
             let last_at: Option<String> = r.get(9)?;
             let rate = if pt > 0 {
-                ((cached as f64 / pt as f64) * 1000.0).round() / 10.0
+                (((cached as f64 / pt as f64) * 1000.0).round() / 10.0).clamp(0.0, 100.0)
             } else {
                 0.0
             };
@@ -5023,7 +5023,7 @@ fn row_to_long_task(conn: &Connection, r: &rusqlite::Row) -> rusqlite::Result<Lo
         .unwrap_or((0, 0, 0, 0));
     let final_total = (total_tok as u64).max(sess_tot);
     let cache_rate = if sess_prompt > 0 {
-        ((sess_cached as f64 / sess_prompt as f64) * 1000.0).round() / 10.0
+        (((sess_cached as f64 / sess_prompt as f64) * 1000.0).round() / 10.0).clamp(0.0, 100.0)
     } else {
         0.0
     };
@@ -5264,6 +5264,17 @@ pub fn startup_reconcile(conn: &Connection) -> Result<(), String> {
     // 4. 批量收敛残留的 running sessions (subprocess, subagent, collaborator) 为 interrupted
     let _ = conn.execute(
         "UPDATE sessions SET status = 'interrupted' WHERE status = 'running' AND (session_type IN ('subprocess', 'subagent', 'collaborator') OR parent_session_id IS NOT NULL)",
+        [],
+    );
+
+    // 5. 自动净化历史消息中被长任务累计账单污染的异常 prompt_tokens 与 cached_tokens
+    let _ = conn.execute(
+        "UPDATE messages \
+         SET prompt_tokens = 0, \
+             cached_tokens = 0, \
+             total_tokens = COALESCE(completion_tokens, 0) \
+         WHERE prompt_tokens > 500000 \
+            OR (role = 'assistant' AND (content LIKE '%长任务全部子任务已顺利达成%' OR content LIKE '%阶段 [%] 顺利达成%'))",
         [],
     );
 

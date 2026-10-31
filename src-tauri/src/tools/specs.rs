@@ -321,6 +321,38 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 }
             }),
         },
+        ToolSpec {
+            name: "control_long_task",
+            description: "管控长任务守护进程的生命周期。当总目标已达成宣告结案完成、遇到阻碍/等待人工决策安全挂起、或需要自主发起长任务守护进程时调用。系统将原子性更新长任务状态机、归档检查点并同步右侧看板。",
+            risk: Risk::Write,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["start", "pause", "complete"],
+                        "description": "控制动作：start(启动长任务守护模式), pause(遇到阻碍/等待用户确认安全挂起), complete(总目标已达成宣告结案)"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "执行该操作的说明理由（如：已完成全部阶段的综合总结，或暂停的具体原因）"
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "description": "仅在 action='complete' 时推荐提供：证明目标已达成的实测证据（如测试通过命令及输出摘要、功能运行状态等）"
+                    },
+                    "goal": {
+                        "type": "string",
+                        "description": "仅在 action='start' 时使用：长任务的总目标"
+                    },
+                    "max_budget_tokens": {
+                        "type": "integer",
+                        "description": "仅在 action='start' 时可选：长任务的最大 Token 预算上限"
+                    }
+                },
+                "required": ["action", "reason"]
+            }),
+        },
         // ---------- 任务方案计划中枢工具集 (.harness/plans/) ----------
         ToolSpec {
             name: "create_plan",

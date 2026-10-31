@@ -403,13 +403,12 @@ interface Store {
   /** 任务检查点（按 taskId 索引） */
   taskCheckpoints: Record<string, TaskCheckpoint[]>;
   /** 是否打开长任务详情弹窗 */
-  showTaskDetailModal: boolean;
-  setShowTaskDetailModal: (v: boolean) => void;
 
   startLongTask: (sessionId: string, goal: string, maxBudgetTokens?: number | null) => Promise<LongTask | null>;
   pauseLongTask: (taskId: string) => Promise<void>;
   resumeLongTask: (taskId: string) => Promise<LongTask | null>;
   cancelLongTask: (taskId: string) => Promise<void>;
+  completeLongTask: (taskId: string, summary?: string | null, evidence?: string | null) => Promise<LongTask | null>;
   fetchActiveTask: (sessionId: string) => Promise<LongTask | null>;
   fetchTaskCheckpoints: (taskId: string) => Promise<TaskCheckpoint[]>;
   rollbackToCheckpoint: (checkpointId: string) => Promise<LongTask | null>;
@@ -628,8 +627,6 @@ export const useStore = create<Store>((set, get) => ({
 
   activeTasks: {},
   taskCheckpoints: {},
-  showTaskDetailModal: false,
-  setShowTaskDetailModal: (v) => set({ showTaskDetailModal: v }),
   showBrowserInspector: false,
   setShowBrowserInspector: (v) => set({ showBrowserInspector: v }),
   browserInspectorTab: "view",
@@ -2899,6 +2896,20 @@ export const useStore = create<Store>((set, get) => ({
       get().pushToast("长任务已终止", "info");
     } catch (e: any) {
       get().pushToast(`终止长任务失败: ${e}`, "error");
+    }
+  },
+
+  async completeLongTask(taskId, summary, evidence) {
+    try {
+      const task = await ipc.completeLongTask(taskId, summary, evidence);
+      set((st) => ({
+        activeTasks: { ...st.activeTasks, [task.sessionId]: task },
+      }));
+      get().pushToast("长任务已结案并标记完成", "success");
+      return task;
+    } catch (e: any) {
+      get().pushToast(`完成长任务失败: ${e}`, "error");
+      return null;
     }
   },
 

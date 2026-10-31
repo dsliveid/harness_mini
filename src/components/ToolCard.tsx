@@ -1601,6 +1601,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
   const isPlanTool = ["create_plan", "update_plan", "switch_plan"].includes(ev.toolName);
   const isVisionTool = ev.toolName === "recognize_image";
   const isDecisionTool = ["judge_decision", "choice_decision", "score_decision"].includes(ev.toolName);
+  const isCollabTool = ["dispatch_collaborator", "wait_collaborators", "wait_subprocesses", "wait_subagents"].includes(ev.toolName);
   const needsModelInfo = isImageTool || isVisionTool || isDecisionTool;
 
   // 关键解耦：只有生图/识图/决策工具才解析模型信息，常规工具不提取；使用等值判定切断无关配置变更导致的重渲染风暴
@@ -1617,17 +1618,17 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
     }
   );
 
-  // 计划工具、生图工具、识图工具与决策工具执行中/成功默认展开，失败默认收起；其他工具默认收起
+  // 计划工具、生图工具、识图工具、决策工具与协作者工件卡片执行中/成功默认展开，失败默认收起；其他工具默认收起
   const [expanded, setExpanded] = useState(() => {
-    if (isImageTool || isVisionTool || isPlanTool || isDecisionTool) {
+    if (isImageTool || isVisionTool || isPlanTool || isDecisionTool || isCollabTool) {
       return ev.status !== "failed" && ev.status !== "timeout" && ev.status !== "denied";
     }
     return false;
   });
 
-  // 当生图/识图/决策状态在执行或流转中变为失败时，自动收起卡片；成功展开；计划操作若流转失败也自动收起
+  // 当生图/识图/决策/协同工件状态在执行或流转中变为失败时，自动收起卡片；成功展开；计划操作若流转失败也自动收起
   useEffect(() => {
-    if (isImageTool || isVisionTool || isDecisionTool) {
+    if (isImageTool || isVisionTool || isDecisionTool || isCollabTool) {
       if (ev.status === "failed" || ev.status === "timeout" || ev.status === "denied") {
         setExpanded(false);
       } else if (ev.status === "success") {
@@ -1638,7 +1639,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
         setExpanded(false);
       }
     }
-  }, [isImageTool, isVisionTool, isPlanTool, isDecisionTool, ev.status]);
+  }, [isImageTool, isVisionTool, isPlanTool, isDecisionTool, isCollabTool, ev.status]);
 
   const generatedImagePath = useMemo(() => {
     if (ev.toolName !== "generate_image" || !ev.resultText) return null;
@@ -1855,35 +1856,99 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
     });
   };
 
-  // 提取子任务/协作者交付报告工件的物理路径（.harness/subtasks/*_report.md）
-  const resolvedSubtaskReportPath = useMemo(() => {
+  // 提取子任务/协作者交付报告工件的物理路径列表（.harness/subtasks/*_report.md），支持单任务与多任务并行返回
+  const resolvedSubtaskReports = useMemo(() => {
     if (!["wait_subprocesses", "wait_subagents", "wait_collaborators"].includes(ev.toolName)) {
+      return [];
+    }
+    if (!ev.resultText) return [];
+
+    const text = ev.resultText.replace(/\\/g, "/");
+    const items: { title: string; role?: string; relPath: string; absPath: string; fileName: string }[] = [];
+
+    // 1. 尝试按多任务 section 分割匹配
+    const sections = text.split(/(?=###\s+(?:协同子\s*Agent|协作者|子进程):)/i);
+
+    for (const sec of sections) {
+      const headerMatch = sec.match(/###\s+(?:协同子\s*Agent|协作者|子进程):\s*([^(]+?)(?:\s*\(([^)]+)\))?(?:\n|$)/i);
+      const pathMatch = sec.match(/(?:\.harness\/subtasks\/)([^`\s\n"'<>]*_report\.md)/i);
+      if (pathMatch) {
+        const relPath = `.harness/subtasks/${pathMatch[1]}`;
+        const fileName = pathMatch[1].split("/").pop() || "子任务交付报告.md";
+        const absPath =
+          /^[a-zA-Z]:\//.test(relPath) || relPath.startsWith("/")
+            ? relPath
+            : currentWorkspace
+              ? `${currentWorkspace.replace(/\\/g, "/").replace(/\/$/, "")}/${relPath.replace(/^\//, "")}`
+              : relPath;
+
+        items.push({
+          title: headerMatch ? headerMatch[1].trim() : fileName.replace(/_report\.md$/, ""),
+          role: headerMatch && headerMatch[2] ? headerMatch[2].trim() : undefined,
+          relPath,
+          absPath,
+          fileName,
+        });
+      }
+    }
+
+    // 2. 兜底回退：如果没分出 section，但有 _report.md 匹配，进行全局捕获
+    if (items.length === 0) {
+      const globalRegex = /(?:\.harness\/subtasks\/)([^`\s\n"'<>]*_report\.md)/gi;
+      let m;
+      while ((m = globalRegex.exec(text)) !== null) {
+        const relPath = `.harness/subtasks/${m[1]}`;
+        const fileName = m[1].split("/").pop() || "子任务交付报告.md";
+        const absPath =
+          /^[a-zA-Z]:\//.test(relPath) || relPath.startsWith("/")
+            ? relPath
+            : currentWorkspace
+              ? `${currentWorkspace.replace(/\\/g, "/").replace(/\/$/, "")}/${relPath.replace(/^\//, "")}`
+              : relPath;
+
+        if (!items.some((it) => it.relPath === relPath)) {
+          items.push({
+            title: fileName.replace(/_report\.md$/, ""),
+            relPath,
+            absPath,
+            fileName,
+          });
+        }
+      }
+    }
+
+    return items;
+  }, [ev.toolName, ev.resultText, currentWorkspace]);
+
+  // 提取子任务/协作者任务知识交接书工件的物理路径（.harness/subtasks/*_knowledge.md）
+  const resolvedSubtaskKnowledgePath = useMemo(() => {
+    if (!["spawn_subprocess", "spawn_subagent", "dispatch_collaborator"].includes(ev.toolName)) {
       return null;
     }
     if (ev.resultText) {
       const normalized = ev.resultText.replace(/\\/g, "/");
-      const match = normalized.match(/(?:\.harness\/subtasks\/)([^`\s\n"'<>]+\.md)/i);
+      const match = normalized.match(/(?:\.harness\/subtasks\/)([^`\s\n"'<>]*_knowledge\.md)/i);
       if (match) return `.harness/subtasks/${match[1]}`;
     }
     return null;
   }, [ev.toolName, ev.resultText]);
 
-  const handleOpenSubtaskReport = (e: React.MouseEvent) => {
+  const handleOpenSubtaskKnowledge = (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (!resolvedSubtaskReportPath) return;
-    const cleanRel = resolvedSubtaskReportPath.replace(/\\/g, "/");
+    if (!resolvedSubtaskKnowledgePath) return;
+    const cleanRel = resolvedSubtaskKnowledgePath.replace(/\\/g, "/");
     const absPath =
       /^[a-zA-Z]:\//.test(cleanRel) || cleanRel.startsWith("/")
         ? cleanRel
         : currentWorkspace
           ? `${currentWorkspace.replace(/\\/g, "/").replace(/\/$/, "")}/${cleanRel.replace(/^\//, "")}`
           : cleanRel;
-    const fileName = cleanRel.split("/").pop() || "子任务交付报告.md";
+    const fileName = cleanRel.split("/").pop() || "任务知识交接书.md";
 
     ipc.openFileViewer({
       id: `file:${absPath}`,
       type: "file",
-      title: `交付报告: ${fileName}`,
+      title: `任务交接书: ${fileName}`,
       path: absPath,
       workspacePath: currentWorkspace,
       sessionId: currentSessionId || undefined,
@@ -2111,17 +2176,6 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
               <span>浮窗查看</span>
             </button>
           )}
-          {["wait_subprocesses", "wait_subagents", "wait_collaborators"].includes(ev.toolName) && resolvedSubtaskReportPath && (
-            <button
-              type="button"
-              className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 transition-colors cursor-pointer border border-indigo-500/30"
-              title="在独立窗体中查看完整子任务详细报告"
-              onClick={handleOpenSubtaskReport}
-            >
-              <FileText size={11} />
-              <span>报告工件 (MD)</span>
-            </button>
-          )}
           {["record_memory", "read_memory"].includes(ev.toolName) && resolvedMemoryFilePath && (
             <button
               type="button"
@@ -2241,6 +2295,99 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
           }
         />
       )}
+
+      {/* 展开时：若是派发协作者，展示专用任务交接文档单行卡片 */}
+      {expanded &&
+        ev.toolName === "dispatch_collaborator" &&
+        resolvedSubtaskKnowledgePath && (
+          <div className="mt-2.5 rounded-lg border border-indigo-500/25 bg-panel3/30 overflow-hidden">
+            <div className="flex items-center justify-between px-3 py-1.5 bg-panel3/40 border-b border-edge/40 text-[11px] text-inkdim select-none">
+              <span className="flex items-center gap-1.5 font-medium text-blue-400">
+                <FileText size={12} />
+                <span>任务知识交接文档</span>
+              </span>
+              <span className="text-[10px] text-inkdim/70">只读查阅 · 点击在右侧抽屉打开</span>
+            </div>
+            <div className="flex items-center justify-between gap-2 px-3 py-1.5 hover:bg-panel3/70 transition-colors text-[11.5px]">
+              <div className="flex items-center gap-2 min-w-0 flex-1">
+                <span className="font-medium text-ink truncate max-w-[200px]" title={title}>
+                  {title || "协作者交接文档"}
+                </span>
+                <span className="font-mono text-[10.5px] text-inkdim/60 truncate hidden sm:inline" title={resolvedSubtaskKnowledgePath}>
+                  {resolvedSubtaskKnowledgePath}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={handleOpenSubtaskKnowledge}
+                className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-blue-500/15 hover:bg-blue-500/25 text-blue-400 border border-blue-500/30 text-[11px] font-medium transition-colors shrink-0 cursor-pointer shadow-xs"
+                title="在右侧独立抽屉中查看任务知识交接文档"
+              >
+                <FileText size={10} />
+                <span>查看交接书</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+      {/* 展开时：若是等待子任务/协作者汇聚且已产出报告，展示专用交付报告单行卡片（仅在完成后统一展示） */}
+      {expanded &&
+        ["wait_subprocesses", "wait_subagents", "wait_collaborators"].includes(ev.toolName) &&
+        ev.status !== "running" &&
+        ev.status !== "pending_approval" &&
+        resolvedSubtaskReports.length > 0 && (
+          <div className="mt-2.5 rounded-lg border border-emerald-500/25 bg-emerald-950/10 overflow-hidden">
+            <div className="flex items-center justify-between px-3 py-1.5 bg-panel3/40 border-b border-edge/40 text-[11px] text-inkdim select-none">
+              <span className="flex items-center gap-1.5 font-medium text-emerald-400">
+                <FileText size={12} />
+                <span>协同任务交付报告 {resolvedSubtaskReports.length > 1 ? `(${resolvedSubtaskReports.length})` : ""}</span>
+              </span>
+              <span className="text-[10px] text-inkdim/70">只读查阅 · 点击在右侧抽屉打开</span>
+            </div>
+            <div className="divide-y divide-edge/30">
+              {resolvedSubtaskReports.map((rep, idx) => (
+                <div
+                  key={rep.relPath || idx}
+                  className="flex items-center justify-between gap-2 px-3 py-1.5 hover:bg-panel3/70 transition-colors text-[11.5px]"
+                >
+                  <div className="flex items-center gap-2 min-w-0 flex-1">
+                    {rep.role && (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] font-medium border text-indigo-400 bg-indigo-500/10 border-indigo-500/30 shrink-0">
+                        {rep.role}
+                      </span>
+                    )}
+                    <span className="font-medium text-ink truncate max-w-[160px] sm:max-w-[220px]" title={rep.title}>
+                      {rep.title}
+                    </span>
+                    <span className="font-mono text-[10.5px] text-inkdim/60 truncate hidden sm:inline" title={rep.relPath}>
+                      {rep.relPath}
+                    </span>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      ipc.openFileViewer({
+                        id: `file:${rep.absPath}`,
+                        type: "file",
+                        title: `交付报告: ${rep.fileName}`,
+                        path: rep.absPath,
+                        workspacePath: currentWorkspace,
+                        sessionId: currentSessionId || undefined,
+                      });
+                    }}
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/30 text-[11px] font-medium transition-colors shrink-0 cursor-pointer shadow-xs"
+                    title={`在右侧独立抽屉中查看交付报告 (${rep.fileName})`}
+                  >
+                    <Search size={10} />
+                    <span>查看报告</span>
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
       {expanded && showResult && !["judge_decision", "choice_decision", "score_decision"].includes(ev.toolName) && (
         <CollapsibleResult text={ev.resultText!} />

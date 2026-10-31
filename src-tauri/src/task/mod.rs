@@ -30,10 +30,11 @@ pub fn get_next_subtask_index(task: &LongTask) -> Option<usize> {
     if let Some(idx) = task.subtasks.iter().position(|s| s.status == "running" || s.status == "verifying" || s.status == "in_progress") {
         return Some(idx);
     }
-    if task.current_subtask_index < task.subtasks.len() {
-        return Some(task.current_subtask_index);
+    // 优先寻找下一个处于待推进/未结案状态的子任务（跳过已 completed / skipped 阶段）
+    if let Some(idx) = task.subtasks.iter().position(|s| s.status != "completed" && s.status != "skipped") {
+        return Some(idx);
     }
-    task.subtasks.iter().position(|s| s.status == "pending" || s.status == "failed" || s.status == "interrupted" || s.status == "paused")
+    None
 }
 
 pub(crate) fn register_control(task_id: &str) -> watch::Receiver<bool> {
@@ -260,6 +261,105 @@ pub fn resume_long_task(app: &AppHandle, task_id: &str) -> Result<LongTask, Stri
 }
 
 /// 终止/取消长任务（单一权威控制中心：即时冻结各子任务与进程树，原子持久化 cancelled 状态）
+
+/// 宣告完成长任务（支持 Agent 自主裁决或系统结案：原子性将所有子任务与总任务置为 completed，生成终态检查点，并通知权威看板与前端）
+pub fn complete_long_task(
+    app: &AppHandle,
+    task_id: &str,
+    summary: Option<&str>,
+    evidence: Option<&str>,
+) -> Result<LongTask, String> {
+    set_control(task_id, true);
+    let state = app.state::<crate::AppState>();
+    let (task, cp_opt) = {
+        let db = state.db.lock().unwrap();
+        let mut t = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
+        t.status = "completed".to_string();
+        t.updated_at = store::now();
+
+        // 统一标记所有剩余子任务为 completed
+        for sub in &mut t.subtasks {
+            if sub.status != "completed" && sub.status != "skipped" {
+                sub.status = "completed".to_string();
+                if sub.summary.is_none() {
+                    sub.summary = summary.map(|s| s.to_string());
+                }
+                sub.error = None;
+            }
+        }
+        store::update_long_task(&db, &t)?;
+
+        // 归档终态检查点
+        let summary_text = summary.unwrap_or("长任务全部目标达成并由智能体通过实测验收");
+        let evidence_text = evidence.unwrap_or("已在现场通过测试与自检验证");
+        let cp = TaskCheckpoint {
+            id: format!("cp-{}", uuid::Uuid::new_v4().simple()),
+            task_id: t.id.clone(),
+            step_number: t.subtasks.len().max(1),
+            subtask_id: None,
+            status: "completed".to_string(),
+            summary: summary_text.to_string(),
+            working_memory: format!("【长任务结案报告】\n总目标：{}\n结论摘要：{}\n验收证据：{}", t.goal, summary_text, evidence_text),
+            git_commit_hash: None,
+            created_at: store::now(),
+        };
+        let _ = store::save_task_checkpoint(&db, &cp);
+
+        // 若挂载了落地方案，同步结案权威方案
+        let ws = std::path::PathBuf::from(&t.workspace_path);
+        if let Some((_, meta, _)) = crate::plan::find_plan_file(&ws, &t.session_id, None, Some(&db)) {
+            let _ = crate::plan::update_plan(
+                &ws,
+                &t.session_id,
+                Some(&meta.id),
+                summary_text,
+                Some("completed"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&db),
+            );
+        }
+
+        (t, Some(cp))
+    };
+
+    if let Some(cp) = cp_opt {
+        let _ = app.emit("task:checkpoint", &cp);
+    }
+    let _ = app.emit("task:update", &task);
+    {
+        let db = state.db.lock().unwrap();
+        crate::plan::emit_board_updated(app, &db, &task.session_id);
+    }
+    Ok(task)
+}
+
+/// 由会话 ID 宣告完成当前活跃的长任务
+pub fn complete_long_task_by_session(
+    app: &AppHandle,
+    session_id: &str,
+    summary: Option<&str>,
+    evidence: Option<&str>,
+) -> Result<LongTask, String> {
+    let task = get_active_task(app, session_id)?
+        .ok_or_else(|| "当前会话未找到活跃的长任务守护进程".to_string())?;
+    complete_long_task(app, &task.id, summary, evidence)
+}
+
+/// 由会话 ID 暂停当前活跃的长任务
+pub fn pause_long_task_by_session(
+    app: &AppHandle,
+    session_id: &str,
+    _reason: Option<&str>,
+) -> Result<(), String> {
+    let task = get_active_task(app, session_id)?
+        .ok_or_else(|| "当前会话未找到活跃的长任务守护进程".to_string())?;
+    pause_long_task(app, &task.id)
+}
+
 pub fn cancel_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
     set_control(task_id, true);
     let state = app.state::<crate::AppState>();

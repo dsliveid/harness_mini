@@ -1114,6 +1114,16 @@ pub fn delete_queued_message(state: State<'_, crate::AppState>, app: AppHandle, 
 
 #[tauri::command]
 pub fn stop_run(app: AppHandle, session_id: String) -> Result<(), String> {
+    let state = app.state::<crate::AppState>();
+    let active_task = {
+        let db = state.db.lock().unwrap();
+        store::get_active_long_task(&db, &session_id).ok().flatten()
+    };
+    if let Some(task) = active_task {
+        if task.status == "running" || task.status == "planning" {
+            let _ = crate::task::pause_long_task(&app, &task.id);
+        }
+    }
     agent::stop_session(&app, &session_id);
     Ok(())
 }
@@ -3716,6 +3726,16 @@ pub fn resume_long_task(app: AppHandle, task_id: String) -> Result<LongTask, Str
 #[tauri::command]
 pub fn cancel_long_task(app: AppHandle, task_id: String) -> Result<(), String> {
     crate::task::cancel_long_task(&app, &task_id)
+}
+
+#[tauri::command]
+pub fn complete_long_task(
+    app: AppHandle,
+    task_id: String,
+    summary: Option<String>,
+    evidence: Option<String>,
+) -> Result<LongTask, String> {
+    crate::task::complete_long_task(&app, &task_id, summary.as_deref(), evidence.as_deref())
 }
 
 #[tauri::command]

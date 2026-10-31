@@ -73,9 +73,56 @@ pub async fn decompose_goal(
             os_platform
         );
 
+        let user_prompt = {
+            let mut prompt_content = String::new();
+            let db = state.db.lock().unwrap();
+            let mut ctx_snippets = Vec::new();
+
+            if let Some(ref s) = session {
+                if !s.workspace_path.is_empty() {
+                    let ws = std::path::Path::new(&s.workspace_path);
+                    if let Ok(plans) = crate::plan::list_plans(ws, Some(session_id), false, Some(&db)) {
+                        if !plans.is_empty() {
+                            let plan_titles: Vec<String> = plans.iter().take(3).map(|p| format!("- {} ({})", p.title, p.filename)).collect();
+                            ctx_snippets.push(format!("工作区已有方案文档：\n{}", plan_titles.join("\n")));
+                        }
+                    }
+                }
+            }
+
+            if let Ok(recent) = store::get_messages(&db, session_id, None, 8) {
+                let mut dialog_lines = Vec::new();
+                for m in recent {
+                    if m.role == "user" || m.role == "assistant" {
+                        let text = m.content.as_deref().unwrap_or("").trim();
+                        if !text.is_empty() && text != goal && !text.starts_with("🎯") {
+                            let truncated = if text.chars().count() > 200 {
+                                format!("{}...", text.chars().take(200).collect::<String>())
+                            } else {
+                                text.to_string()
+                            };
+                            dialog_lines.push(format!("{}: {}", if m.role == "user" { "用户" } else { "助手" }, truncated));
+                        }
+                    }
+                }
+                if !dialog_lines.is_empty() {
+                    ctx_snippets.push(format!("会话前序关键上下文：\n{}", dialog_lines.join("\n")));
+                }
+            }
+
+            if !ctx_snippets.is_empty() {
+                prompt_content.push_str("【前序工程与会话上下文】\n");
+                prompt_content.push_str(&ctx_snippets.join("\n\n"));
+                prompt_content.push_str("\n\n");
+            }
+
+            prompt_content.push_str(&format!("【本次长任务总目标】：\n{}", goal));
+            prompt_content
+        };
+
         let messages = vec![
             json!({ "role": "system", "content": sys_prompt }),
-            json!({ "role": "user", "content": goal }),
+            json!({ "role": "user", "content": user_prompt }),
         ];
 
         let reasoning_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -169,10 +216,20 @@ pub async fn decompose_goal(
                 content_str.trim()
             };
 
-            let json_str = clean.strip_prefix("```json")
-                .or_else(|| clean.strip_prefix("```"))
-                .unwrap_or(clean);
-            let json_str = json_str.strip_suffix("```").unwrap_or(json_str).trim();
+            let json_str = if let (Some(start), Some(end)) = (clean.find('['), clean.rfind(']')) {
+                if end > start {
+                    &clean[start..=end]
+                } else {
+                    clean
+                }
+            } else {
+                clean.strip_prefix("```json")
+                    .or_else(|| clean.strip_prefix("```"))
+                    .unwrap_or(clean)
+                    .strip_suffix("```")
+                    .unwrap_or(clean)
+                    .trim()
+            };
 
             if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(json_str) {
                 let mut items = Vec::new();
@@ -201,97 +258,13 @@ pub async fn decompose_goal(
                 }
             }
 
-            return (
-                vec![
-                    TaskSubItem {
-                        id: "sub-1".to_string(),
-                        index: 1,
-                        title: "梳理工作区现状与代码依赖".to_string(),
-                        description: Some("探索相关文件结构与当前逻辑，明确修改范围与实现思路".to_string()),
-                        status: "pending".to_string(),
-                        summary: None,
-                        error: None,
-                        verify_command: None,
-                        verify_output: None,
-                        wave: 1,
-                        scope_path: None,
-                    },
-                    TaskSubItem {
-                        id: "sub-2".to_string(),
-                        index: 2,
-                        title: "执行核心功能编码与修改".to_string(),
-                        description: Some("根据梳理结果修改或创建核心代码与配置".to_string()),
-                        status: "pending".to_string(),
-                        summary: None,
-                        error: None,
-                        verify_command: None,
-                        verify_output: None,
-                        wave: 2,
-                        scope_path: None,
-                    },
-                    TaskSubItem {
-                        id: "sub-3".to_string(),
-                        index: 3,
-                        title: "执行检查与结果验收".to_string(),
-                        description: Some("验证修改后的代码与功能是否正常，产出交付总结".to_string()),
-                        status: "pending".to_string(),
-                        summary: None,
-                        error: None,
-                        verify_command: None,
-                        verify_output: None,
-                        wave: 3,
-                        scope_path: None,
-                    },
-                ],
-                final_r,
-                parsed_usage,
-            );
+            return (Vec::new(), final_r, parsed_usage);
         }
     }
 
-    // 默认兜底拆解
+    // 未能成功拆解出步骤时，严禁输出虚假兜底模板，直接返回空清单
     (
-        vec![
-            TaskSubItem {
-                id: "sub-1".to_string(),
-                index: 1,
-                title: "梳理工作区现状与代码依赖".to_string(),
-                description: Some("探索相关文件结构与当前逻辑，明确修改范围与实现思路".to_string()),
-                status: "pending".to_string(),
-                summary: None,
-                error: None,
-                verify_command: None,
-                verify_output: None,
-                wave: 1,
-                scope_path: None,
-            },
-            TaskSubItem {
-                id: "sub-2".to_string(),
-                index: 2,
-                title: "执行核心功能编码与修改".to_string(),
-                description: Some("根据梳理结果修改或创建核心代码与配置".to_string()),
-                status: "pending".to_string(),
-                summary: None,
-                error: None,
-                verify_command: None,
-                verify_output: None,
-                wave: 2,
-                scope_path: None,
-            },
-            TaskSubItem {
-                id: "sub-3".to_string(),
-                index: 3,
-                title: "执行检查与结果验收".to_string(),
-                description: Some("验证修改后的代码与功能是否正常，产出交付总结".to_string()),
-                status: "pending".to_string(),
-                summary: None,
-                error: None,
-                verify_command: None,
-                verify_output: None,
-                wave: 3,
-                scope_path: None,
-            },
-        ],
+        Vec::new(),
         String::new(),
         crate::models::ParsedTokenUsage::default(),
     )
@@ -378,10 +351,20 @@ pub async fn replan_subtasks(
             );
         }
         let clean = res.content.trim();
-        let json_str = clean.strip_prefix("```json")
-            .or_else(|| clean.strip_prefix("```"))
-            .unwrap_or(clean);
-        let json_str = json_str.strip_suffix("```").unwrap_or(json_str).trim();
+        let json_str = if let (Some(start), Some(end)) = (clean.find('['), clean.rfind(']')) {
+            if end > start {
+                &clean[start..=end]
+            } else {
+                clean
+            }
+        } else {
+            clean.strip_prefix("```json")
+                .or_else(|| clean.strip_prefix("```"))
+                .unwrap_or(clean)
+                .strip_suffix("```")
+                .unwrap_or(clean)
+                .trim()
+        };
 
         if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(json_str) {
             let mut new_remains = Vec::new();

@@ -76,15 +76,14 @@ export function computeContextUsage(
   let activeTokens = 0;
   let isEstimated = false;
 
-  // 倒序定位最后一条已完成并具备 promptTokens 的 assistant 消息
+  // 倒序定位最后一条已完成且在合理物理上限内的 assistant 消息（过滤被累计账单污染的异常值）
   let lastAssistantIdx = -1;
+  const maxSanePt = limit * 3;
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i];
     if (m.role === "assistant" && !m.queued && m.seq > maxCompactedSeq) {
-      if (
-        (m.promptTokens != null && m.promptTokens > 0) ||
-        (m.usage?.promptTokens != null && m.usage.promptTokens > 0)
-      ) {
+      const pt = m.promptTokens ?? m.usage?.promptTokens ?? 0;
+      if (pt > 0 && pt <= maxSanePt) {
         lastAssistantIdx = i;
         break;
       }

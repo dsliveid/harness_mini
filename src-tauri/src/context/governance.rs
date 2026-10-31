@@ -200,13 +200,15 @@ pub fn evaluate_context_viewport(
         .filter(|m| !m.queued && m.seq > max_compacted_seq && m.reverted_at.is_none())
         .collect();
 
-    // 优先倒序寻找最近一条具备真实 Usage 的 assistant 消息
+    // 优先倒序寻找最近一条具备真实 Usage 且在合理物理上限范围内的 assistant 消息
+    // 自动过滤被历史长任务累计账单污染的异常值（pt <= limit * 3）
+    let max_sane_pt = limit.saturating_mul(3);
     let last_asst_idx = uncompacted.iter().rposition(|m| {
         if m.role != "assistant" {
             return false;
         }
         let (pt, _) = extract_msg_tokens(m);
-        pt > 0
+        pt > 0 && pt <= max_sane_pt
     });
 
     let (baseline_tokens, is_estimated) = if let Some(idx) = last_asst_idx {

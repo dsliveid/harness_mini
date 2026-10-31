@@ -50,6 +50,9 @@ interface SlashCommand {
 const BEST_REVIEW_REQUIREMENT =
   "评审要求：分析在不考虑成本的情况下，当前方案是否为最优。我不希望采用堆叠式的修改，我希望每次改动后能够让程序结构更清晰，功能更稳定。";
 
+const JEV_DECISION_REQUIREMENT =
+  "决策要求：用户有输入，决策用户输入，无输入决策最近方案";
+
 const JEV_BADGE = {
   badgeClass: "bg-amber-500/15 border-amber-500/35 text-amber-300",
   iconClass: "text-amber-400",
@@ -111,10 +114,13 @@ const SLASH_COMMANDS: SlashCommand[] = [
     cmd: "/jev:决策",
     label: "/jev:决策 <意图或方案>",
     desc: "场景化意图理解与方案决策：自动分析意图并智能调度决策工具（评分/判定/选择）",
-    placeholder: "输入待评估的意图或方案，Enter 自动选择决策工具执行决策，Backspace 删除标签取消…",
-    requireBody: true,
-    emptyHint: "/jev:决策 指令已激活，请输入待评估的意图或方案",
-    buildMessage: (body) => `/jev:决策 ${body}`,
+    placeholder: "输入待评估的意图或方案（可选），Enter 发送决策，Backspace 删除标签取消…",
+    requireBody: false,
+    emptyHint: "",
+    buildMessage: (body) =>
+      body
+        ? `请针对以下用户输入的问题，选中合适的决策工具进行决策：\n\n${body}\n\n${JEV_DECISION_REQUIREMENT}`
+        : `请针对本会话最近的方案讨论或者用户输入的问题，选中合适的决策工具进行决策。\n\n${JEV_DECISION_REQUIREMENT}`,
     ...JEV_BADGE,
     badgeTitle: "删除标签以取消决策 (Backspace)",
   },
@@ -195,10 +201,15 @@ export function Composer() {
     let completion = 0;
     let cached = 0;
     for (const msg of msgs) {
+      const isMilestone =
+        Boolean(msg.usage?.isEstimated) ||
+        Boolean(msg.usage?.taskMetrics) ||
+        Boolean(msg.content && (msg.content.includes("长任务全部子任务已顺利达成") || msg.content.includes("顺利达成")));
+
       const tt = msg.totalTokens ?? (msg.usage?.totalTokens || (msg.usage?.inputEst || 0) + (msg.usage?.outputEst || 0)) ?? 0;
-      const pt = msg.promptTokens ?? (msg.usage?.promptTokens || msg.usage?.inputEst) ?? 0;
+      const pt = isMilestone ? 0 : (msg.promptTokens ?? (msg.usage?.promptTokens || msg.usage?.inputEst) ?? 0);
       const ct = msg.completionTokens ?? (msg.usage?.completionTokens || msg.usage?.outputEst) ?? 0;
-      const ckt = msg.cachedTokens ?? (msg.usage?.cachedTokens || msg.usage?.promptCacheHitTokens || msg.usage?.cacheReadInputTokens) ?? 0;
+      const ckt = isMilestone ? 0 : (msg.cachedTokens ?? (msg.usage?.cachedTokens || msg.usage?.promptCacheHitTokens || msg.usage?.cacheReadInputTokens) ?? 0);
       total += Number(tt) || 0;
       prompt += Number(pt) || 0;
       completion += Number(ct) || 0;
@@ -206,9 +217,10 @@ export function Composer() {
     }
     const finalTotal = Math.max(total, Number(session?.totalTokens) || 0);
     const finalPrompt = Math.max(prompt, Number(session?.promptTokens) || 0);
-    const finalCached = Math.max(cached, Number(session?.cachedTokens) || 0);
+    const finalCached = Math.min(finalPrompt, Math.max(cached, Number(session?.cachedTokens) || 0));
     const finalCompletion = Math.max(completion, Number(session?.completionTokens) || 0);
-    const cacheHitRate = finalPrompt > 0 ? Math.round((finalCached / finalPrompt) * 1000) / 10 : (session?.cacheHitRate ?? 0);
+    const rawHitRate = finalPrompt > 0 ? Math.round((finalCached / finalPrompt) * 1000) / 10 : (session?.cacheHitRate ?? 0);
+    const cacheHitRate = Math.min(100, Math.max(0, rawHitRate));
     return {
       totalTokens: finalTotal,
       promptTokens: finalPrompt,
@@ -300,7 +312,7 @@ export function Composer() {
 
   const hasAttachments = pendingAttachments.length > 0;
   const canSend = !readOnly && !tempBlocked && !uploading && (!editingMessage || !running);
-  const hasContent = !!text.trim() || hasAttachments;
+  const hasContent = !!text.trim() || hasAttachments || !!activeCmd;
 
   const isTagCommand = !!activeCmd || SLASH_TOKEN_RE.test(text.trim());
 
@@ -531,14 +543,10 @@ export function Composer() {
     if (cfg?.cmd === "/goal") {
       const goalBody = (body || "").trim();
       if (!goalBody) {
-        setActiveCmd(cfg.cmd);
+        setActiveCmd(null);
         setSessionDraft(targetId, "");
-        pushToast(cfg.emptyHint, "info");
-        requestAnimationFrame(() => {
-          if (taRef.current) {
-            taRef.current.focus();
-          }
-        });
+        setPendingAttachments([]);
+        requestAnimationFrame(resize);
         return;
       }
       setActiveCmd(null);
@@ -586,16 +594,12 @@ export function Composer() {
     }
 
     if (cfg) {
-      // 需要正文的指令在留空时不发送，保持标签态并提示用户输入
+      // 需要正文的指令在留空时不发送，直接清空输入框且无实际效果
       if (cfg.requireBody && !body) {
-        setActiveCmd(cfg.cmd);
+        setActiveCmd(null);
         setSessionDraft(targetId, "");
-        pushToast(cfg.emptyHint, "info");
-        requestAnimationFrame(() => {
-          if (taRef.current) {
-            taRef.current.focus();
-          }
-        });
+        setPendingAttachments([]);
+        requestAnimationFrame(resize);
         return;
       }
       setActiveCmd(null);

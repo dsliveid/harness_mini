@@ -239,9 +239,11 @@ pub fn assemble_execution_context(
         }
     }
 
-    // ---- 动态上下文感知工具输出瘦身 (仅当 est > safe_threshold 时触发) ----
+    // ---- 动态上下文感知工具输出瘦身与瞬态衰减 (Ephemeral Output Decay) ----
+    // 核心准则：活跃轮次 (is_active) 保留 100% 完整工具结果以供精准决策；
+    // 已完成决策的远期历史工具组（超过 2 轮前）实施就地衰减折叠，阻断长会话死日志堆积与梯形积分爆炸。
     let safe_threshold = token_limit * 80 / 100;
-    if est > safe_threshold {
+    {
         struct AssistantToolGroup {
             assistant_idx: usize,
             tool_indices: Vec<usize>,
@@ -291,17 +293,15 @@ pub fn assemble_execution_context(
 
         let recent_cutoff = groups.len().saturating_sub(2);
 
-        // 阶段 1：自远及近遍历远期历史工具组
+        // 阶段 1：对远期历史工具组（> 2 轮前）实施就地衰减折叠（> 1000 字符收敛至 600；压力高时收敛至 350）
         for g in groups.iter().take(recent_cutoff) {
             for &t_idx in &g.tool_indices {
-                if est <= safe_threshold {
-                    break;
-                }
                 let text = out[t_idx].get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                if text.len() > 2048 {
-                    let safe_len = text.char_indices().nth(2048).map(|(i, _)| i).unwrap_or(text.len());
+                let fold_limit = if est > safe_threshold { 350 } else { 1000 };
+                if text.len() > fold_limit {
+                    let safe_len = text.char_indices().nth(fold_limit).map(|(i, _)| i).unwrap_or(text.len());
                     let slimmed = format!(
-                        "{}\n\n...[历史工具输出过长（共 {} 字符），已折叠前序详情以节省上下文空间]...",
+                        "{}\n\n...[历史工具输出过长（共 {} 字符），已就地折叠衰减以保护活跃上下文空间]...",
                         &text[..safe_len],
                         text.len()
                     );
@@ -311,26 +311,23 @@ pub fn assemble_execution_context(
                     out[t_idx]["content"] = Value::String(slimmed);
                 }
             }
-            if est <= safe_threshold {
-                break;
-            }
         }
 
-        // 阶段 2：若折叠完远期历史后仍然超过 token_limit，允许对「近期但非活跃」工具输出折叠（绝对保护 is_active）
-        if est > token_limit {
+        // 阶段 2：若折叠完远期历史后仍然超过 safe_threshold，允许对「近期但非活跃」工具输出折叠（绝对保护 is_active）
+        if est > safe_threshold {
             for g in groups.iter().skip(recent_cutoff) {
                 if g.is_active {
                     continue;
                 }
                 for &t_idx in &g.tool_indices {
-                    if est <= token_limit {
+                    if est <= safe_threshold {
                         break;
                     }
                     let text = out[t_idx].get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    if text.len() > 2048 {
-                        let safe_len = text.char_indices().nth(2048).map(|(i, _)| i).unwrap_or(text.len());
+                    if text.len() > 1200 {
+                        let safe_len = text.char_indices().nth(1200).map(|(i, _)| i).unwrap_or(text.len());
                         let slimmed = format!(
-                            "{}\n\n...[历史工具输出过长（共 {} 字符），已折叠前序详情以节省上下文空间]...",
+                            "{}\n\n...[近期非活跃工具输出过长（共 {} 字符），已折叠前序详情以节省上下文空间]...",
                             &text[..safe_len],
                             text.len()
                         );
@@ -340,7 +337,7 @@ pub fn assemble_execution_context(
                         out[t_idx]["content"] = Value::String(slimmed);
                     }
                 }
-                if est <= token_limit {
+                if est <= safe_threshold {
                     break;
                 }
             }

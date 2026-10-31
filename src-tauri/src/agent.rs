@@ -612,6 +612,8 @@ pub fn extract_jev_intent(raw_text: &str) -> (bool, String) {
             &trimmed["/jev： 决策".len()..]
         }.trim();
         (true, remainder.to_string())
+    } else if trimmed.contains("决策要求：用户有输入，决策用户输入，无输入决策最近方案") {
+        (true, trimmed.to_string())
     } else {
         (false, String::new())
     }
@@ -780,6 +782,47 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
                     RunOutcome::Failed => "failed",
                 };
                 let _ = store::set_session_status(&db, &session_id, sub_status);
+
+                // 终态持久化闭环：子任务/协作者执行完成后，自动提取产出结论落地到 .harness/subtasks/{subagent_id}_report.md
+                let ws_path_str = if !s.workspace_path.is_empty() {
+                    s.workspace_path.clone()
+                } else if let Some(ref pid) = s.parent_session_id {
+                    store::get_session(&db, pid).ok().flatten().map(|ps| ps.workspace_path).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+
+                if !ws_path_str.is_empty() {
+                    let ws_path = std::path::Path::new(&ws_path_str);
+                    let msgs = store::get_messages(&db, &session_id, None, 100).unwrap_or_default();
+                    let last_assistant = msgs
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == "assistant" && !m.content.as_deref().unwrap_or("").is_empty());
+                    if let Some(m) = last_assistant {
+                        let last_reply = m.content.as_deref().unwrap_or("");
+                        let mut touched_files = std::collections::BTreeSet::new();
+                        for msg in &msgs {
+                            for te in &msg.tool_events {
+                                if ["write_file", "edit_file", "apply_diff"].contains(&te.tool_name.as_str()) {
+                                    if let Some(p) = te.params.get("path").and_then(|v| v.as_str()) {
+                                        touched_files.insert(p.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        let touched_vec: Vec<String> = touched_files.into_iter().collect();
+                        let _ = crate::tools::subagent::save_subtask_report_artifact(
+                            ws_path,
+                            &session_id,
+                            &s.title,
+                            s.subagent_role.as_deref().unwrap_or("协作者"),
+                            last_reply,
+                            &touched_vec,
+                        );
+                    }
+                }
+
                 let _ = app.emit("collaborator:update", json!({
                     "parentId": parent_id,
                     "parentSessionId": parent_id,

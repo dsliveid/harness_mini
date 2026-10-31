@@ -90,9 +90,14 @@ pub async fn run_verify_cmd(
 
     #[cfg(windows)]
     let mut cmd = {
-        let mut c = tokio::process::Command::new("cmd");
-        c.arg("/C");
-        c.raw_arg(format!("chcp 65001>nul 2>nul & {cmd_trimmed}"));
+        let mut c = tokio::process::Command::new("powershell");
+        c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]);
+        c.arg(format!(
+            "$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8;\n\
+             $PSDefaultParameterValues = @{{ 'Out-File:Encoding' = 'utf8'; '*:Encoding' = 'utf8' }};\n\
+             {cmd_trimmed}\n\
+             if ($LASTEXITCODE -ne $null) {{{{ exit $LASTEXITCODE }}}}"
+        ));
         c.creation_flags(CREATE_NO_WINDOW);
         c
     };

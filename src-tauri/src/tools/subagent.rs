@@ -93,7 +93,34 @@ pub(crate) fn build_briefing_packet(
 
     packet.push_str("\n【施工工人准则】：你作为实施工人，请优先对已知目标文件进行手术级精读（read_file 局部 30~50 行）并完成代码修改或验证；严禁脱离蓝图全库漫游！");
     packet.push_str("\n【分级验证提示】：查验数据请直接用只读命令；代码检查优先用轻量静态检查（如 TS 用 `tsc --noEmit`、Rust 用 `cargo check`、Go 用 `go vet`）；单测需指定精准目标；严禁修改生产源码当作临时探针。");
+    packet.push_str("\n【严格负向边界与禁区清单（严禁脱缰漫游）】：\n- 严禁执行全工程递归通配扫描（如严禁 dir /s /b，find .，Get-ChildItem -Recurse 扫描全盘）；\n- 严禁遍历探索非关联业务目录（如排查技术架构或协议时，严禁漫游所有叶子业务组件与页面代码）；\n- 必须严格沿着主进程给出的已知重点文件与上下文图钉展开定向精读。");
+    packet.push_str("\n【步骤预算与定向收敛（必须严格遵守）】：\n- 本任务拥有严格的步骤预算上限（必须在 6~8 步以内收敛并结题），严禁无节制反复调用工具；\n- 架构调研类任务在摸清核心证据后必须立即收敛，直接整理并输出最终技术报告，严禁死磕枝节；\n- 最终交付时，请以清晰的结构化问卷形式逐项陈述事实依据与技术结论，并输出 Markdown mermaid 架构或时序图。");
     packet
+}
+
+pub(crate) fn save_subtask_knowledge_artifact(
+    workspace: &Path,
+    subagent_id: &str,
+    title: &str,
+    role: &str,
+    briefing_content: &str,
+    parent_id: &str,
+) -> Result<String, String> {
+    if workspace.as_os_str().is_empty() {
+        return Err("工作区为空".into());
+    }
+    let subtasks_dir = workspace.join(".harness").join("subtasks");
+    let _ = std::fs::create_dir_all(&subtasks_dir);
+    let filename = format!("{}_knowledge.md", subagent_id.replace('-', "_"));
+    let file_path = subtasks_dir.join(&filename);
+
+    let doc_md = format!(
+        "# 协同子任务知识交接书: {title}\n\n- **子任务 ID**: `{subagent_id}`\n- **角色定位**: {role}\n- **所属父会话**: `{parent_id}`\n- **生成时间**: {}\n\n---\n\n{briefing_content}\n",
+        chrono::Utc::now().to_rfc3339()
+    );
+
+    let _ = std::fs::write(&file_path, doc_md).map_err(|e| format!("保存知识交接工件失败: {e}"))?;
+    Ok(format!(".harness/subtasks/{}", filename))
 }
 
 pub(crate) fn save_subtask_report_artifact(
@@ -173,7 +200,7 @@ pub(crate) async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<S
     // 子 Agent 工作区严格与父会话保持完全一致
     let sub_workspace = parent_session.workspace_path.clone();
 
-    let (sub, user_msg) = {
+    let (sub, user_msg, initial_prompt) = {
         let db = state.db.lock().unwrap();
         let sub = crate::store::create_subagent_session(
             &db,
@@ -200,8 +227,22 @@ pub(crate) async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<S
             );
         }
         let initial_prompt = build_briefing_packet(&db, &ctx.workspace, parent_id, role, title, task, args);
-        let user_msg = crate::store::new_message(&db, &sub.id, "user", Some(initial_prompt), false)?;
-        (sub, user_msg)
+        let user_msg = crate::store::new_message(&db, &sub.id, "user", Some(initial_prompt.clone()), false)?;
+        (sub, user_msg, initial_prompt)
+    };
+
+    // 双轨持久化：将生成的知识交接书物理落盘至 .harness/subtasks/{subagent_id}_knowledge.md
+    let knowledge_path_opt = if !ctx.workspace.as_os_str().is_empty() {
+        save_subtask_knowledge_artifact(
+            &ctx.workspace,
+            &sub.id,
+            title,
+            role,
+            &initial_prompt,
+            parent_id,
+        ).ok()
+    } else {
+        None
     };
 
     // 启动子 Agent 异步运行循环
@@ -225,9 +266,15 @@ pub(crate) async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<S
         "parentId": parent_id,
     }));
 
+    let knowledge_line = if let Some(ref kp) = knowledge_path_opt {
+        format!("- 📋 任务知识交接书: [查看交接文档](file:///{})\n", kp.replace('\\', "/"))
+    } else {
+        String::new()
+    };
+
     Ok(format!(
-        "已成功创建并启动子 Agent 进程！\n- ID: `{}`\n- 角色: {}\n- 标题: {}\n- 状态: 运行中 (running)\n\n子 Agent 正在独立上下文中执行，用户点击界面右侧可实时查看其完整对话流程与工具卡片。后续可通过 `wait_subagents` 或 `get_subagent_status` 协同跟进。",
-        sub.id, role, title
+        "已成功创建并启动子 Agent 进程！\n- ID: `{}`\n- 角色: {}\n- 标题: {}\n- 状态: 运行中 (running)\n{}子 Agent 正在独立上下文中执行，用户点击界面右侧可实时查看其完整对话流程与工具卡片。后续可通过 `wait_subagents` 或 `get_subagent_status` 协同跟进。",
+        sub.id, role, title, knowledge_line
     ))
 }
 
@@ -522,12 +569,20 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
                 String::new()
             };
 
+            let knowledge_file_rel = format!(".harness/subtasks/{}_knowledge.md", id.replace('-', "_"));
+            let knowledge_line = if !ctx.workspace.as_os_str().is_empty() && ctx.workspace.join(&knowledge_file_rel).exists() {
+                format!("- 📋 任务知识交接工件: [查看原始交接文档](file:///{})\n", knowledge_file_rel.replace('\\', "/"))
+            } else {
+                String::new()
+            };
+
             sub_results.push(format!(
-                "### 协同子 Agent: {} ({})\n- 状态: {}\n- Token 消耗: {}\n{}{}- 交付核心结论：\n```markdown\n{}\n```\n\n",
+                "### 协同子 Agent: {} ({})\n- 状态: {}\n- Token 消耗: {}\n{}{}{}- 交付核心结论：\n```markdown\n{}\n```\n\n",
                 s.title,
                 s.subagent_role.as_deref().unwrap_or("协作助手"),
                 status_display,
                 s.total_tokens.unwrap_or(0),
+                knowledge_line,
                 touched_line,
                 artifact_line,
                 compact_summary
@@ -644,19 +699,40 @@ pub(crate) async fn dispatch_collaborator_tool(args: &Value, ctx: &ToolCtx) -> R
             args,
         )
     };
-    let user_msg = {
+    let (user_msg, user_prompt) = {
         let db = state.db.lock().unwrap();
         let _ = crate::store::set_kv(&db, collaborator_id, "dispatched_by_parent", "true");
-        crate::store::new_message(&db, collaborator_id, "user", Some(user_prompt), false)?
+        let msg = crate::store::new_message(&db, collaborator_id, "user", Some(user_prompt.clone()), false)?;
+        (msg, user_prompt)
+    };
+
+    let knowledge_path_opt = if !ctx.workspace.as_os_str().is_empty() {
+        save_subtask_knowledge_artifact(
+            &ctx.workspace,
+            collaborator_id,
+            &collab.title,
+            collab.subagent_role.as_deref().unwrap_or("协作者"),
+            &user_prompt,
+            parent_id,
+        ).ok()
+    } else {
+        None
     };
 
     crate::agent::spawn_session_task(host.app.clone(), collaborator_id.to_string(), Some(user_msg.id));
 
+    let knowledge_line = if let Some(ref kp) = knowledge_path_opt {
+        format!("- 📋 任务知识交接书: [查看交接文档](file:///{})\n", kp.replace('\\', "/"))
+    } else {
+        String::new()
+    };
+
     Ok(format!(
-        "已成功向协作者【{}】(角色: {}) 委派任务！\n- 任务要求: {}\n- 状态: 运行中 (running)\n\n协作者已开始独立执行。你可以紧接着调用 wait_collaborators 等待并获取其增量产出报告。",
+        "已成功向协作者【{}】(角色: {}) 委派任务！\n- 任务要求: {}\n- 状态: 运行中 (running)\n{}协作者已开始独立执行。你可以紧接着调用 wait_collaborators 等待并获取其增量产出报告。",
         collab.title,
         collab.subagent_role.as_deref().unwrap_or("协作者"),
-        task
+        task,
+        knowledge_line
     ))
 }
 
@@ -783,6 +859,13 @@ pub(crate) async fn wait_collaborators_tool(args: &Value, ctx: &ToolCtx) -> Resu
             String::new()
         };
 
+        let knowledge_file_rel = format!(".harness/subtasks/{}_knowledge.md", id.replace('-', "_"));
+        let knowledge_line = if !ctx.workspace.as_os_str().is_empty() && ctx.workspace.join(&knowledge_file_rel).exists() {
+            format!("- 📋 任务知识交接工件: [查看原始交接文档](file:///{})\n", knowledge_file_rel.replace('\\', "/"))
+        } else {
+            String::new()
+        };
+
         let last_asst = msgs.iter().rev().find(|m| m.role == "assistant");
         let has_terminal_reply = last_asst.map(|m| {
             m.tool_calls.is_none()
@@ -801,11 +884,12 @@ pub(crate) async fn wait_collaborators_tool(args: &Value, ctx: &ToolCtx) -> Resu
         }
 
         out.push_str(&format!(
-            "### 协作者: {} ({})\n- 状态: {}\n- Token 消耗: {}\n{}{}- 增量交付结论：\n```markdown\n{}\n```\n\n",
+            "### 协作者: {} ({})\n- 状态: {}\n- Token 消耗: {}\n{}{}{}- 增量交付结论：\n```markdown\n{}\n```\n\n",
             s.title,
             s.subagent_role.as_deref().unwrap_or("协作者"),
             status_display,
             s.total_tokens.unwrap_or(0),
+            knowledge_line,
             touched_line,
             artifact_line,
             compact_summary

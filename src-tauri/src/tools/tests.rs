@@ -1,6 +1,6 @@
 use super::file::*;
 use super::helpers::*;
-use super::subagent::{build_briefing_packet, extract_compact_summary, save_subtask_report_artifact};
+use super::subagent::{build_briefing_packet, extract_compact_summary, save_subtask_knowledge_artifact, save_subtask_report_artifact};
 use super::types::*;
 use super::web::*;
 use serde_json::json;
@@ -257,7 +257,17 @@ const handleClick = async () => {
         assert!(packet.contains("严禁修改外部接口"));
         assert!(packet.contains("【施工工人准则】"));
 
-        // 2. 测试工件保存与紧凑摘要截断
+        // 2. 测试知识交接工件保存
+        let knowledge_path = save_subtask_knowledge_artifact(&ws, "sub_123", "重构JWT", "后端工程师", &packet, &parent_sess.id).unwrap();
+        assert!(knowledge_path.contains(".harness/subtasks/sub_123_knowledge.md"));
+        let full_knowledge_path = ws.join(&knowledge_path);
+        assert!(full_knowledge_path.exists());
+        let knowledge_content = std::fs::read_to_string(&full_knowledge_path).unwrap();
+        assert!(knowledge_content.contains("# 协同子任务知识交接书: 重构JWT"));
+        assert!(knowledge_content.contains(&parent_sess.id));
+        assert!(knowledge_content.contains("src/auth.rs"));
+
+        // 3. 测试报告工件保存与紧凑摘要截断
         let touched = vec!["src/auth.rs".to_string()];
         let full_text = "A".repeat(800);
         let artifact_path = save_subtask_report_artifact(&ws, "sub_123", "测试任务", "测试角色", &full_text, &touched).unwrap();

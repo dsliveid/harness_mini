@@ -19,8 +19,9 @@ pub fn build_working_memory_block(checkpoints: &[TaskCheckpoint], goal: &str) ->
     }
     let mut text = format!("【总目标锚点】: {}\n\n【已完成历史阶段检查点与沉淀事实 (Working Memory)】:\n", goal);
     for cp in checkpoints {
-        let summary_preview = if cp.summary.len() > 300 {
-            format!("{}…", safe_truncate(&cp.summary, 300))
+        // 允许保留更丰富完整的阶段产出契约（扩容至 1500 字节），彻底根除因信息过切导致下游盲目探索
+        let summary_preview = if cp.summary.len() > 1500 {
+            format!("{}…", safe_truncate(&cp.summary, 1500))
         } else {
             cp.summary.clone()
         };
@@ -63,7 +64,7 @@ pub mod tests {
             step_number: 1,
             subtask_id: Some("sub-1".to_string()),
             status: "completed".to_string(),
-            summary: "这".repeat(200), // 600 bytes
+            summary: "这".repeat(600), // 1800 bytes > 1500 limit
             working_memory: String::new(),
             git_commit_hash: None,
             created_at: "2026-09-24".to_string(),

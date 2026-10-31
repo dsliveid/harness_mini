@@ -513,6 +513,7 @@ pub fn run() {
             commands::pause_long_task,
             commands::resume_long_task,
             commands::cancel_long_task,
+            commands::complete_long_task,
             commands::get_active_task,
             commands::list_task_checkpoints,
             commands::rollback_to_checkpoint,

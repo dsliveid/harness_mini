@@ -848,7 +848,9 @@ export function MessageItem({
 
 
 
-    const toolGroups = useMemo(() => groupToolEvents(events), [events]);
+    // 双轨容器防御：若为外部交付轨消息（携带整轮工具事件且非抽屉内部步骤），工具卡片（含子进程）已在过程抽屉内收拢展示，外部不重复呈现
+    const isDeliverableWithTurnTools = !isProcessStep && Boolean(msg.turnToolEvents && msg.turnToolEvents.length > 0);
+    const toolGroups = useMemo(() => (isDeliverableWithTurnTools ? [] : groupToolEvents(events)), [events, isDeliverableWithTurnTools]);
 
 
 
