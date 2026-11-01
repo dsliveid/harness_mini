@@ -243,7 +243,7 @@ const handleClick = async () => {
 
         let parent_sess = crate::store::create_session(&conn, &ws.to_string_lossy(), None, "主会话", "standard").unwrap();
 
-        // 1. 测试简报生成
+        // 1. 测试简报生成（工程施工工人角色）
         let args = json!({
             "relevant_files": ["src/auth.rs", "src/token.rs"],
             "acceptance_criteria": "cargo test test_auth",
@@ -256,6 +256,15 @@ const handleClick = async () => {
         assert!(packet.contains("cargo test test_auth"));
         assert!(packet.contains("严禁修改外部接口"));
         assert!(packet.contains("【施工工人准则】"));
+        assert!(!packet.contains("mermaid"));
+
+        // 1.1 测试架构调研分析角色分化简报
+        let research_args = json!({
+            "relevant_files": ["src/router.rs"],
+        });
+        let research_packet = build_briefing_packet(&conn, &ws, &parent_sess.id, "架构师", "路由协议调研", "摸清路由分发机制", &research_args);
+        assert!(research_packet.contains("【架构调研/分析准则】"));
+        assert!(research_packet.contains("mermaid"));
 
         // 2. 测试知识交接工件保存
         let knowledge_path = save_subtask_knowledge_artifact(&ws, "sub_123", "重构JWT", "后端工程师", &packet, &parent_sess.id).unwrap();

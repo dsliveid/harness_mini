@@ -91,10 +91,26 @@ pub(crate) fn build_briefing_packet(
         packet.push_str(&format!("\n【严格禁止项与负向约束】\n{c}\n"));
     }
 
-    packet.push_str("\n【施工工人准则】：你作为实施工人，请优先对已知目标文件进行手术级精读（read_file 局部 30~50 行）并完成代码修改或验证；严禁脱离蓝图全库漫游！");
-    packet.push_str("\n【分级验证提示】：查验数据请直接用只读命令；代码检查优先用轻量静态检查（如 TS 用 `tsc --noEmit`、Rust 用 `cargo check`、Go 用 `go vet`）；单测需指定精准目标；严禁修改生产源码当作临时探针。");
-    packet.push_str("\n【严格负向边界与禁区清单（严禁脱缰漫游）】：\n- 严禁执行全工程递归通配扫描（如严禁 dir /s /b，find .，Get-ChildItem -Recurse 扫描全盘）；\n- 严禁遍历探索非关联业务目录（如排查技术架构或协议时，严禁漫游所有叶子业务组件与页面代码）；\n- 必须严格沿着主进程给出的已知重点文件与上下文图钉展开定向精读。");
-    packet.push_str("\n【步骤预算与定向收敛（必须严格遵守）】：\n- 本任务拥有严格的步骤预算上限（必须在 6~8 步以内收敛并结题），严禁无节制反复调用工具；\n- 架构调研类任务在摸清核心证据后必须立即收敛，直接整理并输出最终技术报告，严禁死磕枝节；\n- 最终交付时，请以清晰的结构化问卷形式逐项陈述事实依据与技术结论，并输出 Markdown mermaid 架构或时序图。");
+    // 5. 按工种角色精准生成行为契约与交付规范（坚决杜绝把调研报告硬套在实施工人头上）
+    let combined_indicator = format!("{role} {title}");
+    let is_research = combined_indicator.contains("架构")
+        || combined_indicator.contains("调研")
+        || combined_indicator.contains("分析")
+        || combined_indicator.contains("排查")
+        || combined_indicator.contains("评估")
+        || combined_indicator.contains("探查")
+        || combined_indicator.contains("设计")
+        || combined_indicator.contains("研究");
+
+    if is_research {
+        packet.push_str("\n【架构调研/分析准则】：你作为架构调研与技术分析师，请定向收集核心证据后立即收敛，直接整理技术结论与事实依据；输出清晰的分析报告与 Markdown mermaid 架构或时序图；严禁死磕非关键枝节。");
+        packet.push_str("\n【严格负向边界与禁区清单（严禁脱缰漫游）】：\n- 严禁执行全工程递归通配扫描（如严禁 dir /s /b，find .，Get-ChildItem -Recurse 扫描全盘）；\n- 严禁遍历探索非关联业务目录（如排查技术架构或协议时，严禁漫游所有叶子业务组件与页面代码）；\n- 必须严格沿着主进程给出的已知重点文件与上下文图钉展开定向精读。");
+        packet.push_str("\n【步骤预算与定向收敛（必须严格遵守）】：\n- 本任务拥有严格的步骤预算上限（必须在 6~8 步以内收敛并结题），严禁无节制反复调用工具；\n- 架构调研类任务在摸清核心证据后必须立即收敛，直接整理并输出最终技术报告，严禁死磕枝节；\n- 最终交付时，请以清晰的结构化问卷形式逐项陈述事实依据与技术结论，并输出 Markdown mermaid 架构或时序图。");
+    } else {
+        packet.push_str("\n【施工工人准则】：你作为工程实施工人，以【修改代码并进行本地验证】为唯一交付目标。请快速定位关键代码行，阅读局部上下文后立即调用 edit_file / write_file 完成施工，严禁只看不改！");
+        packet.push_str("\n【分级验证提示】：查验代码优先用轻量静态检查（如 TS 用 `tsc --noEmit`、Rust 用 `cargo check`、Go 用 `go vet`）；单测需指定精准目标；严禁修改生产源码当作临时探针。");
+        packet.push_str("\n【严格负向边界与禁区清单（严禁脱缰漫游）】：\n- 严禁执行全工程递归通配扫描；严禁脱离施工目标漫游探索非关联目录；\n- 必须严格聚焦于施工目标文件与上下文图钉，完成修改与自检后直接输出简要交付说明。");
+    }
     packet
 }
 
@@ -413,19 +429,29 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
                 any_running = true;
             } else if !auto_recovered.contains(id) {
                 // 检查是否是非正常中断停止（未交付且未显式取消），若发生意外中断且尚有等待时间，自动触发一次自愈恢复
-                let should_recover = {
+                // 核心防护：若父会话已被中止或停止，严禁反向触发子任务自愈复活！
+                let parent_is_active = crate::agent::is_run_active(&state, parent_id);
+                let should_recover = if !parent_is_active {
+                    false
+                } else {
                     let db = state.db.lock().unwrap();
-                    if let Ok(Some(s)) = crate::store::get_session(&db, id) {
-                        if s.status == "interrupted" || s.status == "failed" {
-                            true
-                        } else if s.status != "cancelled" {
-                            let msgs = crate::store::get_messages(&db, id, None, 10).unwrap_or_default();
-                            let last_asst = msgs.iter().rev().find(|m| m.role == "assistant");
-                            let has_terminal_reply = last_asst.map(|m| {
-                                m.tool_calls.is_none()
-                                    || m.tool_calls.as_ref().map(|t| t.is_null() || t.as_array().map(|a| a.is_empty()).unwrap_or(false)).unwrap_or(false)
-                            }).unwrap_or(false);
-                            !has_terminal_reply
+                    if let Ok(Some(ps)) = crate::store::get_session(&db, parent_id) {
+                        if ps.status == "cancelled" || ps.status == "stopped" || ps.status == "interrupted" {
+                            false
+                        } else if let Ok(Some(s)) = crate::store::get_session(&db, id) {
+                            if s.status == "interrupted" || s.status == "failed" {
+                                true
+                            } else if s.status != "cancelled" && s.status != "stopped" {
+                                let msgs = crate::store::get_messages(&db, id, None, 10).unwrap_or_default();
+                                let last_asst = msgs.iter().rev().find(|m| m.role == "assistant");
+                                let has_terminal_reply = last_asst.map(|m| {
+                                    m.tool_calls.is_none()
+                                        || m.tool_calls.as_ref().map(|t| t.is_null() || t.as_array().map(|a| a.is_empty()).unwrap_or(false)).unwrap_or(false)
+                                }).unwrap_or(false);
+                                !has_terminal_reply
+                            } else {
+                                false
+                            }
                         } else {
                             false
                         }

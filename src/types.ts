@@ -431,7 +431,7 @@ export interface Session {
   workspacePath: string;
   accessMode?: "confirm" | "full_access" | null;
   projectId?: string | null;
-  status: string; // active | archived
+  status: string; // active | archived | cancelled | completed | failed | interrupted
   lastMessageAt?: string | null;
   createdAt: string;
   updatedAt: string;
@@ -502,6 +502,11 @@ export interface Session {
   reasoning_effort?: string | null;
   /** 会话专属最大工具步数上限（为空则跟随全局默认） */
   maxSteps?: number | null;
+}
+
+/** 判断会话是否处于未完结的活跃执行/待执行态 */
+export function isSessionNonTerminal(status: string | undefined | null): boolean {
+  return status === "active" || status === "running" || status === "pending" || status === "in_progress";
 }
 
 export interface SubagentCreateInput {

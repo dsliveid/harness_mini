@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "./ipc";
-import { DRAFT_ID, resolveActiveModel, samePath, sortMessages, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type CurrentBoard, type DataStatus, type GrowthItem, type ActiveStepState, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem, type FocusFloatingTarget, type PlanSummary, type IntentAlignmentEvent, type IntentInterventionRequest } from "./types";
+import { DRAFT_ID, isSessionNonTerminal, resolveActiveModel, samePath, sortMessages, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type CurrentBoard, type DataStatus, type GrowthItem, type ActiveStepState, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem, type FocusFloatingTarget, type PlanSummary, type IntentAlignmentEvent, type IntentInterventionRequest } from "./types";
 
 
 export interface EditingMessageTarget {
@@ -813,12 +813,47 @@ export const useStore = create<Store>((set, get) => ({
           message: "会话已停止，未完成的工具自纠已取消",
         };
       }
+      // ==== 级联乐观停止子会话 / 子进程 / 协作者 ====
+      const nextRunStatus = { ...st.runStatus, [sessionId]: "idle" as const };
+      const nextLastRunOutcome = { ...st.lastRunOutcome, [sessionId]: "cancelled" };
+
+      const childProcs = st.subprocesses[sessionId] ?? [];
+      const childAgents = st.subagents[sessionId] ?? [];
+      const childCollabs = st.collaborators[sessionId] ?? [];
+
+      const cancelSession = (s: Session) => (s.status === "completed" ? s : { ...s, status: "cancelled" });
+
+      for (const c of [...childProcs, ...childAgents, ...childCollabs]) {
+        if (c.status !== "completed") {
+          nextRunStatus[c.id] = "idle";
+          nextLastRunOutcome[c.id] = "cancelled";
+        }
+      }
+
+      const nextSubprocesses = childProcs.length > 0 ? {
+        ...st.subprocesses,
+        [sessionId]: childProcs.map(cancelSession),
+      } : st.subprocesses;
+
+      const nextSubagents = childAgents.length > 0 ? {
+        ...st.subagents,
+        [sessionId]: childAgents.map(cancelSession),
+      } : st.subagents;
+
+      const nextCollaborators = childCollabs.length > 0 ? {
+        ...st.collaborators,
+        [sessionId]: childCollabs.map(cancelSession),
+      } : st.collaborators;
+
       return {
-        runStatus: { ...st.runStatus, [sessionId]: "idle" },
-        lastRunOutcome: { ...st.lastRunOutcome, [sessionId]: "cancelled" },
+        runStatus: nextRunStatus,
+        lastRunOutcome: nextLastRunOutcome,
         toolRetryStatus: nextRetry,
         messages: nextMessages,
         toolOutputs: nextOutputs,
+        subprocesses: nextSubprocesses,
+        subagents: nextSubagents,
+        collaborators: nextCollaborators,
       };
     });
     void ipc.stopRun(sessionId).catch((e) => get().pushToast(String(e)));
@@ -1789,7 +1824,7 @@ export const useStore = create<Store>((set, get) => ({
             nextSubprocesses = {
               ...nextSubprocesses,
               [p.sessionId]: nextSubprocesses[p.sessionId].map((s) =>
-                s.status === "running" || s.status === "pending" || s.status === "in_progress"
+                isSessionNonTerminal(s.status)
                   ? { ...s, status: "cancelled" }
                   : s
               ),
@@ -1799,7 +1834,7 @@ export const useStore = create<Store>((set, get) => ({
             nextSubagents = {
               ...nextSubagents,
               [p.sessionId]: nextSubagents[p.sessionId].map((s) =>
-                s.status === "running" || s.status === "pending" || s.status === "in_progress"
+                isSessionNonTerminal(s.status)
                   ? { ...s, status: "cancelled" }
                   : s
               ),
@@ -2835,17 +2870,34 @@ export const useStore = create<Store>((set, get) => ({
             : undefined;
 
           const updatedSubprocesses = { ...st.subprocesses };
+          const updatedSubagents = { ...st.subagents };
+          const nextRunStatus = { ...st.runStatus, [cur]: "idle" as const };
+
           if (updatedSubprocesses[cur]) {
-            updatedSubprocesses[cur] = updatedSubprocesses[cur].map((p) =>
-              p.status === "running" || p.status === "in_progress" ? { ...p, status: "paused" } : p
-            );
+            updatedSubprocesses[cur] = updatedSubprocesses[cur].map((p) => {
+              if (isSessionNonTerminal(p.status)) {
+                nextRunStatus[p.id] = "idle";
+                return { ...p, status: "paused" };
+              }
+              return p;
+            });
+          }
+          if (updatedSubagents[cur]) {
+            updatedSubagents[cur] = updatedSubagents[cur].map((a) => {
+              if (isSessionNonTerminal(a.status)) {
+                nextRunStatus[a.id] = "idle";
+                return { ...a, status: "paused" };
+              }
+              return a;
+            });
           }
 
           return {
-            runStatus: { ...st.runStatus, [cur]: "idle" },
+            runStatus: nextRunStatus,
             lastRunOutcome: { ...st.lastRunOutcome, [cur]: "idle" },
             activeTasks: updatedTask ? { ...st.activeTasks, [cur]: updatedTask } : st.activeTasks,
             subprocesses: updatedSubprocesses,
+            subagents: updatedSubagents,
           };
         });
       }
@@ -2888,10 +2940,23 @@ export const useStore = create<Store>((set, get) => ({
       await ipc.cancelLongTask(taskId);
       const cur = get().currentId;
       if (cur) {
-        set((st) => ({
-          runStatus: { ...st.runStatus, [cur]: "idle" },
-          lastRunOutcome: { ...st.lastRunOutcome, [cur]: "cancelled" },
-        }));
+        set((st) => {
+          const nextRunStatus = { ...st.runStatus, [cur]: "idle" as const };
+          const cancelSession = (s: Session) => (s.status === "completed" ? s : { ...s, status: "cancelled" });
+          const procs = st.subprocesses[cur] ?? [];
+          const ags = st.subagents[cur] ?? [];
+          for (const c of [...procs, ...ags]) {
+            if (c.status !== "completed") {
+              nextRunStatus[c.id] = "idle";
+            }
+          }
+          return {
+            runStatus: nextRunStatus,
+            lastRunOutcome: { ...st.lastRunOutcome, [cur]: "cancelled" },
+            subprocesses: procs.length > 0 ? { ...st.subprocesses, [cur]: procs.map(cancelSession) } : st.subprocesses,
+            subagents: ags.length > 0 ? { ...st.subagents, [cur]: ags.map(cancelSession) } : st.subagents,
+          };
+        });
       }
       get().pushToast("长任务已终止", "info");
     } catch (e: any) {

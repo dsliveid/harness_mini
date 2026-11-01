@@ -148,20 +148,18 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
                 continue;
             }
 
-            // 2. 活跃状态检测：判断子会话是否当前处于执行中
-            let is_active = is_run_active(&state, &sub.id)
-                || sub.status == "running"
-                || sub.status == "pending"
-                || sub.status == "in_progress";
+            // 2. 活跃与非终态检测：判断子会话是否当前处于执行中或属于未完结态
+            let is_running_task = is_run_active(&state, &sub.id);
+            let is_non_terminal = matches!(sub.status.as_str(), "active" | "running" | "pending" | "in_progress");
 
             // 3. 常驻协作者保护：若为常驻协作者，仅在当前真实处于运行活跃状态时才停止并置为 cancelled；
-            // 若协作者处于空闲待命（active/idle），绝不误杀与篡改状态
-            if sub.session_type == "collaborator" && !is_active {
+            // 若协作者处于空闲待命（active/idle 但未在执行），绝不误杀与篡改状态
+            if sub.session_type == "collaborator" && !is_running_task {
                 continue;
             }
 
             // 4. 幂等性保护：若非活跃且已为终止态，跳过，避免重复派发事件
-            if !is_active && (sub.status == "cancelled" || sub.status == "failed" || sub.status == "interrupted" || sub.status == "stopped") {
+            if !is_running_task && !is_non_terminal {
                 continue;
             }
 
@@ -169,7 +167,7 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
                 let db = state.db.lock().unwrap();
                 let _ = store::set_session_status(&db, &sub.id, "cancelled");
             }
-            stop_session_ext(app, &sub.id, false);
+            stop_session_ext(app, &sub.id, true);
             let _ = app.emit("subagent:update", json!({
                 "parentId": session_id,
                 "subagentId": sub.id,
@@ -1463,7 +1461,6 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
     let mut tool_tracker = ToolErrorTracker::new(2);
     let mut has_checked_compaction = false;
     let mut created_plan_in_this_turn = false;
-    let mut consecutive_read_steps = 0usize;
     let mut _step = 0usize;
     let reached_max_steps;
     loop {
@@ -1518,7 +1515,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
 
         // 临界步数倒计时收敛提醒：当步数接近上限时注入高优先级系统收敛提示，防止达到 maxSteps 硬性强杀导致无输出
         let remaining_steps = current_max_steps.saturating_sub(_step);
-        if remaining_steps <= 3 && current_max_steps > 3 {
+        if remaining_steps <= 2 && current_max_steps > 2 {
             let limit_label = format!("最大步数上限（{current_max_steps}）");
             let warn_content = format!(
                 "【⚠️ 临界步数紧急预警：当前仅剩最后 {remaining_steps} 步，即将达到{limit_label}！严禁继续调用任何探索、排查或读取类工具！必须立即根据目前已掌握的所有信息，按规定结构化格式输出最终总结与交付回复！】"
@@ -1526,12 +1523,6 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             messages.push(json!({
                 "role": "user",
                 "content": warn_content,
-            }));
-        } else if consecutive_read_steps >= 5 {
-            let explore_warn = "【⚠️ 探索预算提示：你已连续执行了 5 次只读探索，上下文已充分具备。请立即收敛并停止调用只读工具，直接输出最终方案或调用写入工具。行动验证比脑内推演更快得到真实结果。】";
-            messages.push(json!({
-                "role": "user",
-                "content": explore_warn,
             }));
         }
 
@@ -1984,15 +1975,6 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             if let Ok(Some(s)) = store::get_session(&db, session_id) {
                 let _ = app.emit("session:update", &s);
             }
-        }
-
-        let is_all_read_only = !tcs.is_empty() && tcs.iter().all(|tc| {
-            matches!(tc.name.as_str(), "read_file" | "list_dir" | "grep" | "glob" | "file_outline")
-        });
-        if is_all_read_only {
-            consecutive_read_steps += 1;
-        } else if !tcs.is_empty() {
-            consecutive_read_steps = 0;
         }
 
         for tc in &tcs {
