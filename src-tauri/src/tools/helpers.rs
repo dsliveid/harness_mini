@@ -11,6 +11,7 @@ pub(crate) fn change_mark(c: char) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 pub fn is_high_danger(cmd: &str) -> bool {
     let patterns = [
         r"(?i)\brm\s+(-[a-z]+)*\s*-[a-z]*r[a-z]*\b",
@@ -106,6 +107,7 @@ pub(crate) fn resolve(ctx: &ToolCtx, rel: &str) -> PathBuf {
 }
 
 /// 路径是否位于沙箱内（用于审批判定；临时空间会话的沙箱为整个临时空间根目录）
+#[allow(dead_code)]
 pub fn inside_workspace(ctx: &ToolCtx, rel: &str) -> bool {
     let p = resolve(ctx, rel);
     let root = ctx.sandbox_root.as_ref().unwrap_or(&ctx.workspace);

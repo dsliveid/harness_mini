@@ -14,6 +14,7 @@ pub mod memory;
 mod models;
 mod paths;
 pub mod plan;
+pub mod policy;
 pub mod protocol;
 mod secrets;
 pub mod server;

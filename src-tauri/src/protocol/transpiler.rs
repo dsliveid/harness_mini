@@ -87,14 +87,9 @@ pub fn transpile_to_openai_chat(
             "assistant" => {
                 if let Some(obj) = m.as_object_mut() {
                     if thinking {
-                        // 思考模式：确保存在 reasoning_content 字符串
-                        let current_reasoning = obj
-                            .get("reasoning_content")
-                            .or_else(|| obj.get("reasoning"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        obj.insert("reasoning_content".to_string(), json!(current_reasoning));
+                        // 思考模式：所有历史 Assistant 消息一律脱敏为空字符串保底（满足部分上游网关的 schema 校验），
+                        // 严禁将历史思维链作为输入回传，防止思维反刍与 Token 爆炸
+                        obj.insert("reasoning_content".to_string(), json!(""));
                         obj.remove("reasoning");
                     } else {
                         // 非思考模式：彻底移除厂商私有推理字段，避免原生 OpenAI 严格校验拦截

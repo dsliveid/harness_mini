@@ -2,7 +2,7 @@ use crate::approval::{self, Decision};
 use crate::llm::{self, LlmCfg};
 use crate::models::*;
 use crate::store;
-use crate::tools::{self, Risk, ToolCtx, ToolSpec};
+use crate::tools::{self, ToolCtx, ToolSpec};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1405,6 +1405,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
     let mut tool_tracker = ToolErrorTracker::new(2);
     let mut has_checked_compaction = false;
     let mut created_plan_in_this_turn = false;
+    let mut consecutive_read_steps = 0usize;
     let mut _step = 0usize;
     let reached_max_steps;
     loop {
@@ -1484,6 +1485,12 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             messages.push(json!({
                 "role": "user",
                 "content": warn_content,
+            }));
+        } else if consecutive_read_steps >= 5 {
+            let explore_warn = "【⚠️ 探索预算提示：你已连续执行了 5 次只读探索，上下文已充分具备。请立即收敛并停止调用只读工具，直接输出最终方案或调用写入工具。行动验证比脑内推演更快得到真实结果。】";
+            messages.push(json!({
+                "role": "user",
+                "content": explore_warn,
             }));
         }
 
@@ -1938,6 +1945,15 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             }
         }
 
+        let is_all_read_only = !tcs.is_empty() && tcs.iter().all(|tc| {
+            matches!(tc.name.as_str(), "read_file" | "list_dir" | "grep" | "glob" | "file_outline")
+        });
+        if is_all_read_only {
+            consecutive_read_steps += 1;
+        } else if !tcs.is_empty() {
+            consecutive_read_steps = 0;
+        }
+
         for tc in &tcs {
             let args: Value = serde_json::from_str(&tc.args).unwrap_or_else(|_| {
                 json!({"__parse_error": "工具参数不是有效 JSON"})
@@ -2214,102 +2230,62 @@ async fn handle_tool_call(
     };
     let risk = spec.risk;
 
-    // 未绑定工作区的会话为纯对话模式：文件/命令工具不可用（todo、generate_image、recognize_image 除外）
-    if ctx.workspace.as_os_str().is_empty() && tool_name != "todo" && tool_name != "generate_image" && tool_name != "recognize_image" {
-        let text = "当前会话未绑定工作区，文件与命令工具不可用。请直接以文字回答用户，并提示：如需读写文件或执行命令，可在顶栏选择工作区目录后重试。".to_string();
-        ev.status = "failed".into();
-        ev.result_text = Some(text.clone());
-        {
-            let db = state.db.lock().unwrap();
-            let _ = store::insert_tool_event(&db, &ev);
-        }
-        emit_tool(app, session_id, &ev);
-        return ("failed".into(), text);
-    }
-
-    // 路径越界检测（只读工具越界也需审批）
-    let path_arg = args.get("path").and_then(|p| p.as_str());
-    let outside = path_arg.map(|p| !tools::inside_workspace(ctx, p)).unwrap_or(false);
-    let mut already_inserted = false;
-
-    // ---- 权限判定：访问模式 → 会话规则 → 风险级 → 审批 ----
-    // 访问模式与会话规则均在此实时读取：对话进行中在顶栏改模式、审批时选「本会话允许」，
-    // 都能对本次运行内后续的工具调用立即生效，不必等下一轮运行。
-    let (full_access, session_rules, _settings) = {
+    // ---- 策略引擎安全评估（访问模式、安全域、规则判定） ----
+    let (access_mode, session_rules) = {
         let db = state.db.lock().unwrap();
-        let master = state.master_key.lock().unwrap();
         let mode = store::get_session(&db, session_id)
             .ok()
             .flatten()
             .and_then(|s| s.access_mode)
             .unwrap_or_else(|| "confirm".into());
-        let s = store::get_settings_with_secrets(&db, &master).unwrap_or_default();
         (
-            mode == "full_access",
+            mode,
             store::list_session_rules(&db, session_id).unwrap_or_default(),
-            s,
         )
     };
-    let mut scope: Option<&'static str> = None;
-    let mut need_ask = false;
-    let mut ask_risk = "write";
-    let mut force_once = false;
-    let mut risk_source: Option<String> = None;
 
-    // 检查是否命中 .harness 目录全量读写白名单（系统记忆、方案、配置、自省目录免审放行）
-    let is_harness_operation = {
-        let is_harness_tool = matches!(
-            tool_name,
-            "create_plan" | "update_plan" | "switch_plan" | "read_plan" | "record_memory"
-        );
-        let is_harness_path = path_arg.map(|p| {
-            let p_norm = p.replace('\\', "/");
-            p_norm.starts_with(".harness/")
-                || p_norm == ".harness"
-                || p_norm.contains("/.harness/")
-                || p_norm.ends_with("/.harness")
-        }).unwrap_or(false);
-        is_harness_tool || is_harness_path
+    let policy_decision = crate::policy::PolicyEngine::evaluate(
+        &crate::policy::ToolInvocation {
+            name: tool_name,
+            args,
+            risk,
+        },
+        &crate::policy::SecurityContext {
+            workspace_root: &ctx.workspace,
+            sandbox_root: ctx.sandbox_root.as_deref(),
+            access_mode: &access_mode,
+            session_rules: &session_rules,
+            is_temp_workspace: ctx.temp.is_some(),
+        },
+    );
+
+    let mut scope: Option<&'static str> = None;
+    let mut already_inserted = false;
+
+    let (ask_risk, force_once, risk_source, preview) = match policy_decision {
+        crate::policy::PolicyDecision::Deny { reason } => {
+            ev.status = "failed".into();
+            ev.result_text = Some(reason.clone());
+            {
+                let db = state.db.lock().unwrap();
+                let _ = store::insert_tool_event(&db, &ev);
+            }
+            emit_tool(app, session_id, &ev);
+            return ("failed".into(), reason);
+        }
+        crate::policy::PolicyDecision::Allow { scope: s } => {
+            scope = Some(s);
+            ("", false, None, String::new())
+        }
+        crate::policy::PolicyDecision::RequireApproval {
+            risk: r,
+            force_once: fo,
+            risk_source: rs,
+            preview: prev,
+        } => (r, fo, rs, prev),
     };
 
-    let high_danger = tool_name == "run_command"
-        && args.get("command").and_then(|c| c.as_str()).map(tools::is_high_danger).unwrap_or(false);
-
-    if high_danger {
-        risk_source = Some("regex".to_string());
-        need_ask = true;
-        ask_risk = "execute";
-        force_once = true;
-    } else if full_access && tool_name != "temp_merge" {
-        scope = Some("mode");
-    } else if is_harness_operation {
-        // .harness 目录全量读写放行白名单（方案/记忆/治理系统），免去底层写审批
-        scope = Some("harness_whitelist");
-    } else if tool_name == "temp_merge" {
-        // 合并写回用户原始目录：不可逆且影响范围超出沙箱，
-        // 任何访问模式下都强制逐次审批，且不可记忆放行
-        need_ask = true;
-        ask_risk = "write";
-        force_once = true;
-    } else if session_rules
-        .iter()
-        .any(|r| approval::rule_matches(r, tool_name, args, ctx))
-    {
-        scope = Some("session");
-    } else if risk == Risk::ReadOnly && !outside {
-        scope = Some("none");
-    } else {
-        need_ask = true;
-        ask_risk = if risk == Risk::Execute {
-            "execute"
-        } else if outside {
-            "path"
-        } else {
-            "write"
-        };
-    }
-
-    if need_ask {
+    if scope.is_none() {
         ev.status = "pending_approval".into();
         ev.approval_scope = None;
         {
@@ -2319,7 +2295,6 @@ async fn handle_tool_call(
         already_inserted = true;
         emit_tool(app, session_id, &ev);
 
-        let preview = build_preview(tool_name, args);
         let req = ApprovalRequest {
             event_id: ev.id.clone(),
             session_id: session_id.to_string(),
@@ -2796,72 +2771,6 @@ pub fn stop_session_todos(state: &crate::AppState, app: &AppHandle, session_id: 
     crate::plan::emit_board_updated(app, &db, session_id);
 }
 
-fn build_preview(tool_name: &str, args: &Value) -> String {
-    match tool_name {
-        "run_command" => args
-            .get("command")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string(),
-        "temp_merge" => {
-            "把临时空间的全部变更写回各项目原目录（冲突走 AI 智能合并）。\
-             该操作影响你的原始目录且不可自动撤销；存在无法自动合并的冲突文件时将列出清单供人工处理。"
-                .to_string()
-        }
-        "temp_snapshot" => {
-            let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("manual");
-            format!("为临时空间当前状态建立备份快照（恢复点）：{label}")
-        }
-        "temp_restore" => {
-            let snap = args
-                .get("snapshot")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            match snap {
-                Some(s) => format!(
-                    "把临时空间全部项目副本恢复到快照「{s}」：丢弃快照之后的全部修改（不影响原目录）。"
-                ),
-                None => "把临时空间全部项目副本恢复到基线：丢弃全部未提交修改（不影响原目录）。".to_string(),
-            }
-        }
-        "write_file" => {
-            let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
-            let content = args.get("content").and_then(|c| c.as_str()).unwrap_or("");
-            let d = crate::diffutil::diff_lines("", content, 4000);
-            format!("{path}（新增 {} 行）\n{}", d.added, d.text)
-        }
-        "edit_file" => {
-            let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
-            let old = args.get("old_string").and_then(|c| c.as_str()).unwrap_or("");
-            let new = args.get("new_string").and_then(|c| c.as_str()).unwrap_or("");
-            format!("{path}\n{}", crate::diffutil::diff_lines(old, new, 4000).text)
-        }
-        "generate_image" => {
-            let prompt = args.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
-            let size = args.get("size").and_then(|s| s.as_str()).unwrap_or("1024x1024");
-            let filename = args.get("filename").and_then(|f| f.as_str()).unwrap_or("自动生成路径");
-            format!("根据提示词生成图片：\n提示词: {prompt}\n分辨率: {size}\n目标文件: {filename}")
-        }
-        "recognize_image" => {
-            let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
-            let prompt = args.get("prompt").and_then(|p| p.as_str()).unwrap_or("全面分析图片内容");
-            format!("图像识别与分析：\n目标图片: {path}\n分析要求: {prompt}")
-        }
-        "create_plan" => {
-            let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("未命名计划");
-            let goals = args.get("goals").and_then(|v| v.as_str()).unwrap_or("");
-            let arch = args.get("architecture").and_then(|v| v.as_str()).unwrap_or("");
-            format!("创建任务执行计划【{}】\n目标：{}\n架构设计：{}", title, goals, arch)
-        }
-        "update_plan" => {
-            let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-            let note = args.get("revision_note").and_then(|v| v.as_str()).unwrap_or("");
-            format!("更新任务计划\n调整原因：{}\n变更备注：{}", reason, note)
-        }
-        _ => serde_json::to_string_pretty(args).unwrap_or_default(),
-    }
-}
 
 fn truncate_preview(s: &str, max_chars: usize) -> String {
     let s = s.trim().replace(['\r', '\n'], " ");
@@ -3052,7 +2961,8 @@ mod tests {
         let msgs = msgs.unwrap();
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[2]["role"], "assistant");
-        assert_eq!(msgs[2]["reasoning_content"], "I am thinking deeply...");
+        // 核心验证：发往模型的上下文中剥离了历史思维链，防止思维反刍
+        assert!(msgs[2].get("reasoning_content").is_none() || msgs[2]["reasoning_content"].is_null());
     }
 
     #[test]

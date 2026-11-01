@@ -161,13 +161,25 @@ pub fn load_static_project_memory(workspace: &Path) -> Option<String> {
         }
     }
 
-    // 2. 读取 conventions.md
+    // 2. 读取 conventions.md（设置 3,000 字符 / ~1,200 Token 硬上限，按最新条目逆序保留，防止盲目膨胀）
     let conv_path = mem.join("conventions.md");
     if let Ok(c) = fs::read_to_string(&conv_path) {
         let trimmed = c.trim();
         let lines: Vec<_> = trimmed.lines().filter(|l| !l.trim().is_empty()).collect();
         if lines.len() > 2 {
-            parts.push(format!("### 常用工程规范与避坑约定 (conventions.md)\n{trimmed}"));
+            let max_chars = 3000;
+            let content_to_use = if trimmed.len() > max_chars {
+                // 优先从末尾向前寻找最近的完整章节（\n### ），保留最新沉淀的工程约定
+                let slice = &trimmed[trimmed.len().saturating_sub(max_chars)..];
+                if let Some(pos) = slice.find("\n### ") {
+                    format!("*(注：项目历史规约较多，此处精选最新关键沉淀，全量见 .harness/memory/conventions.md)*\n\n{}", &slice[pos + 1..].trim())
+                } else {
+                    format!("*(注：此处精选最新关键沉淀，全量见 .harness/memory/conventions.md)*\n\n{}", slice.trim())
+                }
+            } else {
+                trimmed.to_string()
+            };
+            parts.push(format!("### 常用工程规范与避坑约定 (conventions.md)\n{content_to_use}"));
         }
     }
 

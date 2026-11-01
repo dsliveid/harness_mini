@@ -324,8 +324,8 @@ fn test_openai_chat_thinking_mode_auto_heals_missing_reasoning_content() {
     let payload = transpile_to_openai_chat(&messages, &[], "deepseek-v4.1-flash", Some("high"));
     assert_eq!(payload.messages.len(), 5);
 
-    // 轮次 1 的 reasoning_content 保持原样
-    assert_eq!(payload.messages[1]["reasoning_content"], "Let me search files...");
+    // 轮次 1 的历史 reasoning_content 被脱敏为空字符串（不把历史思维作为输入回传）
+    assert_eq!(payload.messages[1]["reasoning_content"], "");
 
     // 轮次 2 原本缺失的 reasoning_content 被自动注入保底空字符串，彻底满足 DeepSeek 上游校验
     assert_eq!(payload.messages[3]["reasoning_content"], "");

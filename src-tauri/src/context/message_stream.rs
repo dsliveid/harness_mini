@@ -163,12 +163,7 @@ pub fn assemble_execution_context(
             "assistant" => {
                 let mut obj = json!({"role": "assistant"});
                 let content = m.content.clone().unwrap_or_default();
-                if let Some(ref r) = m.reasoning {
-                    if !r.trim().is_empty() {
-                        obj["reasoning_content"] = Value::String(r.clone());
-                        est += estimate_tokens(r);
-                    }
-                }
+                // 核心准则：历史 reasoning 仅用于 UI 展示与入库审计，发往模型的消息流严禁回传历史思维链反刍
                 match &m.tool_calls {
                     Some(tcs) if !tcs.is_null() && tcs.as_array().map(|a| !a.is_empty()).unwrap_or(false) => {
                         if !content.is_empty() {
@@ -227,7 +222,8 @@ pub fn assemble_execution_context(
                         }
                     }
                     _ => {
-                        if !content.is_empty() || obj.get("reasoning_content").is_some() {
+                        let has_reasoning = m.reasoning.as_deref().map(|r| !r.trim().is_empty()).unwrap_or(false);
+                        if !content.is_empty() || has_reasoning {
                             obj["content"] = Value::String(content.clone());
                             est += estimate_tokens(&content);
                             out.push(obj);
@@ -293,11 +289,12 @@ pub fn assemble_execution_context(
 
         let recent_cutoff = groups.len().saturating_sub(2);
 
-        // 阶段 1：对远期历史工具组（> 2 轮前）实施就地衰减折叠（> 1000 字符收敛至 600；压力高时收敛至 350）
+        // 阶段 1：对所有已完成决策的历史工具组（超过最近 2 组前）执行统一滑动衰减（> 250 字符立即收敛）
+        // 确保单轮内多步探索产生的数十次工具调用不至于呈梯形积分式打爆上下文
         for g in groups.iter().take(recent_cutoff) {
             for &t_idx in &g.tool_indices {
                 let text = out[t_idx].get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let fold_limit = if est > safe_threshold { 350 } else { 1000 };
+                let fold_limit = if est > safe_threshold { 150 } else { 250 };
                 if text.len() > fold_limit {
                     let safe_len = text.char_indices().nth(fold_limit).map(|(i, _)| i).unwrap_or(text.len());
                     let slimmed = format!(
@@ -324,8 +321,8 @@ pub fn assemble_execution_context(
                         break;
                     }
                     let text = out[t_idx].get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    if text.len() > 1200 {
-                        let safe_len = text.char_indices().nth(1200).map(|(i, _)| i).unwrap_or(text.len());
+                    if text.len() > 800 {
+                        let safe_len = text.char_indices().nth(400).map(|(i, _)| i).unwrap_or(text.len());
                         let slimmed = format!(
                             "{}\n\n...[近期非活跃工具输出过长（共 {} 字符），已折叠前序详情以节省上下文空间]...",
                             &text[..safe_len],

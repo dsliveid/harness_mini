@@ -53,6 +53,7 @@ pub async fn request_approval(
 }
 
 /// 审批规则匹配
+#[allow(dead_code)]
 pub fn rule_matches(rule: &ApprovalRule, tool_name: &str, args: &Value, ctx: &ToolCtx) -> bool {
     match rule.kind.as_str() {
         "tool" => rule.pattern == tool_name,
