@@ -72,15 +72,8 @@ pub fn start_long_task(
 ) -> Result<LongTask, String> {
     let state = app.state::<crate::AppState>();
 
-    // 检查该会话是否已有进行中的长任务
-    {
-        let db = state.db.lock().unwrap();
-        if let Ok(Some(existing)) = store::get_active_long_task(&db, &session_id) {
-            if existing.status == "running" || existing.status == "planning" {
-                return Err("当前会话已有正在运行的长任务，请等待完成或先暂停/终止它。".into());
-            }
-        }
-    }
+    // 若当前会话已有正在运行或规划中的长任务，自动覆盖并平滑归档旧任务
+    let _ = cancel_long_task_by_session(&app, &session_id, Some("被新发起的长任务覆盖替代"));
 
     let (workspace_path, task_id, subtask_max_steps) = {
         let db = state.db.lock().unwrap();
@@ -328,6 +321,17 @@ pub fn pause_long_task_by_session(
     let task = get_active_task(app, session_id)?
         .ok_or_else(|| "当前会话未找到活跃的长任务守护进程".to_string())?;
     pause_long_task(app, &task.id)
+}
+
+/// 由会话 ID 终止当前活跃的长任务
+pub fn cancel_long_task_by_session(
+    app: &AppHandle,
+    session_id: &str,
+    _reason: Option<&str>,
+) -> Result<(), String> {
+    let task = get_active_task(app, session_id)?
+        .ok_or_else(|| "当前会话未找到活跃的长任务守护进程".to_string())?;
+    cancel_long_task(app, &task.id)
 }
 
 /// 获取会话当前活跃长任务

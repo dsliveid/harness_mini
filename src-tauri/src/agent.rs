@@ -1462,25 +1462,12 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
     loop {
         let current_max_steps = {
             let db = state.db.lock().unwrap();
-            if is_long_task {
-                if let Ok(Some(task)) = store::get_active_long_task(&db, session_id) {
-                    task.max_steps.max(1)
-                } else {
-                    store::get_session(&db, session_id)
-                        .ok()
-                        .flatten()
-                        .and_then(|s| s.max_steps)
-                        .map(|v| v as usize)
-                        .unwrap_or(settings.max_steps.max(1) as usize)
-                }
-            } else {
-                store::get_session(&db, session_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.max_steps)
-                    .map(|v| v as usize)
-                    .unwrap_or(settings.max_steps.max(1) as usize)
-            }
+            store::get_session(&db, session_id)
+                .ok()
+                .flatten()
+                .and_then(|s| s.max_steps)
+                .map(|v| v as usize)
+                .unwrap_or(settings.max_steps.max(1) as usize)
         };
 
         if _step >= current_max_steps {
@@ -1525,11 +1512,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         // 临界步数倒计时收敛提醒：当步数接近上限时注入高优先级系统收敛提示，防止达到 maxSteps 硬性强杀导致无输出
         let remaining_steps = current_max_steps.saturating_sub(_step);
         if remaining_steps <= 3 && current_max_steps > 3 {
-            let limit_label = if is_long_task {
-                format!("单子任务轮次预算硬上限（{current_max_steps} 轮）")
-            } else {
-                format!("最大步数上限（{current_max_steps}）")
-            };
+            let limit_label = format!("最大步数上限（{current_max_steps}）");
             let warn_content = format!(
                 "【⚠️ 临界步数紧急预警：当前仅剩最后 {remaining_steps} 步，即将达到{limit_label}！严禁继续调用任何探索、排查或读取类工具！必须立即根据目前已掌握的所有信息，按规定结构化格式输出最终总结与交付回复！】"
             );
@@ -2220,18 +2203,14 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         _step += 1;
     }
 
-    let err_msg = if is_long_task {
-        format!("单子任务已达到最大轮次预算上限（{reached_max_steps} 轮），为防止死循环已安全中止。可在会话设置中调整「单子任务轮次预算」。")
-    } else {
-        format!("已达到最大步数（{reached_max_steps}），任务中止。可在会话设置或下方快捷操作中调整「最大步数」并继续推进。")
-    };
+    let err_msg = format!("已达到最大步数（{reached_max_steps}），任务中止。可在会话设置或下方快捷操作中调整「最大步数」并继续推进。");
     emit_error(
         app,
         session_id,
         "max_steps",
         err_msg,
     );
-    let outcome = if is_long_task { RunOutcome::Failed } else { RunOutcome::Done };
+    let outcome = RunOutcome::Done;
     (outcome, last_assistant_id, run_tokens)
 }
 

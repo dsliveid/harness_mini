@@ -120,30 +120,61 @@ pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiv
                 let _ = crate::task::complete_long_task(&app, &task_id, Some("长任务已由主会话推进完成并通过自检验收"), None);
                 return;
             }
+
+            // 识别是否停下等待人工确认（不确定性二元决策门禁，自动安全挂起防止后台空转催促）
+            if role == "assistant" && is_waiting_for_user_confirmation(&content) {
+                task.status = "paused".to_string();
+                task.updated_at = store::now();
+                {
+                    let db = state.db.lock().unwrap();
+                    let _ = store::update_long_task(&db, &task);
+                }
+                let _ = app.emit("task:update", &task);
+                return;
+            }
         }
 
         // 8. 尚未完结且会话已空闲，发送自动推进脉冲！
         task.current_step += 1;
-        if task.current_step > task.max_steps {
-            task.status = "paused".to_string();
-            task.updated_at = store::now();
-            {
-                let db = state.db.lock().unwrap();
-                let _ = store::update_long_task(&db, &task);
-                let alert = format!(
-                    "⚠️ **长任务已达到最大轮次上限 ({} 步)**，自动挂起以防过度消耗。如需继续，请点击恢复或输入进一步指示。",
-                    task.max_steps
-                );
-                let _ = store::new_message(&db, &session_id, "assistant", Some(alert), false);
-            }
-            let _ = app.emit("task:update", &task);
-            return;
+        task.updated_at = store::now();
+        {
+            let db = state.db.lock().unwrap();
+            let _ = store::update_long_task(&db, &task);
         }
+        let _ = app.emit("task:update", &task);
 
         // 驱动主会话进入下一轮自治推进
         idle_consecutive_ticks = 0;
         let _ = agent::continue_turn_autonomous(&app, &session_id);
 
         tokio::time::sleep(Duration::from_millis(1000)).await;
+    }
+}
+
+/// 智能判定助手是否停下请求用户裁决或审阅确认
+pub fn is_waiting_for_user_confirmation(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    content.contains("请确认")
+        || content.contains("等待确认")
+        || content.contains("等待您的确认")
+        || content.contains("请审阅确认")
+        || content.contains("请您确认")
+        || content.contains("需要您的裁决")
+        || content.contains("请指示")
+        || content.contains("请问是否")
+        || content.contains("等待人工")
+        || lower.contains("<user_confirmation_needed>")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_waiting_for_user_confirmation() {
+        assert!(is_waiting_for_user_confirmation("关于这 14 个未提交的测试文件，请确认是否需要一并提交？"));
+        assert!(is_waiting_for_user_confirmation("遇到核心阻断问题，等待人工裁决后再行继续。"));
+        assert!(is_waiting_for_user_confirmation("请审阅确认以上计划后，我们将开始执行。"));
+        assert!(!is_waiting_for_user_confirmation("已完成第一阶段代码重构，接下来开始编译自检。"));
     }
 }

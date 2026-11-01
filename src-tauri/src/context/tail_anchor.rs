@@ -65,6 +65,28 @@ pub fn build_runtime_anchor(
         );
     }
 
+    // 5. 长任务自主推进状态感知与五步公理推进约束
+    let active_long_task: Option<(String, String)> = conn
+        .query_row(
+            "SELECT id, goal FROM long_tasks WHERE session_id = ?1 AND status = 'running' LIMIT 1",
+            rusqlite::params![session.id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .ok();
+
+    if let Some((task_id, goal)) = active_long_task {
+        sections.push(format!(
+            "## 🤖 长任务自主推进中 (Task ID: `{task_id}`)\n\
+            > 当前会话正处于长任务守护推进中。总目标：**{goal}**\n\
+            > **执行准则**：\n\
+            > 1. 已明确的方向与既定清单，坚决调用工具推进实施（微小改动就地修改，大施工可调用 spawn_subagent 委派专职子 Agent）；\n\
+            > 2. 宏观勘察严格限制在 3 步内；严禁在原地反复只读读盘或犹豫徘徊；\n\
+            > 3. 若遇到关键阻断性前置条件不确定，请停下来向用户提问求证，并调用 `control_long_task(action: \"pause\", reason: \"...\")` 安全挂起；\n\
+            > 4. 若为次要非阻断疑点，记录为备注直接跳过并坚决继续推进；\n\
+            > 5. 目标全部完成后，总结验收证据并调用 `control_long_task(action: \"complete\")` 结案归档。"
+        ));
+    }
+
     if sections.is_empty() {
         None
     } else {
@@ -107,5 +129,22 @@ mod tests {
         assert!(a.contains("<runtime_environment_anchor>"));
         assert!(a.contains("Jev 场景化决策先行准则"));
         assert!(a.contains("judge_decision"));
+    }
+
+    #[test]
+    fn test_tail_anchor_includes_running_long_task() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        let s = crate::store::create_session(&conn, "", None, "测试会话", "full_access").unwrap();
+        conn.execute(
+            "INSERT INTO long_tasks (id, session_id, workspace_path, goal, status, created_at, updated_at) VALUES ('lt-1', ?1, '', '全面重构代码', 'running', 1000, 1000)",
+            [&s.id],
+        ).unwrap();
+        let anchor = build_runtime_anchor(&conn, &s, Some("继续推进"));
+        assert!(anchor.is_some());
+        let a = anchor.unwrap();
+        assert!(a.contains("长任务自主推进中"));
+        assert!(a.contains("lt-1"));
+        assert!(a.contains("全面重构代码"));
     }
 }

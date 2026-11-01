@@ -323,7 +323,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "control_long_task",
-            description: "管控长任务守护进程的生命周期。当总目标已达成宣告结案完成、遇到阻碍/等待人工决策安全挂起、或需要自主发起长任务守护进程时调用。系统将原子性更新长任务状态机、归档检查点并同步右侧看板。",
+            description: "管控长任务守护进程的生命周期。当总目标已达成宣告结案完成、遇到阻断性前置条件缺失需停下等待人工裁决时安全挂起、或需要发起长任务守护推进时调用。系统将原子性更新长任务状态机、归档检查点并同步右侧看板。",
             risk: Risk::Write,
             schema: json!({
                 "type": "object",
@@ -331,7 +331,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "action": {
                         "type": "string",
                         "enum": ["start", "pause", "complete"],
-                        "description": "控制动作：start(启动长任务守护模式), pause(遇到阻碍/等待用户确认安全挂起), complete(总目标已达成宣告结案)"
+                        "description": "控制动作：start(启动长任务守护推进), pause(遇到阻断性前置未知/需等待用户确认时安全挂起), complete(总目标已达成宣告结案)"
                     },
                     "reason": {
                         "type": "string",
