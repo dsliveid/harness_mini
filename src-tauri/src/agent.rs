@@ -1390,11 +1390,18 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             false
         };
 
-        let is_goal_task = is_long_task || directly_triggered_goal || ongoing_goal_plan;
+        // 识别长任务触发：包含显式指令前缀、/goal、或者数据库中有处于运行/推进中的长任务
+        let is_running_long_task = store::get_active_long_task(&db, session_id)
+            .ok()
+            .flatten()
+            .map(|t| t.status == "running" || t.status == "planning")
+            .unwrap_or(false);
 
-        // 长任务自动走 always_proceed 流程（由模型先规划后自主连贯实施）；
-        // 只有当用户在当前指令中明确要求“先不改动代码/仅出方案/先评估”时，由运行时守卫拦截阻断代码修改
-        let effective_plan_mode = if is_goal_task {
+        let is_goal_task = is_long_task || directly_triggered_goal || ongoing_goal_plan || is_running_long_task;
+
+        // 子任务（工人沙箱）与长任务（后台自治）均自动强制走 always_proceed 模式（自治推进，落盘即开工，严禁停顿审批）；
+        // 普通对话则严格按用户/项目设置的 plan_mode 运行（支持 standard / always_plan / always_proceed）。
+        let effective_plan_mode = if is_subagent || is_goal_task {
             "always_proceed".to_string()
         } else {
             plan_mode
@@ -3381,6 +3388,62 @@ mod tests {
 
         let effective_mode2 = if is_goal2 { "always_proceed" } else { "always_plan" };
         assert_eq!(effective_mode2, "always_proceed");
+    }
+
+    #[test]
+    fn test_subagent_and_long_task_mode_hierarchy() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        store::init_schema(&conn).unwrap();
+        let proj = store::create_project(&conn, "StrictProj", Some("D:\\ws")).unwrap();
+        store::set_project_plan_mode(&conn, &proj.id, "always_plan").unwrap();
+
+        // 1. 普通前台会话在 always_plan 项目中 -> 继承 always_plan
+        let s = store::create_session(&conn, "D:\\ws", Some(&proj.id), "normal", "confirm").unwrap();
+        let plan_mode = store::get_project(&conn, &proj.id).unwrap().unwrap().plan_mode;
+        let is_sub = s.session_type == "subagent" || s.parent_session_id.is_some();
+        let is_running_long = store::get_active_long_task(&conn, &s.id)
+            .ok()
+            .flatten()
+            .map(|t| t.status == "running" || t.status == "planning")
+            .unwrap_or(false);
+        let eff = if is_sub || is_running_long { "always_proceed" } else { &plan_mode };
+        assert_eq!(eff, "always_plan");
+
+        // 2. 子任务沙箱会话在 always_plan 项目中 -> 强制升级为 always_proceed
+        let sub = store::create_subagent_session(&conn, &s.id, "worker", "Worker Sub", "Do task", "D:\\ws", None, Some(&proj.id), None).unwrap();
+        let is_sub2 = sub.session_type == "subagent" || sub.parent_session_id.is_some();
+        let eff2 = if is_sub2 { "always_proceed" } else { &plan_mode };
+        assert_eq!(eff2, "always_proceed");
+
+        // 3. 长任务在 always_plan 项目中处于 running -> 强制升级为 always_proceed
+        let now = chrono::Utc::now().to_rfc3339();
+        let running_lt = crate::models::LongTask {
+            id: "task-test-hierarchy".to_string(),
+            session_id: s.id.clone(),
+            workspace_path: "D:\\ws".to_string(),
+            goal: "Long Task".to_string(),
+            status: "running".to_string(),
+            current_subtask_index: 0,
+            subtasks: vec![],
+            max_budget_tokens: None,
+            total_tokens_used: 0,
+            cached_tokens_used: 0,
+            cache_hit_rate: 0.0,
+            prompt_tokens_used: 0,
+            completion_tokens_used: 0,
+            current_step: 1,
+            max_steps: 30,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        store::create_long_task(&conn, &running_lt).unwrap();
+        let is_running_long2 = store::get_active_long_task(&conn, &s.id)
+            .ok()
+            .flatten()
+            .map(|t| t.status == "running" || t.status == "planning")
+            .unwrap_or(false);
+        let eff3 = if is_running_long2 { "always_proceed" } else { &plan_mode };
+        assert_eq!(eff3, "always_proceed");
     }
 
     #[test]

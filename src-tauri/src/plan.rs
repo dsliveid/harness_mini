@@ -576,7 +576,7 @@ pub fn create_plan_with_effect(
     };
 
     let msg = format!(
-        "已成功在 `.harness/plans/{filename}` 创建专属任务计划【{title}】（版本 v1）。\n- 方案文件物理路径: `.harness/plans/{filename}`\n- 活动计划ID: `{plan_id}`\n\n【⚠️ 重要阶段指令 - 方案先行门禁】: 方案文档现已物理落盘！根据规划先行原则，当前轮次严禁继续调用任何代码写入/编辑工具（write_file/edit_file）！你必须立即停止调用工具，向用户输出结构化总结回复（汇报核心目标、设计方案、影响文件清单及实施步骤），并明确请用户在对话中审阅确认方案！用户在对话中回复确认或给出调整指示后方可开始编写代码实施。"
+        "已成功在 `.harness/plans/{filename}` 创建专属任务计划【{title}】（版本 v1）。\n- 方案文件物理路径: `.harness/plans/{filename}`\n- 活动计划ID: `{plan_id}`\n- 任务步骤与清单已同步至待办池。"
     );
 
     Ok(PlanEffect {
@@ -2694,6 +2694,32 @@ mod tests {
         assert_eq!(board_all_done.completed_steps, 2);
         assert_eq!(board_all_done.progress_pct, 100);
         assert_eq!(board_all_done.status, "completed");
+    }
+
+    #[test]
+    fn test_create_plan_returns_neutral_factual_message() {
+        let temp = TempDir::new();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        let s = crate::store::create_session(&conn, temp.path().to_str().unwrap(), None, "test", "confirm").unwrap();
+        let eff = create_plan_with_effect(
+            temp.path(),
+            &s.id,
+            "测试计划",
+            "核心目标",
+            "核心架构",
+            &[],
+            &["步骤1".to_string()],
+            None,
+            None,
+            None,
+            Some(&conn),
+        ).unwrap();
+
+        assert!(eff.message.contains("已成功在 `.harness/plans/"));
+        assert!(eff.message.contains("任务步骤与清单已同步至待办池"));
+        assert!(!eff.message.contains("方案先行门禁"));
+        assert!(!eff.message.contains("严禁继续调用"));
     }
 }
 
