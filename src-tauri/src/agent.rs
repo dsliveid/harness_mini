@@ -494,16 +494,13 @@ pub fn retry_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
 pub fn continue_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
     let state = app.state::<crate::AppState>();
 
-    // 0. 若当前会话关联长任务，全权委托给长任务调度引擎管理，坚决不启动主会话 Agent 轮次
+    // 0. 若当前会话关联处于挂起状态的长任务，通过 resume 恢复
     {
         let db = state.db.lock().unwrap();
         if let Ok(Some(lt)) = store::get_latest_long_task(&db, session_id) {
             if lt.status == "interrupted" || lt.status == "failed" || lt.status == "paused" {
                 drop(db);
                 crate::task::resume_long_task(app, &lt.id)?;
-                return Ok(());
-            } else if lt.status == "running" {
-                // 长任务调度引擎已在后台运行中，直接返回避免并发冲突
                 return Ok(());
             } else if lt.status == "cancelled" {
                 return Err("长任务已终止。如需继续执行，请重新发起长任务。".into());
@@ -595,6 +592,60 @@ pub fn continue_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
 }
 
 /// 提取用户主动发起的 `/jev: 决策 [意图]` 指令
+
+/// 自治驱动推进：长任务守护进程专用的自动推进入口（向主会话注入轻量自治脉冲）
+pub fn continue_turn_autonomous(app: &AppHandle, session_id: &str) -> Result<(), String> {
+    let state = app.state::<crate::AppState>();
+    if is_run_active(&state, session_id) {
+        return Ok(());
+    }
+
+    // 1. 自动恢复关联的未完成子任务（若有）
+    let subs_to_resume = {
+        let db = state.db.lock().unwrap();
+        let subs = store::list_subagents(&db, session_id).unwrap_or_default();
+        subs.into_iter()
+            .filter(|s| s.status == "interrupted" || s.status == "failed")
+            .map(|s| s.id)
+            .collect::<Vec<_>>()
+    };
+    for sub_id in subs_to_resume {
+        let _ = restart_subagent(app, &sub_id);
+    }
+
+    // 2. 注入轻量自治推进脉冲
+    let (trigger_id, new_msg) = {
+        let db = state.db.lock().unwrap();
+        let msgs = store::all_messages(&db, session_id)?;
+        let last_msg = msgs.last();
+
+        let prompt = match last_msg {
+            Some(m) if m.role == "tool" => {
+                "请根据上述工具执行结果，继续自主推进长任务目标。".into()
+            }
+            Some(m) if m.role == "assistant" => {
+                "请承接上一步进展，继续自主推进长任务目标。若需具体编写代码或深度排查，请调用 spawn_subagent 委派给工人沙箱。全部达成时请在输出中声明 🎯 **长任务全部目标达成**。".into()
+            }
+            _ => {
+                "请继续推进长任务目标。".into()
+            }
+        };
+
+        let new_m = store::new_message(&db, session_id, "user", Some(prompt), false)?;
+        (new_m.id.clone(), new_m)
+    };
+
+    let _ = app.emit("message:final", &new_msg);
+    let _ = app.emit("messages:changed", serde_json::json!({"sessionId": session_id}));
+
+    spawn_session_task(app.clone(), session_id.to_string(), Some(trigger_id.clone()));
+    state.emit(
+        "run:status",
+        &serde_json::json!({"sessionId": session_id, "status": "running", "triggerId": trigger_id}),
+    );
+    Ok(())
+}
+
 pub fn extract_jev_intent(raw_text: &str) -> (bool, String) {
     let trimmed = raw_text.trim();
     if trimmed.starts_with("/jev:决策")

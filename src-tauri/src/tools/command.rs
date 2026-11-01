@@ -12,17 +12,34 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 pub(crate) const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-/// 强制杀死指定进程及其所有子进程树（跨平台安全强杀）
+/// 强制杀死指定进程及其所有子进程树（跨平台安全非阻塞强杀）
 pub fn kill_process_tree(pid: u32) {
     #[cfg(windows)]
     {
+        extern "system" {
+            fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut std::ffi::c_void;
+            fn TerminateProcess(hProcess: *mut std::ffi::c_void, uExitCode: u32) -> i32;
+            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+        }
+        const PROCESS_TERMINATE: u32 = 0x0001;
+
+        // 1. 微秒级内核直接终止目标主进程，消除任何线程阻塞
+        unsafe {
+            let h_proc = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !h_proc.is_null() {
+                let _ = TerminateProcess(h_proc, 1);
+                let _ = CloseHandle(h_proc);
+            }
+        }
+
+        // 2. 异步拉起 taskkill 彻底清理深层子进程树，严禁使用 .output() 同步挂死 IPC 线程
         let taskkill_bin = std::env::var("SystemRoot")
             .map(|r| format!("{r}\\System32\\taskkill.exe"))
             .unwrap_or_else(|_| "taskkill".into());
         let mut kill_cmd = std::process::Command::new(taskkill_bin);
         kill_cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
         kill_cmd.creation_flags(CREATE_NO_WINDOW);
-        let _ = kill_cmd.output();
+        let _ = kill_cmd.spawn();
     }
     #[cfg(not(windows))]
     {

@@ -3704,7 +3704,7 @@ pub fn revert_file_hunk(path: String, hunk: DiffHunk) -> Result<(), String> {
 // ==================== 长任务（Long-Running Task）Commands ====================
 
 #[tauri::command]
-pub fn start_long_task(
+pub async fn start_long_task(
     app: AppHandle,
     session_id: String,
     goal: String,
@@ -3714,22 +3714,22 @@ pub fn start_long_task(
 }
 
 #[tauri::command]
-pub fn pause_long_task(app: AppHandle, task_id: String) -> Result<(), String> {
+pub async fn pause_long_task(app: AppHandle, task_id: String) -> Result<(), String> {
     crate::task::pause_long_task(&app, &task_id)
 }
 
 #[tauri::command]
-pub fn resume_long_task(app: AppHandle, task_id: String) -> Result<LongTask, String> {
+pub async fn resume_long_task(app: AppHandle, task_id: String) -> Result<LongTask, String> {
     crate::task::resume_long_task(&app, &task_id)
 }
 
 #[tauri::command]
-pub fn cancel_long_task(app: AppHandle, task_id: String) -> Result<(), String> {
+pub async fn cancel_long_task(app: AppHandle, task_id: String) -> Result<(), String> {
     crate::task::cancel_long_task(&app, &task_id)
 }
 
 #[tauri::command]
-pub fn complete_long_task(
+pub async fn complete_long_task(
     app: AppHandle,
     task_id: String,
     summary: Option<String>,

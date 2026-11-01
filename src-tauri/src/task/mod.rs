@@ -9,7 +9,7 @@ pub use planner::{decompose_goal, replan_subtasks};
 pub use verifier::{create_git_snapshot, execute_verify_command};
 
 use crate::agent;
-use crate::models::{LongTask, LongTaskStatus, TaskCheckpoint, TaskSubItem};
+use crate::models::{LongTask, TaskCheckpoint, TaskSubItem};
 use crate::store;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -30,7 +30,6 @@ pub fn get_next_subtask_index(task: &LongTask) -> Option<usize> {
     if let Some(idx) = task.subtasks.iter().position(|s| s.status == "running" || s.status == "verifying" || s.status == "in_progress") {
         return Some(idx);
     }
-    // 优先寻找下一个处于待推进/未结案状态的子任务（跳过已 completed / skipped 阶段）
     if let Some(idx) = task.subtasks.iter().position(|s| s.status != "completed" && s.status != "skipped") {
         return Some(idx);
     }
@@ -64,7 +63,7 @@ pub fn recover_orphaned_tasks(conn: &rusqlite::Connection) -> Result<usize, Stri
     Ok(n)
 }
 
-/// 启动新的长任务
+/// 启动新的长任务（主会话单轨自治推进 + 后台守护进程控制）
 pub fn start_long_task(
     app: AppHandle,
     session_id: String,
@@ -73,7 +72,7 @@ pub fn start_long_task(
 ) -> Result<LongTask, String> {
     let state = app.state::<crate::AppState>();
 
-    // 检查该会话是否已有进行中或已暂停的长任务
+    // 检查该会话是否已有进行中的长任务
     {
         let db = state.db.lock().unwrap();
         if let Ok(Some(existing)) = store::get_active_long_task(&db, &session_id) {
@@ -100,7 +99,7 @@ pub fn start_long_task(
         session_id: session_id.clone(),
         workspace_path,
         goal: goal.clone(),
-        status: LongTaskStatus::Planning.as_str().to_string(),
+        status: "running".to_string(),
         current_subtask_index: 0,
         subtasks: vec![],
         max_budget_tokens,
@@ -109,22 +108,28 @@ pub fn start_long_task(
         cache_hit_rate: 0.0,
         prompt_tokens_used: 0,
         completion_tokens_used: 0,
-        current_step: 0,
-        max_steps: subtask_max_steps,
+        current_step: 1,
+        max_steps: subtask_max_steps.max(25),
         created_at: now.clone(),
         updated_at: now,
     };
 
-    {
+    let user_msg_id = {
         let db = state.db.lock().unwrap();
         store::create_long_task(&db, &task)?;
-        let prompt_text = format!("🎯 **启动长任务目标模式**\n\n**总目标**：{}", goal);
-        if let Ok(user_msg) = store::new_message(&db, &session_id, "user", Some(prompt_text), false) {
-            let _ = app.emit("message:final", &user_msg);
-        }
-    }
+        let prompt_text = format!(
+            "🎯 **启动长任务自治推进模式**\n\n            **总目标**：{}\n\n            【长任务自主协同准则】：\n            1. 当前会话已进入后台守护进程驱动的长任务模式，主会话享有全量历史上下文与单轨决策权；\n            2. 请依据前文完整的工程全貌与盘点结论，直接思考并展开第一阶段工作；\n            3. 【严格防 Token 膨胀机制】：若涉及大范围文件探索、具体代码编写、测试调试等重度施工，**请务必调用 `spawn_subagent` 委派给独立子沙箱执行**，主会话只接收交付工件摘要；\n            4. 当全部目标已彻底完成并通过自检验收后，请在回复末尾明确输出 `🎯 **长任务全部目标达成**`，守护进程将自动结案。",
+            goal
+        );
+        let user_msg = store::new_message(&db, &session_id, "user", Some(prompt_text), false)?;
+        let _ = app.emit("message:final", &user_msg);
+        user_msg.id
+    };
 
     let _ = app.emit("task:update", &task);
+
+    // 立即启动主会话 Agent 轮次推进！
+    agent::spawn_session_task(app.clone(), session_id.clone(), Some(user_msg_id));
 
     let rx = register_control(&task_id);
     let app_clone = app.clone();
@@ -137,68 +142,21 @@ pub fn start_long_task(
     Ok(task)
 }
 
-/// 暂停长任务（单一权威控制中心：即时冻结各子任务与进程树，原子持久化 paused 状态）
+/// 暂停长任务（微秒级非阻塞暂停）
 pub fn pause_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
     set_control(task_id, true);
     let state = app.state::<crate::AppState>();
-    let (session_id, running_sub_ids) = {
+    let session_id = {
         let db = state.db.lock().unwrap();
         let mut task = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
         task.status = "paused".to_string();
-        let mut running_subs = Vec::new();
-        for sub in &mut task.subtasks {
-            if sub.status == "running" || sub.status == "verifying" || sub.status == "in_progress" {
-                sub.status = "paused".to_string();
-                if !sub.id.is_empty() && !sub.id.starts_with("sub-") {
-                    running_subs.push(sub.id.clone());
-                }
-            }
-        }
         task.updated_at = store::now();
         store::update_long_task(&db, &task)?;
-
-        // 同步将进行中的子会话在 sessions 表中置为 paused，并关闭 open runs
-        for sid in &running_subs {
-            let _ = store::set_session_status(&db, sid, "paused");
-            let _ = db.execute(
-                "UPDATE runs SET status = 'cancelled', ended_at = ?1 WHERE session_id = ?2 AND status IN ('running', 'interrupted')",
-                rusqlite::params![store::now(), sid],
-            );
-        }
-
-        let _ = db.execute(
-            "UPDATE runs SET status = 'cancelled', ended_at = ?1 WHERE session_id = ?2 AND status IN ('running', 'interrupted')",
-            rusqlite::params![store::now(), &task.session_id],
-        );
-        (task.session_id, running_subs)
+        task.session_id
     };
 
-    // 确定性即刻强杀：直接对所有运行中的子任务执行 AbortHandle 强杀与控制台进程树销毁（cascade=false，防止意外篡改）
-    for sid in &running_sub_ids {
-        agent::stop_session_ext(app, sid, false);
-        let _ = app.emit("subprocess:update", serde_json::json!({
-            "parentId": &session_id,
-            "parentSessionId": &session_id,
-            "subprocessId": sid,
-            "status": "paused"
-        }));
-        let _ = app.emit("subagent:update", serde_json::json!({
-            "parentId": &session_id,
-            "subagentId": sid,
-            "status": "paused"
-        }));
-        crate::emit_event(
-            app,
-            "run:status",
-            &serde_json::json!({
-                "sessionId": sid,
-                "status": "idle"
-            }),
-        );
-    }
-
-    // 停止主会话挂起状态（cascade = false 保证不将子会话误刷成 cancelled）
-    agent::stop_session_ext(app, &session_id, false);
+    // 级联非阻塞停止主会话及其实时运行的子任务
+    agent::stop_session_ext(app, &session_id, true);
 
     crate::emit_event(
         app,
@@ -208,9 +166,6 @@ pub fn pause_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
             "status": "idle"
         }),
     );
-    let _ = app.emit("subprocesses:changed", serde_json::json!({ "parentId": &session_id }));
-    let _ = app.emit("subagents:changed", serde_json::json!({ "parentId": &session_id }));
-
     if let Ok(Some(task)) = {
         let db = state.db.lock().unwrap();
         store::get_long_task(&db, task_id)
@@ -226,24 +181,8 @@ pub fn resume_long_task(app: &AppHandle, task_id: &str) -> Result<LongTask, Stri
     let task = {
         let db = state.db.lock().unwrap();
         let mut t = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
-        if t.status != "paused" && t.status != "failed" && t.status != "interrupted" {
-            return Err(format!("任务当前状态为 {}，无法恢复执行", t.status));
-        }
         t.status = "running".to_string();
         t.updated_at = store::now();
-        for sub in &mut t.subtasks {
-            if sub.status == "failed"
-                || sub.status == "in_progress"
-                || sub.status == "verifying"
-                || sub.status == "interrupted"
-                || sub.status == "paused"
-            {
-                sub.status = "pending".to_string();
-                sub.error = None;
-            }
-        }
-        let next_idx = get_next_subtask_index(&t).unwrap_or(t.current_subtask_index);
-        t.current_subtask_index = next_idx;
         store::update_long_task(&db, &t)?;
         t
     };
@@ -253,16 +192,50 @@ pub fn resume_long_task(app: &AppHandle, task_id: &str) -> Result<LongTask, Stri
     let app_clone = app.clone();
     let task_clone = task.clone();
 
+    // 重新拉起守护推进循环
     tauri::async_runtime::spawn(async move {
         run_task_loop(app_clone, task_clone, rx).await;
     });
 
+    // 恢复主会话推进
+    let _ = agent::continue_turn_autonomous(app, &task.session_id);
+
     Ok(task)
 }
 
-/// 终止/取消长任务（单一权威控制中心：即时冻结各子任务与进程树，原子持久化 cancelled 状态）
+/// 终止/取消长任务
+pub fn cancel_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
+    set_control(task_id, true);
+    let state = app.state::<crate::AppState>();
+    let session_id = {
+        let db = state.db.lock().unwrap();
+        let mut task = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
+        task.status = "cancelled".to_string();
+        task.updated_at = store::now();
+        store::update_long_task(&db, &task)?;
+        task.session_id
+    };
 
-/// 宣告完成长任务（支持 Agent 自主裁决或系统结案：原子性将所有子任务与总任务置为 completed，生成终态检查点，并通知权威看板与前端）
+    agent::stop_session_ext(app, &session_id, true);
+
+    crate::emit_event(
+        app,
+        "run:status",
+        &serde_json::json!({
+            "sessionId": &session_id,
+            "status": "idle"
+        }),
+    );
+    if let Ok(Some(task)) = {
+        let db = state.db.lock().unwrap();
+        store::get_long_task(&db, task_id)
+    } {
+        let _ = app.emit("task:update", &task);
+    }
+    Ok(())
+}
+
+/// 宣告完成长任务（支持 Agent 自主裁决或系统结案）
 pub fn complete_long_task(
     app: &AppHandle,
     task_id: &str,
@@ -277,7 +250,6 @@ pub fn complete_long_task(
         t.status = "completed".to_string();
         t.updated_at = store::now();
 
-        // 统一标记所有剩余子任务为 completed
         for sub in &mut t.subtasks {
             if sub.status != "completed" && sub.status != "skipped" {
                 sub.status = "completed".to_string();
@@ -289,13 +261,12 @@ pub fn complete_long_task(
         }
         store::update_long_task(&db, &t)?;
 
-        // 归档终态检查点
         let summary_text = summary.unwrap_or("长任务全部目标达成并由智能体通过实测验收");
         let evidence_text = evidence.unwrap_or("已在现场通过测试与自检验证");
         let cp = TaskCheckpoint {
             id: format!("cp-{}", uuid::Uuid::new_v4().simple()),
             task_id: t.id.clone(),
-            step_number: t.subtasks.len().max(1),
+            step_number: t.current_step.max(1),
             subtask_id: None,
             status: "completed".to_string(),
             summary: summary_text.to_string(),
@@ -305,7 +276,6 @@ pub fn complete_long_task(
         };
         let _ = store::save_task_checkpoint(&db, &cp);
 
-        // 若挂载了落地方案，同步结案权威方案
         let ws = std::path::PathBuf::from(&t.workspace_path);
         if let Some((_, meta, _)) = crate::plan::find_plan_file(&ws, &t.session_id, None, Some(&db)) {
             let _ = crate::plan::update_plan(
@@ -360,85 +330,6 @@ pub fn pause_long_task_by_session(
     pause_long_task(app, &task.id)
 }
 
-pub fn cancel_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
-    set_control(task_id, true);
-    let state = app.state::<crate::AppState>();
-    let (session_id, running_sub_ids) = {
-        let db = state.db.lock().unwrap();
-        let mut task = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
-        task.status = "cancelled".to_string();
-        let mut running_subs = Vec::new();
-        for sub in &mut task.subtasks {
-            if sub.status == "running" || sub.status == "verifying" || sub.status == "in_progress" {
-                sub.status = "cancelled".to_string();
-                if !sub.id.is_empty() && !sub.id.starts_with("sub-") {
-                    running_subs.push(sub.id.clone());
-                }
-            }
-        }
-        task.updated_at = store::now();
-        store::update_long_task(&db, &task)?;
-
-        for sid in &running_subs {
-            let _ = store::set_session_status(&db, sid, "cancelled");
-            let _ = db.execute(
-                "UPDATE runs SET status = 'cancelled', ended_at = ?1 WHERE session_id = ?2 AND status IN ('running', 'interrupted')",
-                rusqlite::params![store::now(), sid],
-            );
-        }
-
-        let _ = db.execute(
-            "UPDATE runs SET status = 'cancelled', ended_at = ?1 WHERE session_id = ?2 AND status IN ('running', 'interrupted')",
-            rusqlite::params![store::now(), &task.session_id],
-        );
-        (task.session_id, running_subs)
-    };
-
-    for sid in &running_sub_ids {
-        agent::stop_session_ext(app, sid, false);
-        let _ = app.emit("subprocess:update", serde_json::json!({
-            "parentId": &session_id,
-            "parentSessionId": &session_id,
-            "subprocessId": sid,
-            "status": "cancelled"
-        }));
-        let _ = app.emit("subagent:update", serde_json::json!({
-            "parentId": &session_id,
-            "subagentId": sid,
-            "status": "cancelled"
-        }));
-        crate::emit_event(
-            app,
-            "run:status",
-            &serde_json::json!({
-                "sessionId": sid,
-                "status": "idle"
-            }),
-        );
-    }
-
-    agent::stop_session_ext(app, &session_id, false);
-
-    crate::emit_event(
-        app,
-        "run:status",
-        &serde_json::json!({
-            "sessionId": &session_id,
-            "status": "idle"
-        }),
-    );
-    let _ = app.emit("subprocesses:changed", serde_json::json!({ "parentId": &session_id }));
-    let _ = app.emit("subagents:changed", serde_json::json!({ "parentId": &session_id }));
-
-    if let Ok(Some(task)) = {
-        let db = state.db.lock().unwrap();
-        store::get_long_task(&db, task_id)
-    } {
-        let _ = app.emit("task:update", &task);
-    }
-    Ok(())
-}
-
 /// 获取会话当前活跃长任务
 pub fn get_active_task(app: &AppHandle, session_id: &str) -> Result<Option<LongTask>, String> {
     let state = app.state::<crate::AppState>();
@@ -453,7 +344,7 @@ pub fn list_task_checkpoints(app: &AppHandle, task_id: &str) -> Result<Vec<TaskC
     store::list_task_checkpoints(&db, task_id)
 }
 
-/// 回退到指定检查点（时光机与代码级 Reset）
+/// 回退到指定检查点
 pub fn rollback_to_checkpoint(app: &AppHandle, checkpoint_id: &str) -> Result<LongTask, String> {
     let state = app.state::<crate::AppState>();
     let (mut task, cp) = {
@@ -486,15 +377,12 @@ pub fn rollback_to_checkpoint(app: &AppHandle, checkpoint_id: &str) -> Result<Lo
         (task, cp)
     };
 
-    // 1. 暂停当前可能在运行的任务
     let _ = pause_long_task(app, &task.id);
 
-    // 2. 将任务回退到该检查点步数
     task.current_subtask_index = cp.step_number.saturating_sub(1);
     task.status = "paused".to_string();
     task.updated_at = store::now();
 
-    // 3. 重置后续子任务状态为 pending
     for i in task.current_subtask_index..task.subtasks.len() {
         task.subtasks[i].status = "pending".to_string();
         task.subtasks[i].summary = None;
@@ -515,7 +403,7 @@ pub fn rollback_to_checkpoint(app: &AppHandle, checkpoint_id: &str) -> Result<Lo
     Ok(task)
 }
 
-/// 更新待执行的子任务清单（支持用户在线手动编辑/增删调序）
+/// 更新待执行的子任务清单
 pub fn update_task_subtasks(
     app: &AppHandle,
     task_id: &str,
