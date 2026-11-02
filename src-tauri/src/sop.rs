@@ -141,6 +141,28 @@ pub async fn run_verify_cmd(
     }
 }
 
+/// 检查交付自检命令的报错输出是否与本次修改的文件强相关。
+/// 若输出中包含修改文件路径或文件名（如编译报错、单测失败堆栈引用），返回 true；
+/// 若完全未提及本次修改的文件，判定为既有历史遗留问题，返回 false。
+pub fn is_sop_error_correlated(out: &str, modified_files: &[String]) -> bool {
+    if modified_files.is_empty() {
+        return false;
+    }
+    let lower_out = out.to_lowercase();
+    for f in modified_files {
+        let f_trimmed = f.trim();
+        if f_trimmed.is_empty() {
+            continue;
+        }
+        let lower_f = f_trimmed.to_lowercase();
+        // 匹配正斜杠与反斜杠形式
+        if lower_out.contains(&lower_f) || lower_out.contains(&lower_f.replace('/', "\\")) {
+            return true;
+        }
+    }
+    false
+}
+
 /// 判断路径中某组件是否属于非代码/纯文档目录（相对工作区而言）
 fn is_non_code_dir_component(comp: &str) -> bool {
     matches!(
@@ -457,6 +479,28 @@ mod tests {
             .unwrap();
         assert!(ok);
         assert!(out.contains("success"));
+    }
+
+    #[test]
+    fn test_is_sop_error_correlated() {
+        let modified = vec![
+            "src/agent.rs".to_string(),
+            "agent.rs".to_string(),
+        ];
+        // 1. 匹配到相对路径或文件名
+        let out1 = "error[E0425]: cannot find value `x` in this scope\n --> src/agent.rs:1517:9";
+        assert!(is_sop_error_correlated(out1, &modified));
+
+        // 2. 匹配 Windows 反斜杠
+        let out2 = "error: failed in src\\agent.rs line 12";
+        assert!(is_sop_error_correlated(out2, &modified));
+
+        // 3. 完全无关的历史遗留测试报错
+        let out3 = "FAIL tests/legacy_auth.test.ts: 401 Unauthorized\n    at Object.<anonymous> (tests/legacy_auth.test.ts:25:12)";
+        assert!(!is_sop_error_correlated(out3, &modified));
+
+        // 4. 空修改文件列表
+        assert!(!is_sop_error_correlated(out1, &[]));
     }
 
     #[test]

@@ -863,5 +863,24 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             risk: Risk::Write,
             schema: json!({ "type": "object", "properties": {} }),
         },
+        ToolSpec {
+            name: "call_extended_tool",
+            description: "按需调用扩展工具目录中的专业工具（如浏览器操作 browser_*、协作者委派 dispatch_collaborator、长期记忆 record_memory、网页抓取 fetch_web_page 等）。若不确定入参，可传 arguments: {\"help\": true} 查看该工具的完整参数规范与使用说明。",
+            risk: Risk::Execute,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "type": "string",
+                        "description": "要调用的扩展工具名称，如 'browser_navigate', 'dispatch_collaborator', 'record_memory', 'fetch_web_page' 等"
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "description": "传递给扩展工具的入参对象。若传 {\"help\": true} 则直接返回该工具的入参规范与使用说明。"
+                    }
+                },
+                "required": ["tool_name", "arguments"]
+            }),
+        },
     ]
 }

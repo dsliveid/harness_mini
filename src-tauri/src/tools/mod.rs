@@ -92,6 +92,31 @@ pub(crate) async fn dispatch_static(
         "temp_snapshot" => temp::temp_snapshot(args, ctx).await,
         "temp_restore" => temp::temp_restore(args, ctx).await,
         "temp_merge" => temp::temp_merge(ctx).await,
+        "call_extended_tool" => {
+            let target_name = args
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "缺少必需参数 `tool_name`".to_string())?;
+            let sub_args = args
+                .get("arguments")
+                .cloned()
+                .unwrap_or(Value::Object(serde_json::Map::new()));
+
+            if sub_args.get("help").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let all_specs = specs::tool_specs();
+                if let Some(s) = all_specs.into_iter().find(|s| s.name == target_name) {
+                    return Ok(format!(
+                        "【扩展工具 `{target_name}` 详细参数规范】\n功能描述：{}\n参数 Schema：\n```json\n{}\n```",
+                        s.description,
+                        serde_json::to_string_pretty(&s.schema).unwrap_or_default()
+                    ));
+                } else {
+                    return Err(format!("未在扩展工具目录中找到工具 `{target_name}`"));
+                }
+            }
+
+            Box::pin(dispatch_static(target_name, &sub_args, ctx, on_partial)).await
+        },
         _ => Err(format!("未知工具: {name}")),
     }
 }

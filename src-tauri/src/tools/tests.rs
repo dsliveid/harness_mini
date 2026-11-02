@@ -314,3 +314,51 @@ const handleClick = async () => {
         assert!(md.contains("[link](https://example.com)"));
         assert!(md.contains(r#""quotes" and & ampersand"#));
     }
+
+    #[tokio::test]
+    async fn test_core_tools_contain_call_extended_tool_and_catalog_filtering() {
+        let registry = super::registry::ToolRegistry::new();
+        let specs = registry.list_specs(false, false).await;
+        let names: Vec<&str> = specs.iter().map(|s| s.name).collect();
+
+        // 核心工具数量严格收敛
+        assert_eq!(names.len(), CORE_TOOL_NAMES.len());
+        assert!(names.contains(&"call_extended_tool"));
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"create_plan"));
+        assert!(names.contains(&"update_plan"));
+        assert!(names.contains(&"todo"));
+
+        // 扩展工具被收敛，不在顶层直接暴露
+        assert!(!names.contains(&"browser_navigate"));
+        assert!(!names.contains(&"browser_interact"));
+        assert!(!names.contains(&"record_memory"));
+    }
+
+    #[tokio::test]
+    async fn test_call_extended_tool_help() {
+        let ws = std::env::temp_dir().join(format!("hm_test_cet_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&ws);
+        let ctx = ToolCtx {
+            workspace: ws.clone(),
+            sandbox_root: None,
+            command_timeout: std::time::Duration::from_secs(5),
+            temp: None,
+            host: None,
+            event_id: None,
+            message_id: None,
+            proxy_url: None,
+        };
+        let on_partial = |_line: &str| {};
+        let args = json!({
+            "tool_name": "browser_navigate",
+            "arguments": {
+                "help": true
+            }
+        });
+        let res = super::dispatch_static("call_extended_tool", &args, &ctx, &on_partial).await.unwrap();
+        assert!(res.contains("browser_navigate"));
+        assert!(res.contains("参数 Schema"));
+        assert!(res.contains("Chromium"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }

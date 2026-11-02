@@ -1,4 +1,4 @@
-use super::types::{PartialCb, Tool, ToolCtx, ToolSpec, SUBAGENT_TOOL_NAMES, TEMP_TOOL_NAMES};
+use super::types::{PartialCb, Tool, ToolCtx, ToolSpec, CORE_TOOL_NAMES, SUBAGENT_TOOL_NAMES, TEMP_TOOL_NAMES};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,7 +33,10 @@ impl ToolRegistry {
 
     pub async fn list_specs(&self, is_temp: bool, is_subagent: bool) -> Vec<ToolSpec> {
         let mut specs = super::specs::tool_specs();
-        specs.retain(|s| is_temp || !TEMP_TOOL_NAMES.contains(&s.name));
+        // 核心收敛：常规会话仅下发 CORE_TOOL_NAMES（含 call_extended_tool 元工具），其余扩展工具统一通过目录按需调用
+        specs.retain(|s| {
+            CORE_TOOL_NAMES.contains(&s.name) || (is_temp && TEMP_TOOL_NAMES.contains(&s.name))
+        });
         specs.retain(|s| !is_subagent || !SUBAGENT_TOOL_NAMES.contains(&s.name));
 
         let dyn_tools = self.dynamic_tools.read().await;

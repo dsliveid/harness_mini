@@ -134,7 +134,7 @@ pub fn build_static_collaborator_section(
     if collabs.is_empty() {
         return None;
     }
-    let mut text = String::from("## 可用项目协作者名录 (Collaborators)\n你拥有以下常驻专业协作者团队。当用户任务命中某位协作者的【调度触发规则】时，你**必须无条件优先调用 `dispatch_collaborator` 委派**，随后紧接着调用 `wait_collaborators` 获取其成果报告，严禁自行直接执行！\n\n");
+    let mut text = String::from("## 可用项目协作者名录 (Collaborators)\n你拥有以下常驻专业协作者团队。主进程作为总架构师，默认优先就地直接处理简单任务与局部改动；仅在遇到明确的跨模块并发、专职领域或大体量独立子任务时，根据下述职责定位按需委派给对应协作者。\n\n");
     for c in collabs {
         let role_display = match c.subagent_role.as_deref() {
             Some("image_gen") => "AI 绘画师 / 图像生成",
@@ -165,7 +165,7 @@ pub fn build_static_collaborator_section(
             String::new()
         };
         text.push_str(&format!(
-            "### 【{}】(ID: `{}` | 角色: {}{}{})\n- **主进程调度触发规则（命中即委派）**: {}\n- **专业职责设定**: {}\n\n",
+            "### 【{}】(ID: `{}` | 角色: {}{}{})\n- **主进程建议调度规则（按需委派）**: {}\n- **专业职责设定**: {}\n\n",
             c.title,
             c.id,
             role_display,
@@ -430,7 +430,7 @@ pub fn build_static_system_prompt(
                    ① 准备委派架构分析、技术调研或复杂模块任务前，主进程必须先用 1~2 步只读工具（如读取 package.json/Cargo.toml 或根目录大纲）快速识别项目技术栈与入口文件，完成 O(1) 宏观地貌锚定；\n     \
                    ② 严禁空对空下发抽象宽泛的指令！生成交接任务书时必须明确指明：初始探查入口文件（target_anchors）、严格负向禁止项（negative_scope，如严禁全盘通配扫描 dir /s，严禁遍历业务组件）以及步骤预算（step_budget: 6~8 步以内收敛）与 2~3 个具体问卷问题；\n     \
                    ③ 主进程把控全局契约，严禁替子任务做完整分析（避免过度工作），也严禁把控太宽导致子任务失控。\n   \
-                 - 常驻协作者委派（优先）：当下方【可用项目协作者名录】中已存在对应常驻协作者且命中其专属职责时，你【必须调用 `dispatch_collaborator` 工具】进行委派，并在调用后紧接着调用 `wait_collaborators` 等待成果汇报。\n   \
+                 - 常驻协作者委派（按需）：当遇到复杂跨模块或专职领域任务时，可按需调用 `dispatch_collaborator` 工具（或通过 `call_extended_tool`）委派并等待成果汇报；微小明确的就地修改严禁过度委派，直接在主会话中完成。\n   \
                  - 弹性多子 Agent 并行：面对大型复杂任务，支持同时派发多个前端和多个后端子 Agent 开展高并发开发，必须划分互不正交的战场范围。\n   \
                  - 过程免重构，单一结案门禁：全量编译构建与回归测试统一延后至所有子任务交付后的【最终验收门禁】一次性执行。\n   \
                  - ⚠️【反过度委派原则与自决准则】：微小明确的就地修改严禁派生子 Agent，直接在主会话中完成。"
@@ -466,6 +466,11 @@ pub fn build_static_system_prompt(
 
         rules.push(format!(
             "{rule_num}. 【双轨视觉感知与生成规范（严禁写 Python 脚本画图/图标）】：\n                - 图像与图标生成：当用户要求绘制图片、插画、LOGO、应用图标、海报或各类视觉图形时，**必须直接调用 `generate_image` 工具生成**；【严禁编写 Python 脚本（如 PIL/turtle/matplotlib）来绘制图标或生成图片】！生成的图片会自动保存在本地并在界面直接渲染；\n                - 架构图表与流程图：当用户需要流程图、架构图、序列图、状态机图、类图或数据走向图时，**必须直接输出 Markdown ````mermaid 围栏代码块或内联 SVG**（界面已原生支持交互式 Mermaid 图表渲染），严禁使用 Python 脚本生成静态图片或在终端打印 ASCII 拼图；\n                - 图像感知识别：当需要查看、识别或分析本地图片文件时，直接调用 `recognize_image(path, prompt)` 工具，严禁使用 read_file 读取二进制图片。"
+        ));
+        rule_num += 1;
+
+        rules.push(format!(
+            "{rule_num}. 【扩展工具目录（按需调用机制）】：\n             当上述常驻核心工具无法满足特定业务场景时，你可通过 `call_extended_tool(tool_name: \"...\", arguments: {{...}})` 按需调用以下扩展工具：\n             - 网页与浏览器交互：\n               * `fetch_web_page(url)`: 通过 HTTP/HTTPS 获取网页并提取为 Markdown 文本\n               * `browser_navigate(url)`: 打开后台 Chromium 访问网页并获取可交互元素清单 (@eX)\n               * `browser_interact(action, element_id, text)`: 网页元素点击、表单输入、提交等\n               * `browser_scroll(direction)`: 滚动网页视口 (down/up/top/bottom)\n               * `browser_get_debug_state()`: 获取当前页面的 Console 报错与 HTTP 异常列表\n               * `browser_screenshot()`: 截取当前网页屏幕快照\n               * `browser_close()`: 关闭当前浏览器会话并释放系统资源\n             - 团队协作与子任务委派：\n               * `dispatch_collaborator(collaborator_id, task, context)`: 按需委派任务给常驻专业协作者\n               * `wait_collaborators(timeout_secs)`: 等待协作者执行完成并获取成果汇报\n               * `get_collaborators()`: 查询当前可用协作者名录与状态\n               * `spawn_subagent(role, task)`: 派生专职子 Agent 并行处理大型独立任务\n               * `wait_subagents()`: 等待子 Agent 汇聚\n             - 知识沉淀与技能管理：\n               * `record_memory(content, category)`: 沉淀技术大盘与主题事实至 .harness/memory/\n               * `read_memory(query, category)`: 检索 .harness/memory/ 中已沉淀的记忆知识\n               * `list_skills()`, `run_skill(skill_name, args)`: 查看与运行已固化项目技能\n             - 多模态感知与生成：\n               * `generate_image(prompt, aspect_ratio)`: 绘制图片、图标、LOGO 或视觉图形\n               * `recognize_image(path, prompt)`: 深入识别与分析本地图片内容\n             *(若需查阅任一扩展工具的完整入参 Schema，直接调用 `call_extended_tool(tool_name: \"...\", arguments: {{\'help\': true}})` 即可)"
         ));
         rule_num += 1;
 

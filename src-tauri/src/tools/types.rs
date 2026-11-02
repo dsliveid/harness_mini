@@ -53,6 +53,22 @@ pub struct ToolCtx {
 
 pub type PartialCb<'a> = &'a (dyn Fn(&str) + Send + Sync);
 
+/// 常驻核心工具集（直接以原生顶级 Function 下发给大模型，保持前缀缓存 100% 恒定）
+pub const CORE_TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "list_dir",
+    "file_outline",
+    "glob",
+    "grep",
+    "write_file",
+    "edit_file",
+    "run_command",
+    "todo",
+    "create_plan",
+    "update_plan",
+    "call_extended_tool",
+];
+
 /// 临时空间会话下发的 temp_* 工具集（普通会话不下发，见 agent.rs run_once 的 specs 过滤）
 pub const TEMP_TOOL_NAMES: &[&str] = &[
     "temp_status",

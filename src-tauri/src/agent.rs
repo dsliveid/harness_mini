@@ -1457,6 +1457,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
     let mut sop_verified = false;
     let mut files_modified = false;
     let mut code_modified = false;
+    let mut modified_files: Vec<String> = Vec::new();
     let mut sop_retry_count = 0usize;
     let mut tool_tracker = ToolErrorTracker::new(2);
     let mut has_checked_compaction = false;
@@ -1893,30 +1894,49 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                             );
                         }
                         Ok((false, out)) => {
-                            sop_retry_count += 1;
-                            let _ = app.emit(
-                                "sop:status",
-                                json!({
-                                    "sessionId": session_id,
-                                    "status": "failed",
-                                    "command": cmd,
-                                    "output": out,
-                                }),
-                            );
-
-                            {
-                                let db = state.db.lock().unwrap();
-                                let _ = store::update_message_content(&db, &assistant_id, &result.content, Some(&usage));
-                                if !result.reasoning.is_empty() {
-                                    let _ = store::update_message_reasoning(&db, &assistant_id, &result.reasoning);
-                                }
-                                let err_prompt = format!(
-                                    "【🛡️ 交付前 SOP 自检未通过】\n自检命令：`{cmd}`\n执行输出：\n```\n{out}\n```\n检测到上述构建或测试报错。请分析原因并修改代码进行自愈修复，确保自检通过后再交付完成任务。"
+                            let is_correlated = crate::sop::is_sop_error_correlated(&out, &modified_files);
+                            if is_correlated {
+                                sop_retry_count += 1;
+                                let _ = app.emit(
+                                    "sop:status",
+                                    json!({
+                                        "sessionId": session_id,
+                                        "status": "failed",
+                                        "command": cmd,
+                                        "output": out,
+                                    }),
                                 );
-                                let _ = store::new_message(&db, session_id, "user", Some(err_prompt), false);
+
+                                {
+                                    let db = state.db.lock().unwrap();
+                                    let _ = store::update_message_content(&db, &assistant_id, &result.content, Some(&usage));
+                                    if !result.reasoning.is_empty() {
+                                        let _ = store::update_message_reasoning(&db, &assistant_id, &result.reasoning);
+                                    }
+                                    let err_prompt = format!(
+                                        "【🛡️ 交付前 SOP 自检未通过】\n自检命令：`{cmd}`\n执行输出：\n```\n{out}\n```\n检测到上述构建或测试报错。请分析原因并修改代码进行自愈修复，确保自检通过后再交付完成任务。"
+                                    );
+                                    let _ = store::new_message(&db, session_id, "user", Some(err_prompt), false);
+                                }
+                                _step += 1;
+                                continue;
+                            } else {
+                                // 历史无关报错：安全放行交付（选项 B），在答复末尾附带轻量提示
+                                sop_verified = true;
+                                let _ = app.emit(
+                                    "sop:status",
+                                    json!({
+                                        "sessionId": session_id,
+                                        "status": "passed_unrelated_ignored",
+                                        "command": cmd,
+                                        "output": out,
+                                    }),
+                                );
+                                let note = format!(
+                                    "\n\n> 💡 **自检提示**：交付自检命令（`{cmd}`）检测到工程存在历史遗留测试/构建异常（经比对与本次修改文件无关），已安全放行交付。"
+                                );
+                                result.content.push_str(&note);
                             }
-                            _step += 1;
-                            continue;
                         }
                         Err(e) => {
                             let _ = app.emit(
@@ -2011,11 +2031,17 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 json!({"__parse_error": "工具参数不是有效 JSON"})
             });
 
+            let target_sub_tool = if tc.name == "call_extended_tool" {
+                args.get("tool_name").and_then(|v| v.as_str())
+            } else {
+                None
+            };
             let is_modifying = tc.name == "write_file"
                 || tc.name == "edit_file"
                 || tc.name == "run_command"
                 || tc.name == "delete_file"
-                || tc.name == "apply_diff";
+                || tc.name == "apply_diff"
+                || matches!(target_sub_tool, Some("write_file" | "edit_file" | "run_command" | "delete_file" | "apply_diff"));
             let guard_denied: Option<String> = if is_modifying {
                 if project_plan_mode == "always_plan" && created_plan_in_this_turn {
                     Some("【模式守卫拦截】: 当前项目启用了「Always Plan 模式」，执行方案刚刚生成，严禁在同一轮次中未经用户确认直接修改代码。请停止调用写入工具，向用户汇报当前计划核心并请求确认。".to_string())
@@ -2184,6 +2210,16 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                         code_modified = true;
                         sop_verified = false;
                     }
+                    let norm_rel = rel.replace('\\', "/");
+                    if !modified_files.contains(&norm_rel) {
+                        modified_files.push(norm_rel);
+                    }
+                    if let Some(fname) = p.file_name().and_then(|f| f.to_str()) {
+                        let fname_str = fname.to_string();
+                        if !modified_files.contains(&fname_str) {
+                            modified_files.push(fname_str);
+                        }
+                    }
                     let _ = app.emit("file_viewer:file_changed", serde_json::json!({
                         "path": full_path.to_string_lossy().to_string()
                     }));
@@ -2260,9 +2296,15 @@ async fn handle_tool_call(
         reverted_at: None,
     };
 
+    let check_name = if tool_name == "call_extended_tool" {
+        args.get("tool_name").and_then(|v| v.as_str()).unwrap_or(tool_name)
+    } else {
+        tool_name
+    };
+
     // Todo 先行门禁校验：
     // 主会话中，若启用 todo_first_gate，在没有 active todo 且没有 active plan 的情况下，严禁调用 write_file 或 edit_file
-    if tool_name == "write_file" || tool_name == "edit_file" {
+    if check_name == "write_file" || check_name == "edit_file" {
         let (is_sub, is_sop_enabled, has_active_plan_or_todo) = {
             let db = state.db.lock().unwrap();
             let sop_enabled = store::get_settings(&db)
@@ -2316,7 +2358,15 @@ async fn handle_tool_call(
         emit_tool(app, session_id, &ev);
         return (ev.status.clone(), ev.result_text.clone().unwrap_or_default());
     };
-    let risk = spec.risk;
+    let (eval_name, eval_args, risk) = if tool_name == "call_extended_tool" {
+        let t_name = args.get("tool_name").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let t_args = args.get("arguments").unwrap_or(args);
+        let all_specs = tools::specs::tool_specs();
+        let t_risk = all_specs.into_iter().find(|s| s.name == t_name).map(|s| s.risk).unwrap_or(spec.risk);
+        (t_name, t_args, t_risk)
+    } else {
+        (tool_name, args, spec.risk)
+    };
 
     // ---- 策略引擎安全评估（访问模式、安全域、规则判定） ----
     let (access_mode, session_rules) = {
@@ -2334,8 +2384,8 @@ async fn handle_tool_call(
 
     let policy_decision = crate::policy::PolicyEngine::evaluate(
         &crate::policy::ToolInvocation {
-            name: tool_name,
-            args,
+            name: eval_name,
+            args: eval_args,
             risk,
         },
         &crate::policy::SecurityContext {
@@ -2383,11 +2433,16 @@ async fn handle_tool_call(
         already_inserted = true;
         emit_tool(app, session_id, &ev);
 
+        let display_tool_name = if tool_name == "call_extended_tool" {
+            format!("call_extended_tool ({eval_name})")
+        } else {
+            tool_name.to_string()
+        };
         let req = ApprovalRequest {
             event_id: ev.id.clone(),
             session_id: session_id.to_string(),
-            tool_name: tool_name.to_string(),
-            params: args.clone(),
+            tool_name: display_tool_name,
+            params: eval_args.clone(),
             risk: ask_risk.into(),
             preview,
             force_once,
