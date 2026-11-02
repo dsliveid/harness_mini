@@ -67,6 +67,7 @@ const TOOL_TITLES: Record<string, string> = {
   temp_snapshot: "保存备份快照",
   temp_restore: "恢复状态",
   temp_merge: "合并回原目录",
+  deliver_to_parent: "向父对话交付",
 };
 
 function renderRiskBadge(risk: string) {
@@ -471,6 +472,19 @@ export function SettingsModal() {
             {title && <span className="text-[12px] text-ink font-medium">{title}</span>}
             {renderRiskBadge(t.risk)}
             {renderCategoryBadge(t.name, t.isTemp)}
+            {t.scopeLabel && (
+              <span
+                className={`text-[11px] px-1.5 py-0.5 rounded font-medium border ${
+                  t.scope === "sub_only"
+                    ? "bg-amber-500/15 text-amber-300 border-amber-500/30"
+                    : t.scope === "main_only"
+                    ? "bg-sky-500/15 text-sky-300 border-sky-500/30"
+                    : "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                }`}
+              >
+                {t.scopeLabel}
+              </span>
+            )}
           </div>
           <div className="text-[12px] text-inkdim mt-1.5 leading-relaxed">{t.description}</div>
         </div>
@@ -583,6 +597,19 @@ export function SettingsModal() {
               {s.phaseLabel}
             </span>
             {renderSopCategoryBadge(s.category, s.categoryLabel)}
+            {s.scopeLabel && (
+              <span
+                className={`text-[11px] px-1.5 py-0.5 rounded font-medium border ${
+                  s.scope === "sub_only"
+                    ? "bg-amber-500/15 text-amber-300 border-amber-500/30"
+                    : s.scope === "main_only"
+                    ? "bg-sky-500/15 text-sky-300 border-sky-500/30"
+                    : "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                }`}
+              >
+                {s.scopeLabel}
+              </span>
+            )}
           </div>
           <div className="text-[12px] text-inkdim mt-1.5 leading-relaxed">{s.description}</div>
           <div className="text-[11px] text-inkdim/60 mt-1.5 flex items-center gap-1 font-mono">

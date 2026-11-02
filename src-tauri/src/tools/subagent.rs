@@ -970,3 +970,69 @@ pub(crate) async fn get_collaborators_tool(ctx: &ToolCtx) -> Result<String, Stri
     Ok(out)
 }
 
+
+
+pub(crate) async fn deliver_to_parent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
+    let status_str = args.get("status").and_then(|v| v.as_str()).unwrap_or("completed");
+    let summary = args.get("summary").and_then(|v| v.as_str()).ok_or("缺少 summary 参数")?;
+    let verification = args.get("verification_result").and_then(|v| v.as_str()).unwrap_or("未提供自检输出");
+
+    let subagent_id = &host.session_id;
+    let state = host.app.state::<crate::AppState>();
+
+    let (parent_id, title, role) = {
+        let db = state.db.lock().unwrap();
+        let s = crate::store::get_session(&db, subagent_id)?.ok_or("子会话不存在")?;
+        if s.parent_session_id.is_none() && s.session_type != "subagent" && s.session_type != "subprocess" {
+            return Err("deliver_to_parent 仅允许在子任务会话中调用".into());
+        }
+        (s.parent_session_id.unwrap_or_default(), s.title.clone(), s.subagent_role.unwrap_or_else(|| "子任务协作 Agent".into()))
+    };
+
+    let final_status = if status_str == "blocked" { "failed" } else { "completed" };
+
+    let mut touched_files: Vec<String> = Vec::new();
+    if let Some(arr) = args.get("modified_files").and_then(|v| v.as_array()) {
+        for v in arr {
+            if let Some(p) = v.as_str() {
+                touched_files.push(p.to_string());
+            }
+        }
+    }
+
+    if !ctx.workspace.as_os_str().is_empty() {
+        let full_text = format!("### 交付总结\n{}\n\n### 验证结果\n{}", summary, verification);
+        let _ = save_subtask_report_artifact(
+            &ctx.workspace,
+            subagent_id,
+            &title,
+            &role,
+            &full_text,
+            &touched_files,
+        );
+    }
+
+    {
+        let db = state.db.lock().unwrap();
+        let _ = crate::store::set_session_status(&db, subagent_id, final_status);
+        let _ = crate::store::set_kv(&db, subagent_id, "delivered_outcome", final_status);
+    }
+
+    let _ = host.app.emit("subagent:update", json!({
+        "subagentId": subagent_id,
+        "status": final_status,
+        "summary": summary,
+        "modifiedFiles": touched_files,
+    }));
+    let _ = host.app.emit("subprocess:update", json!({
+        "subprocessId": subagent_id,
+        "status": final_status,
+    }));
+    if !parent_id.is_empty() {
+        let _ = host.app.emit("subagents:changed", json!({"parentId": parent_id}));
+        let _ = host.app.emit("subprocesses:changed", json!({"parentId": parent_id}));
+    }
+
+    Ok(format!("已成功向主进程提交交付成果！任务状态已登记为：【{final_status}】。系统将据此结案并唤醒主进程汇总。"))
+}

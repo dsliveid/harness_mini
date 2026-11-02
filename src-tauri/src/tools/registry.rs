@@ -1,4 +1,4 @@
-use super::types::{PartialCb, Tool, ToolCtx, ToolSpec, CORE_TOOL_NAMES, SUBAGENT_TOOL_NAMES, TEMP_TOOL_NAMES};
+use super::types::{PartialCb, Tool, ToolCtx, ToolScope, ToolSpec, CORE_TOOL_NAMES, TEMP_TOOL_NAMES};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,11 +33,24 @@ impl ToolRegistry {
 
     pub async fn list_specs(&self, is_temp: bool, is_subagent: bool) -> Vec<ToolSpec> {
         let mut specs = super::specs::tool_specs();
-        // 核心收敛：常规会话仅下发 CORE_TOOL_NAMES（含 call_extended_tool 元工具），其余扩展工具统一通过目录按需调用
+        // 基于 ToolScope 进行严格作用域过滤：
+        // 1. 主会话只下发 Universal 与 MainOnly 工具（不下发 SubOnly 如 deliver_to_parent）
+        // 2. 子任务会话只下发 Universal 与 SubOnly 工具（物理屏蔽 MainOnly 如子进程派生、浏览器等）
+        // 3. 核心收敛：常规会话仅下发 CORE_TOOL_NAMES 及 deliver_to_parent（临时空间含 temp_*），其余扩展工具统一通过 call_extended_tool 目录按需调用
         specs.retain(|s| {
-            CORE_TOOL_NAMES.contains(&s.name) || (is_temp && TEMP_TOOL_NAMES.contains(&s.name))
+            let scope_allowed = if is_subagent {
+                s.scope == ToolScope::Universal || s.scope == ToolScope::SubOnly
+            } else {
+                s.scope == ToolScope::Universal || s.scope == ToolScope::MainOnly
+            };
+            if !scope_allowed {
+                return false;
+            }
+            if !is_temp && TEMP_TOOL_NAMES.contains(&s.name) {
+                return false;
+            }
+            CORE_TOOL_NAMES.contains(&s.name) || s.name == "deliver_to_parent" || (is_temp && TEMP_TOOL_NAMES.contains(&s.name))
         });
-        specs.retain(|s| !is_subagent || !SUBAGENT_TOOL_NAMES.contains(&s.name));
 
         let dyn_tools = self.dynamic_tools.read().await;
         for tool in dyn_tools.values() {
@@ -48,6 +61,7 @@ impl ToolRegistry {
                 description: desc_str,
                 schema: tool.schema(),
                 risk: tool.risk(),
+                scope: ToolScope::Universal,
             });
         }
         specs

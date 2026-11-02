@@ -195,6 +195,10 @@ pub struct ToolInfo {
     pub description: String,
     pub risk: String,
     pub is_temp: bool,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub scope_label: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

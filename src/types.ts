@@ -156,6 +156,8 @@ export interface ToolInfo {
   description: string;
   risk: "read" | "write" | "execute";
   isTemp: boolean;
+  scope?: "universal" | "main_only" | "sub_only";
+  scopeLabel?: string;
 }
 
 export type ReasoningEffort = "default" | "low" | "medium" | "high";
@@ -322,6 +324,8 @@ export interface AgentSopInfo {
   phaseLabel: string;
   category: "thinking" | "memory" | "orchestration" | "quality" | "workflow";
   categoryLabel: string;
+  scope: "universal" | "main_only" | "sub_only";
+  scopeLabel: string;
   description: string;
   disableEffect: string;
 }
@@ -334,7 +338,9 @@ export const AGENT_SOPS: AgentSopInfo[] = [
     phaseLabel: "第一层级 · 前置意图与写入门禁",
     category: "thinking",
     categoryLabel: "思考范式",
-    description: "动代码前必须先调用 todo 工具声明任务清单（哪怕只有 1 个微小改动任务亦须立项）；只读勘察严格限制在 ≤8 步以内，查清直接答复；若达 8 步仍无法梳理 todo 必须立即停下向用户汇报事实并对齐目标；子进程与已有落盘计划天然豁免。",
+    scope: "universal",
+    scopeLabel: "主/子对话可用",
+    description: "动代码前必须先调用 todo 工具声明任务清单（哪怕只有 1 个微小改动任务亦须立项）；只读勘察严格限制在 ≤8 步以内，查清直接答复；若达 8 步仍无法梳理 todo 必须立即停下向用户/父进程汇报事实并对齐阻碍；落盘计划与子进程施工统一遵守此项门禁。",
     disableEffect: "禁用后：Agent 免除动代码前的强制 todo 立项约束，且不触发 8 步勘察上限熔断，可自由读写探索。",
   },
   {
@@ -344,6 +350,8 @@ export const AGENT_SOPS: AgentSopInfo[] = [
     phaseLabel: "第二层级 · 工程规划与落地执行",
     category: "thinking",
     categoryLabel: "思考范式",
+    scope: "universal",
+    scopeLabel: "主/子对话可用",
     description: "面对大改动任务（3个以上文件）或多轮需求，在 .harness/plans/ 自动建立结构化计划 MD 文档；需求变更时优先更新计划，后续严格根据计划分步执行，防止多轮需求失真与遗忘；若已有落盘计划，天然满足代码写入门禁。",
     disableEffect: "禁用后：Agent 接到任务后可直接编写代码，不强制在 .harness/plans/ 建立结构化方案文档。",
   },
@@ -354,6 +362,8 @@ export const AGENT_SOPS: AgentSopInfo[] = [
     phaseLabel: "第二层级 · 工程规划与落地执行",
     category: "workflow",
     categoryLabel: "任务规划",
+    scope: "universal",
+    scopeLabel: "主/子对话可用",
     description: "在涉及任何代码或文件变更时，无论任务大小（即使仅有 1 个任务项），均须调用 todo 工具列出计划，并随进展更新各项状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done，切勿遗留 in_progress 状态。",
     disableEffect: "禁用后：允许 Agent 自由多步推进，不强制调用 todo 工具维护状态清单。",
   },
@@ -364,8 +374,22 @@ export const AGENT_SOPS: AgentSopInfo[] = [
     phaseLabel: "第二层级 · 工程规划与落地执行",
     category: "orchestration",
     categoryLabel: "协同体系",
+    scope: "main_only",
+    scopeLabel: "仅主对话",
     description: "面对复杂需求、多模块并发开发（如前后端分离、多业务模块并行）时，总架构师按标准流程（规划拆解 -> 派生子 Agent -> 等待汇聚 -> 全局验收）采用子进程协同提升效率与模块隔离度。",
     disableEffect: "禁用后：停用多子进程协作编排指引，Agent 倾向于在单主进程内串行处理全部任务。",
+  },
+  {
+    id: "subagent_deliver",
+    name: "子任务交付与状态汇报规范",
+    phase: 2,
+    phaseLabel: "第二层级 · 工程规划与落地执行",
+    category: "orchestration",
+    categoryLabel: "协同体系",
+    scope: "sub_only",
+    scopeLabel: "子对话可用",
+    description: "专职子任务在完成施工、纯调研结案或遇到重大阻碍时，必须调用 deliver_to_parent 工具向父进程正式交付结构化成果（completed/partial/blocked 与 250 字以内核心总结）。交付后子会话立即优雅结案。",
+    disableEffect: "子对话专属交付规范，主对话天然跳过。",
   },
   {
     id: "surgical_code_reading",
@@ -374,6 +398,8 @@ export const AGENT_SOPS: AgentSopInfo[] = [
     phaseLabel: "第二层级 · 工程规划与落地执行",
     category: "quality",
     categoryLabel: "工程质量",
+    scope: "universal",
+    scopeLabel: "主/子对话可用",
     description: "探索业务与代码时遵循漏斗式渐进探索（目录/清单 ➔ file_outline 骨架 ➔ grep 线索 ➔ 局部靶向精读）；严禁对大型文件进行多轮无休止的分页切片（offset_line）式逐行通读；修改前只精读最小必要上下文，严禁凭空盲猜。",
     disableEffect: "禁用后：允许 Agent 自由阅读大段源码，解除对连续分页通读与精益读取的强约束。",
   },
@@ -384,6 +410,8 @@ export const AGENT_SOPS: AgentSopInfo[] = [
     phaseLabel: "第二层级 · 工程规划与落地执行",
     category: "quality",
     categoryLabel: "工程质量",
+    scope: "universal",
+    scopeLabel: "主/子对话可用",
     description: "修改文件前必须先用 read_file 读取相关内容，用 edit_file 做基于精确原文的最小化修改；新文件才用 write_file；动手前探索代码结构，修改后尽量用 run_command 运行构建或测试验证。",
     disableEffect: "禁用后：移除代码最小化精确修改与构建验证的强指引约束。",
   },
@@ -394,6 +422,8 @@ export const AGENT_SOPS: AgentSopInfo[] = [
     phaseLabel: "第二层级 · 工程规划与落地执行",
     category: "memory",
     categoryLabel: "知识资产",
+    scope: "universal",
+    scopeLabel: "主/子对话可用",
     description: "内置工作区长期认知记忆（.harness/memory/）；常见技术栈提问优先秒级召回；深入探索或阅读多个文件后强制调用 record_memory 沉淀技术大盘与主题碎记；对话完成后台自动萃取 digests。",
     disableEffect: "禁用后：移除强制调用 record_memory 沉淀约束，且会话结束后不触发后台自动提炼。",
   },

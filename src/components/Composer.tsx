@@ -94,6 +94,23 @@ const SLASH_COMMANDS: SlashCommand[] = [
     Icon: Sparkles,
   },
   {
+    cmd: "/init",
+    label: "/init [可选重点指引]",
+    desc: "初始化项目基线记忆：深度研读技术栈、核心端点与工程规范，并落盘至 .harness/memory/ 档案",
+    placeholder: "可选输入需重点梳理的业务模块或端点，Enter 执行初始化，Backspace 删除标签取消…",
+    requireBody: false,
+    emptyHint: "",
+    buildMessage: (body) =>
+      body
+        ? `【项目认知记忆初始化 /init】\n\n请全面深入勘察当前工作区的核心配置文件与代码架构骨架，沉淀初始化认知：\n1. 研读核心技术栈与依赖清单（如 package.json、Cargo.toml、pom.xml 等）；\n2. 梳理主要分层架构、API 与核心端点入口；\n3. 重点关注：${body}\n4. 动工前先通过 todo 立项，探查后调用 record_memory 工具将项目架构画像与工程规范更新至 .harness/memory/profile.md 及 conventions.md 中。`
+        : `【项目认知记忆初始化 /init】\n\n请全面深入勘察当前工作区的核心配置文件与代码架构骨架，沉淀初始化认知：\n1. 研读核心技术栈与依赖清单（如 package.json、Cargo.toml、pom.xml 等）；\n2. 梳理主要分层架构、API 与核心端点入口；\n3. 动工前先通过 todo 立项，探查后调用 record_memory 工具将项目架构画像与工程规范更新至 .harness/memory/profile.md 及 conventions.md 中。`,
+    badgeClass: "bg-teal-500/15 border-teal-500/35 text-teal-300",
+    iconClass: "text-teal-400",
+    closeClass: "hover:bg-teal-500/25 text-teal-400 hover:text-teal-100",
+    badgeTitle: "删除标签以取消初始化 (Backspace)",
+    Icon: Sparkles,
+  },
+  {
     cmd: "/compact",
     label: "/compact [可选聚焦重点]",
     desc: "提炼并压缩当前上下文历史：生成结构化技术备忘录并替换早期对话，释放 Token 空间",

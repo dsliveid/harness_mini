@@ -18,7 +18,7 @@ pub use file::record_file_snapshot_raw;
 pub use helpers::{inside_workspace, is_high_danger};
 pub use registry::ToolRegistry;
 pub use specs::tool_specs;
-pub use types::{HostCtx, PartialCb, Risk, Tool, ToolCtx, ToolSpec, SUBAGENT_TOOL_NAMES, TEMP_TOOL_NAMES};
+pub use types::{HostCtx, PartialCb, Risk, Tool, ToolCtx, ToolScope, ToolSpec, TEMP_TOOL_NAMES};
 
 use serde_json::Value;
 use std::sync::OnceLock;
@@ -81,6 +81,7 @@ pub(crate) async fn dispatch_static(
         "dispatch_collaborator" => subagent::dispatch_collaborator_tool(args, ctx).await,
         "wait_collaborators" => subagent::wait_collaborators_tool(args, ctx).await,
         "get_collaborators" => subagent::get_collaborators_tool(ctx).await,
+        "deliver_to_parent" => subagent::deliver_to_parent_tool(args, ctx).await,
         "generate_image" => skills_memory_plan::generate_image_tool(args, ctx).await,
         "recognize_image" => skills_memory_plan::recognize_image_tool(args, ctx).await,
         "judge_decision" => skills_memory_plan::judge_decision_tool(args, ctx).await,

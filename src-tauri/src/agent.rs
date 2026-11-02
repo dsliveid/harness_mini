@@ -1516,7 +1516,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
 
         // 第 8 步阶梯门禁拦截：当只读勘察达 8 步且尚未建立 Todo 时，注入强制对齐/立项提示
         let todo_first_enabled = !settings.disabled_sops.iter().any(|s| s == "todo_first_gate");
-        if todo_first_enabled && !is_subagent && _step == 8 {
+        if todo_first_enabled && _step == 8 {
             let has_active_plan_or_todo = {
                 let db = state.db.lock().unwrap();
                 let has_plan = store::get_kv(&db, session_id, "active_plan_id")
@@ -1532,10 +1532,17 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 has_plan || has_todo
             };
             if !has_active_plan_or_todo {
-                let gate_msg = "【🛑 第 8 步门禁拦截】：只读勘察已达 8 步上限且当前未创建 Todo 任务！\n\
+                let gate_msg = if is_subagent {
+                    "【🛑 第 8 步门禁拦截（子任务施工/探索门禁）】：只读勘察已达 8 步上限且当前未创建 Todo 任务！\n\
+                    1. 若本任务需要修改代码且施工目标明确，必须在下一步立即调用 todo 工具声明施工步骤清单（哪怕只有 1 个任务），方可开始调用 write_file / edit_file 施工；\n\
+                    2. 若为纯探索/调研类任务且事实已查明，严禁盲目漫游，直接整理结论并调用 deliver_to_parent(status: \"completed\", summary: \"...\") 结案交付；\n\
+                    3. 若在 8 步内探索受阻、无法梳理出可行方案或缺少前置条件，严禁继续漫游或盲目重试，必须立即调用 deliver_to_parent(status: \"blocked\", summary: \"...\") 汇报遇到的具体阻碍并交回主会话！"
+                } else {
+                    "【🛑 第 8 步门禁拦截】：只读勘察已达 8 步上限且当前未创建 Todo 任务！\n\
                     1. 若已查明事实且无需修改代码（如咨询答疑），必须立即在正式回复（Content）中输出完整答复并直接结案；\n\
                     2. 若需要修改代码且方向明确，必须在下一步先调用 todo 工具声明任务清单（哪怕只有 1 个任务），方可进行代码修改；\n\
-                    3. 若依然方向模糊、无法梳理出清晰的 todo 计划，严禁盲目漫游或脑补计划，必须立即停止调用工具，在正式回复中向用户汇报当前事实并对齐目标！";
+                    3. 若依然方向模糊、无法梳理出清晰的 todo 计划，严禁盲目漫游或脑补计划，必须立即停止调用工具，在正式回复中向用户汇报当前事实并对齐目标！"
+                };
                 messages.push(json!({
                     "role": "user",
                     "content": gate_msg,
@@ -2228,6 +2235,14 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                     sop_verified = false;
                 }
             }
+            if (tc.name == "deliver_to_parent"
+                || (tc.name == "call_extended_tool"
+                    && args.get("tool_name").and_then(|v| v.as_str()) == Some("deliver_to_parent")))
+                && status == "success"
+            {
+                // 子任务向父进程完成正式结构化交付，优雅结案并直接退出执行循环
+                return (RunOutcome::Done, last_assistant_id, run_tokens);
+            }
             if tc.name == "create_plan" && status == "success" {
                 created_plan_in_this_turn = true;
             }
@@ -2329,8 +2344,12 @@ async fn handle_tool_call(
                 .unwrap_or(false);
             (sub, sop_enabled, has_plan || has_todo)
         };
-        if is_sop_enabled && !is_sub && !has_active_plan_or_todo {
-            let reason = "【Todo 先行门禁拦截】：修改代码或文件前必须先调用 todo 工具声明任务清单（哪怕只有 1 个任务）。请先调用 todo 工具明确你将要执行的具体修改，然后再调用编辑或写入工具。".to_string();
+        if is_sop_enabled && !has_active_plan_or_todo {
+            let reason = if is_sub {
+                "【Todo 先行门禁拦截（子任务施工门禁）】：修改代码或文件前必须先调用 todo 工具声明任务步骤清单（哪怕只有 1 个任务）。主进程交接书为总体目标，施工前请先调用 todo 明确具体施工步骤，然后再调用编辑或写入工具。".to_string()
+            } else {
+                "【Todo 先行门禁拦截】：修改代码或文件前必须先调用 todo 工具声明任务清单（哪怕只有 1 个任务）。请先调用 todo 工具明确你将要执行的具体修改，然后再调用编辑或写入工具。".to_string()
+            };
             ev.status = "failed".into();
             ev.result_text = Some(reason.clone());
             {
@@ -2358,15 +2377,49 @@ async fn handle_tool_call(
         emit_tool(app, session_id, &ev);
         return (ev.status.clone(), ev.result_text.clone().unwrap_or_default());
     };
-    let (eval_name, eval_args, risk) = if tool_name == "call_extended_tool" {
+    let (eval_name, eval_args, risk, eval_scope) = if tool_name == "call_extended_tool" {
         let t_name = args.get("tool_name").and_then(|v| v.as_str()).unwrap_or("unknown");
         let t_args = args.get("arguments").unwrap_or(args);
         let all_specs = tools::specs::tool_specs();
-        let t_risk = all_specs.into_iter().find(|s| s.name == t_name).map(|s| s.risk).unwrap_or(spec.risk);
-        (t_name, t_args, t_risk)
+        let target_spec = all_specs.into_iter().find(|s| s.name == t_name);
+        let t_risk = target_spec.as_ref().map(|s| s.risk).unwrap_or(spec.risk);
+        let t_scope = target_spec.as_ref().map(|s| s.scope).unwrap_or(tools::ToolScope::Universal);
+        (t_name, t_args, t_risk, t_scope)
     } else {
-        (tool_name, args, spec.risk)
+        (tool_name, args, spec.risk, spec.scope)
     };
+
+    let is_subagent_session = {
+        let db = state.db.lock().unwrap();
+        store::get_session(&db, session_id).ok().flatten().map(|s| {
+            s.session_type == "subagent"
+                || s.session_type == "subprocess"
+                || s.session_type == "collaborator"
+                || s.parent_session_id.is_some()
+        }).unwrap_or(false)
+    };
+    if is_subagent_session && eval_scope == tools::ToolScope::MainOnly {
+        ev.status = "failed".into();
+        let reason = format!("【工具作用域拦截】：当前子任务会话不支持调用主会话专属工具 `{eval_name}`");
+        ev.result_text = Some(reason.clone());
+        {
+            let db = state.db.lock().unwrap();
+            let _ = store::insert_tool_event(&db, &ev);
+        }
+        emit_tool(app, session_id, &ev);
+        return ("failed".into(), reason);
+    }
+    if !is_subagent_session && eval_scope == tools::ToolScope::SubOnly {
+        ev.status = "failed".into();
+        let reason = format!("【工具作用域拦截】：主会话不支持调用子任务专属工具 `{eval_name}`");
+        ev.result_text = Some(reason.clone());
+        {
+            let db = state.db.lock().unwrap();
+            let _ = store::insert_tool_event(&db, &ev);
+        }
+        emit_tool(app, session_id, &ev);
+        return ("failed".into(), reason);
+    }
 
     // ---- 策略引擎安全评估（访问模式、安全域、规则判定） ----
     let (access_mode, session_rules) = {
@@ -3233,13 +3286,11 @@ mod tests {
         assert_eq!(msgs2[3]["role"], "tool");
         assert_eq!(msgs2[3]["content"].as_str().unwrap().len(), 5000);
 
-        // 仅当上下文面临严重压力（设置较小 token_limit 触发 safe_threshold）时，才按需对远期历史实施折叠瘦身
-        let (msgs3, _, _) = build_context(&conn, &s.id, "sys", 1000);
+        // 当上下文面临严重压力（如 token_limit=1000 且历史单个轮次超限）时，触发轮次级原子截断保护
+        let (msgs3, _, notice) = build_context(&conn, &s.id, "sys", 1000);
         let msgs3 = msgs3.unwrap();
-        assert_eq!(msgs3[3]["role"], "tool");
-        let hist_tool_content = msgs3[3]["content"].as_str().unwrap();
-        assert!(hist_tool_content.contains("已折叠前序详情以节省上下文空间"));
-        assert!(hist_tool_content.len() < 5000);
+        assert_eq!(msgs3.len(), 2); // sys, user (第二轮已原子保留，超限第一轮被优雅修剪)
+        assert!(notice.is_some());
     }
 
     fn link(name: &str, path: &str, description: &str, constraints: Option<&str>) -> ResolvedLink {
@@ -3416,7 +3467,7 @@ mod tests {
         assert!(p.contains("Todo 先行与阶梯门禁公理"));
         assert!(p.contains("Todo 先行与写入前置拦截"));
         assert!(p.contains("≤8 步勘察上限与目标对齐"));
-        assert!(p.contains("已有计划与子进程豁免"));
+        assert!(p.contains("已有计划豁免"));
         assert!(!p.contains("浏览器无头自主测试与免视觉验证 SOP"));
         assert!(!p.contains("崇尚行动与精益收敛准则"));
     }

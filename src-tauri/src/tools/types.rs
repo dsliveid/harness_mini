@@ -19,11 +19,40 @@ impl Risk {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ToolScope {
+    /// 主子会话通用核心工具（文件读写、检索、命令、Todo、计划、记忆等）
+    Universal,
+    /// 仅主会话可用（子任务派发、协作者编排、浏览器自动化等）
+    MainOnly,
+    /// 仅子任务会话可用（向父会话正式交付）
+    SubOnly,
+}
+
+impl ToolScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ToolScope::Universal => "universal",
+            ToolScope::MainOnly => "main_only",
+            ToolScope::SubOnly => "sub_only",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            ToolScope::Universal => "主/子对话可用",
+            ToolScope::MainOnly => "仅主对话",
+            ToolScope::SubOnly => "子对话可用",
+        }
+    }
+}
+
 pub struct ToolSpec {
     pub name: &'static str,
     pub description: &'static str,
     pub schema: Value,
     pub risk: Risk,
+    pub scope: ToolScope,
 }
 
 #[derive(Clone)]
@@ -79,7 +108,8 @@ pub const TEMP_TOOL_NAMES: &[&str] = &[
     "temp_merge",
 ];
 
-/// 子 Agent、协作者与子进程相关工具名称列表（子会话不下发）
+/// 子 Agent、协作者与子进程相关工具名称列表（已由 ToolScope::MainOnly 替代，保留常用于兼容与断言）
+#[allow(dead_code)]
 pub const SUBAGENT_TOOL_NAMES: &[&str] = &[
     "spawn_subagent",
     "get_subagent_status",

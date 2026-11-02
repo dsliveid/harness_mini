@@ -151,13 +151,20 @@ pub fn load_static_project_memory(workspace: &Path) -> Option<String> {
 
     let mut parts = Vec::new();
 
-    // 1. 读取 profile.md
+    // 1. 读取 profile.md（设置 8,000 字符上限，防止超大型项目档案无限膨胀）
     let profile_path = mem.join("profile.md");
     if let Ok(c) = fs::read_to_string(&profile_path) {
         let trimmed = c.trim();
         // 排除仅有模板初始文字的情况
         if !trimmed.is_empty() && !trimmed.contains("（待提炼沉淀：") {
-            parts.push(format!("### 项目技术大盘与架构档案 (profile.md)\n{trimmed}"));
+            let max_profile_chars = 8000;
+            let profile_content = if trimmed.len() > max_profile_chars {
+                let safe_slice = trimmed.char_indices().nth(max_profile_chars).map(|(i, _)| &trimmed[..i]).unwrap_or(&trimmed[..max_profile_chars]);
+                format!("{safe_slice}\n\n*(注：profile.md 超过 8,000 字符，已展示前部核心大盘，完整内容见 .harness/memory/profile.md)*")
+            } else {
+                trimmed.to_string()
+            };
+            parts.push(format!("### 项目技术大盘与架构档案 (profile.md)\n{profile_content}"));
         }
     }
 

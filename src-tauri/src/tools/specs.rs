@@ -7,6 +7,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "read_file",
             description: "读取工作区内文本文件的局部或全部内容（带行号）。修改文件前必须先用它确认精确原文。支持配合 offset_line 与 max_lines 定向阅读目标区域。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -21,6 +22,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "list_dir",
             description: "列出目录下的文件与子目录（含大小）。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -32,6 +34,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "file_outline",
             description: "提取代码文件的结构骨架与大纲（包含类、结构体、接口、枚举、函数签名及起始行号），过滤具体实现细节。在深入阅读代码前优先用它获取全局地图，以极低 Token 掌握全貌并精准定位目标行号。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -44,6 +47,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "glob",
             description: "按 glob 模式（支持 ** 与 *）查找文件，返回相对路径列表。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -57,6 +61,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "grep",
             description: "在工作区文件内容中按正则搜索，返回 `路径:行号: 内容` 列表。支持返回匹配行周边的上下文行数（context_lines），便于快速看清代码逻辑而无需频繁调用 read_file。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -72,6 +77,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "write_file",
             description: "新建文件或整体覆盖写入完整内容，返回 diff。仅用于新文件，修改已有文件请用 edit_file。",
             risk: Risk::Write,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -85,6 +91,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "edit_file",
             description: "用精确原文替换的方式修改文件（old_string 必须与文件内容逐字符一致），返回 diff。",
             risk: Risk::Write,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -100,6 +107,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "run_command",
             description: "在工作区目录执行 shell 命令（构建、测试、git 等），实时返回输出。禁止破坏性命令。",
             risk: Risk::Execute,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -113,6 +121,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "fetch_web_page",
             description: "通过 HTTP/HTTPS 请求获取指定网页的内容，并清洗转换为结构清晰的纯文本或 Markdown（自动过滤脚本、样式与无意义标签）。用于查阅外部技术文档、GitHub 内容、API 参考或网页资料。支持通过统一配置的代理访问网络。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -126,6 +135,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "browser_navigate",
             description: "在受控真实的 Chromium 浏览器中打开指定网页（默认无头模式后台静默运行，零桌面侵入，不干扰用户日常桌面操作；完整支持 Vue/React 等单页 SPA 渲染与动态 JS 执行）。返回页面标题、精简后的可交互元素清单（包含 @e1, @e2 等标签）、格式化数据表格、控制台错误与失败的网络请求。测试验证全面基于结构化文本断言，可用于本地服务 (如 127.0.0.1:8080) 的全链路界面调试与功能验证。",
             risk: Risk::Execute,
+            scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -139,6 +149,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "browser_interact",
             description: "在当前受控网页上执行交互操作（如点击、打字输入、回车提交、等待元素加载等）。通过 CDP 虚拟事件通道直接注入内核，绝不抢占物理鼠标键盘。优先使用 @e1, @e2 等 ref 标识符（由 browser_navigate 提取返回）定位元素，也可使用 CSS 选择器。交互完成后自动返回更新后的页面状态、控制台错误及网络异常。",
             risk: Risk::Execute,
+            scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -157,6 +168,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "browser_scroll",
             description: "滚动当前受控网页视口。支持按方向滚动(down/up/top/bottom)、按指定像素滚动，或直接滚动到指定交互元素(@eX)使其居中。长页面或表格溢出时，优先调用本工具向下滑动探索未展示内容。执行后自动刷新并返回最新视口内的元素与状态。",
             risk: Risk::Execute,
+            scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -180,6 +192,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "browser_get_debug_state",
             description: "获取当前受控网页的最新调试状态（包括可交互元素清单、最新的 Console 报错信息及 4xx/5xx 网络请求异常列表）。用于在异步数据加载完成或排查 Bug 时快速诊断前端问题。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {}
@@ -189,6 +202,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "browser_screenshot",
             description: "截取当前受控网页的实时视口屏幕截图并保存至本地工作区 .harness/tmp/browser_screenshot.png。注意：标准自动化测试应遵循免视觉准则（直接依据 DOM、数据表格与异常日志断言），本工具仅作为复杂排版或图表的人工协同查验辅助。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -203,6 +217,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "browser_close",
             description: "关闭当前的受控浏览器调试会话并释放系统资源。",
             risk: Risk::Execute,
+            scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {}
@@ -212,6 +227,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "todo",
             description: "维护当前任务清单（全量覆盖）。多步任务开始时列出计划，随进展更新各项状态。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -235,6 +251,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "list_skills",
             description: "列出当前工作区已定义的所有项目技能（.harness/skills/）。执行复杂或高频任务前可先查询已有技能。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {}
@@ -244,6 +261,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "save_skill",
             description: "将高频或复杂的组合脚本固化为工作区技能（.harness/skills/<name>/），供后续重复调用。",
             risk: Risk::Write,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -259,6 +277,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "run_skill",
             description: "执行工作区已存在的项目技能（.harness/skills/<name>/），返回执行输出。",
             risk: Risk::Execute,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -273,6 +292,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "record_memory",
             description: "在多步探索或代码阅读中，及时将关键技术栈、架构约定或阶段性分析结论固化至项目知识库（.harness/memory/），避免大文件反复堆积与遗忘。",
             risk: Risk::Write,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -297,6 +317,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "read_memory",
             description: "查阅当前项目在 .harness/memory/ 中已积累的知识库档案（包括技术大盘、工程规范或特定主题碎记）。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -311,6 +332,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "compact_context",
             description: "主动压缩当前会话的上下文历史。当对话轮次过多、上下文负载过高，或者用户明确指示压缩/总结上下文时调用该工具。系统将把先前的历史消息总结为结构化备忘录并替换早期消息，以释放大量 Token 空间。支持传入 focus 参数指明需要重点保留的技术细节。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -325,6 +347,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "control_long_task",
             description: "管控长任务守护进程的生命周期。当总目标已达成宣告结案完成、遇到阻断性前置条件缺失需停下等待人工裁决时安全挂起、或需要发起长任务守护推进时调用。系统将原子性更新长任务状态机、归档检查点并同步右侧看板。",
             risk: Risk::Write,
+            scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -358,6 +381,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "create_plan",
             description: "针对大改动任务（3个以上文件变动/重构）或多轮对话任务，在 .harness/plans/ 下建立规范的结构化计划 MD 文档，作为权威执行锚点。防止需求在多轮对话中失真或遗失。",
             risk: Risk::Write,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -386,6 +410,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "update_plan",
             description: "当用户在多轮对话中调整需求、或任务推进完成某一阶段时，更新计划文档正文、推进分步清单状态，并记录变更历史。在改动代码前务必先同步计划！若计划调整导致步骤发生变动，必须通过 modified_sections.steps 传入更新后的完整执行清单；若任务全部完成并通过测试，请将 status 设为 completed 以结案解除挂载。",
             risk: Risk::Write,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -443,6 +468,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "switch_plan",
             description: "在当前会话的历史任务计划之间快速切换。例如当用户在多需求场景中提出“回到之前的鉴权任务改个参数”时，调用此工具将历史计划重新唤醒为当前活动计划。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -455,6 +481,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "read_plan",
             description: "查阅指定计划或当前正在执行的活动计划的完整 Markdown 方案文档。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -466,6 +493,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "list_plans",
             description: "列出当前工作区在 .harness/plans/ 中已建立的所有任务计划清单及其推进状态、版本与完成度。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -478,6 +506,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "spawn_subagent",
             description: "创建并启动一个独立的子 Agent 进程并行协作（如前端开发、后端开发、多模块开发等）。子 Agent 拥有独立上下文与工具环境，不污染主会话上下文。通常与 wait_subagents 配合使用：总架构师连续派生多个子任务后，应紧接着调用 wait_subagents 等待完成并汇总结果。严禁子 Agent 递归嵌套调用本工具。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -494,6 +523,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "get_subagent_status",
             description: "查询子 Agent 进程的当前执行状态（running、done、failed、cancelled）与最新进展输出摘要。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -505,6 +535,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "wait_subagents",
             description: "等待一个或多个子 Agent 协作进程执行完毕，并自动获取汇总它们的执行结论、产出总结与改动文件清单。在调用 spawn_subagent 派生子任务后，应紧接着调用本工具等待汇聚。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -524,6 +555,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "stop_subagent",
             description: "停止指定的正在运行的子 Agent 协作进程。",
             risk: Risk::Write,
+            scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -536,6 +568,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "spawn_subprocess",
             description: "创建并启动一个独立的临时子进程并行执行特定任务（如探索、排查、独立测试等）。子进程拥有独立上下文与工具环境，物理工作区与主进程严格保持一致，执行完成后其成果直接内嵌在主对话流中呈现。外部用户无法干预子进程，任务完成后自动销毁/归档。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -568,6 +601,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "wait_subprocesses",
             description: "等待一个或多个由你派生的临时子进程执行完毕，并自动汇总它们的执行结论与改动文件清单。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -587,6 +621,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "stop_subprocess",
             description: "强制停止指定的正在运行的临时子进程。",
             risk: Risk::Write,
+            scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -599,6 +634,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "resume_subprocess",
             description: "恢复推进指定处于中断、停止或失败状态的临时子进程，使其在当前已有断点处继续执行任务。",
             risk: Risk::Write,
+            scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -611,6 +647,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "dispatch_collaborator",
             description: "向项目专属的常驻【项目协作者】（如前端专家、测试专家等）委派工作任务。协作者将在独立会话中基于其长远角色设定工作，完成后自动增量汇报主会话。注意：委派前请先调用 get_collaborators 确认其处于空闲状态。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -642,6 +679,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "wait_collaborators",
             description: "等待一个或多个协作者完成其当前轮次执行，并自动提取它们自上次汇报以来的增量成果与改动文件汇总回主会话。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -661,6 +699,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "get_collaborators",
             description: "查询当前项目已配置的所有协作者名录、角色专长、当前运行状态（idle 空闲 / busy 运行中）及最新产出摘要。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {}
@@ -670,6 +709,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "generate_image",
             description: "根据提示词生成图像或图标。当用户需要绘制图片、插画、LOGO、应用图标、海报等视觉图像时调用。生成的图片将保存至本地并在界面直接展示。严禁编写 Python 脚本（如 PIL/matplotlib）绘制图标或图片，必须直接调用本工具。",
             risk: Risk::Write,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -698,6 +738,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "recognize_image",
             description: "多模态视觉识别与图像理解工具。当需要查看、识别或分析本地图片文件（如 generated_images 目录中的生成图、项目图片资源、设计图、截图、相片等）的内容时调用。严禁使用 read_file 读取图片文件。系统将调用配置的视觉模型并返回深入的视觉理解分析结果。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -721,6 +762,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "judge_decision",
             description: "调用决策模型进行高精度二元判断。适用于评估条件是否满足、用户意图是否明确完整、方案是否可行、是否存在风险等对/错或真/假判断场景。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -744,6 +786,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "choice_decision",
             description: "调用决策模型在多个备选项中做出最优选择与分类。适用于方案多选一、分类归因、路由分发等离散选择场景。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -772,6 +815,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "score_decision",
             description: "调用决策模型对目标业务意图理解与交付边界进行量化百分制评分与多维度质检评估。用于第一层级意图理解与复杂需求方案准入审查。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -808,12 +852,14 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "temp_status",
             description: "查看当前临时空间状态：项目清单（key/名称/临时路径）、各项目变更文件数、已保存的快照。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({ "type": "object", "properties": {} }),
         },
         ToolSpec {
             name: "temp_changes",
             description: "列出临时空间中指定项目相对基线的全部变更文件（含增删行数）。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -825,6 +871,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "temp_diff",
             description: "查看临时空间中单个变更文件的 diff（基线 vs 当前副本，±3 行上下文分块）。",
             risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -838,6 +885,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "temp_snapshot",
             description: "仅用于临时空间内部：为当前临时空间的修改状态保存备份快照（恢复点）。【注意：本工具不是创建临时空间，临时空间由用户在界面左侧栏发起】。在临时空间中做高风险或批量修改前，可用它留存备份快照，后续可通过 temp_restore 回滚到该状态。",
             risk: Risk::Write,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -849,6 +897,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "temp_restore",
             description: "把临时空间恢复到基线（丢弃全部未提交修改）或指定快照。只影响临时副本，不动原目录；已合并回原目录的内容不会被撤销。危险操作，需用户逐次审批。",
             risk: Risk::Write,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -861,12 +910,44 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "temp_merge",
             description: "把临时空间的全部变更写回各项目原目录（冲突走 AI 智能合并）。不可逆且影响用户原始目录：务必在任务完成、验证通过并向用户说明后调用。",
             risk: Risk::Write,
+            scope: ToolScope::Universal,
             schema: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "deliver_to_parent",
+            description: "当专属子任务施工或调研完成、或者遇到阻碍无法继续时，调用此工具向主进程正式提交交付成果并结案。",
+            risk: Risk::Execute,
+            scope: ToolScope::SubOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["completed", "blocked"],
+                        "description": "交付状态：completed（任务圆满完成）或 blocked（遇到阻碍无法继续）"
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "核心工作总结或遇到的阻碍详情（简明扼要，控制在 300 字以内）"
+                    },
+                    "modified_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "本次子任务实际新建或修改的文件相对路径列表"
+                    },
+                    "verification_result": {
+                        "type": "string",
+                        "description": "语法/类型检查（如 tsc/cargo check/go vet）或单测验证结果"
+                    }
+                },
+                "required": ["status", "summary"]
+            }),
         },
         ToolSpec {
             name: "call_extended_tool",
             description: "按需调用扩展工具目录中的专业工具（如浏览器操作 browser_*、协作者委派 dispatch_collaborator、长期记忆 record_memory、网页抓取 fetch_web_page 等）。若不确定入参，可传 arguments: {\"help\": true} 查看该工具的完整参数规范与使用说明。",
             risk: Risk::Execute,
+            scope: ToolScope::Universal,
             schema: json!({
                 "type": "object",
                 "properties": {

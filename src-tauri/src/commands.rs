@@ -91,6 +91,8 @@ pub fn list_tools() -> Result<Vec<ToolInfo>, String> {
             description: s.description.to_string(),
             risk: s.risk.as_str().to_string(),
             is_temp: crate::tools::TEMP_TOOL_NAMES.contains(&s.name),
+            scope: Some(s.scope.as_str().to_string()),
+            scope_label: Some(s.scope.label().to_string()),
         })
         .collect();
     Ok(list)
