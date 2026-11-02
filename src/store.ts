@@ -526,6 +526,77 @@ function mergeSessionMessages(local: Message[] | undefined, fetched: Message[]):
   return sortMessages(Array.from(mergedMap.values()));
 }
 
+/**
+ * 解析新建对话（草稿）的基础运行与模型配置：
+ * 1. 优先使用同项目内最新一条对话的配置（按最后消息/创建时间倒序第一条）
+ * 2. 同项目无对话（或纯对话）时，使用 全局默认能力模型 的 主对话模型
+ * 3. 全局未设置时，显示未选择模型（null），不默认选中列表第一个模型
+ */
+export function resolveNewDraftConfig(
+  st: { sessions: Session[]; settings: Settings },
+  projectId: string | null
+) {
+  // 1. 同项目内最新一条对话
+  if (projectId) {
+    const projectSessions = st.sessions.filter(
+      (s) =>
+        s.projectId === projectId &&
+        !s.parentSessionId &&
+        s.sessionType !== "subagent" &&
+        s.sessionType !== "subprocess" &&
+        s.sessionType !== "collaborator"
+    );
+    if (projectSessions.length > 0) {
+      projectSessions.sort((a, b) =>
+        (b.lastMessageAt ?? b.createdAt).localeCompare(a.lastMessageAt ?? a.createdAt)
+      );
+      const latest = projectSessions[0];
+      const pid = latest.providerId || latest.provider_id || null;
+      const mid = latest.modelId || latest.model_id || null;
+      const isModelValid = Boolean(
+        pid &&
+          mid &&
+          st.settings.providers?.some((p) => p.id === pid && (p.models ?? []).includes(mid))
+      );
+
+      // 若最新会话的模型在当前列表中仍然有效，直接继承；若已失效则走第 2 步全局兜底
+      const globalActive = !isModelValid ? resolveActiveModel(st.settings) : null;
+      return {
+        providerId: isModelValid ? pid : globalActive?.provider.id ?? null,
+        modelId: isModelValid ? mid : globalActive?.model ?? null,
+        imageProviderId: latest.imageProviderId ?? latest.image_provider_id ?? null,
+        imageModelId: latest.imageModelId ?? latest.image_model_id ?? null,
+        visionProviderId: latest.visionProviderId ?? latest.vision_provider_id ?? null,
+        visionModelId: latest.visionModelId ?? latest.vision_model_id ?? null,
+        decisionProviderId: latest.decisionProviderId ?? latest.decision_provider_id ?? null,
+        decisionModelId: latest.decisionModelId ?? latest.decision_model_id ?? null,
+        contextTokenLimit: latest.contextTokenLimit ?? null,
+        accessMode: latest.accessMode ?? st.settings.globalAccessMode,
+        reasoningEffort:
+          latest.reasoningEffort ?? latest.reasoning_effort ?? st.settings.reasoningEffort ?? null,
+      };
+    }
+  }
+
+  // 2. 同一项目内无对话 / 纯对话：使用全局默认能力模型的主对话模型
+  const globalActive = resolveActiveModel(st.settings);
+
+  // 3. 全局也未设置时返回 null（未选择模型）
+  return {
+    providerId: globalActive?.provider.id ?? null,
+    modelId: globalActive?.model ?? null,
+    imageProviderId: null,
+    imageModelId: null,
+    visionProviderId: null,
+    visionModelId: null,
+    decisionProviderId: null,
+    decisionModelId: null,
+    contextTokenLimit: null,
+    accessMode: st.settings.globalAccessMode,
+    reasoningEffort: st.settings.reasoningEffort ?? null,
+  };
+}
+
 export const useStore = create<Store>((set, get) => ({
   ready: false,
   settings: {
@@ -973,11 +1044,9 @@ export const useStore = create<Store>((set, get) => ({
 
   newDraft(projectId, inherit = true) {
     // 工作区即项目：从项目新建空对话时，草稿直接绑定该项目的目录；
-    // 其余新对话（inherit=true）默认继承“上一条对话”（= 当前选中的对话）的模式与工作区；
+    // 其余新对话（inherit=true）继承上一条对话所在工作区；
     // inherit=false 用于“新建纯对话”：工作区始终为空。
-    // 没有可继承来源（当前无选中对话）时：纯对话 + 设置页的新对话默认模式。
     const st = get();
-    const prev = inherit ? currentSession(st) : null;
     const explicit = projectId ? st.projects.find((p) => p.id === projectId) ?? null : null;
     let workspacePath: string | null;
     let boundProjectId: string | null;
@@ -985,7 +1054,7 @@ export const useStore = create<Store>((set, get) => ({
       workspacePath = explicit.path ?? null;
       boundProjectId = explicit.id;
     } else if (inherit) {
-      // 临时空间对话的工作区是临时副本，不作为继承来源
+      const prev = currentSession(st);
       workspacePath = prev && !prev.isTemp ? prev.workspacePath || null : null;
       boundProjectId = workspacePath
         ? st.projects.find((p) => samePath(p.path, workspacePath))?.id ?? null
@@ -995,28 +1064,16 @@ export const useStore = create<Store>((set, get) => ({
       boundProjectId = null;
     }
     localStorage.removeItem(LAST_SESSION_KEY); // 草稿不可恢复，清除记住的会话
-    // 专属对话模型：继承上一条对话；无可继承来源时取当前全局默认模型作为草稿专属初始值
-    const activeGlobal = resolveActiveModel(st.settings);
-    const initProviderId = (inherit ? (prev?.providerId || prev?.provider_id) : undefined) ?? activeGlobal?.provider.id ?? null;
-    const initModelId = (inherit ? (prev?.modelId || prev?.model_id) : undefined) ?? activeGlobal?.model ?? null;
+
+    // 默认配置按三级优先级解析：同项目最新对话 -> 全局主对话能力模型 -> 未选择模型(null)
+    const config = resolveNewDraftConfig(st, boundProjectId);
 
     set({
       draft: {
         projectId: boundProjectId,
         workspacePath,
         temp: null,
-        // 模式继承上一条对话；无可继承来源时用设置页的新对话默认值
-        accessMode: (inherit ? prev?.accessMode : undefined) ?? st.settings.globalAccessMode,
-        contextTokenLimit: inherit ? prev?.contextTokenLimit ?? null : null,
-        providerId: initProviderId,
-        modelId: initModelId,
-        imageProviderId: inherit ? prev?.imageProviderId ?? null : null,
-        imageModelId: inherit ? prev?.imageModelId ?? null : null,
-        visionProviderId: inherit ? prev?.visionProviderId ?? null : null,
-        visionModelId: inherit ? prev?.visionModelId ?? null : null,
-        decisionProviderId: inherit ? prev?.decisionProviderId ?? null : null,
-        decisionModelId: inherit ? prev?.decisionModelId ?? null : null,
-        reasoningEffort: (inherit ? prev?.reasoningEffort ?? prev?.reasoning_effort : undefined) ?? st.settings.reasoningEffort ?? null,
+        ...config,
       },
       currentId: DRAFT_ID,
       readOnly: false,
@@ -1035,27 +1092,13 @@ export const useStore = create<Store>((set, get) => ({
       // 后端生成唯一随机码与计划路径，不创建目录；git 缺失时在此报错提示
       const temp = await ipc.allocTempCode(projectId);
       const st = get();
-      const prev = currentSession(st);
-      const activeGlobal = resolveActiveModel(st.settings);
-      const initProviderId = prev?.providerId || prev?.provider_id || activeGlobal?.provider.id || null;
-      const initModelId = prev?.modelId || prev?.model_id || activeGlobal?.model || null;
+      const config = resolveNewDraftConfig(st, projectId);
       set({
         draft: {
           projectId,
           workspacePath: temp.mainTemp,
           temp,
-          // 临时空间对话同样继承上一条对话的访问模式与思考程度
-          accessMode: prev?.accessMode ?? st.settings.globalAccessMode,
-          contextTokenLimit: prev?.contextTokenLimit ?? null,
-          providerId: initProviderId,
-          modelId: initModelId,
-          imageProviderId: prev?.imageProviderId ?? null,
-          imageModelId: prev?.imageModelId ?? null,
-          visionProviderId: prev?.visionProviderId ?? null,
-          visionModelId: prev?.visionModelId ?? null,
-          decisionProviderId: prev?.decisionProviderId ?? null,
-          decisionModelId: prev?.decisionModelId ?? null,
-          reasoningEffort: prev?.reasoningEffort ?? prev?.reasoning_effort ?? st.settings.reasoningEffort ?? null,
+          ...config,
         },
         currentId: DRAFT_ID,
         readOnly: false,
@@ -1073,10 +1116,27 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   setDraftWorkspace(p, projectId) {
-    const d = get().draft;
+    const st = get();
+    const d = st.draft;
     if (!d) return;
-    // projectId 未传时保持不变；显式传 null 表示脱离项目
-    set({ draft: { ...d, workspacePath: p, projectId: projectId === undefined ? d.projectId : projectId } });
+    const nextProjectId = projectId === undefined ? d.projectId : projectId;
+    const projectChanged = nextProjectId !== d.projectId;
+
+    if (projectChanged) {
+      // 切换工作区项目时，重新依照目标项目的默认配置初始化模型与参数
+      const config = resolveNewDraftConfig(st, nextProjectId);
+      set({
+        draft: {
+          ...d,
+          workspacePath: p,
+          projectId: nextProjectId,
+          ...config,
+        },
+      });
+      return;
+    }
+
+    set({ draft: { ...d, workspacePath: p, projectId: nextProjectId } });
   },
 
   setDraftAccessMode(mode) {

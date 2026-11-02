@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ipc } from "../ipc";
 import { useStore } from "../store";
-import { Attachment, DRAFT_ID } from "../types";
+import { Attachment, DRAFT_ID, resolveSessionActiveModel } from "../types";
 import { SafeImage } from "./SafeImage";
 import { toAssetUrl, isVisionModel, formatFileSize } from "../utils/image";
 import { ContextUsageGauge } from "./ContextUsageGauge";
@@ -489,6 +489,18 @@ export function Composer() {
     const t = text.trim();
     if (!hasContent || !canSend) return;
 
+    const st = useStore.getState();
+    const isDraftLike = !currentId || currentId === DRAFT_ID;
+    const resolvedActive = resolveSessionActiveModel(
+      st.settings,
+      session,
+      isDraftLike ? draft : null
+    );
+    if (!resolvedActive) {
+      pushToast("未选择对话模型，请先在顶栏选择模型", "error");
+      return;
+    }
+
     const hasImages = pendingAttachments.some((a) => a.is_image);
     if (hasImages && !bypassVisionCheck && !isVisionModel(activeModel)) {
       setVisionWarningOpen(true);
@@ -502,6 +514,18 @@ export function Composer() {
   const doSend = async () => {
     const t = text.trim();
     if (!hasContent || !canSend) return;
+
+    const st = useStore.getState();
+    const isDraftLike = !currentId || currentId === DRAFT_ID;
+    const resolvedActive = resolveSessionActiveModel(
+      st.settings,
+      session,
+      isDraftLike ? draft : null
+    );
+    if (!resolvedActive) {
+      pushToast("未选择对话模型，请先在顶栏选择模型", "error");
+      return;
+    }
     const targetId = activeId;
     const sendingAttachments = [...pendingAttachments];
 

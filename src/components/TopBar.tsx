@@ -457,12 +457,12 @@ export function TopBar() {
                 ? `${active.provider.name}/${active.model}\n有效上下文上限: ${effectiveLimit.toLocaleString()} tokens (~${formatTokens(effectiveLimit)})${
                     isSessionOverridden ? " (仅当前对话生效)" : " (跟随模型默认)"
                   }\n有效思考程度: ${currentEffort === "default" ? "厂商默认 (不传)" : currentEffort.toUpperCase()}`
-                : "未配置模型"
+                : "未选择模型"
             }
           >
-            <Sparkles size={13} className="text-accent shrink-0" />
-            <span className="truncate min-w-0 flex-1 text-left">
-              {active ? `${active.provider.name}/${active.model}` : "选择模型"}
+            <Sparkles size={13} className={active ? "text-accent shrink-0" : "text-inkdim shrink-0"} />
+            <span className={`truncate min-w-0 flex-1 text-left ${!active ? "text-inkdim" : ""}`}>
+              {active ? `${active.provider.name}/${active.model}` : "未选择模型"}
             </span>
             {currentEffort !== "default" && (
               <span

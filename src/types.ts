@@ -1125,17 +1125,14 @@ export interface OptimizeResult {
 
 export const DRAFT_ID = "draft";
 
-/** 解析当前生效的厂商 + 模型：激活项失效时回落到第一个有模型的厂商 */
+/** 解析全局默认能力模型中的主对话模型；未配置或失效时返回 null（不默认选中第一个模型） */
 export function resolveActiveModel(settings: Settings): { provider: Provider; model: string } | null {
-  const withModels = settings.providers.filter((p) => (p.models ?? []).length > 0);
-  const provider = withModels.find((p) => p.id === settings.activeProviderId) ?? withModels[0];
+  if (!settings?.activeProviderId) return null;
+  const provider = settings.providers?.find((p) => p.id === settings.activeProviderId);
   if (!provider) return null;
   const active = settings.activeModelId ?? settings.activeModel;
-  const model =
-    active && provider.models.includes(active)
-      ? active
-      : provider.models[0];
-  return { provider, model };
+  if (!active || !(provider.models ?? []).includes(active)) return null;
+  return { provider, model: active };
 }
 
 /**

@@ -637,21 +637,16 @@ pub fn resolve_decision_route(
 }
 
 
-/// 解析当前生效的 (厂商, 模型)：优先全局激活项，激活项缺失/失效时回落到第一个有模型的厂商
+/// 解析全局默认能力模型中的主对话模型；未配置或失效时返回 None（不回退到列表首个模型）
 pub fn resolve_active_model(settings: &SettingsData) -> Option<(&ProviderCfg, &str)> {
-    let provider = settings
-        .providers
-        .iter()
-        .find(|p| Some(p.id.as_str()) == settings.active_provider_id.as_deref() && !p.models.is_empty())
-        .or_else(|| settings.providers.iter().find(|p| !p.models.is_empty()))?;
+    let pid = settings.active_provider_id.as_deref()?;
+    let provider = settings.providers.iter().find(|p| p.id == pid)?;
     let active = settings
         .active_model_id
         .as_deref()
-        .or(settings.active_model.as_deref());
-    let model = active
-        .filter(|m| provider.models.iter().any(|x| x == m))
-        .or_else(|| provider.models.first().map(|x| x.as_str()))?;
-    Some((provider, model))
+        .or(settings.active_model.as_deref())?;
+    let model = provider.models.iter().find(|x| x.as_str() == active)?;
+    Some((provider, model.as_str()))
 }
 
 #[cfg(test)]
@@ -684,6 +679,8 @@ mod tests {
         }];
         s.migrate_legacy_model();
         assert_eq!(s.providers[0].models, vec!["glm-4.6".to_string()]);
+        s.active_provider_id = Some("p1".into());
+        s.active_model = Some("glm-4.6".into());
         let (p, m) = resolve_active_model(&s).unwrap();
         assert_eq!(p.id, "p1");
         assert_eq!(m, "glm-4.6");
@@ -702,22 +699,18 @@ mod tests {
         assert_eq!(p.id, "b");
         assert_eq!(m, "model-b1");
 
-        // active_model 不属于当前厂商时回落到第一个模型
+        // active_model 不属于当前厂商时返回 None（不再自动回落到第一个模型）
         s.active_model = Some("model-a1".into());
-        let (p, m) = resolve_active_model(&s).unwrap();
-        assert_eq!(p.id, "b");
-        assert_eq!(m, "model-b1");
+        assert!(resolve_active_model(&s).is_none());
 
-        // 激活厂商没有模型时回落到第一个有模型的厂商
+        // 激活厂商没有模型时返回 None
         s.providers = vec![
             provider("c", "空厂商", &[]),
             provider("b", "厂商B", &["model-b1"]),
         ];
         s.active_provider_id = Some("c".into());
         s.active_model = None;
-        let (p, m) = resolve_active_model(&s).unwrap();
-        assert_eq!(p.id, "b");
-        assert_eq!(m, "model-b1");
+        assert!(resolve_active_model(&s).is_none());
     }
 
     #[test]
