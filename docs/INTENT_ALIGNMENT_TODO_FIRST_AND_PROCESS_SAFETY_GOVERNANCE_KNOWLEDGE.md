@@ -327,3 +327,27 @@ cargo test --manifest-path src-tauri/Cargo.toml test_kill_by_name_denied
 cargo check --manifest-path src-tauri/Cargo.toml
 ```
 * **验证结果**：编译通过（Exit code: 0），所有修改无语法、类型及所有权借用错误。
+
+
+---
+
+## 七、SOP 设置中心集成与提示词精益治理
+
+在后续治理中，为了彻底杜绝由于冗余提示词诱发的大模型注意力发散与越权改代码行为，并为用户提供全局可视化的 SOP 开关能力，完成了以下四项治理（均采用方案 A）：
+
+1. **`todo_first_gate` 设置中心可视化与开关接入（Phase 1）**：
+   - 在 `src/types.ts` 中将 `todo_first_gate` 注册为第一层级（`phase: 1` · 前置意图与写入门禁），用户可在“设置 -> SOP 规范”中自由开启或关闭；
+   - 在 `static_system.rs` 与 `agent.rs`（工具执行门禁与第 8 步熔断器）中全面接入 `disabled_sops` 校验；
+   - 禁用后：免除改代码前的强制 todo 校验与第 8 步目标对齐熔断，满足用户自由勘察探索的特定需要。
+
+2. **彻底移除强制浏览器自主测试提示词（Option A）**：
+   - 移除 `static_system.rs` 中原有的 `browser_autonomous_testing` 提示词；
+   - 避免模型在开发或修改非 Web 逻辑时被强行诱导调用无头浏览器进入冗长自测排障闭环；浏览器工具（`browser_*`）完整保留在工具箱中，仅在用户显式要求浏览器测试时方可按需调用。
+
+3. **彻底移除行动优先准则（Option A）**：
+   - 删除 `【崇尚行动与精益收敛准则（行动优先，严禁分析瘫痪）】` 提示词；
+   - 消除诱使大模型在无明确任务、无用户授权下提前“动手写脚本验证”的偏置，强化 Todo 先行与意图对齐原则。
+
+4. **前端设置界面层级恢复与描述同步**：
+   - `SettingsModal.tsx` 恢复 Phase 1（前置意图与写入门禁公理）与 Phase 2（工程规划与落地执行规范）的双层分组布局；
+   - 同步校准 `todo_lifecycle`（不再限多步任务，单项任务改动亦须立项）与 `plan_first`（计划落盘天然满足写入门禁）的文案描述。
