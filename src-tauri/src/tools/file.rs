@@ -15,7 +15,7 @@ pub(crate) async fn read_file(args: &Value, ctx: &ToolCtx) -> Result<String, Str
     }
     let text = String::from_utf8_lossy(&bytes);
     let offset = get_u64_arg(args, "offset_line", 1).max(1) as usize;
-    let max_lines = get_u64_arg(args, "max_lines", 300) as usize;
+    let max_lines = get_u64_arg(args, "max_lines", 500) as usize;
 
     let mut out = String::new();
     let mut count = 0usize;
@@ -27,7 +27,7 @@ pub(crate) async fn read_file(args: &Value, ctx: &ToolCtx) -> Result<String, Str
         if count >= max_lines {
             let end_line = offset + count - 1;
             out.push_str(&format!(
-                "\n[已达到单次读取上限 max_lines={max_lines}（当前展示至第 {end_line} 行），文件尚未读完。若需了解代码结构，请优先使用 file_outline 提取大纲，或结合 grep 定位目标函数后用 offset_line 局部精读，严禁连续循环分页遍历]\n"
+                "\n[当前已展示至第 {end_line} 行，文件尚未完结。如需继续查阅后续段落，可指定 offset_line={}；若需宏观了解结构，可调用 file_outline 提取大纲]\n", offset + count
             ));
             break;
         }
@@ -35,7 +35,7 @@ pub(crate) async fn read_file(args: &Value, ctx: &ToolCtx) -> Result<String, Str
         let _ = writeln!(out, "{lineno:>6}\t{line}");
         count += 1;
         if out.len() > crate::models::TOOL_RESULT_LIMIT {
-            out.push_str("\n[文件过大，已截断至 32KB]\n");
+            out.push_str("\n[文件过大，已截断至 64KB]\n");
             break;
         }
     }

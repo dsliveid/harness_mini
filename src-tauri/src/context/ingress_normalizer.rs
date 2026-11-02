@@ -49,23 +49,23 @@ pub fn normalize_tool_output_for_ingress(tool_name: &str, raw_output: &str) -> S
             }
         }
         "read_file" => {
-            // 读取文件若过大 (> 8000 字符)，收敛保留前 4500 字符与尾部 1800 字符
-            if raw_output.len() > 8000 {
+            // 读取文件若过大 (> 64KB 即 TOOL_RESULT_LIMIT)，收敛保留前 32,000 字符与尾部 16,000 字符
+            if raw_output.len() > crate::models::TOOL_RESULT_LIMIT {
                 let head_safe = raw_output
                     .char_indices()
-                    .nth(4500)
+                    .nth(32000)
                     .map(|(i, _)| i)
-                    .unwrap_or(4500.min(raw_output.len()));
+                    .unwrap_or(32000.min(raw_output.len()));
                 let total_chars = raw_output.chars().count();
-                let tail_start_char = total_chars.saturating_sub(1800);
+                let tail_start_char = total_chars.saturating_sub(16000);
                 let tail_safe = raw_output
                     .char_indices()
                     .nth(tail_start_char)
                     .map(|(i, _)| i)
-                    .unwrap_or(raw_output.len().saturating_sub(1800));
+                    .unwrap_or(raw_output.len().saturating_sub(16000));
 
                 format!(
-                    "{}\n\n...[文件内容过长（共 {} 字符），已入库收敛首尾关键段落。需阅读局部请指定 start_line/end_line]...\n\n{}",
+                    "{}\n\n...[文件内容过长（共 {} 字符），已在入库时安全收敛首尾关键段落。需阅读特定区域请指定 offset_line 与 max_lines]...\n\n{}",
                     &raw_output[..head_safe],
                     raw_output.len(),
                     &raw_output[tail_safe..]
@@ -137,8 +137,15 @@ mod tests {
     }
 
     #[test]
+    fn test_normalizer_read_file_medium_preserves_full() {
+        let medium = "fn hello() { println!(\"world\"); }\n".repeat(500); // ~17,500 chars (< 64KB)
+        let res = normalize_tool_output_for_ingress("read_file", &medium);
+        assert_eq!(res, medium, "Files under 64KB must be fully preserved without truncation");
+    }
+
+    #[test]
     fn test_normalizer_read_file_long() {
-        let long = "fn hello() { println!(\"world\"); }\n".repeat(300); // > 10,000 chars
+        let long = "fn hello() { println!(\"world\"); }\n".repeat(2000); // > 68,000 chars (> 64KB)
         let res = normalize_tool_output_for_ingress("read_file", &long);
         assert!(res.contains("文件内容过长"));
         assert!(res.len() < long.len());

@@ -5,14 +5,14 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "read_file",
-            description: "读取工作区内文本文件的局部或全部内容（带行号）。修改文件前必须先用它确认精确原文。推荐配合 offset_line 与 max_lines 外科手术式精读局部，严禁对大型文件进行多轮循环分页遍历。",
+            description: "读取工作区内文本文件的局部或全部内容（带行号）。修改文件前必须先用它确认精确原文。支持配合 offset_line 与 max_lines 定向阅读目标区域。",
             risk: Risk::ReadOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "相对于工作区的文件路径"},
                     "offset_line": {"type": "integer", "description": "起始行（1 开始，默认 1）"},
-                    "max_lines": {"type": "integer", "description": "最多读取行数（默认 300，避免单次返回过多噪音与 Token 消耗）"}
+                    "max_lines": {"type": "integer", "description": "读取最大行数（默认 500，可按需指定至 1000 行）"}
                 },
                 "required": ["path"]
             }),

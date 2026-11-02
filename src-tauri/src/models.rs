@@ -1624,7 +1624,7 @@ pub struct MessagesPage {
 }
 
 /// 工具结果上限
-pub const TOOL_RESULT_LIMIT: usize = 32 * 1024;
+pub const TOOL_RESULT_LIMIT: usize = 64 * 1024;
 
 pub fn truncate_result(s: &str) -> String {
     if s.len() <= TOOL_RESULT_LIMIT {
@@ -1634,7 +1634,7 @@ pub fn truncate_result(s: &str) -> String {
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}\n\n[结果过长，已截断至 32KB]", &s[..end])
+    format!("{}\n\n[结果过长，已截断至 64KB]", &s[..end])
 }
 
 /// 运行中的会话（全局查询结果项）：界面刷新后恢复运行状态用
