@@ -1514,7 +1514,8 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         };
 
         // 第 8 步阶梯门禁拦截：当只读勘察达 8 步且尚未建立 Todo 时，注入强制对齐/立项提示
-        if !is_subagent && _step == 8 {
+        let todo_first_enabled = !settings.disabled_sops.iter().any(|s| s == "todo_first_gate");
+        if todo_first_enabled && !is_subagent && _step == 8 {
             let has_active_plan_or_todo = {
                 let db = state.db.lock().unwrap();
                 let has_plan = store::get_kv(&db, session_id, "active_plan_id")
@@ -2260,10 +2261,13 @@ async fn handle_tool_call(
     };
 
     // Todo 先行门禁校验：
-    // 主会话中，在没有 active todo 且没有 active plan 的情况下，严禁调用 write_file 或 edit_file
+    // 主会话中，若启用 todo_first_gate，在没有 active todo 且没有 active plan 的情况下，严禁调用 write_file 或 edit_file
     if tool_name == "write_file" || tool_name == "edit_file" {
-        let (is_sub, has_active_plan_or_todo) = {
+        let (is_sub, is_sop_enabled, has_active_plan_or_todo) = {
             let db = state.db.lock().unwrap();
+            let sop_enabled = store::get_settings(&db)
+                .map(|s| !s.disabled_sops.iter().any(|sop| sop == "todo_first_gate"))
+                .unwrap_or(true);
             let s = store::get_session(&db, session_id).ok().flatten();
             let sub = s.as_ref().map(|s| {
                 s.session_type == "subagent"
@@ -2281,9 +2285,9 @@ async fn handle_tool_call(
                 .flatten()
                 .map(|raw| raw.contains(r#""in_progress""#) || raw.contains(r#""pending""#))
                 .unwrap_or(false);
-            (sub, has_plan || has_todo)
+            (sub, sop_enabled, has_plan || has_todo)
         };
-        if !is_sub && !has_active_plan_or_todo {
+        if is_sop_enabled && !is_sub && !has_active_plan_or_todo {
             let reason = "【Todo 先行门禁拦截】：修改代码或文件前必须先调用 todo 工具声明任务清单（哪怕只有 1 个任务）。请先调用 todo 工具明确你将要执行的具体修改，然后再调用编辑或写入工具。".to_string();
             ev.status = "failed".into();
             ev.result_text = Some(reason.clone());
@@ -3325,9 +3329,9 @@ mod tests {
         assert!(all_enabled.contains("边读边记与强制沉淀 SOP"));
         assert!(all_enabled.contains("团队协同委派原则"));
         assert!(all_enabled.contains("修改文件前必须先用 read_file 读取相关内容"));
-        assert!(all_enabled.contains("精益代码研读与克制探索 SOP"));
-        assert!(all_enabled.contains("todo 工具列出计划"));
-        assert!(all_enabled.contains("浏览器无头自主测试与免视觉验证 SOP"));
+        assert!(all_enabled.contains("精益代码研读与规范探索 SOP"));
+        assert!(all_enabled.contains("任务清单全生命周期 SOP"));
+        assert!(all_enabled.contains("Todo 先行与阶梯门禁公理"));
 
         let disabled = vec![
             "plan_first".to_string(),
@@ -3335,30 +3339,31 @@ mod tests {
             "todo_lifecycle".to_string(),
             "safe_code_edit".to_string(),
             "surgical_code_reading".to_string(),
-                        "browser_autonomous_testing".to_string(),
+            "todo_first_gate".to_string(),
         ];
         let filtered = system_prompt(&session, None, &disabled, "standard");
         assert!(!filtered.contains("方案先行"));
         assert!(!filtered.contains("边读边记与强制沉淀 SOP"));
-        assert!(!filtered.contains("todo 工具列出计划"));
+        assert!(!filtered.contains("任务清单全生命周期 SOP"));
         assert!(!filtered.contains("修改文件前必须先用 read_file 读取相关内容"));
-        assert!(!filtered.contains("精益代码研读与克制探索 SOP"));
-                assert!(!filtered.contains("浏览器无头自主测试与免视觉验证 SOP"));
+        assert!(!filtered.contains("精益代码研读与规范探索 SOP"));
+        assert!(!filtered.contains("Todo 先行与阶梯门禁公理"));
         assert!(filtered.contains("团队协同委派原则"));
     }
 
     #[test]
-    fn test_browser_autonomous_testing_sop_in_system_prompt() {
+    fn test_todo_first_gate_sop_in_system_prompt() {
         let session = Session {
             workspace_path: "D:\\ws".into(),
             ..Default::default()
         };
         let p = system_prompt(&session, None, &[], "standard");
-        assert!(p.contains("浏览器无头自主测试与免视觉验证 SOP"));
-        assert!(p.contains("headless: true"));
-        assert!(p.contains("免视觉断言原则"));
-        assert!(p.contains("登录态自愈与免登保底"));
-        assert!(p.contains("探针式自检与自愈闭环"));
+        assert!(p.contains("Todo 先行与阶梯门禁公理"));
+        assert!(p.contains("Todo 先行与写入前置拦截"));
+        assert!(p.contains("≤8 步勘察上限与目标对齐"));
+        assert!(p.contains("已有计划与子进程豁免"));
+        assert!(!p.contains("浏览器无头自主测试与免视觉验证 SOP"));
+        assert!(!p.contains("崇尚行动与精益收敛准则"));
     }
 
     #[test]

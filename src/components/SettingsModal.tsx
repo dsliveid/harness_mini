@@ -1597,13 +1597,26 @@ export function SettingsModal() {
                   </div>
 
                   <div className="flex flex-col gap-5 mt-4">
+                    {/* 第一层级 */}
+                    {AGENT_SOPS.some((s) => s.phase === 1) && (
+                      <div className="flex flex-col gap-2">
+                        <div className="flex items-center gap-2 text-[12px] font-semibold text-purple-400 px-0.5">
+                          <span className="w-2 h-2 rounded-full bg-purple-400"></span>
+                          <span>第一层级 · 前置意图与写入门禁公理</span>
+                          <span className="text-[11px] font-normal text-inkdim">动代码前必须先立项 todo；勘察严格 ≤8 步，防盲目漫游；已有计划或子进程天然豁免</span>
+                        </div>
+                        {AGENT_SOPS.filter((s) => s.phase === 1).map(renderSopItem)}
+                      </div>
+                    )}
+
+                    {/* 第二层级 */}
                     <div className="flex flex-col gap-2 mt-1">
                       <div className="flex items-center gap-2 text-[12px] font-semibold text-blue-400 px-0.5">
                         <span className="w-2 h-2 rounded-full bg-blue-400"></span>
-                        <span>标准作业程序 (SOP) 与工程落地规范</span>
-                        <span className="text-[11px] font-normal text-inkdim">包含方案先行、任务状态自愈、协作者委派、代码精读与精确编辑</span>
+                        <span>第二层级 · 工程规划与落地执行规范</span>
+                        <span className="text-[11px] font-normal text-inkdim">包含方案先行、任务全生命周期自愈、架构编排、代码精读与精确编辑</span>
                       </div>
-                      {AGENT_SOPS.map(renderSopItem)}
+                      {AGENT_SOPS.filter((s) => s.phase === 2).map(renderSopItem)}
                     </div>
                   </div>
                 </section>

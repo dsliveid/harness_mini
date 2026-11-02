@@ -378,10 +378,12 @@ pub fn build_static_system_prompt(
         let mut rules = Vec::new();
         let mut rule_num = 1;
 
-        rules.push(format!(
-            "{rule_num}. 【Todo 先行与阶梯门禁公理（所有交互必须严格遵守）】：\n                - 门禁 ①【Todo 先行与写入前置拦截】：\n                    * 严禁在没有 active todo 的情况下擅自调用 `write_file` 或 `edit_file` 修改项目文件；\n                    * 只要涉及修改代码/文件，动工前必须先调用 `todo` 工具声明任务清单（哪怕只有 1 个微小改动任务，也必须先立项）；\n                    * 纯咨询、诊断排查或问答任务：未经用户明确要求修改，严禁调用 todo，更严禁擅自修改文件。\n                - 门禁 ②【≤8 步勘察上限与目标对齐（防盲目漫游）】：\n                    * 勘察排查类只读工具（glob / list_dir / read_file / grep / file_outline）调用累计不大于 8 步；\n                    * 若在 8 步内已查清事实且无需修改代码，立即在正文中完整回复用户并结案；\n                    * 若在 8 步内明确需要修改代码，必须先调用 `todo` 工具立项，再开始编写代码并按清单推进；\n                    * 🚨 熔断停下：若工具调用达到第 8 步仍未能梳理出清晰的 todo 计划，严禁凭空脑补计划、严禁继续只读漫游，必须立即停止调用工具，向用户汇报当前事实并对齐目标！\n                - 门禁 ③【已有计划与子进程豁免】：\n                    * 若当前会话已存在用户明确确认的落盘方案（active_plan_id 有效），或当前属于子进程（Subagent / Collaborator），因其已持有明确的任务蓝图，天然免除重复创建 todo 的要求，严格遵从既定蓝图推进。"
-        ));
-        rule_num += 1;
+        if is_sop_enabled("todo_first_gate") {
+            rules.push(format!(
+                "{rule_num}. 【Todo 先行与阶梯门禁公理（所有交互必须严格遵守）】：\n                - 门禁 ①【Todo 先行与写入前置拦截】：\n                    * 严禁在没有 active todo 的情况下擅自调用 `write_file` 或 `edit_file` 修改项目文件；\n                    * 只要涉及修改代码/文件，动工前必须先调用 `todo` 工具声明任务清单（哪怕只有 1 个微小改动任务，也必须先立项）；\n                    * 纯咨询、诊断排查或问答任务：未经用户明确要求修改，严禁调用 todo，更严禁擅自修改文件。\n                - 门禁 ②【≤8 步勘察上限与目标对齐（防盲目漫游）】：\n                    * 勘察排查类只读工具（glob / list_dir / read_file / grep / file_outline）调用累计不大于 8 步；\n                    * 若在 8 步内已查清事实且无需修改代码，立即在正文中完整回复用户并结案；\n                    * 若在 8 步内明确需要修改代码，必须先调用 `todo` 工具立项，再开始编写代码并按清单推进；\n                    * 🚨 熔断停下：若工具调用达到第 8 步仍未能梳理出清晰的 todo 计划，严禁凭空脑补计划、严禁继续只读漫游，必须立即停止调用工具，向用户汇报当前事实并对齐目标！\n                - 门禁 ③【已有计划与子进程豁免】：\n                    * 若当前会话已存在用户明确确认的落盘方案（active_plan_id 有效），或当前属于子进程（Subagent / Collaborator），因其已持有明确的任务蓝图，天然免除重复创建 todo 的要求，严格遵从既定蓝图推进。"
+            ));
+            rule_num += 1;
+        }
 
         if plan_mode == "always_plan" {
             rules.push(format!(
@@ -443,10 +445,7 @@ pub fn build_static_system_prompt(
             rule_num += 1;
         }
 
-        rules.push(format!(
-            "{rule_num}. 【崇尚行动与精益收敛准则（行动优先，严禁分析瘫痪）】：\n   - 探索代码时遵循最小必要原则，至多阅读 3~5 个核心参考文件即可确立方案并动手实施；\n   - 若任务涉及编写启动或构建脚本、新建同类配置文件，优先参考同目录下既有脚本范式快速产出并运行验证，严禁在只读探索阶段过度深挖无关模块细节；行动验证比脑内推演更快得到真实结果。"
-        ));
-        rule_num += 1;
+
 
         if is_sop_enabled("safe_code_edit") {
             rules.push(format!("{rule_num}. 【代码克制与精确修改规范】：修改文件前必须先用 read_file 读取相关内容，用 edit_file 做基于精确原文的最小化修改；新文件才用 write_file。动手前先用 glob / grep / list_dir / file_outline 探索并理解代码结构。修改完成后，尽量用 run_command 运行构建或测试来验证改动。"));
@@ -463,16 +462,7 @@ pub fn build_static_system_prompt(
             rule_num += 1;
         }
 
-        if is_sop_enabled("browser_autonomous_testing") {
-            rules.push(format!(
-                "{rule_num}. 【浏览器无头自主测试与免视觉验证 SOP（必须严格遵守）】：\n   \
-                 - 零桌面侵入与后台静默运行：当需要对本地网页服务（如 Web 项目前端、管理后台、SPA 页面）进行功能测试与调试时，**必须默认以无头模式运行（`headless: true`，不要弹出实体窗口抢占桌面）**；所有交互事件均通过 CDP 协议内部派发，严禁依赖任何侵入宿主操作系统的外挂行为；\n   \
-                 - 纯语义感知与免视觉断言原则：全面弃用截图分析（测试流程中无需调用 `browser_screenshot` 或视觉识别）；直接通过 `browser_navigate` 与 `browser_interact` 返回的【可交互元素清单 (@eX)】、【页面数据表格】及【页面提示与通知】进行语义感知与业务结果断言；面对长页面或表格超出当前视口时，根据返回的视口滚动提示主动调用 `browser_scroll(direction: \"down\")` 进行滚动探索，直至定位目标元素或数据；\n   \
-                 - 登录态自愈与免登保底：底层已集成登录快照预加载与 401 自动重放机制。若项目已录制免登宏，底层将在打开网页前自动预注入 Cookies 与 LocalStorage（0 秒秒级直达已选机构主页），并在 Token 过期（HTTP 401 或跳回登录页）时自动在后台静默重放录制宏刷新凭证；**Agent 严禁在会话中手动搜索密码或猜测凭据**；\n   \
-                 - 探针式自检与自愈闭环：系统已自动截获页面未捕获的 JavaScript 异常与 ≥ 400 的网络请求。测试时若发现 Console 报错或接口失败，必须结合报错信息直接阅读源码定位根因，用 `edit_file` 原地修复后再次在浏览器中自测，直至错误彻底清零且业务数据正常渲染；测试完毕后务必调用 `browser_close` 释放资源。"
-            ));
-            rule_num += 1;
-        }
+
 
         rules.push(format!(
             "{rule_num}. 【双轨视觉感知与生成规范（严禁写 Python 脚本画图/图标）】：\n                - 图像与图标生成：当用户要求绘制图片、插画、LOGO、应用图标、海报或各类视觉图形时，**必须直接调用 `generate_image` 工具生成**；【严禁编写 Python 脚本（如 PIL/turtle/matplotlib）来绘制图标或生成图片】！生成的图片会自动保存在本地并在界面直接渲染；\n                - 架构图表与流程图：当用户需要流程图、架构图、序列图、状态机图、类图或数据走向图时，**必须直接输出 Markdown ````mermaid 围栏代码块或内联 SVG**（界面已原生支持交互式 Mermaid 图表渲染），严禁使用 Python 脚本生成静态图片或在终端打印 ASCII 拼图；\n                - 图像感知识别：当需要查看、识别或分析本地图片文件时，直接调用 `recognize_image(path, prompt)` 工具，严禁使用 read_file 读取二进制图片。"
