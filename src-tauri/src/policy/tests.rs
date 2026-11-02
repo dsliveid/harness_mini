@@ -236,3 +236,55 @@ fn test_empty_workspace_denied() {
         other => panic!("未绑定工作区必须 Deny，实际返回: {:?}", other),
     }
 }
+
+#[test]
+fn test_kill_by_name_denied() {
+    let ws = PathBuf::from(r"D:\WorkSpace\Project\harness_go");
+    let ctx = test_ctx(&ws, "full_access", &[]);
+
+    let kill_cmds = [
+        "Stop-Process -Name node -Force",
+        "powershell -NoProfile -Command \"Get-Process -Name harness-go -ErrorAction SilentlyContinue | Stop-Process -Force\"",
+        "Get-Process -Name node | Stop-Process -Force",
+        "killall -9 node",
+        "pkill -f vite",
+        "taskkill /IM node.exe /F",
+        "taskkill -im python.exe",
+        "Stop-Process -ProcessName node",
+    ];
+
+    for cmd in kill_cmds {
+        let args = json!({ "command": cmd });
+        let tool = ToolInvocation {
+            name: "run_command",
+            args: &args,
+            risk: Risk::Execute,
+        };
+        let decision = PolicyEngine::evaluate(&tool, &ctx);
+        match decision {
+            PolicyDecision::Deny { reason } => {
+                assert!(reason.contains("严禁使用进程名称全局通配强杀命令"), "命令 {cmd} 拦截提示不符: {reason}");
+            }
+            other => panic!("高危杀进程命令 {cmd} 未被 Deny，实际返回: {:?}", other),
+        }
+    }
+
+    // 允许通过 PID 精准杀自身子进程
+    let safe_cmds = [
+        "Stop-Process -Id 1234",
+        "taskkill /PID 1234 /F",
+    ];
+    for cmd in safe_cmds {
+        let args = json!({ "command": cmd });
+        let tool = ToolInvocation {
+            name: "run_command",
+            args: &args,
+            risk: Risk::Execute,
+        };
+        let decision = PolicyEngine::evaluate(&tool, &ctx);
+        match decision {
+            PolicyDecision::Allow { .. } => {}
+            other => panic!("安全 PID 命令 {cmd} 不应被阻断，实际返回: {:?}", other),
+        }
+    }
+}

@@ -24,6 +24,7 @@ fn init_regexes() {
             ("reg_delete", Regex::new(r"(?i)\breg\s+delete\b").unwrap()),
             ("git_force_push", Regex::new(r"(?i)\bgit\s+push\s+.*--force\b").unwrap()),
             ("git_reset_hard", Regex::new(r"(?i)\bgit\s+reset\s+--hard\b").unwrap()),
+            ("kill_by_name", Regex::new(r"(?i)\b(killall|pkill)\b|Stop-Process\s+.*-(?:Process)?Name\b|Get-Process\s+.*\|\s*(?:Stop-Process|spps|kill)\b|taskkill\b.*[/\-]im\b").unwrap()),
         ]
     });
 

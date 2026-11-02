@@ -60,8 +60,13 @@ impl PolicyEngine {
         let classification = CommandClassifier::classify(cmd, ctx.workspace_root, ctx.sandbox_root);
 
         match classification {
-            // A. 无条件全局高危命令（format、git reset --hard 等）：强制单次审批
+            // A. 无条件全局高危命令（format、git reset --hard 等）：强制单次审批；禁止按进程名强杀
             CommandRiskCategory::UnconditionalHighDanger { pattern_name } => {
+                if pattern_name == "kill_by_name" {
+                    return PolicyDecision::Deny {
+                        reason: "[安全拦截] 严禁使用进程名称全局通配强杀命令（如 Stop-Process -Name / killall / pkill / taskkill /IM）！此操作会误杀宿主应用。请使用具体的 PID (如 Stop-Process -Id $PID 或 taskkill /PID $PID) 仅定向管理由当前任务主动启动的子进程。".into(),
+                    };
+                }
                 PolicyDecision::RequireApproval {
                     risk: "execute",
                     force_once: true,

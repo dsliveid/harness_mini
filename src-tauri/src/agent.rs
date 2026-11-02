@@ -1513,6 +1513,34 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             }
         };
 
+        // 第 8 步阶梯门禁拦截：当只读勘察达 8 步且尚未建立 Todo 时，注入强制对齐/立项提示
+        if !is_subagent && _step == 8 {
+            let has_active_plan_or_todo = {
+                let db = state.db.lock().unwrap();
+                let has_plan = store::get_kv(&db, session_id, "active_plan_id")
+                    .ok()
+                    .flatten()
+                    .map(|id| !id.trim().is_empty())
+                    .unwrap_or(false);
+                let has_todo = store::get_kv(&db, session_id, "todos")
+                    .ok()
+                    .flatten()
+                    .map(|raw| raw.contains(r#""in_progress""#) || raw.contains(r#""pending""#))
+                    .unwrap_or(false);
+                has_plan || has_todo
+            };
+            if !has_active_plan_or_todo {
+                let gate_msg = "【🛑 第 8 步门禁拦截】：只读勘察已达 8 步上限且当前未创建 Todo 任务！\n\
+                    1. 若已查明事实且无需修改代码（如咨询答疑），必须立即在正式回复（Content）中输出完整答复并直接结案；\n\
+                    2. 若需要修改代码且方向明确，必须在下一步先调用 todo 工具声明任务清单（哪怕只有 1 个任务），方可进行代码修改；\n\
+                    3. 若依然方向模糊、无法梳理出清晰的 todo 计划，严禁盲目漫游或脑补计划，必须立即停止调用工具，在正式回复中向用户汇报当前事实并对齐目标！";
+                messages.push(json!({
+                    "role": "user",
+                    "content": gate_msg,
+                }));
+            }
+        }
+
         // 临界步数倒计时收敛提醒：当步数接近上限时注入高优先级系统收敛提示，防止达到 maxSteps 硬性强杀导致无输出
         let remaining_steps = current_max_steps.saturating_sub(_step);
         if remaining_steps <= 2 && current_max_steps > 2 {
@@ -2230,6 +2258,43 @@ async fn handle_tool_call(
         subprocess_id: None,
         reverted_at: None,
     };
+
+    // Todo 先行门禁校验：
+    // 主会话中，在没有 active todo 且没有 active plan 的情况下，严禁调用 write_file 或 edit_file
+    if tool_name == "write_file" || tool_name == "edit_file" {
+        let (is_sub, has_active_plan_or_todo) = {
+            let db = state.db.lock().unwrap();
+            let s = store::get_session(&db, session_id).ok().flatten();
+            let sub = s.as_ref().map(|s| {
+                s.session_type == "subagent"
+                    || s.session_type == "subprocess"
+                    || s.session_type == "collaborator"
+                    || s.parent_session_id.is_some()
+            }).unwrap_or(false);
+            let has_plan = store::get_kv(&db, session_id, "active_plan_id")
+                .ok()
+                .flatten()
+                .map(|id| !id.trim().is_empty())
+                .unwrap_or(false);
+            let has_todo = store::get_kv(&db, session_id, "todos")
+                .ok()
+                .flatten()
+                .map(|raw| raw.contains(r#""in_progress""#) || raw.contains(r#""pending""#))
+                .unwrap_or(false);
+            (sub, has_plan || has_todo)
+        };
+        if !is_sub && !has_active_plan_or_todo {
+            let reason = "【Todo 先行门禁拦截】：修改代码或文件前必须先调用 todo 工具声明任务清单（哪怕只有 1 个任务）。请先调用 todo 工具明确你将要执行的具体修改，然后再调用编辑或写入工具。".to_string();
+            ev.status = "failed".into();
+            ev.result_text = Some(reason.clone());
+            {
+                let db = state.db.lock().unwrap();
+                let _ = store::insert_tool_event(&db, &ev);
+            }
+            emit_tool(app, session_id, &ev);
+            return ("failed".into(), reason);
+        }
+    }
 
     let spec = specs.iter().find(|s| s.name == tool_name);
     let Some(spec) = spec else {
