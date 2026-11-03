@@ -16,13 +16,29 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::watch;
 
-static TASK_CONTROLS: Mutex<Option<HashMap<String, watch::Sender<bool>>>> = Mutex::new(None);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonControlSignal {
+    Running,
+    Pause { reason: Option<String> },
+    Cancel { reason: Option<String> },
+    Complete { summary: Option<String>, evidence: Option<String> },
+}
 
-pub fn set_control(task_id: &str, stop_val: bool) {
+static TASK_CONTROLS: Mutex<Option<HashMap<String, watch::Sender<DaemonControlSignal>>>> = Mutex::new(None);
+
+pub fn send_control_signal(task_id: &str, signal: DaemonControlSignal) {
     let mut map = TASK_CONTROLS.lock().unwrap();
     let controls = map.get_or_insert_with(HashMap::new);
     if let Some(tx) = controls.get(task_id) {
-        let _ = tx.send(stop_val);
+        let _ = tx.send(signal);
+    }
+}
+
+pub fn set_control(task_id: &str, stop_val: bool) {
+    if stop_val {
+        send_control_signal(task_id, DaemonControlSignal::Pause { reason: None });
+    } else {
+        send_control_signal(task_id, DaemonControlSignal::Running);
     }
 }
 
@@ -36,10 +52,10 @@ pub fn get_next_subtask_index(task: &LongTask) -> Option<usize> {
     None
 }
 
-pub(crate) fn register_control(task_id: &str) -> watch::Receiver<bool> {
+pub(crate) fn register_control(task_id: &str) -> watch::Receiver<DaemonControlSignal> {
     let mut map = TASK_CONTROLS.lock().unwrap();
     let controls = map.get_or_insert_with(HashMap::new);
-    let (tx, rx) = watch::channel(false);
+    let (tx, rx) = watch::channel(DaemonControlSignal::Running);
     controls.insert(task_id.to_string(), tx);
     rx
 }
@@ -72,8 +88,12 @@ pub fn start_long_task(
 ) -> Result<LongTask, String> {
     let state = app.state::<crate::AppState>();
 
-    // 若当前会话已有正在运行或规划中的长任务，自动覆盖并平滑归档旧任务
-    let _ = cancel_long_task_by_session(&app, &session_id, Some("被新发起的长任务覆盖替代"));
+    // 若当前会话已有正在运行或挂起的长任务，优雅终止旧任务守护；终态任务（completed/cancelled）绝不误杀
+    if let Ok(Some(old_active)) = get_active_task(&app, &session_id) {
+        if old_active.status == "running" || old_active.status == "planning" || old_active.status == "paused" {
+            let _ = cancel_long_task(&app, &old_active.id);
+        }
+    }
 
     let (workspace_path, task_id, subtask_max_steps) = {
         let db = state.db.lock().unwrap();
@@ -137,7 +157,7 @@ pub fn start_long_task(
 
 /// 暂停长任务（微秒级非阻塞暂停）
 pub fn pause_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
-    set_control(task_id, true);
+    send_control_signal(task_id, DaemonControlSignal::Pause { reason: None });
     let state = app.state::<crate::AppState>();
     let session_id = {
         let db = state.db.lock().unwrap();
@@ -198,7 +218,7 @@ pub fn resume_long_task(app: &AppHandle, task_id: &str) -> Result<LongTask, Stri
 
 /// 终止/取消长任务
 pub fn cancel_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
-    set_control(task_id, true);
+    send_control_signal(task_id, DaemonControlSignal::Cancel { reason: None });
     let state = app.state::<crate::AppState>();
     let session_id = {
         let db = state.db.lock().unwrap();
@@ -235,7 +255,10 @@ pub fn complete_long_task(
     summary: Option<&str>,
     evidence: Option<&str>,
 ) -> Result<LongTask, String> {
-    set_control(task_id, true);
+    send_control_signal(task_id, DaemonControlSignal::Complete {
+        summary: summary.map(|s| s.to_string()),
+        evidence: evidence.map(|e| e.to_string()),
+    });
     let state = app.state::<crate::AppState>();
     let (task, cp_opt) = {
         let db = state.db.lock().unwrap();

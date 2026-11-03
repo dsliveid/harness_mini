@@ -110,9 +110,11 @@ pub fn spawn_session_task(app: AppHandle, session_id: String, trigger: Option<St
         let state = app.state::<crate::AppState>();
         let mut handles = state.handles.lock().unwrap();
         let h = handles.entry(session_id.clone()).or_insert_with(SessionHandle::new);
-        if h.active_run.lock().unwrap().is_none() {
-            *h.active_run.lock().unwrap() = Some("starting".into());
+        if h.active_run.lock().unwrap().is_some() {
+            // 当前会话已有正在执行的 run，绝对不并发拉起第二个 run_loop，严禁覆盖现有 abort handle！
+            return;
         }
+        *h.active_run.lock().unwrap() = Some("starting".into());
     }
     let app2 = app.clone();
     let sid2 = session_id.clone();
@@ -856,32 +858,16 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
 
                 if !ws_path_str.is_empty() {
                     let ws_path = std::path::Path::new(&ws_path_str);
-                    let msgs = store::get_messages(&db, &session_id, None, 100).unwrap_or_default();
-                    let last_assistant = msgs
-                        .iter()
-                        .rev()
-                        .find(|m| m.role == "assistant" && !m.content.as_deref().unwrap_or("").is_empty());
-                    if let Some(m) = last_assistant {
-                        let last_reply = m.content.as_deref().unwrap_or("");
-                        let mut touched_files = std::collections::BTreeSet::new();
-                        for msg in &msgs {
-                            for te in &msg.tool_events {
-                                if ["write_file", "edit_file", "apply_diff"].contains(&te.tool_name.as_str()) {
-                                    if let Some(p) = te.params.get("path").and_then(|v| v.as_str()) {
-                                        touched_files.insert(p.to_string());
-                                    }
-                                }
-                            }
-                        }
-                        let touched_vec: Vec<String> = touched_files.into_iter().collect();
-                        let _ = crate::tools::subagent::save_subtask_report_artifact(
-                            ws_path,
-                            &session_id,
-                            &s.title,
-                            s.subagent_role.as_deref().unwrap_or("协作者"),
-                            last_reply,
-                            &touched_vec,
-                        );
+                    let report_filename = format!("{}_report.md", session_id.replace('-', "_"));
+                    let report_path = ws_path.join(".harness").join("subtasks").join(&report_filename);
+                    let has_valid_report = report_path.exists()
+                        && std::fs::metadata(&report_path).map(|m| m.len() > 10).unwrap_or(false);
+
+                    if has_valid_report {
+                        let _ = store::set_session_status(&db, &session_id, "completed");
+                        let _ = store::set_kv(&db, &session_id, "delivered_outcome", "completed");
+                    } else if s.status != "failed" && s.status != "cancelled" {
+                        let _ = store::set_session_status(&db, &session_id, "interrupted");
                     }
                 }
 
@@ -1546,15 +1532,18 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             };
             if !has_active_plan_or_todo {
                 let gate_msg = if is_subagent {
-                    "【🛑 第 8 步门禁拦截（子任务施工/探索门禁）】：只读勘察已达 8 步上限且当前未创建 Todo 任务！\n\
-                    1. 若本任务需要修改代码且施工目标明确，必须在下一步立即调用 todo 工具声明施工步骤清单（哪怕只有 1 个任务），方可开始调用 write_file / edit_file 施工；\n\
-                    2. 若为纯探索/调研类任务且事实已查明，严禁盲目漫游，直接整理结论并调用 deliver_to_parent(status: \"completed\", summary: \"...\") 结案交付；\n\
-                    3. 若在 8 步内探索受阻、无法梳理出可行方案或缺少前置条件，严禁继续漫游或盲目重试，必须立即调用 deliver_to_parent(status: \"blocked\", summary: \"...\") 汇报遇到的具体阻碍并交回主会话！"
+                    let report_filename = format!("{}_report.md", session_id.replace('-', "_"));
+                    format!(
+                        "【🛑 第 8 步门禁拦截（子任务施工/探索门禁）】：只读勘察已达 8 步上限且当前未创建 Todo 任务！\n\
+                        1. 若本任务需要修改代码且施工目标明确，必须在下一步立即调用 todo 工具声明施工步骤清单（哪怕只有 1 个任务），方可开始调用 write_file / edit_file 施工；\n\
+                        2. 若为纯探索/调研类任务且事实已查明，严禁盲目漫游，直接调用 write_file 将详尽报告写入 `.harness/subtasks/{report_filename}` 并结案交付；\n\
+                        3. 若在 8 步内探索受阻、无法梳理出可行方案或缺少前置条件，严禁继续漫游或盲目重试，必须立即调用 write_file 写入 `.harness/subtasks/{report_filename}` 汇报遇到的具体阻碍并交回主会话！"
+                    )
                 } else {
                     "【🛑 第 8 步门禁拦截】：只读勘察已达 8 步上限且当前未创建 Todo 任务！\n\
                     1. 若已查明事实且无需修改代码（如咨询答疑），必须立即在正式回复（Content）中输出完整答复并直接结案；\n\
                     2. 若需要修改代码且方向明确，必须在下一步先调用 todo 工具声明任务清单（哪怕只有 1 个任务），方可进行代码修改；\n\
-                    3. 若依然方向模糊、无法梳理出清晰的 todo 计划，严禁盲目漫游或脑补计划，必须立即停止调用工具，在正式回复中向用户汇报当前事实并对齐目标！"
+                    3. 若依然方向模糊、无法梳理出清晰的 todo 计划，严禁盲目漫游或脑补计划，必须立即停止调用工具，在正式回复中向用户汇报当前事实并对齐目标！".to_string()
                 };
                 messages.push(json!({
                     "role": "user",
@@ -2246,14 +2235,6 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                     sop_verified = false;
                 }
             }
-            if (tc.name == "deliver_to_parent"
-                || (tc.name == "call_extended_tool"
-                    && args.get("tool_name").and_then(|v| v.as_str()) == Some("deliver_to_parent")))
-                && status == "success"
-            {
-                // 子任务向父进程完成正式结构化交付，优雅结案并直接退出执行循环
-                return (RunOutcome::Done, last_assistant_id, run_tokens);
-            }
             if tc.name == "create_plan" && status == "success" {
                 created_plan_in_this_turn = true;
             }
@@ -2329,8 +2310,20 @@ async fn handle_tool_call(
     };
 
     // Todo 先行门禁校验：
-    // 主会话中，若启用 todo_first_gate，在没有 active todo 且没有 active plan 的情况下，严禁调用 write_file 或 edit_file
-    if check_name == "write_file" || check_name == "edit_file" {
+    // 主会话中，若启用 todo_first_gate，在没有 active todo 且没有 active plan 的情况下，严禁调用 write_file 或 edit_file 修改业务代码
+    // 写入内部工件（.harness/subtasks/ 黑板交接与报告、.harness/plans/ 等）天然豁免 Todo 先行门禁
+    let check_params = if tool_name == "call_extended_tool" {
+        args.get("arguments").unwrap_or(args)
+    } else {
+        args
+    };
+    let is_internal_harness_artifact = {
+        let p = check_params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        p.contains(".harness/subtasks") || p.contains(".harness\\subtasks")
+            || p.contains(".harness/plans") || p.contains(".harness\\plans")
+            || p.contains(".harness/memory") || p.contains(".harness\\memory")
+    };
+    if (check_name == "write_file" || check_name == "edit_file") && !is_internal_harness_artifact {
         let (is_sub, is_sop_enabled, has_active_plan_or_todo) = {
             let db = state.db.lock().unwrap();
             let sop_enabled = store::get_settings(&db)

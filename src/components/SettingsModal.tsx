@@ -67,7 +67,6 @@ const TOOL_TITLES: Record<string, string> = {
   temp_snapshot: "保存备份快照",
   temp_restore: "恢复状态",
   temp_merge: "合并回原目录",
-  deliver_to_parent: "向父对话交付",
 };
 
 function renderRiskBadge(risk: string) {

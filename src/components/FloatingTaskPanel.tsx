@@ -111,6 +111,7 @@ function LongTaskSection({
   const pauseLongTask = useStore((s) => s.pauseLongTask);
   const resumeLongTask = useStore((s) => s.resumeLongTask);
   const cancelLongTask = useStore((s) => s.cancelLongTask);
+  const waitHeartbeat = useStore((s) => (task.sessionId ? s.subagentsWaitHeartbeat[task.sessionId] ?? null : null));
   const [acting, setActing] = useState(false);
 
   const subtasks = task.subtasks || [];
@@ -118,7 +119,9 @@ function LongTaskSection({
   const total = subtasks.length;
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
   const isRunning = task.status === "running" || task.status === "planning";
+  const isWaitingSubagents = task.status === "waiting_subagents";
   const isPaused = task.status === "paused" || task.status === "interrupted";
+  const isCancelled = task.status === "cancelled";
   const isFailed = task.status === "failed";
   const isCompleted = task.status === "completed";
 
@@ -165,10 +168,14 @@ function LongTaskSection({
             className={`text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0 flex items-center gap-1 ${
               isCompleted
                 ? "bg-green-500/20 text-green-300 border border-green-500/30"
+                : isCancelled
+                ? "bg-slate-500/20 text-slate-300 border border-slate-500/30"
                 : isPaused
                 ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
                 : isFailed
                 ? "bg-red-500/20 text-red-300 border border-red-500/30"
+                : isWaitingSubagents
+                ? "bg-purple-500/20 text-purple-300 border border-purple-500/30 animate-pulse"
                 : "bg-blue-500/20 text-blue-300 border border-blue-500/30 animate-pulse"
             }`}
           >
@@ -176,6 +183,11 @@ function LongTaskSection({
               <>
                 <CheckCircle2 size={11} className="text-green-400" />
                 <span>已达成</span>
+              </>
+            ) : isCancelled ? (
+              <>
+                <Square size={10} className="text-slate-400 fill-slate-400/20" />
+                <span>已终止</span>
               </>
             ) : isPaused ? (
               <>
@@ -186,6 +198,11 @@ function LongTaskSection({
               <>
                 <X size={10} className="text-red-400" />
                 <span>遇阻</span>
+              </>
+            ) : isWaitingSubagents ? (
+              <>
+                <Loader2 size={10} className="animate-spin text-purple-400" />
+                <span>等待沙箱</span>
               </>
             ) : (
               <>
@@ -219,10 +236,21 @@ function LongTaskSection({
           </div>
         )}
 
+        {/* 沙箱协同等待实时进度心跳 */}
+        {isWaitingSubagents && waitHeartbeat && (
+          <div className="flex items-center justify-between text-[10.5px] px-2 py-1 rounded bg-purple-500/15 border border-purple-500/25 text-purple-300">
+            <span className="flex items-center gap-1">
+              <Loader2 size={10} className="animate-spin text-purple-400" />
+              <span>协同沙箱推进中: {waitHeartbeat.completed}/{waitHeartbeat.total} 已就绪</span>
+            </span>
+            <span className="font-mono text-[10px] text-inkdim">{waitHeartbeat.elapsedSecs}s / {waitHeartbeat.timeoutSecs}s</span>
+          </div>
+        )}
+
         {/* 调度器控制按钮栏 (Scheduler Controls) */}
         <div className="flex items-center justify-between gap-1.5 pt-1 border-t border-purple-500/20">
           <div className="flex items-center gap-1.5">
-            {isRunning && (
+            {(isRunning || isWaitingSubagents) && (
               <button
                 type="button"
                 disabled={acting}
@@ -246,7 +274,7 @@ function LongTaskSection({
                 <span>{isFailed ? "重试推进" : "启动/继续推进"}</span>
               </button>
             )}
-            {!isCompleted && (
+            {!isCompleted && !isCancelled && (
               <button
                 type="button"
                 disabled={acting}
@@ -261,14 +289,18 @@ function LongTaskSection({
           </div>
 
           <div className="text-[10px] text-inkdim font-mono">
-            {isRunning ? (
+            {isCompleted ? (
+              <span className="text-green-400">全部完成</span>
+            ) : isCancelled ? (
+              <span className="text-slate-400">已终止</span>
+            ) : isWaitingSubagents ? (
+              <span className="text-purple-400">沙箱协同中</span>
+            ) : isRunning ? (
               <span className="text-blue-400">调度中</span>
             ) : isPaused ? (
               <span className="text-amber-400">已挂起</span>
-            ) : isFailed ? (
-              <span className="text-red-400">异常待查</span>
             ) : (
-              <span className="text-green-400">全部完成</span>
+              <span className="text-red-400">异常待查</span>
             )}
           </div>
         </div>
@@ -556,7 +588,7 @@ export function FloatingTaskPanel() {
 
   const hasTasks = !!currentBoard && currentBoard.items.length > 0;
   const hasCmds = runningCmds.length > 0;
-  const hasLongTask = !!activeTask && activeTask.status !== "cancelled";
+  const hasLongTask = !!activeTask;
 
   if (!currentId || currentId === DRAFT_ID || (!hasTasks && !hasCmds && !hasLongTask)) return null;
 
@@ -578,9 +610,44 @@ export function FloatingTaskPanel() {
             className="text-inkdim group-hover:text-accent transition-transform duration-150 group-hover:-translate-x-0.5 shrink-0"
           />
           {hasLongTask && (
-            <span className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-purple-500/15 text-purple-400 inline-flex items-center gap-1">
+            <span
+              className={`text-[10px] px-1.5 py-0.5 rounded font-medium inline-flex items-center gap-1 ${
+                activeTask?.status === "completed"
+                  ? "bg-green-500/15 text-green-400"
+                  : activeTask?.status === "cancelled"
+                  ? "bg-slate-500/15 text-slate-400"
+                  : activeTask?.status === "paused" || activeTask?.status === "interrupted"
+                  ? "bg-amber-500/15 text-amber-400"
+                  : activeTask?.status === "waiting_subagents"
+                  ? "bg-purple-500/15 text-purple-400"
+                  : "bg-blue-500/15 text-blue-400"
+              }`}
+            >
+              <span
+                className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                  activeTask?.status === "running"
+                    ? "bg-blue-400 animate-pulse"
+                    : activeTask?.status === "waiting_subagents"
+                    ? "bg-purple-400 animate-ping"
+                    : activeTask?.status === "completed"
+                    ? "bg-green-400"
+                    : activeTask?.status === "cancelled"
+                    ? "bg-slate-400"
+                    : "bg-amber-400"
+                }`}
+              />
               <Target size={11} className="shrink-0" />
-              <span>长任务</span>
+              <span>
+                {activeTask?.status === "completed"
+                  ? "已达成"
+                  : activeTask?.status === "cancelled"
+                  ? "已终止"
+                  : activeTask?.status === "paused" || activeTask?.status === "interrupted"
+                  ? "已暂停"
+                  : activeTask?.status === "waiting_subagents"
+                  ? "等待沙箱"
+                  : "长任务推进"}
+              </span>
             </span>
           )}
           {currentBoard?.board_type === "plan" && (

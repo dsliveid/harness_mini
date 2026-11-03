@@ -233,7 +233,7 @@ pub fn build_static_system_prompt(
             format!(
                 r#"你是 harness_mini 派生出的专业协作子 Agent 进程。
 角色定位：{role}
-专属任务目标已由主进程在首条任务简报中详述。请依据简报与已知重点切入，通过 todo 明确步骤推进落实。
+专属任务目标、探查入口与交付验收标准已在下方【黑板交接书】中权威定义。请依此展开分析与推进。
 工作区根目录：{path}
 操作系统：{os}"#,
                 role = role,
@@ -272,8 +272,9 @@ pub fn build_static_system_prompt(
 
         if is_sop_enabled("todo_first_gate") {
             let gate_rule = if is_sub {
+                let report_filename = format!("{}_report.md", session.id.replace('-', "_"));
                 format!(
-                    "{rule_num}. 【Todo 先行与阶梯门禁公理（所有交互必须严格遵守）】：\n                     - 门禁 ①【Todo 先行与写入前置拦截】：\n                       * 严禁在没有 active todo 的情况下擅自调用 `write_file` 或 `edit_file` 修改项目文件；\n                       * 只要涉及修改代码/文件，动工前必须先调用 `todo` 工具声明任务清单（哪怕只有 1 个微小改动任务，也必须先立项）；\n                       * 纯探索调研、排查诊断或问答任务：未经明确要求修改代码，严禁调用 todo，更严禁擅自修改文件。\n                     - 门禁 ②【≤8 步勘察上限与目标对齐（防盲目漫游）】：\n                       * 勘察排查类只读工具（glob / list_dir / read_file / grep / file_outline）调用累计不大于 8 步；\n                       * 若在 8 步内已查清事实且无需修改代码，立即直接调用 `deliver_to_parent(status: \"completed\", summary: \"...\")` 结案交付；\n                       * 若在 8 步内明确需要修改代码，必须先调用 `todo` 工具立项，再开始编写代码并按清单推进；\n                       * 🚨 熔断停下：若工具调用达到第 8 步仍未能梳理出清晰的 todo 施工清单，或发现前置条件严重缺失，严禁凭空脑补计划、严禁继续只读漫游，必须立即调用 `deliver_to_parent(status: \"blocked\", summary: \"...\")` 向主进程汇报当前遇到的具体阻碍并交回决策权！"
+                    "{rule_num}. 【Todo 先行与阶梯门禁公理（所有交互必须严格遵守）】：\n                     - 门禁 ①【Todo 先行与写入前置拦截】：\n                       * 严禁在没有 active todo 的情况下擅自调用 `write_file` 或 `edit_file` 修改项目代码；\n                       * 只要涉及修改代码，动工前必须先调用 `todo` 工具声明任务清单（哪怕只有 1 个微小改动任务，也必须先立项）；\n                       * 纯探索调研、排查诊断或问答任务：未经明确要求修改代码，严禁调用 todo，更严禁擅自修改文件；写入交付报告 `.harness/subtasks/{report_filename}` 天然豁免 todo 门禁。\n                     - 门禁 ②【≤8 步勘察上限与目标对齐（防盲目漫游）】：\n                       * 勘察排查类只读工具（glob / list_dir / read_file / grep / file_outline）调用累计不大于 8 步；\n                       * 若在 8 步内已查清事实且无需修改代码，立即调用 `write_file` 写入交付报告 `.harness/subtasks/{report_filename}` 并结案；\n                       * 若在 8 步内明确需要修改代码，必须先调用 `todo` 工具立项，再开始编写代码并按清单推进；\n                       * 🚨 熔断停下：若工具调用达到第 8 步仍未能梳理出清晰的 todo 施工清单，或发现前置条件严重缺失，严禁凭空脑补计划、严禁继续只读漫游，必须立即调用 `write_file` 写入交付报告向主进程汇报当前遇到的具体阻碍并交回决策权！"
                 )
             } else {
                 format!(
@@ -309,14 +310,15 @@ pub fn build_static_system_prompt(
         }
 
         if is_sub {
+            let report_filename = format!("{}_report.md", session.id.replace('-', "_"));
             rules.push(format!(
-                "{rule_num}. 【子任务成果交付规范 (deliver_to_parent)】：\n                 - 任务全部完成、部分完成或遇到重大阻碍时，必须直接调用 `deliver_to_parent` 工具进行结构化交付：\n                   * `status`: 可选 \"completed\"（成功结案）、\"partial\"（部分完成）或 \"blocked\"（受阻）；\n                   * `summary`: 简明总结任务完成状态、改动文件清单、核心交付结论与测试验证结果（控制在 250 字以内，以便父进程汇聚决策）；\n                 - 交付后子会话立即结案归档；严禁仅输出文本回复而不调用 `deliver_to_parent`；\n                 - 【单层执行准则】：严禁再次派生子 Agent，直接使用现有工具高效完成分配的目标。"
+                "{rule_num}. 【纯黑板交付规范与结案硬性标准】：\n                 - 任务目标、验收标准与负向禁区已在下方【黑板交接书】中权威定义；\n                 - 无论任务是全部完成、部分完成或遇到重大阻碍，【唯一硬性结案标准】是调用 `write_file` 工具将结构化交付报告写入 `.harness/subtasks/{report_filename}`：\n                   * 报告内容需详尽记录：执行结论、事实依据、架构/时序图（Mermaid）、涉及改动的文件列表及自检测试输出；\n                   * 若任务受阻，需在报告中明确陈述阻碍原因与前置缺失；\n                 - 写入交付报告后，在对话正文中简短总结交付结论即可自然结束；严禁仅输出文本回复而不落盘报告；\n                 - 【单层执行准则】：严禁再次派生子 Agent，直接使用现有工具高效完成分配的目标。"
             ));
             rule_num += 1;
 
             if !is_collab {
                 rules.push(format!(
-                    "{rule_num}. 【施工工人准则与架构遵从（必须严格遵守）】：\n                     - 若主进程在简报中提供了《实施蓝图》、拟定函数签名或目标文件与行号锚点，你作为实施工人，【严禁重新设计接口签名、擅自改动方法名或推翻既定架构】；\n                     - 你的核心职责是：使用 read_file 对目标局部精读确认原文，严格按照既定蓝图进行精确修改并运行测试验证；\n                     - 若在执行中发现计划或方案存在重大隐患，请在 deliver_to_parent 的 summary 中提出《计划调整建议》，交由主进程统筹处理。"
+                    "{rule_num}. 【施工工人准则与架构遵从（必须严格遵守）】：\n                     - 若主进程在简报或交接书中提供了《实施蓝图》、拟定函数签名或目标文件与行号锚点，你作为实施工人，【严禁重新设计接口签名、擅自改动方法名或推翻既定架构】；\n                     - 你的核心职责是：使用 read_file 对目标局部精读确认原文，严格按照既定蓝图进行精确修改并运行测试验证；\n                     - 若在执行中发现计划或方案存在重大隐患，请在交付报告 `.harness/subtasks/{report_filename}` 中提出《计划调整建议》，交由主进程统筹处理。"
                 ));
                 rule_num += 1;
             }
@@ -401,6 +403,23 @@ pub fn build_static_system_prompt(
     if let Some(collabs) = static_collab_section {
         full.push_str("\n\n");
         full.push_str(collabs);
+    }
+
+    // 子任务黑板任务交接书权威挂载 (Layer 3 权威上下文)
+    // 保证任务目标、交付标准与禁区在多轮交互中 100% 字节级恒定，100% 命中 KV 前缀缓存且永不被历史压缩抹除
+    if is_sub && !session.workspace_path.is_empty() {
+        let ws = std::path::Path::new(&session.workspace_path);
+        let knowledge_filename = format!("{}_knowledge.md", session.id.replace('-', "_"));
+        let knowledge_path = ws.join(".harness").join("subtasks").join(&knowledge_filename);
+        if knowledge_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&knowledge_path) {
+                if !content.trim().is_empty() {
+                    full.push_str(&format!(
+                        "\n\n## 📋 协同任务黑板交接书（最高权威基准，来自 .harness/subtasks/{knowledge_filename}）\n> ⚠️ 核心准则：此交接书定义了本任务的目标、验收标准与负向禁区。在多轮执行中始终保持最高效力。\n\n{content}\n"
+                    ));
+                }
+            }
+        }
     }
 
     full

@@ -107,6 +107,7 @@ export function useAppEvents() {
       listen<any>("subagents:changed", (e) => s.onSubagentsChanged(e.payload)),
       listen<Session>("subagent:created", (e) => s.onSubagentCreated(e.payload as Session)),
       listen<any>("subagent:update", (e) => s.onSubagentUpdate(e.payload)),
+      listen<any>("subagents:wait_heartbeat", (e) => s.onWaitHeartbeat(e.payload)),
       listen<any>("task:update", (e) => s.onTaskUpdate(e.payload)),
       listen<any>("task:checkpoint", (e) => s.onTaskCheckpoint(e.payload)),
       listen<any>("task:finished", () => s.pushToast("长任务已圆满完成！", "success")),

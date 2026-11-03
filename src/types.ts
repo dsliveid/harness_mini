@@ -388,7 +388,7 @@ export const AGENT_SOPS: AgentSopInfo[] = [
     categoryLabel: "协同体系",
     scope: "sub_only",
     scopeLabel: "子对话可用",
-    description: "专职子任务在完成施工、纯调研结案或遇到重大阻碍时，必须调用 deliver_to_parent 工具向父进程正式交付结构化成果（completed/partial/blocked 与 250 字以内核心总结）。交付后子会话立即优雅结案。",
+    description: "专职子任务在完成施工、纯调研结案或遇到重大阻碍时，必须调用 write_file 工具向黑板文件 .harness/subtasks/{id}_report.md 正式交付结构化成果。落盘后子会话立即优雅结案。",
     disableEffect: "子对话专属交付规范，主对话天然跳过。",
   },
   {
@@ -1898,12 +1898,23 @@ export interface FileOutlineItem {
 export type LongTaskStatus =
   | "planning"
   | "running"
+  | "waiting_subagents"
   | "paused"
+  | "interrupted"
   | "waiting_approval"
   | "completed"
   | "failed"
   | "cancelled"
   | string;
+
+export interface SubagentsWaitHeartbeat {
+  parentSessionId: string;
+  total: number;
+  running: number;
+  completed: number;
+  elapsedSecs: number;
+  timeoutSecs: number;
+}
 
 export interface TaskSubItem {
   id: string;

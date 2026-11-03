@@ -387,6 +387,8 @@ export function Composer() {
     ? activeCommandCfg.placeholder
     : isTagCommand
     ? "斜杠标签指令：输入内容，回车将注入对应提示词并推进执行…"
+    : currentId && useStore.getState().activeTasks[currentId] && ["running", "planning", "waiting_subagents"].includes(useStore.getState().activeTasks[currentId]?.status || "")
+    ? "长任务推进中…输入内容将作为实时纠偏干预指令即刻注入"
     : running
     ? "Agent 运行中…输入消息回车将加入待执行列表"
     : "输入消息，/goal 发起长任务、/best 评审方案，Enter 发送…";
@@ -622,6 +624,20 @@ export function Composer() {
           targetSessionId = s.id;
           st.onSessionUpdate(s);
           await st.selectSession(s.id);
+        }
+
+        // 门禁：同一会话仅允许一个活跃长任务守护进程（单例守护保障）
+        const existingTask = targetSessionId ? st.activeTasks[targetSessionId] : null;
+        if (
+          existingTask &&
+          (existingTask.status === "running" ||
+            existingTask.status === "planning" ||
+            existingTask.status === "waiting_subagents")
+        ) {
+          pushToast("当前会话已有正在推进的长任务，请先暂停或终止旧任务后再启动新长任务", "warning");
+          setSessionDraft(targetId, t);
+          setPendingAttachments(sendingAttachments);
+          return;
         }
 
         // 启动长任务核心引擎，并在主界面激活 TaskBar

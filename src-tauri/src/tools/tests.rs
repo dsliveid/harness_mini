@@ -379,3 +379,38 @@ const handleClick = async () => {
 
         let _ = std::fs::remove_dir_all(&ws);
     }
+
+    #[test]
+    fn test_subagent_blackboard_handover_mount_and_no_deliver_to_parent() {
+        let ws = std::env::temp_dir().join(format!("hm_test_bb_{}", uuid::Uuid::new_v4()));
+        let subtasks_dir = ws.join(".harness").join("subtasks");
+        let _ = std::fs::create_dir_all(&subtasks_dir);
+
+        let subagent_id = "test-sub-456";
+        let knowledge_filename = format!("{}_knowledge.md", subagent_id.replace('-', "_"));
+        let knowledge_file = subtasks_dir.join(&knowledge_filename);
+        std::fs::write(&knowledge_file, "# 知识交接书内容\n- 目标：全面调研架构\n- 验收标准：完成报告").unwrap();
+
+        let sub_session = crate::models::Session {
+            id: subagent_id.into(),
+            parent_session_id: Some("parent-123".into()),
+            session_type: "subagent".into(),
+            workspace_path: ws.to_string_lossy().to_string(),
+            subagent_role: Some("架构调研员".into()),
+            title: "调研任务".into(),
+            ..Default::default()
+        };
+
+        // 验证 System Prompt 自动挂载黑板交接书
+        let sys_prompt = crate::context::build_static_system_prompt(&sub_session, &[], "standard", None, None, None);
+        assert!(sys_prompt.contains("## 📋 协同任务黑板交接书"));
+        assert!(sys_prompt.contains("全面调研架构"));
+        assert!(sys_prompt.contains("test_sub_456_report.md"));
+        assert!(!sys_prompt.contains("deliver_to_parent"));
+
+        // 验证工具列表中已无 deliver_to_parent 专用工具
+        let specs = super::specs::tool_specs();
+        assert!(!specs.iter().any(|s| s.name == "deliver_to_parent"));
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }

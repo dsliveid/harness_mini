@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "./ipc";
-import { DRAFT_ID, isSessionNonTerminal, resolveActiveModel, samePath, sortMessages, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type CurrentBoard, type DataStatus, type GrowthItem, type ActiveStepState, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type TaskCheckpoint, type TaskSubItem, type FocusFloatingTarget, type PlanSummary, type IntentAlignmentEvent, type IntentInterventionRequest } from "./types";
+import { DRAFT_ID, isSessionNonTerminal, resolveActiveModel, samePath, sortMessages, type ApprovalReq, type ApprovalRule, type Attachment, type CollaboratorCreateInput, type CollaboratorUpdateInput, type CompactionReq, type CurrentBoard, type DataStatus, type GrowthItem, type ActiveStepState, type Message, type Project, type QueuedItem, type Session, type SessionCompaction, type SessionModelsUpdateInput, type Settings, type TempAlloc, type TempInfo, type ToolEvent, type ToolRetryGuidanceEvent, type ToolRetryStatus, type TruncationNotice, type LongTask, type SubagentsWaitHeartbeat, type TaskCheckpoint, type TaskSubItem, type FocusFloatingTarget, type PlanSummary, type IntentAlignmentEvent, type IntentInterventionRequest } from "./types";
 
 
 export interface EditingMessageTarget {
@@ -415,6 +415,8 @@ interface Store {
   fetchTaskCheckpoints: (taskId: string) => Promise<TaskCheckpoint[]>;
   rollbackToCheckpoint: (checkpointId: string) => Promise<LongTask | null>;
   updateTaskSubtasks: (taskId: string, subtasks: TaskSubItem[]) => Promise<LongTask | null>;
+  subagentsWaitHeartbeat: Record<string, SubagentsWaitHeartbeat | null>;
+  onWaitHeartbeat: (ev: SubagentsWaitHeartbeat) => void;
   onTaskUpdate: (task: LongTask) => void;
   onTaskCheckpoint: (checkpoint: TaskCheckpoint) => void;
 
@@ -764,6 +766,7 @@ export const useStore = create<Store>((set, get) => ({
 
   activeTasks: {},
   taskCheckpoints: {},
+  subagentsWaitHeartbeat: {},
   showBrowserInspector: false,
   setShowBrowserInspector: (v) => set({ showBrowserInspector: v }),
   browserInspectorTab: "view",
@@ -1904,10 +1907,11 @@ export const useStore = create<Store>((set, get) => ({
       }
       // 若当前会话关联长任务且运行被中止/失败，立即将长任务及进行中的子步骤置为 interrupted/failed，严禁变为 completed
       let nextActiveTasks = st.activeTasks;
-      if (p.status !== "running" && p.status !== "done" && st.activeTasks[p.sessionId]) {
+      // 明确收到取消/失败事件时，将进行中的长任务标记为 cancelled/failed；正常单轮结束不篡改长任务状态
+      if ((p.status === "cancelled" || p.status === "failed") && st.activeTasks[p.sessionId]) {
         const curTask = st.activeTasks[p.sessionId]!;
-        if (curTask.status === "running" || curTask.status === "planning") {
-          const mappedTaskStatus = p.status === "failed" ? "failed" : "interrupted";
+        if (curTask.status === "running" || curTask.status === "planning" || curTask.status === "waiting_subagents") {
+          const mappedTaskStatus = p.status === "failed" ? "failed" : "cancelled";
           const updatedSubtasks = (curTask.subtasks || []).map((sub) =>
             sub.status === "running" || sub.status === "verifying"
               ? { ...sub, status: mappedTaskStatus }
@@ -1982,8 +1986,15 @@ export const useStore = create<Store>((set, get) => ({
         }
       }
 
+      let effectiveRunStatus = p.status === "running" ? ("running" as const) : ("idle" as const);
+      const activeTaskForSession = nextActiveTasks[p.sessionId];
+      if (activeTaskForSession && (activeTaskForSession.status === "running" || activeTaskForSession.status === "planning" || activeTaskForSession.status === "waiting_subagents")) {
+        // 守护进程治理：主对话与守护进程绑定，长任务处于活跃态（running/waiting_subagents）时，主状态保持 running
+        effectiveRunStatus = "running" as const;
+      }
+
       return {
-        runStatus: { ...st.runStatus, [p.sessionId]: p.status === "running" ? "running" : "idle" },
+        runStatus: { ...st.runStatus, [p.sessionId]: effectiveRunStatus },
         activeStepMap: nextActiveStepMap,
         lastRunOutcome: { ...st.lastRunOutcome, [p.sessionId]: p.status },
         sessions: st.sessions.map((s) => (s.id === p.sessionId ? { ...s, lastRunStatus: p.status } : s)),
@@ -3175,9 +3186,42 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   onTaskUpdate(task) {
-    set((st) => ({
-      activeTasks: { ...st.activeTasks, [task.sessionId]: task },
-    }));
+    set((st) => {
+      const isTaskActive = task.status === "running" || task.status === "planning" || task.status === "waiting_subagents";
+      const nextRunStatus = isTaskActive
+        ? { ...st.runStatus, [task.sessionId]: "running" as const }
+        : (task.status === "completed" || task.status === "paused" || task.status === "cancelled" || task.status === "failed")
+        ? { ...st.runStatus, [task.sessionId]: "idle" as const }
+        : st.runStatus;
+
+      return {
+        activeTasks: { ...st.activeTasks, [task.sessionId]: task },
+        runStatus: nextRunStatus,
+      };
+    });
+  },
+
+  onWaitHeartbeat(ev) {
+    set((st) => {
+      const curTask = st.activeTasks[ev.parentSessionId];
+      const nextTasks = curTask && curTask.status === "running"
+        ? {
+            ...st.activeTasks,
+            [ev.parentSessionId]: {
+              ...curTask,
+              status: "waiting_subagents" as const,
+            },
+          }
+        : st.activeTasks;
+
+      return {
+        activeTasks: nextTasks,
+        subagentsWaitHeartbeat: {
+          ...st.subagentsWaitHeartbeat,
+          [ev.parentSessionId]: ev,
+        },
+      };
+    });
   },
 
   onTaskCheckpoint(checkpoint) {

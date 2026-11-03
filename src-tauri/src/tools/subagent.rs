@@ -216,7 +216,7 @@ pub(crate) async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<S
     // 子 Agent 工作区严格与父会话保持完全一致
     let sub_workspace = parent_session.workspace_path.clone();
 
-    let (sub, user_msg, initial_prompt) = {
+    let (sub, initial_prompt) = {
         let db = state.db.lock().unwrap();
         let sub = crate::store::create_subagent_session(
             &db,
@@ -243,11 +243,11 @@ pub(crate) async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<S
             );
         }
         let initial_prompt = build_briefing_packet(&db, &ctx.workspace, parent_id, role, title, task, args);
-        let user_msg = crate::store::new_message(&db, &sub.id, "user", Some(initial_prompt.clone()), false)?;
-        (sub, user_msg, initial_prompt)
+        (sub, initial_prompt)
     };
 
-    // 双轨持久化：将生成的知识交接书物理落盘至 .harness/subtasks/{subagent_id}_knowledge.md
+    // 权威黑板持久化：先将生成的知识交接书物理落盘至 .harness/subtasks/{subagent_id}_knowledge.md
+    // 确保子任务启动后 System Prompt 可以立即读取并权威挂载
     let knowledge_path_opt = if !ctx.workspace.as_os_str().is_empty() {
         save_subtask_knowledge_artifact(
             &ctx.workspace,
@@ -259,6 +259,19 @@ pub(crate) async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<S
         ).ok()
     } else {
         None
+    };
+
+    let report_filename = format!("{}_report.md", sub.id.replace('-', "_"));
+    let trigger_prompt = format!(
+        "【协同子任务指令】：你已受命启动专职协同任务【{title}】（角色定位：{role}）。\n\
+        核心目标：{task}\n\n\
+        ⚠️ 你的完整任务知识交接书（含探查入口锚点、交付验收标准与严格负向禁区）已作为最高权威基准挂载在系统上下文【黑板交接书】中，并已物理落盘至 `.harness/subtasks/{}_knowledge.md`。\n\
+        请立即围绕交接书目标展开分析与推进。完成任务或遇到阻碍时，唯一硬性交付标准是调用 `write_file` 工具将详尽报告写入 `.harness/subtasks/{report_filename}` 并做简短收敛宣告。",
+        sub.id.replace('-', "_")
+    );
+    let user_msg = {
+        let db = state.db.lock().unwrap();
+        crate::store::new_message(&db, &sub.id, "user", Some(trigger_prompt), false)?
     };
 
     // 启动子 Agent 异步运行循环
@@ -432,62 +445,47 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
 
     let start_wait = std::time::Instant::now();
     let max_wait = std::time::Duration::from_secs(timeout_secs);
-    let mut auto_recovered = std::collections::HashSet::new();
-
+    let mut last_heartbeat = std::time::Instant::now();
     loop {
-        let mut any_running = false;
-        for id in &target_ids {
-            let is_running = crate::agent::is_run_active(&state, id);
-            if is_running {
-                any_running = true;
-            } else if !auto_recovered.contains(id) {
-                // 检查是否是非正常中断停止（未交付且未显式取消），若发生意外中断且尚有等待时间，自动触发一次自愈恢复
-                // 核心防护：若父会话已被中止或停止，严禁反向触发子任务自愈复活！
-                let parent_is_active = crate::agent::is_run_active(&state, parent_id);
-                let should_recover = if !parent_is_active {
-                    false
-                } else {
-                    let db = state.db.lock().unwrap();
-                    if let Ok(Some(ps)) = crate::store::get_session(&db, parent_id) {
-                        if ps.status == "cancelled" || ps.status == "stopped" || ps.status == "interrupted" {
-                            false
-                        } else if let Ok(Some(s)) = crate::store::get_session(&db, id) {
-                            let is_already_delivered = s.status == "completed"
-                                || crate::store::get_kv(&db, id, "delivered_outcome").ok().flatten().is_some();
-                            if is_already_delivered {
-                                false
-                            } else if s.status == "interrupted" || s.status == "failed" {
-                                true
-                            } else if s.status != "cancelled" && s.status != "stopped" {
-                                let msgs = crate::store::get_messages(&db, id, None, 10).unwrap_or_default();
-                                let last_asst = msgs.iter().rev().find(|m| m.role == "assistant");
-                                let has_terminal_reply = last_asst.map(|m| {
-                                    m.tool_calls.is_none()
-                                        || m.tool_calls.as_ref().map(|t| t.is_null() || t.as_array().map(|a| a.is_empty()).unwrap_or(false)).unwrap_or(false)
-                                }).unwrap_or(false);
-                                !has_terminal_reply
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                };
-
-                if should_recover && start_wait.elapsed() < max_wait {
-                    auto_recovered.insert(id.clone());
-                    let _ = crate::agent::restart_subagent(&host.app, id);
-                    any_running = true;
-                }
-            }
+        // 1. 若父会话已被外部停止或收到新的干预指示，立即退出等待
+        if !crate::agent::is_run_active(&state, parent_id) {
+            break;
+        }
+        let has_user_steering = {
+            let db = state.db.lock().unwrap();
+            crate::store::list_queued(&db, parent_id).map(|l| !l.is_empty()).unwrap_or(false)
+        };
+        if has_user_steering {
+            break;
         }
 
+        let any_running = target_ids.iter().any(|id| crate::agent::is_run_active(&state, id));
         if !any_running || start_wait.elapsed() >= max_wait {
             break;
         }
+
+        // 2. 定期向前端广播心跳（每 2 秒一次），实时同步子沙箱执行聚合进度
+        if last_heartbeat.elapsed() >= std::time::Duration::from_secs(2) {
+            last_heartbeat = std::time::Instant::now();
+            let mut running_cnt = 0usize;
+            let mut done_cnt = 0usize;
+            for id in &target_ids {
+                if crate::agent::is_run_active(&state, id) {
+                    running_cnt += 1;
+                } else {
+                    done_cnt += 1;
+                }
+            }
+            let _ = host.app.emit("subagents:wait_heartbeat", serde_json::json!({
+                "parentSessionId": parent_id,
+                "total": target_ids.len(),
+                "running": running_cnt,
+                "completed": done_cnt,
+                "elapsedSecs": start_wait.elapsed().as_secs(),
+                "timeoutSecs": timeout_secs,
+            }));
+        }
+
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
@@ -523,11 +521,6 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
                 .and_then(|m| m.content.as_deref())
                 .unwrap_or("(未产生文本回复)");
 
-            let last_asst = msgs.iter().rev().find(|m| m.role == "assistant");
-            let has_terminal_reply = last_asst.map(|m| {
-                m.tool_calls.is_none()
-                    || m.tool_calls.as_ref().map(|t| t.is_null() || t.as_array().map(|a| a.is_empty()).unwrap_or(false)).unwrap_or(false)
-            }).unwrap_or(false);
             let has_max_steps_msg = msgs.iter().rev().any(|m| m.role == "system" && m.content.as_deref().unwrap_or("").contains("已达到最大步数"));
 
             let has_pending_approval = state
@@ -537,27 +530,36 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
                 .values()
                 .any(|p| p.session_id == *id);
 
-            let (status_code, status_display) = determine_subagent_status(
-                is_running,
-                &s.status,
-                has_terminal_reply,
-                has_max_steps_msg,
-                has_pending_approval,
-            );
+            let report_filename = format!("{}_report.md", id.replace('-', "_"));
+            let report_rel_path = format!(".harness/subtasks/{}", report_filename);
+            let report_full_path = ctx.workspace.join(&report_rel_path);
+            let report_content_opt = if !ctx.workspace.as_os_str().is_empty() && report_full_path.exists() {
+                std::fs::read_to_string(&report_full_path).ok().filter(|c| c.trim().len() > 10)
+            } else {
+                None
+            };
+            let has_valid_report = report_content_opt.is_some();
+
+            let (status_code, status_display) = if has_pending_approval {
+                ("pending_approval", "🟡 等待用户审批中 (pending_approval - 等待用户在界面确认放行)")
+            } else if is_running {
+                ("running", "🟡 仍在运行 (running)")
+            } else if has_valid_report {
+                ("completed", "🟢 已完成交付 (completed)")
+            } else if s.status == "cancelled" {
+                ("cancelled", "⚪ 已取消/停止 (cancelled)")
+            } else if s.status == "failed" {
+                ("failed", "🔴 运行失败出错 (failed - 可由主任务决定是否恢复)")
+            } else {
+                ("interrupted", "🟠 执行中断未交付报告 (interrupted)")
+            };
+
             if is_running || has_pending_approval {
                 any_still_running = true;
             }
             if status_code == "interrupted" || status_code == "failed" {
                 any_interrupted_or_failed = true;
             }
-
-            let display_reply = if has_max_steps_msg {
-                format!("⚠️ 该子任务已达到最大步数上限中止，未生成最终交付报告。最后思考或动作：\n{}", last_reply)
-            } else if status_code == "interrupted" && last_reply != "(未产生文本回复)" {
-                format!("⚠️ 该子任务执行中断或未完全收敛交付。最后思考或动作：\n{}", last_reply)
-            } else {
-                last_reply.to_string()
-            };
 
             let mut touched_files = std::collections::BTreeSet::new();
             for m in &msgs {
@@ -586,41 +588,51 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
                     || title_str.contains("技术栈") || title_str.contains("架构")
                     || task_str.contains("技术栈") || task_str.contains("依赖分析")
             };
-            if is_tech_analysis && !is_running && has_terminal_reply && last_reply.len() > 50 && last_reply != "(未产生文本回复)" {
+            if is_tech_analysis && !is_running && has_valid_report {
                 let already_recorded = msgs.iter().any(|m| {
                     m.tool_events.iter().any(|te| te.tool_name == "record_memory")
                 });
                 if !already_recorded && !ctx.workspace.as_os_str().is_empty() {
-                    if let Ok(effect) = crate::memory::record_memory_with_effect(
-                        &ctx.workspace,
-                        "profile",
-                        &s.title,
-                        last_reply,
-                    ) {
-                        memory_effects.push(effect);
+                    if let Some(ref rep_text) = report_content_opt {
+                        if let Ok(effect) = crate::memory::record_memory_with_effect(
+                            &ctx.workspace,
+                            "profile",
+                            &s.title,
+                            rep_text,
+                        ) {
+                            memory_effects.push(effect);
+                        }
                     }
                 }
             }
 
-            // 双轨交付：将长文本落地到工件文件 .harness/subtasks/{subagent_id}_report.md
-            let artifact_path_opt = if !ctx.workspace.as_os_str().is_empty() && (display_reply.len() > 250 || display_reply.contains("```") || !touched_vec.is_empty()) {
-                save_subtask_report_artifact(
-                    &ctx.workspace,
-                    id,
-                    &s.title,
-                    s.subagent_role.as_deref().unwrap_or("协作助手"),
-                    &display_reply,
-                    &touched_vec,
-                ).ok()
+            let (artifact_line, conclusion_title, compact_summary) = if let Some(ref rep_text) = report_content_opt {
+                let art_line = format!("- 📄 完整技术报告工件: [查看完整详细报告](file:///{})\n", report_rel_path.replace('\\', "/"));
+                let title = "- 交付核心结论：".to_string();
+                let summary = extract_compact_summary(rep_text, 400);
+                (art_line, title, summary)
+            } else if is_running {
+                let art_line = String::new();
+                let title = "- 阶段性进展（⚠️ 任务仍在后台推进中，尚未交付报告）：".to_string();
+                let summary = extract_compact_summary(last_reply, 350);
+                (art_line, title, summary)
+            } else if has_pending_approval {
+                let art_line = String::new();
+                let title = "- 阶段性进展（⚠️ 等待安全审批放行）：".to_string();
+                let summary = extract_compact_summary(last_reply, 350);
+                (art_line, title, summary)
             } else {
-                None
-            };
-
-            let compact_summary = extract_compact_summary(&display_reply, 350);
-            let artifact_line = if let Some(ref ap) = artifact_path_opt {
-                format!("- 📄 完整技术报告工件: [查看完整详细报告](file:///{})\n", ap.replace('\\', "/"))
-            } else {
-                String::new()
+                let art_line = String::new();
+                let diag = if has_max_steps_msg {
+                    "达到执行步数预算上限中止，未生成交付报告"
+                } else if s.status == "failed" {
+                    "运行过程发生错误失败，未生成交付报告"
+                } else {
+                    "子任务已停止，但未调用 write_file 生成交付报告文件"
+                };
+                let title = format!("- 阶段状态（⚠️ 未完成交付 - {diag}）：\n  * 子任务末尾输出：");
+                let summary = extract_compact_summary(last_reply, 350);
+                (art_line, title, summary)
             };
 
             let knowledge_file_rel = format!(".harness/subtasks/{}_knowledge.md", id.replace('-', "_"));
@@ -634,16 +646,6 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
                 "- ⚠️ 审批受阻: 该子任务触发了安全审批，当前已挂起，正在等待用户在界面弹窗中放行审批！\n"
             } else {
                 ""
-            };
-
-            let conclusion_title = if status_code == "completed" {
-                "- 交付核心结论："
-            } else if has_pending_approval {
-                "- 阶段性进展（⚠️ 等待审批放行，尚未完成交付）："
-            } else if is_running {
-                "- 阶段性进展（⚠️ 任务仍在后台推进，尚未交付）："
-            } else {
-                "- 中断前阶段状态（⚠️ 未完成交付）："
             };
 
             sub_results.push(format!(
@@ -669,17 +671,22 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
 
     if is_timed_out || any_still_running {
         out.push_str(&format!(
-            "⚠️【重要系统指令 - 任务仍在执行中，严禁输出最终业务结案】\n\
-            等待达到单次超时上限（{timeout_secs}s），目标子 Agent 仍在后台推进中或等待用户审批，尚未产出最终结案成果！\n\
-            【模型行为准则】：\n\
-            1. 严禁向用户直接输出业务结案回答，严禁假设子任务已交付完毕！\n\
-            2. 若有子 Agent 处于「等待用户审批」，请简短提示用户在界面审批放行；\n\
-            3. 你必须在当前思考后【再次调用 wait_subagents】继续等待，直到所有子 Agent 均变为「🟢 已完成交付」！\n\n"
+            "⚠️【提示：部分子 Agent 仍在后台推进中】\n\
+            等待达到设定时间（{timeout_secs}s），目标子 Agent 仍在后台运行中或等待用户审批。\n\
+            【建议】：你可根据当前进展选择再次调用 wait_subagents 继续等待，或先推进其他独立准备工作。\n\n"
         ));
     } else if any_interrupted_or_failed {
-        out.push_str("⚠️ 部分子 Agent 执行中断或未完成交付（可在下一步调用 resume_subprocess 继续恢复推进）：\n\n");
+        out.push_str(
+            "⚠️【诊断提示：部分子 Agent 未生成交付报告已中止】\n\
+            检测到有子任务在未完成报告交付的情况下停止。\n\
+            【主任务决策指引】：\n\
+            1. 查阅上方诊断与子任务最后输出，分析中断原因；\n\
+            2. 若仅为步数耗尽或遗漏写报告，可调用 `resume_subprocess(subprocess_id: \"...\")` 唤醒其继续完工；\n\
+            3. 若遇到关键外部阻碍或缺少条件，可向用户汇报确认；\n\
+            4. 若事实已明晰，可由主会话直接采纳已有事实继续向下推进，无需强制重新拉起。\n\n"
+        );
     } else {
-        out.push_str("✅ 所有目标子 Agent 执行完毕！汇总结果如下：\n\n");
+        out.push_str("✅ 所有目标子 Agent 执行完毕并已提交交付报告！汇总结果如下：\n\n");
     }
 
     for sr in sub_results {
@@ -1033,71 +1040,4 @@ pub(crate) async fn get_collaborators_tool(ctx: &ToolCtx) -> Result<String, Stri
     }
 
     Ok(out)
-}
-
-
-
-pub(crate) async fn deliver_to_parent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
-    let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
-    let status_str = args.get("status").and_then(|v| v.as_str()).unwrap_or("completed");
-    let summary = args.get("summary").and_then(|v| v.as_str()).ok_or("缺少 summary 参数")?;
-    let verification = args.get("verification_result").and_then(|v| v.as_str()).unwrap_or("未提供自检输出");
-
-    let subagent_id = &host.session_id;
-    let state = host.app.state::<crate::AppState>();
-
-    let (parent_id, title, role) = {
-        let db = state.db.lock().unwrap();
-        let s = crate::store::get_session(&db, subagent_id)?.ok_or("子会话不存在")?;
-        if s.parent_session_id.is_none() && s.session_type != "subagent" && s.session_type != "subprocess" {
-            return Err("deliver_to_parent 仅允许在子任务会话中调用".into());
-        }
-        (s.parent_session_id.unwrap_or_default(), s.title.clone(), s.subagent_role.unwrap_or_else(|| "子任务协作 Agent".into()))
-    };
-
-    let final_status = if status_str == "blocked" { "failed" } else { "completed" };
-
-    let mut touched_files: Vec<String> = Vec::new();
-    if let Some(arr) = args.get("modified_files").and_then(|v| v.as_array()) {
-        for v in arr {
-            if let Some(p) = v.as_str() {
-                touched_files.push(p.to_string());
-            }
-        }
-    }
-
-    if !ctx.workspace.as_os_str().is_empty() {
-        let full_text = format!("### 交付总结\n{}\n\n### 验证结果\n{}", summary, verification);
-        let _ = save_subtask_report_artifact(
-            &ctx.workspace,
-            subagent_id,
-            &title,
-            &role,
-            &full_text,
-            &touched_files,
-        );
-    }
-
-    {
-        let db = state.db.lock().unwrap();
-        let _ = crate::store::set_session_status(&db, subagent_id, final_status);
-        let _ = crate::store::set_kv(&db, subagent_id, "delivered_outcome", final_status);
-    }
-
-    let _ = host.app.emit("subagent:update", json!({
-        "subagentId": subagent_id,
-        "status": final_status,
-        "summary": summary,
-        "modifiedFiles": touched_files,
-    }));
-    let _ = host.app.emit("subprocess:update", json!({
-        "subprocessId": subagent_id,
-        "status": final_status,
-    }));
-    if !parent_id.is_empty() {
-        let _ = host.app.emit("subagents:changed", json!({"parentId": parent_id}));
-        let _ = host.app.emit("subprocesses:changed", json!({"parentId": parent_id}));
-    }
-
-    Ok(format!("已成功向主进程提交交付成果！任务状态已登记为：【{final_status}】。系统将据此结案并唤醒主进程汇总。"))
 }

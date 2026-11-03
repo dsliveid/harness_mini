@@ -81,7 +81,6 @@ pub(crate) async fn dispatch_static(
         "dispatch_collaborator" => subagent::dispatch_collaborator_tool(args, ctx).await,
         "wait_collaborators" => subagent::wait_collaborators_tool(args, ctx).await,
         "get_collaborators" => subagent::get_collaborators_tool(ctx).await,
-        "deliver_to_parent" => subagent::deliver_to_parent_tool(args, ctx).await,
         "generate_image" => skills_memory_plan::generate_image_tool(args, ctx).await,
         "recognize_image" => skills_memory_plan::recognize_image_tool(args, ctx).await,
         "judge_decision" => skills_memory_plan::judge_decision_tool(args, ctx).await,

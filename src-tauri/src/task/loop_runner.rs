@@ -11,7 +11,7 @@ use tokio::sync::watch;
 /// 1. 主会话是唯一的大脑与决策中心，享有 100% 完整上下文，不再受外部粗暴预拆解与 200 字符截断困扰；
 /// 2. 守护进程只负责检测主会话空闲并提供自动推进脉冲，彻底消除 300ms DB 轮询与复杂的静态波次矩阵；
 /// 3. 实施工件由主会话在当轮直接调用 spawn_subagent 派发给 Worker 子沙箱，主会话只接收精炼摘要以保护 Token。
-pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiver<bool>) {
+pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiver<crate::task::DaemonControlSignal>) {
     let state = app.state::<crate::AppState>();
     let task_id = task.id.clone();
     let session_id = task.session_id.clone();
@@ -28,16 +28,36 @@ pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiv
     let mut idle_consecutive_ticks = 0usize;
 
     loop {
-        // 1. 响应用户暂停/取消请求
-        if *rx.borrow() {
-            task.status = "paused".to_string();
-            task.updated_at = store::now();
-            {
-                let db = state.db.lock().unwrap();
-                let _ = store::update_long_task(&db, &task);
+        // 1. 响应控制信道指令（强类型信号分流与终态保护）
+        let signal = rx.borrow().clone();
+        match signal {
+            crate::task::DaemonControlSignal::Pause { .. } => {
+                let db_status = {
+                    let db = state.db.lock().unwrap();
+                    store::get_long_task(&db, &task_id).ok().flatten().map(|t| t.status)
+                };
+                // 终态保护：若已在数据库中宣告完成或取消，严禁反向写回 paused！
+                if db_status.as_deref() != Some("completed") && db_status.as_deref() != Some("cancelled") {
+                    task.status = "paused".to_string();
+                    task.updated_at = store::now();
+                    {
+                        let db = state.db.lock().unwrap();
+                        let _ = store::update_long_task(&db, &task);
+                    }
+                    let _ = app.emit("task:update", &task);
+                }
+                crate::task::remove_control(&task_id);
+                return;
             }
-            let _ = app.emit("task:update", &task);
-            return;
+            crate::task::DaemonControlSignal::Cancel { .. } => {
+                crate::task::remove_control(&task_id);
+                return;
+            }
+            crate::task::DaemonControlSignal::Complete { .. } => {
+                crate::task::remove_control(&task_id);
+                return;
+            }
+            crate::task::DaemonControlSignal::Running => {}
         }
 
         // 2. 检查任务是否已在数据库中达成终态（如已被 complete_long_task 结案）
@@ -54,6 +74,7 @@ pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiv
         };
 
         if db_task_status == "completed" || db_task_status == "cancelled" || db_task_status == "paused" {
+            crate::task::remove_control(&task_id);
             return;
         }
 

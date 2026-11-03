@@ -914,36 +914,6 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             schema: json!({ "type": "object", "properties": {} }),
         },
         ToolSpec {
-            name: "deliver_to_parent",
-            description: "当专属子任务施工或调研完成、或者遇到阻碍无法继续时，调用此工具向主进程正式提交交付成果并结案。",
-            risk: Risk::Execute,
-            scope: ToolScope::SubOnly,
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "status": {
-                        "type": "string",
-                        "enum": ["completed", "blocked"],
-                        "description": "交付状态：completed（任务圆满完成）或 blocked（遇到阻碍无法继续）"
-                    },
-                    "summary": {
-                        "type": "string",
-                        "description": "核心工作总结或遇到的阻碍详情（简明扼要，控制在 300 字以内）"
-                    },
-                    "modified_files": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "本次子任务实际新建或修改的文件相对路径列表"
-                    },
-                    "verification_result": {
-                        "type": "string",
-                        "description": "语法/类型检查（如 tsc/cargo check/go vet）或单测验证结果"
-                    }
-                },
-                "required": ["status", "summary"]
-            }),
-        },
-        ToolSpec {
             name: "lookup_tool",
             description: "查询工具（特别是扩展工具目录中的专业工具，如子任务编排、浏览器自动化、长期记忆等）的详细功能说明与完整 JSON 参数 Schema。当你需要调用未列出完整参数的工具且不确定字段时，请先调用此工具查询。",
             risk: Risk::ReadOnly,
