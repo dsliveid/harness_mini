@@ -26,6 +26,7 @@ pub mod snapshot_fs;
 pub mod snapshot_gc;
 pub mod snapshot_revert;
 mod sop;
+pub mod sop_catalog;
 mod store;
 pub mod task;
 mod temp;
@@ -447,6 +448,7 @@ pub fn run() {
             commands::set_session_models,
             commands::set_session_reasoning_effort,
             commands::set_collaborator_auto_report,
+            commands::list_agent_sops,
             commands::report_collaborator_increment,
             commands::spawn_subagent,
             commands::stop_subagent,

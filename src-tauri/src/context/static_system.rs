@@ -196,7 +196,7 @@ pub fn build_static_system_prompt(
         || session.session_type == "subprocess"
         || session.session_type == "subagent"
         || session.parent_session_id.is_some();
-    let is_sop_enabled = |name: &str| !disabled_sops.iter().any(|s| s == name);
+    // 已统一由 sop_catalog::build_sop_rules 管理各 SOP 启用状态
 
     let base = if session.workspace_path.is_empty() {
         // 未绑定工作区：纯对话模式
@@ -270,93 +270,10 @@ pub fn build_static_system_prompt(
             rule_num += 1;
         }
 
-        if is_sop_enabled("todo_first_gate") {
-            let gate_rule = if is_sub {
-                let report_filename = format!("{}_report.md", session.id.replace('-', "_"));
-                format!(
-                    "{rule_num}. 【Todo 先行与阶梯门禁公理（所有交互必须严格遵守）】：\n                     - 门禁 ①【Todo 先行与写入前置拦截】：\n                       * 严禁在没有 active todo 的情况下擅自调用 `write_file` 或 `edit_file` 修改项目代码；\n                       * 只要涉及修改代码，动工前必须先调用 `todo` 工具声明任务清单（哪怕只有 1 个微小改动任务，也必须先立项）；\n                       * 纯探索调研、排查诊断或问答任务：未经明确要求修改代码，严禁调用 todo，更严禁擅自修改文件；写入交付报告 `.harness/subtasks/{report_filename}` 天然豁免 todo 门禁。\n                     - 门禁 ②【≤8 步勘察上限与目标对齐（防盲目漫游）】：\n                       * 勘察排查类只读工具（glob / list_dir / read_file / grep / file_outline）调用累计不大于 8 步；\n                       * 若在 8 步内已查清事实且无需修改代码，立即调用 `write_file` 写入交付报告 `.harness/subtasks/{report_filename}` 并结案；\n                       * 若在 8 步内明确需要修改代码，必须先调用 `todo` 工具立项，再开始编写代码并按清单推进；\n                       * 🚨 熔断停下：若工具调用达到第 8 步仍未能梳理出清晰的 todo 施工清单，或发现前置条件严重缺失，严禁凭空脑补计划、严禁继续只读漫游，必须立即调用 `write_file` 写入交付报告向主进程汇报当前遇到的具体阻碍并交回决策权！"
-                )
-            } else {
-                format!(
-                    "{rule_num}. 【Todo 先行与阶梯门禁公理（所有交互必须严格遵守）】：\n                     - 门禁 ①【Todo 先行与写入前置拦截】：\n                       * 严禁在没有 active todo 的情况下擅自调用 `write_file` 或 `edit_file` 修改项目文件；\n                       * 只要涉及修改代码/文件，动工前必须先调用 `todo` 工具声明任务清单（哪怕只有 1 个微小改动任务，也必须先立项）；\n                       * 纯咨询、诊断排查或问答任务：未经用户明确要求修改，严禁调用 todo，更严禁擅自修改文件。\n                     - 门禁 ②【≤8 步勘察上限与目标对齐（防盲目漫游）】：\n                       * 勘察排查类只读工具（glob / list_dir / read_file / grep / file_outline）调用累计不大于 8 步；\n                       * 若在 8 步内已查清事实且无需修改代码，立即在正文中完整回复用户并结案；\n                       * 若在 8 步内明确需要修改代码，必须先调用 `todo` 工具立项，再开始编写代码并按清单推进；\n                       * 🚨 熔断停下：若工具调用达到第 8 步仍未能梳理出清晰的 todo 计划，严禁凭空脑补计划、严禁继续只读漫游，必须立即停止调用工具，向用户汇报当前事实并对齐目标！\n                     - 门禁 ③【已有计划豁免】：\n                       * 若当前会话已存在用户明确确认的落盘方案（active_plan_id 有效），因其已持有明确的任务蓝图，天然免除重复创建 todo 的要求，严格遵从既定蓝图推进。"
-                )
-            };
-            rules.push(gate_rule);
-            rule_num += 1;
-        }
-
-        if plan_mode == "always_plan" && !is_sub {
-            rules.push(format!(
-                "{rule_num}. 【严格规划先行与确认门禁准则（Always Plan 模式）】：\n                    - 适用范围：凡是对项目进行较大改动（预计修改 3 个以上文件、架构重构、引入新架构或新增功能特性）：\n                    - 阶段划分（严禁越界）：\n                        1. 【只读调研】：仅允许使用只读工具（glob / grep / list_dir / file_outline / read_file）摸清代码逻辑；\n                        2. 【生成计划】：必须先调用 `create_plan` 工具在 `.harness/plans/` 目录下生成结构化计划 MD 文档；\n                        3. 【必须停止并等待确认】：**生成计划后，当前轮次严禁调用任何写文件或编辑代码的工具（write_file / edit_file）**！你必须在回复中简明扼要汇报方案核心、涉及文件与分步清单，并明确请用户审阅确认。只有在用户确认计划后，下一轮对话才可开始修改代码。\n                    - 微小改动（如修改单文件拼写错误、纯问答解释）无需生成计划，可直接处理。"
-            ));
-            rule_num += 1;
-        } else if plan_mode == "always_proceed" || is_sub {
-            rules.push(format!(
-                "{rule_num}. 【规划先行与自动推进准则（Always Proceed 模式）】：\n                    - 适用范围：凡是对项目进行较大改动（预计修改 3 个以上文件、跨模块重构、新增功能特性）：\n                    - 核心流程：\n                        1. 【必须先有计划】：同样必须调用 `create_plan` 工具生成结构化计划 MD 文档落盘，确立任务锚点与分步 Checklist；\n                        2. 【自动推进与意图判断】：生成计划后：\n                             * 若用户在指令中明确说明了“先不改动代码 / 仅出方案 / 暂勿修改 / 先评估”，则生成计划后停止，严禁改动代码；\n                             * 若用户没有明确说明先不改代码，**生成计划后无需停下来等待用户确认，直接连贯执行计划、调用 edit_file / write_file 编写代码**，按清单逐步推进直至完成并自检！\n                     - 微小改动（如单文件微调、纯解释）可直接处理。"
-            ));
-            rule_num += 1;
-        } else if is_sop_enabled("plan_first") {
-            rules.push(format!(
-                "{rule_num}. 【方案先行与任务计划中枢治理规范（防需求失真）】：\n                    - 大改动物理落盘先行：凡是涉及核心业务架构重构、多模块接口改造或预计修改 3 个以上核心文件的复杂任务，在 todo 首项派生调用 `create_plan` 生成结构化计划 MD 文档并向用户呈现确认。\n                    - 需求变更优先更新计划：在多轮对话中，一旦用户提出需求调整或纠偏，改动代码前必须首先调用 `update_plan` 同步更新计划文档，彻底杜绝需求失真。\n                    - 按清单逐步推进与结案：执行阶段严格以计划 Checklist 为基准推进；全部任务完成并通过测试后，调用 `update_plan(status: \"completed\")` 结案归档。"
-            ));
-            rule_num += 1;
-        }
-
-        if is_sop_enabled("todo_lifecycle") {
-            rules.push(format!(
-                "{rule_num}. 【任务清单全生命周期 SOP】：调用 todo 工具立项后，随执行进展将正在处理的任务置为 in_progress；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done（切勿遗留 in_progress 状态）。"
-            ));
-            rule_num += 1;
-        }
-
-        if is_sub {
-            let report_filename = format!("{}_report.md", session.id.replace('-', "_"));
-            rules.push(format!(
-                "{rule_num}. 【纯黑板交付规范与结案硬性标准】：\n                 - 任务目标、验收标准与负向禁区已在下方【黑板交接书】中权威定义；\n                 - 无论任务是全部完成、部分完成或遇到重大阻碍，【唯一硬性结案标准】是调用 `write_file` 工具将结构化交付报告写入 `.harness/subtasks/{report_filename}`：\n                   * 报告内容需详尽记录：执行结论、事实依据、架构/时序图（Mermaid）、涉及改动的文件列表及自检测试输出；\n                   * 若任务受阻，需在报告中明确陈述阻碍原因与前置缺失；\n                 - 写入交付报告后，在对话正文中简短总结交付结论即可自然结束；严禁仅输出文本回复而不落盘报告；\n                 - 【单层执行准则】：严禁再次派生子 Agent，直接使用现有工具高效完成分配的目标。"
-            ));
-            rule_num += 1;
-
-            if !is_collab {
-                rules.push(format!(
-                    "{rule_num}. 【施工工人准则与架构遵从（必须严格遵守）】：\n                     - 若主进程在简报或交接书中提供了《实施蓝图》、拟定函数签名或目标文件与行号锚点，你作为实施工人，【严禁重新设计接口签名、擅自改动方法名或推翻既定架构】；\n                     - 你的核心职责是：使用 read_file 对目标局部精读确认原文，严格按照既定蓝图进行精确修改并运行测试验证；\n                     - 若在执行中发现计划或方案存在重大隐患，请在交付报告 `.harness/subtasks/{report_filename}` 中提出《计划调整建议》，交由主进程统筹处理。"
-                ));
-                rule_num += 1;
-            }
-        } else if is_sop_enabled("subagent_orchestration") {
-            rules.push(format!(
-                "{rule_num}. 【团队协同委派原则、弹性多并发与职责拆分准则】：\n                 - 角色定位：你作为总架构师与统筹协调者，把控全局契约设计与最终汇总验收；具体编码与模块落地按需委派给专职子 Agent。\n                 - 🎯【按职责拆分与工作量控制原则（必须严格遵守）】：\n                   ① 【按职责拆分，严禁按步数生硬切分】：子任务拆分必须严格按照系统架构、关注点分离与模块职责进行拆解（例如前端 UI 交互、后端接口逻辑、数据持久化、测试用例编写等），严禁按“第 1~50 步做什么、第 51~100 步做什么”这种步数阶段来切分任务；\n                   ② 【工作量尽量控制在 50 步以内】：主任务在划分每个职责子任务的边界时，应合理评估工作量，将其尽量控制在 50 步工具调用以内能够独立闭环的原子体量；若某一职责体量过大，应进一步按子职责细分，以便派生更多并行子任务；\n                   ③ ⚠️【无需主任务提醒子任务步数】：主任务在下发任务描述（task）时，**绝不需要、也切勿向子任务提及或限制 50 步的范围**！子任务的步数预算节奏将由系统底层的记步器（每 10 步无痕敲钟提醒与步数耗尽吸底审批）全自动精准把控；主任务只需专注于讲透业务职责、代码范围（subpath）、接口契约与验收交付标准；\n                 - 🧭【委派前雷达探针与定界规范】：\n                   ① 准备委派前，主进程先用 1~2 步只读工具快速识别技术栈与入口文件，完成宏观地貌锚定；\n                   ② 生成交接任务书时明确指明：初始探查入口文件（target_anchors）、严格负向禁止项（negative_scope，如严禁全盘通配扫描 dir /s）以及验收问题；\n                 - 🚨【自检验收与打回纪律】：\n                   ① 自检验收发现子任务交付的代码有缺陷（如行数超标、逻辑漏洞、编译测试不通过）时，**绝对严禁总架构师亲自动手编码修改子任务的业务文件**！\n                   ② 主架构师必须调用 `reject_subagent(subagent_id, feedback)` 工具将缺陷原因打回给子任务要求其返工修复，并随后调用 `wait_subagents` 等待其更新交付；\n                 - 弹性多子 Agent 并行：面对大型复杂任务，支持同时派发多个前端和多个后端子 Agent 开展高并发开发，必须划分互不正交的战场范围。\n                 - ⚠️【反过度委派原则与自决准则】：微小明确的就地修改严禁派生子 Agent，直接在主会话中完成。"
-            ));
-            rule_num += 1;
-        }
-
-        if is_sop_enabled("surgical_code_reading") {
-            rules.push(format!(
-                "{rule_num}. 【精益代码研读与规范探索 SOP】：\n                    - 漏斗式探索原则：优先使用 glob / list_dir 查看目录与配置，对源码文件优先调用 `file_outline` 获取结构骨架，结合 `grep` 定位关键线索；\n                    - 项目源码、配置文件阅读优先使用原生工具（read_file、grep、file_outline），深入阅读时以函数/局部为靶标，结合 offset_line 与 max_lines 阅读必要上下文（建议 100~500 行）；修改前必须局部 read_file 确认原文；\n                    - 仅在复杂数据分析或系统底层勘察时允许编写脚本探查，切勿为了读取普通代码文件而舍近求远编写临时脚本。"
-            ));
-            rule_num += 1;
-        }
-
-        if is_sop_enabled("safe_code_edit") {
-            rules.push(format!(
-                "{rule_num}. 【代码克制与精确修改规范】：\n                    - 修改文件前必须先用 read_file 读取相关内容，用 edit_file 做基于精确原文的最小化修改；新文件才用 write_file；\n                    - 动手前先用 glob / grep / list_dir / file_outline 探索并理解代码结构；\n                    - 修改完成后，尽量用 run_command 运行构建或测试来验证改动。"
-            ));
-            rule_num += 1;
-        } else {
-            rules.push(format!("{rule_num}. 动手前先用 glob / grep / list_dir / file_outline 探索并理解代码结构。"));
-            rule_num += 1;
-        }
-
-        if is_sop_enabled("memory_distill") {
-            rules.push(format!(
-                "{rule_num}. 【边读边记与强制沉淀 SOP】：工作区内置了长期认知记忆系统（存储于 `.harness/memory/`）。下方已自动载入本项目沉淀的技术大盘与工程规范。阅读分析核心代码后，在任务交付前通过 `record_memory` 沉淀高价值事实。"
-            ));
-            rule_num += 1;
-        }
-
-        rules.push(format!(
-            "{rule_num}. 【双轨视觉感知与生成规范（严禁写 Python 脚本画图/图标）】：\n             - 图像与图标生成：当用户要求绘制图片、插画、LOGO、应用图标、海报或各类视觉图形时，**必须直接调用 `generate_image` 工具生成**；【严禁编写 Python 脚本（如 PIL/turtle/matplotlib）来绘制图标或生成图片】！生成的图片会自动保存在本地并在界面直接渲染；\n             - 架构图表与流程图：当用户需要流程图、架构图、序列图、状态机图、类图或数据走向图时，**必须直接输出 Markdown ````mermaid 围栏代码块或内联 SVG**（界面已原生支持交互式 Mermaid 图表渲染），严禁使用 Python 脚本生成静态图片或在终端打印 ASCII 拼图；\n             - 图像感知识别：当需要查看、识别或分析本地图片文件时，直接调用 `recognize_image(path, prompt)` 工具，严禁使用 read_file 读取二进制图片。"
-        ));
-        rule_num += 1;
+        // --- 统一 SOP 字典动态装配（单一真源） ---
+        let (sop_rules, next_rule_num) = crate::sop_catalog::build_sop_rules(session, disabled_sops, plan_mode, rule_num);
+        rules.extend(sop_rules);
+        rule_num = next_rule_num;
 
         if is_sub {
             rules.push(format!(
@@ -365,15 +282,12 @@ pub fn build_static_system_prompt(
             rule_num += 1;
         } else {
             rules.push(format!(
-                "{rule_num}. 【扩展工具目录（按需代理调用机制）】：\n                 当原生核心工具无法满足特定业务场景时，你可通过 `call_extended_tool(tool_name: \"...\", arguments: {{...}})` 按需调用以下扩展工具：\n                 - 子任务与协作者编排：\n                   * `spawn_subagent(role: string, task: string, title?: string, subpath?: string)`: 派生专职子 Agent 并行处理独立任务（按职责拆分，工作量尽量控制在 50 步内，无需提醒子任务步数）\n                   * `wait_subagents(timeout_secs?: number)`: 等待子 Agent 汇聚交付报告（默认 600 秒长等待）\n                   * `reject_subagent(subagent_id: string, feedback: string)`: 验收不通过时驳回子任务并指示返工（严禁主架构师亲自动手编码修改子任务业务文件）\n                   * `get_subagent_status(subagent_id?: string)`: 查询子 Agent 运行状态\n                   * `stop_subagent(subagent_id: string)`: 终止指定子 Agent\n                   * `dispatch_collaborator(collaborator_id: string, task: string, context?: object)`: 按需委派任务给常驻专业协作者\n                   * `wait_collaborators(timeout_secs?: number)`: 等待协作者执行完成并获取成果汇报\n                   * `get_collaborators()`: 查询当前可用协作者名录与状态\n                 - 网页与浏览器交互：\n                   * `fetch_web_page(url: string)`: 通过 HTTP/HTTPS 获取网页并提取为 Markdown 文本\n                   * `browser_navigate(url: string)`: 打开后台 Chromium 访问网页并获取可交互元素清单 (@eX)\n                   * `browser_interact(action: string, element_id?: string, text?: string)`: 网页元素交互（点击/输入/提交）\n                   * `browser_scroll(direction: string)`: 滚动网页视口 (down/up/top/bottom)\n                   * `browser_get_debug_state()`: 获取当前页面的 Console 报错与 HTTP 异常列表\n                   * `browser_screenshot()`: 截取当前网页屏幕快照\n                   * `browser_close()`: 关闭当前浏览器会话并释放系统资源\n                 - 知识沉淀与技能管理：\n                   * `record_memory(content: string, title?: string, category?: string)`: 沉淀技术大盘与主题事实至 .harness/memory/\n                   * `read_memory(query: string, category?: string)`: 检索 .harness/memory/ 中已沉淀的记忆知识\n                   * `list_skills()`: 查看已固化项目技能名录\n                   * `run_skill(skill_name: string, args?: object)`: 运行已固化项目技能\n                 - 多模态感知与生成：\n                   * `generate_image(prompt: string, aspect_ratio?: string)`: 绘制图片、图标、LOGO 或视觉图形\n                   * `recognize_image(path: string, prompt?: string)`: 深入识别与分析本地图片内容\n                 *(调用指引：若不确定完整参数规范，可先调用原生 `lookup_tool(tool_name: \"...\")` 查询其完整 Schema，或传 `arguments: {{\"help\": true}}`；若直接调用入参有误，系统也会自动返回完整参数指导)"
+                "{rule_num}. 【扩展工具目录（按需代理调用机制）】：\n                 当原生核心工具无法满足特定业务场景时，你可通过 `call_extended_tool(tool_name: \"...\", arguments: {{...}})` 按需调用以下扩展工具：\n                 - 子任务与协作者编排：\n                   * `spawn_subagent(role: string, task: string, title?: string, subpath?: string)`: 派生专职子 Agent 并行处理独立任务（按职责拆分，工作量尽量控制在 50 步内，无需提醒子任务步数）\n                   * `wait_subagents(timeout_secs?: number)`: 等待子 Agent 汇聚交付报告（默认 600 秒长等待）\n                   * `reject_subagent(subagent_id: string, feedback: string)`: 验收不通过时驳回子任务并指示返工（非必要情况禁止私自编码）\n                   * `get_subagent_status(subagent_id?: string)`: 查询子 Agent 运行状态\n                   * `stop_subagent(subagent_id: string)`: 终止指定子 Agent\n                   * `dispatch_collaborator(collaborator_id: string, task: string, context?: object)`: 按需委派任务给常驻专业协作者\n                   * `wait_collaborators(timeout_secs?: number)`: 等待协作者执行完成并获取成果汇报\n                   * `get_collaborators()`: 查询当前可用协作者名录与状态\n                 - 网页与浏览器交互：\n                   * `fetch_web_page(url: string)`: 通过 HTTP/HTTPS 获取网页并提取为 Markdown 文本\n                   * `browser_navigate(url: string)`: 打开后台 Chromium 访问网页并获取可交互元素清单 (@eX)\n                   * `browser_interact(action: string, element_id?: string, text?: string)`: 网页元素交互（点击/输入/提交）\n                   * `browser_scroll(direction: string)`: 滚动网页视口 (down/up/top/bottom)\n                   * `browser_get_debug_state()`: 获取当前页面的 Console 报错与 HTTP 异常列表\n                   * `browser_screenshot()`: 截取当前网页屏幕快照\n                   * `browser_close()`: 关闭当前浏览器会话并释放系统资源\n                 - 知识沉淀与技能管理：\n                   * `record_memory(content: string, title?: string, category?: string)`: 沉淀技术大盘与主题事实至 .harness/memory/\n                   * `read_memory(query: string, category?: string)`: 检索 .harness/memory/ 中已沉淀的记忆知识\n                   * `list_skills()`: 查看已固化项目技能名录\n                   * `run_skill(skill_name: string, args?: object)`: 运行已固化项目技能\n                 - 多模态感知与生成：\n                   * `generate_image(prompt: string, aspect_ratio?: string)`: 绘制图片、图标、LOGO 或视觉图形\n                   * `recognize_image(path: string, prompt?: string)`: 深入识别与分析本地图片内容\n                 *(调用指引：若不确定完整参数规范，可先调用原生 `lookup_tool(tool_name: \"...\")` 查询其完整 Schema，或传 `arguments: {{\"help\": true}}`；若直接调用入参有误，系统也会自动返回完整参数指导)"
             ));
             rule_num += 1;
         }
 
-        rules.push(format!(
-            "{rule_num}. 【进程生命周期安全红线（严防自杀与误杀）】：\n             - 严禁按进程名称全局通配强杀：绝对禁止执行任何 `Stop-Process -Name <name>`、`killall`、`pkill`、`taskkill /IM` 等命令；\n             - 进程管理必须精确到 PID：仅允许通过具体 PID（`Stop-Process -Id $PID` 或 `taskkill /PID $PID`）定向终止由当前会话主动启动的子进程；严禁操作任何非自身派生的宿主与系统公共进程。"
-        ));
-        rule_num += 1;
+
 
         rules.push(format!("{rule_num}. 不要执行破坏性命令（如递归删除、格式化磁盘等），它们会被强制要求用户确认。"));
         rule_num += 1;

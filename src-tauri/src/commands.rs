@@ -4582,6 +4582,11 @@ pub async fn browser_open_devtools_window(
     session.open_devtools_window().await
 }
 
+#[tauri::command]
+pub fn list_agent_sops() -> Result<Vec<crate::sop_catalog::SopItem>, String> {
+    Ok(crate::sop_catalog::get_sop_catalog())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

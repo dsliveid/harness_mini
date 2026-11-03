@@ -109,6 +109,7 @@ export function SettingsModal() {
   const [tab, setTab] = useState<Tab>("models");
   const [local, setLocal] = useState<Settings>(storeSettings);
   const [toolList, setToolList] = useState<ToolInfo[]>([]);
+  const [sopList, setSopList] = useState<AgentSopInfo[]>(AGENT_SOPS);
   const [testing, setTesting] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const [visibleKeys, setVisibleKeys] = useState<Record<string, boolean>>({});
@@ -157,6 +158,15 @@ export function SettingsModal() {
       ipc
         .listTools()
         .then(setToolList)
+        .catch((e) => pushToast(String(e)));
+
+      ipc
+        .listAgentSops()
+        .then((sops) => {
+          if (Array.isArray(sops) && sops.length > 0) {
+            setSopList(sops);
+          }
+        })
         .catch((e) => pushToast(String(e)));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -513,9 +523,15 @@ export function SettingsModal() {
     );
   };
 
-  const isSopEnabled = (id: string) => !(local.disabledSops ?? []).includes(id);
+  const isSopEnabled = (id: string) => {
+    const item = sopList.find((s) => s.id === id);
+    if (item?.isHardRule) return true;
+    return !(local.disabledSops ?? []).includes(id);
+  };
 
   const toggleSop = (id: string) => {
+    const item = sopList.find((s) => s.id === id);
+    if (item?.isHardRule) return;
     const current = local.disabledSops ?? [];
     const next = current.includes(id)
       ? current.filter((s) => s !== id)
@@ -527,7 +543,9 @@ export function SettingsModal() {
     setLocal((cur) => ({ ...cur, disabledSops: [] }));
   };
 
-  const disabledSopCount = (local.disabledSops ?? []).length;
+  const disabledSopCount = sopList.filter(
+    (s) => !s.isHardRule && (local.disabledSops ?? []).includes(s.id)
+  ).length;
 
   const renderSopCategoryBadge = (category: AgentSopInfo["category"], label: string) => {
     switch (category) {
@@ -561,6 +579,12 @@ export function SettingsModal() {
             {label}
           </span>
         );
+      case "safety":
+        return (
+          <span className="text-[11px] px-1.5 py-0.5 rounded bg-rose-500/15 text-rose-400 border border-rose-500/30 font-medium">
+            {label}
+          </span>
+        );
       default:
         return (
           <span className="text-[11px] px-1.5 py-0.5 rounded bg-panel3 text-inkdim border border-edge font-medium">
@@ -571,7 +595,8 @@ export function SettingsModal() {
   };
 
   const renderSopItem = (s: AgentSopInfo) => {
-    const enabled = isSopEnabled(s.id);
+    const isHard = !!s.isHardRule;
+    const enabled = isHard || isSopEnabled(s.id);
     return (
       <div
         key={s.id}
@@ -589,10 +614,14 @@ export function SettingsModal() {
               className={`text-[11px] px-2 py-0.5 rounded-full font-medium inline-flex items-center gap-1 ${
                 s.phase === 1
                   ? "bg-purple-500/20 text-purple-300 border border-purple-500/40"
-                  : "bg-blue-500/10 text-blue-300/80 border border-blue-500/25"
+                  : s.phase === 2
+                  ? "bg-blue-500/10 text-blue-300/80 border border-blue-500/25"
+                  : "bg-emerald-500/15 text-emerald-300 border border-emerald-500/30"
               }`}
             >
               {s.phase === 1 && <span className="w-1.5 h-1.5 rounded-full bg-purple-400"></span>}
+              {s.phase === 2 && <span className="w-1.5 h-1.5 rounded-full bg-blue-400"></span>}
+              {s.phase === 3 && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>}
               {s.phaseLabel}
             </span>
             {renderSopCategoryBadge(s.category, s.categoryLabel)}
@@ -609,6 +638,11 @@ export function SettingsModal() {
                 {s.scopeLabel}
               </span>
             )}
+            {isHard && (
+              <span className="text-[11px] px-1.5 py-0.5 rounded font-medium border bg-rose-500/15 text-rose-300 border-rose-500/30">
+                核心底线
+              </span>
+            )}
           </div>
           <div className="text-[12px] text-inkdim mt-1.5 leading-relaxed">{s.description}</div>
           <div className="text-[11px] text-inkdim/60 mt-1.5 flex items-center gap-1 font-mono">
@@ -618,25 +652,33 @@ export function SettingsModal() {
         </div>
 
         <div className="flex items-center gap-2 shrink-0 pt-0.5">
-          <span className={`text-[12px] select-none whitespace-nowrap ${enabled ? "text-green-400 font-medium" : "text-inkdim"}`}>
-            {enabled ? "启用" : "禁用"}
-          </span>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={enabled}
-            title={enabled ? `点击禁用 ${s.name}` : `点击启用 ${s.name}`}
-            onClick={() => toggleSop(s.id)}
-            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-              enabled ? "bg-accent" : "bg-panel3 border-edge"
-            }`}
-          >
-            <span
-              className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
-                enabled ? "translate-x-4" : "translate-x-0"
-              }`}
-            />
-          </button>
+          {isHard ? (
+            <span className="text-[11px] text-inkdim/70 px-2 py-0.5 rounded bg-panel3 border border-edge/60 select-none whitespace-nowrap">
+              常驻生效
+            </span>
+          ) : (
+            <>
+              <span className={`text-[12px] select-none whitespace-nowrap ${enabled ? "text-green-400 font-medium" : "text-inkdim"}`}>
+                {enabled ? "启用" : "禁用"}
+              </span>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={enabled}
+                title={enabled ? `点击禁用 ${s.name}` : `点击启用 ${s.name}`}
+                onClick={() => toggleSop(s.id)}
+                className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                  enabled ? "bg-accent" : "bg-panel3 border-edge"
+                }`}
+              >
+                <span
+                  className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
+                    enabled ? "translate-x-4" : "translate-x-0"
+                  }`}
+                />
+              </button>
+            </>
+          )}
         </div>
       </div>
     );
@@ -1598,7 +1640,7 @@ export function SettingsModal() {
                     </div>
                     <div className="flex items-center gap-2.5 shrink-0 pt-0.5">
                       <span className="text-[12px] text-inkdim font-medium whitespace-nowrap bg-panel3 px-2 py-0.5 rounded-md border border-edge/60">
-                        已启用 {AGENT_SOPS.length - disabledSopCount} / {AGENT_SOPS.length}
+                        已启用 {sopList.length - disabledSopCount} / {sopList.length}
                       </span>
                       {disabledSopCount > 0 && (
                         <button
@@ -1624,26 +1666,40 @@ export function SettingsModal() {
 
                   <div className="flex flex-col gap-5 mt-4">
                     {/* 第一层级 */}
-                    {AGENT_SOPS.some((s) => s.phase === 1) && (
+                    {sopList.some((s) => s.phase === 1) && (
                       <div className="flex flex-col gap-2">
                         <div className="flex items-center gap-2 text-[12px] font-semibold text-purple-400 px-0.5">
                           <span className="w-2 h-2 rounded-full bg-purple-400"></span>
                           <span>第一层级 · 前置意图与写入门禁公理</span>
                           <span className="text-[11px] font-normal text-inkdim">动代码前必须先立项 todo；勘察严格 ≤8 步，防盲目漫游；已有计划或子进程天然豁免</span>
                         </div>
-                        {AGENT_SOPS.filter((s) => s.phase === 1).map(renderSopItem)}
+                        {sopList.filter((s) => s.phase === 1).map(renderSopItem)}
                       </div>
                     )}
 
                     {/* 第二层级 */}
-                    <div className="flex flex-col gap-2 mt-1">
-                      <div className="flex items-center gap-2 text-[12px] font-semibold text-blue-400 px-0.5">
-                        <span className="w-2 h-2 rounded-full bg-blue-400"></span>
-                        <span>第二层级 · 工程规划与落地执行规范</span>
-                        <span className="text-[11px] font-normal text-inkdim">包含方案先行、任务全生命周期自愈、架构编排、代码精读与精确编辑</span>
+                    {sopList.some((s) => s.phase === 2) && (
+                      <div className="flex flex-col gap-2 mt-1">
+                        <div className="flex items-center gap-2 text-[12px] font-semibold text-blue-400 px-0.5">
+                          <span className="w-2 h-2 rounded-full bg-blue-400"></span>
+                          <span>第二层级 · 工程规划与落地执行规范</span>
+                          <span className="text-[11px] font-normal text-inkdim">包含方案先行、任务全生命周期自愈、架构编排、代码精读与精确编辑</span>
+                        </div>
+                        {sopList.filter((s) => s.phase === 2).map(renderSopItem)}
                       </div>
-                      {AGENT_SOPS.filter((s) => s.phase === 2).map(renderSopItem)}
-                    </div>
+                    )}
+
+                    {/* 第三层级 */}
+                    {sopList.some((s) => s.phase === 3) && (
+                      <div className="flex flex-col gap-2 mt-1">
+                        <div className="flex items-center gap-2 text-[12px] font-semibold text-emerald-400 px-0.5">
+                          <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
+                          <span>第三层级 · 系统交互与安全底线红线</span>
+                          <span className="text-[11px] font-normal text-inkdim">前端多维交互工件、进程隔离保护与系统生命周期防御机制</span>
+                        </div>
+                        {sopList.filter((s) => s.phase === 3).map(renderSopItem)}
+                      </div>
+                    )}
                   </div>
                 </section>
               </div>

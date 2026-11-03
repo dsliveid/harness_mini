@@ -593,13 +593,13 @@ pub fn continue_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
         let last_msg = msgs.last();
 
         let tool_guide = if resumed_any_sub {
-            "关联的专职子任务已在后台拉起继续推进。请立即调用 wait_subagents 工具等待其交付最新成果，切勿自行并发修改业务代码！"
+            "关联的专职子任务已在后台恢复推进。你可调用 wait_subagents 工具跟进其交付成果，亦可继续推进其他无冲突的工作。"
         } else {
             "请根据上述工具执行结果，继续推进并输出最终结论。"
         };
 
         let assistant_guide = if resumed_any_sub {
-            "关联的专职子任务已在后台拉起继续推进。请立即调用 wait_subagents 工具等待其交付最新成果，切勿自行并发修改业务代码！"
+            "关联的专职子任务已在后台恢复推进。你可调用 wait_subagents 工具跟进其交付成果，亦可继续推进其他无冲突的工作。"
         } else {
             "请承接前文未完成的内容与思路，直接继续往下执行，无需重复前文已输出的内容。"
         };
@@ -904,11 +904,12 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
                     String::new()
                 };
 
+                let mut has_valid_report = false;
                 if !ws_path_str.is_empty() {
                     let ws_path = std::path::Path::new(&ws_path_str);
                     let report_filename = format!("{}_report.md", session_id.replace('-', "_"));
                     let report_path = ws_path.join(".harness").join("subtasks").join(&report_filename);
-                    let has_valid_report = report_path.exists()
+                    has_valid_report = report_path.exists()
                         && std::fs::metadata(&report_path).map(|m| m.len() > 10).unwrap_or(false);
 
                     if has_valid_report {
@@ -919,11 +920,23 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
                     }
                 }
 
+                let effective_sub_status = if has_valid_report {
+                    "completed"
+                } else if s.status == "interrupted" || s.status == "failed" || s.status == "cancelled" {
+                    s.status.as_str()
+                } else {
+                    sub_status
+                };
+
+                let _ = app.emit("session:status_changed", json!({
+                    "sessionId": session_id,
+                    "status": effective_sub_status,
+                }));
                 let _ = app.emit("collaborator:update", json!({
                     "parentId": parent_id,
                     "parentSessionId": parent_id,
                     "collaboratorId": session_id,
-                    "status": sub_status,
+                    "status": effective_sub_status,
                 }));
                 let _ = app.emit("collaborators:changed", json!({
                     "parentId": parent_id,
@@ -932,7 +945,7 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
                     "parentId": parent_id,
                     "parentSessionId": parent_id,
                     "subagentId": session_id,
-                    "status": sub_status,
+                    "status": effective_sub_status,
                 }));
                 let _ = app.emit("subagents:changed", json!({
                     "parentId": parent_id,
@@ -942,7 +955,7 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
                     "parentId": parent_id,
                     "parentSessionId": parent_id,
                     "subprocessId": session_id,
-                    "status": sub_status,
+                    "status": effective_sub_status,
                 }));
                 let _ = app.emit("subprocesses:changed", json!({
                     "parentId": parent_id,
@@ -1529,6 +1542,38 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         };
 
         if _step >= current_max_steps {
+            // 关键优化：若当前属于子任务，且工作区内已生成合格交付报告，视为正常达成结案，豁免 step_extension 审批阻断
+            let has_valid_report = {
+                let db = state.db.lock().unwrap();
+                if let Ok(Some(s)) = store::get_session(&db, session_id) {
+                    if s.parent_session_id.is_some() || s.session_type == "subprocess" || s.session_type == "subagent" {
+                        let ws = if !s.workspace_path.is_empty() {
+                            s.workspace_path.clone()
+                        } else if let Some(ref pid) = s.parent_session_id {
+                            store::get_session(&db, pid).ok().flatten().map(|ps| ps.workspace_path).unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        if !ws.is_empty() {
+                            let report_filename = format!("{}_report.md", session_id.replace('-', "_"));
+                            let rep_path = std::path::Path::new(&ws).join(".harness").join("subtasks").join(&report_filename);
+                            rep_path.exists() && std::fs::metadata(&rep_path).map(|m| m.len() > 10).unwrap_or(false)
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+
+            if has_valid_report {
+                reached_max_steps = current_max_steps;
+                break;
+            }
+
             // 步数耗尽原地挂起：向前端推送 step_extension 审批申请，无限期等待用户决策
             let event_id = uuid::Uuid::new_v4().to_string();
             let (session_role, session_title) = {

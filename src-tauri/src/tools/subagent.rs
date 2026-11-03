@@ -464,8 +464,34 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
             break;
         }
 
-        let any_running = target_ids.iter().any(|id| crate::agent::is_run_active(&state, id));
-        if !any_running || start_wait.elapsed() >= max_wait {
+        // 优化：检测是否存在仍在实质性推进执行的子任务（已产出报告或挂起等待审批的任务不再死等）
+        let any_effectively_running = target_ids.iter().any(|id| {
+            if !crate::agent::is_run_active(&state, id) {
+                return false;
+            }
+            // 处于审批挂起中（如等待用户追加步数），不应让 wait_subagents 死等
+            let has_pending_approval = state
+                .approvals
+                .lock()
+                .unwrap()
+                .values()
+                .any(|p| p.session_id == *id);
+            if has_pending_approval {
+                return false;
+            }
+            // 已生成有效交付报告，履约完成，不应继续阻塞等待
+            let report_filename = format!("{}_report.md", id.replace('-', "_"));
+            let report_full_path = ctx.workspace.join(".harness").join("subtasks").join(&report_filename);
+            let has_valid_report = !ctx.workspace.as_os_str().is_empty()
+                && report_full_path.exists()
+                && std::fs::metadata(&report_full_path).map(|m| m.len() > 10).unwrap_or(false);
+            if has_valid_report {
+                return false;
+            }
+            true
+        });
+
+        if !any_effectively_running || start_wait.elapsed() >= max_wait {
             break;
         }
 
@@ -682,9 +708,9 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
 
     if is_timed_out || any_still_running {
         out.push_str(&format!(
-            "⚠️【提示：部分子 Agent 仍在后台推进中】\n\
-            等待达到设定时间（{timeout_secs}s），目标子 Agent 仍在后台运行中或等待用户审批。\n\
-            【建议】：你可根据当前进展选择再次调用 wait_subagents 继续等待，或先推进其他独立准备工作。\n\n"
+            "⚠️【提示：部分子 Agent 已提交阶段成果或等待安全审批】\n\
+            目标子 Agent 当前已生成阶段报告或在后台等待用户在界面放行审批。\n\
+            【主任务决策指引】：你可查阅下方已交付的报告内容；若发现缺陷或任务未达成，请调用 `reject_subagent(subagent_id: \"...\", feedback: \"...\")` 指示返工，非必要情况禁止私自编码。\n\n"
         ));
     } else if any_interrupted_or_failed {
         out.push_str(
@@ -692,12 +718,12 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
             检测到有子任务在未完成报告交付的情况下停止。\n\
             【主任务决策指引】：\n\
             1. 查阅上方诊断与子任务最后输出，分析中断原因；\n\
-            2. 若仅为步数耗尽或遗漏写报告，可调用 `resume_subprocess(subprocess_id: \"...\")` 唤醒其继续完工；\n\
+            2. 若存在实现缺口或遗漏写报告，可调用 `reject_subagent(subagent_id: \"...\", feedback: \"...\")` 指明缺口要求其返工继续推进；\n\
             3. 若遇到关键外部阻碍或缺少条件，可向用户汇报确认；\n\
-            4. 若事实已明晰，可由主会话直接采纳已有事实继续向下推进，无需强制重新拉起。\n\n"
+            4. 若事实已明晰，可由主会话直接采纳已有事实继续向下推进。\n\n"
         );
     } else {
-        out.push_str("✅ 所有目标子 Agent 执行完毕并已提交交付报告！汇总结果如下：\n\n");
+        out.push_str("✅ 所有目标子 Agent 执行完毕并已提交交付报告！汇总结果如下：\n【主任务验收指引】：请仔细查阅下方各子 Agent 的交付报告工件。若发现代码缺陷、测试未通过或任务未达成，请调用 `reject_subagent(subagent_id, feedback)` 工具打回返工，非必要情况禁止私自编码；若验收通过，请整合成果并向用户做最终交付。\n\n");
     }
 
     for sr in sub_results {
