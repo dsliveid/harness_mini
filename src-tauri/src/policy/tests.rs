@@ -50,6 +50,36 @@ fn test_unconditional_high_danger_blocked() {
 }
 
 #[test]
+fn test_benign_commands_with_high_danger_keywords_allowed() {
+    let ws = PathBuf::from(r"D:\WorkSpace\Project\harness_go");
+    let ctx = test_ctx(&ws, "full_access", &[]);
+
+    let benign_cmds = [
+        r"Select-String -Path 'cmd/harness-go/main.go' -Pattern 'MaxSteps|MaxConcurrent|agent.New\(|Shutdown|Stop\('",
+        r#"git commit -m "feat: graceful shutdown and reboot support""#,
+        r#"echo "reboot system after update""#,
+        r#"grep -rn "shutdown" ./src"#,
+        r#"node -e "console.log('format c:')""#,
+    ];
+
+    for cmd in benign_cmds {
+        let args = json!({ "command": cmd });
+        let tool = ToolInvocation {
+            name: "run_command",
+            args: &args,
+            risk: Risk::Execute,
+        };
+        let decision = PolicyEngine::evaluate(&tool, &ctx);
+        match decision {
+            PolicyDecision::Allow { scope } => {
+                assert_eq!(scope, "mode", "安全命令【{cmd}】应在 full_access 下直接按模式放行");
+            }
+            other => panic!("安全命令【{cmd}】被误判拦截: {:?}", other),
+        }
+    }
+}
+
+#[test]
 fn test_ephemeral_cache_cleanup_allowed_in_full_access() {
     let ws = PathBuf::from(r"D:\WorkSpace\Project\harness_go");
     let ctx = test_ctx(&ws, "full_access", &[]);
@@ -216,6 +246,30 @@ fn test_file_tools_zones() {
         }
         other => panic!(".git 目录操作必须强制审批，实际返回: {:?}", other),
     }
+
+    // 工作区外读/搜索在 confirm 模式下 -> RequireApproval (force_once = false 允许会话记忆)
+    let outside_search_args = json!({ "path": r"D:\WorkSpace\Vue\yx-medical-manager-web\src", "pattern": "login" });
+    let tool_outside_search = ToolInvocation {
+        name: "grep",
+        args: &outside_search_args,
+        risk: Risk::ReadOnly,
+    };
+    match PolicyEngine::evaluate(&tool_outside_search, &ctx) {
+        PolicyDecision::RequireApproval { force_once, risk, risk_source, .. } => {
+            assert!(!force_once, "工作区外只读查询在 confirm 模式下应允许记住放行");
+            assert_eq!(risk, "read");
+            assert_eq!(risk_source.as_deref(), Some("outside_workspace"));
+        }
+        other => panic!("工作区外检索在 confirm 模式下应提示审批: {:?}", other),
+    }
+
+    // 工作区外读/搜索在 full_access 模式下 -> 直接 Allow mode 放行，无需审批
+    let full_ctx = test_ctx(&ws, "full_access", &[]);
+    assert_eq!(
+        PolicyEngine::evaluate(&tool_outside_search, &full_ctx),
+        PolicyDecision::Allow { scope: "mode" },
+        "工作区外检索在 full_access 模式下应直接放行"
+    );
 }
 
 #[test]

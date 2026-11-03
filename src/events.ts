@@ -35,7 +35,6 @@ export function useAppEvents() {
       listen<any>("run:status", (e) => s.onRunStatus(e.payload)),
       listen<any>("queue:update", (e) => s.onQueueUpdate(e.payload)),
       listen<Session>("session:update", (e) => s.onSessionUpdate(e.payload as Session)),
-      listen<Session>("session:updated", (e) => s.onSessionUpdate(e.payload as Session)),
       listen<any>("settings:changed", (e) => s.onSettingsChanged(e.payload)),
       listen<any>("session:rules", (e) => s.onSessionRules(e.payload)),
       listen<any>("session:plans", (e) => s.onSessionPlans(e.payload)),

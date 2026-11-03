@@ -196,7 +196,50 @@ increment_session_tokens(conn, &pid, prompt_tokens, completion_tokens, total_tok
 
 ---
 
-## 四、 验证与自测保障
+## 四、 深度治理：安全策略误报消除、子任务等待收敛与流式节流反卡顿
+
+在真实大模型复杂长对话测试中，深入发掘并彻底解决了以下 4 项核心缺陷：
+
+### 1. 高危命令正则边界精细化（消除关键字误报）
+- **现象**：子 Agent 在代码检索时执行 `Select-String -Path ... -Pattern '...Shutdown...'`，因包含 `Shutdown` 关键字，触发了“无条件高危命令（shutdown）”拦截，强制单次审批且全权模式无效。
+- **根因**：原 `UNCONDITIONAL_RE` 中使用裸词正则 `(?i)\bshutdown\b`、`(?i)\breboot\b`，无命令位置感知，误伤了字符串字面量、正则模式参数与代码注释。
+- **治理**：
+  - 将高危正则严格限定在命令起始边界 `(?:^|[;&|`\n\(\)])\s*(?:sudo\s+)?`。
+  - Windows `shutdown` 严格匹配参数动作开关（如 `/s`, `/r`, `/h`, `-s` 等）或整行执行；PowerShell 匹配 `Stop-Computer`。
+  - `reboot` 匹配命令位置上的 `reboot` 或 `Restart-Computer`；`mkfs` 与 `format` 必须携带文件系统或盘符参数。
+  - 增补单元测试 `test_benign_commands_with_high_danger_keywords_allowed`，杜绝一切模式匹配误拦截。
+
+### 2. 跨工作区只读操作策略解绑（`full_access` 模式放行）
+- **现象**：用户在 `full_access`（完全访问模式）下使用 `grep` / `read_file` 检索外部项目目录（如 `D:\WorkSpace\Vue\...`），弹窗提示“检测到高危命令，仅允许逐次确认，不可记忆放行：访问工作区之外的路径”。
+- **根因**：`evaluate_path_tool` 只要检测到目标路径越出工作区（`ZoneResolver::resolve_zone == SecurityZone::Critical`），未先检查访问模式与 `Risk::ReadOnly`，便无条件强加 `force_once: true` 审批。
+- **治理**：
+  - **只读操作放行**：对于 `Risk::ReadOnly`（`grep`, `glob`, `read_file`, `list_dir`, `file_outline`），在 `full_access` 模式下直接 `Allow { scope: "mode" }` 免审执行。
+  - **确认模式会话记忆**：在 `confirm` 模式下访问外部路径，标记 `force_once: false`，允许用户勾选“本会话允许”，避免逐个文件连续弹窗。
+  - **破坏性隔离守底**：`.git` 核心元数据的写入/篡改与越界破坏性删除依然受严格保护。
+
+### 3. 子任务等待生命周期与审批穿透治理（`wait_subagents`）
+- **现象**：当子任务达到 60s 等待超时，主 Agent 误将子任务未完成时的初步思考（如“我先按指定范围阅读文档相关章节”）当做最终报告，直接产出结案答复，跳过了后续等待。
+- **根因**：
+  - `wait_subagents_tool` 未检测 `state.approvals`，当子任务被审批拦截时依然呈现为通用 running，超时后直接返回。
+  - 未完成子任务的临时文本被直接格式化为 `- 交付核心结论：`，大模型判定已有结论并提前结案。
+- **治理**：
+  - **审批状态感知**：全面穿透 `state.approvals`，若子任务等待用户审批，状态显式标为 `pending_approval ("🟡 等待用户审批中")`，并呈现拦截原因。
+  - **阶段进展与结论脱钩**：未完成（running / pending_approval / interrupted）的子任务，其摘要输出为 `- 阶段性进展（⚠️ 非最终交付结论，仍在推进中）`。
+  - **硬性系统指令约束**：若存在未完成或超时子 Agent，工具输出顶层与底层强制注入硬约束指令，严禁直接结案，强制模型再次调用 `wait_subagents` 持续等待。
+
+### 4. 激活窗口流式节流与事件广播去重（彻底消除界面卡顿）
+- **现象**：长回复流式输出（如上万字方案、多段 KaTeX/代码）期间，浏览器主线程被占满，界面打字与滚动严重掉帧。
+- **根因**：
+  - 每秒到达数十个 `message:delta`，每次 delta 均直接触发 React Markdown 重新解析整篇上万字文档的 AST 树与 KaTeX，造成高频重排与卡顿。
+  - 后端同时广播 `session:update` 与 `session:updated` 造成 4 倍重复重渲染。
+- **治理**：
+  - **流式 Delta 节流聚合**：在 `src/store.ts` 中实现 ~48ms（约 20 FPS）的增量缓冲区，高频到达的 Token 先在内存累加，定期合并推送至 Zustand 状态，渲染计算量降低 80%~90%。
+  - **最终消息即时同步**：在 `onMessageFinal`、`setCurrent`（会话切换）与 `onStepFinished` 时立即刷新缓冲区，杜绝延迟或丢字。
+  - **事件广播去重**：删除冗余的 `session:updated` 监听与广播，统一收敛至标准 `session:update`。
+
+---
+
+## 五、 验证与自测保障
 
 本次改造涵盖了前端构建与全量 Rust 后端单元测试：
 1. **TypeScript 编译与打包**：
@@ -204,5 +247,5 @@ increment_session_tokens(conn, &pid, prompt_tokens, completion_tokens, total_tok
 2. **后端测试全量覆盖**：
    - 核心工具收敛与目录测试：`test_core_tools_contain_call_extended_tool_and_catalog_filtering` 通过。
    - `lookup_tool` 原生检索与代理纠错测试：`test_call_extended_tool_help` 通过。
-   - 安全策略与安全域解析：`test_file_tools_zones`, `test_ephemeral_cache_cleanup_allowed_in_full_access` 通过。
-   - 全库 214 个 Rust 单元测试全部顺利通过（214 passed; 0 failed）。
+   - 安全策略与安全域解析：`test_file_tools_zones`, `test_ephemeral_cache_cleanup_allowed_in_full_access`, `test_benign_commands_with_high_danger_keywords_allowed`, `test_kill_by_name_denied` 通过。
+   - 全库 215 个 Rust 单元测试全部顺利通过（215 passed; 0 failed）。

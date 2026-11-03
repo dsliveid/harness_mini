@@ -299,8 +299,11 @@ pub(crate) fn determine_subagent_status(
     session_status: &str,
     has_terminal_reply: bool,
     has_max_steps_msg: bool,
+    has_pending_approval: bool,
 ) -> (&'static str, &'static str) {
-    if is_running {
+    if has_pending_approval {
+        ("pending_approval", "🟡 等待用户审批中 (pending_approval - 等待用户在界面确认放行)")
+    } else if is_running {
         ("running", "🟡 仍在运行 (running)")
     } else if session_status == "completed" {
         ("completed", "🟢 已完成交付 (completed)")
@@ -364,11 +367,19 @@ pub(crate) async fn get_subagent_status_tool(args: &Value, ctx: &ToolCtx) -> Res
         }).unwrap_or(false);
         let has_max_steps_msg = msgs.iter().rev().any(|m| m.role == "system" && m.content.as_deref().unwrap_or("").contains("已达到最大步数"));
 
+        let has_pending_approval = state
+            .approvals
+            .lock()
+            .unwrap()
+            .values()
+            .any(|p| p.session_id == s.id);
+
         let (_code, status_display) = determine_subagent_status(
             is_running,
             &s.status,
             has_terminal_reply,
             has_max_steps_msg,
+            has_pending_approval,
         );
 
         let preview = if last_reply.len() > 300 {
@@ -519,12 +530,23 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
             }).unwrap_or(false);
             let has_max_steps_msg = msgs.iter().rev().any(|m| m.role == "system" && m.content.as_deref().unwrap_or("").contains("已达到最大步数"));
 
+            let has_pending_approval = state
+                .approvals
+                .lock()
+                .unwrap()
+                .values()
+                .any(|p| p.session_id == *id);
+
             let (status_code, status_display) = determine_subagent_status(
                 is_running,
                 &s.status,
                 has_terminal_reply,
                 has_max_steps_msg,
+                has_pending_approval,
             );
+            if is_running || has_pending_approval {
+                any_still_running = true;
+            }
             if status_code == "interrupted" || status_code == "failed" {
                 any_interrupted_or_failed = true;
             }
@@ -608,15 +630,33 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
                 String::new()
             };
 
+            let approval_warning = if has_pending_approval {
+                "- ⚠️ 审批受阻: 该子任务触发了安全审批，当前已挂起，正在等待用户在界面弹窗中放行审批！\n"
+            } else {
+                ""
+            };
+
+            let conclusion_title = if status_code == "completed" {
+                "- 交付核心结论："
+            } else if has_pending_approval {
+                "- 阶段性进展（⚠️ 等待审批放行，尚未完成交付）："
+            } else if is_running {
+                "- 阶段性进展（⚠️ 任务仍在后台推进，尚未交付）："
+            } else {
+                "- 中断前阶段状态（⚠️ 未完成交付）："
+            };
+
             sub_results.push(format!(
-                "### 协同子 Agent: {} ({})\n- 状态: {}\n- Token 消耗: {}\n{}{}{}- 交付核心结论：\n```markdown\n{}\n```\n\n",
+                "### 协同子 Agent: {} ({})\n- 状态: {}\n- Token 消耗: {}\n{}{}{}{}{}\n```markdown\n{}\n```\n\n",
                 s.title,
                 s.subagent_role.as_deref().unwrap_or("协作助手"),
                 status_display,
                 s.total_tokens.unwrap_or(0),
+                approval_warning,
                 knowledge_line,
                 touched_line,
                 artifact_line,
+                conclusion_title,
                 compact_summary
             ));
         }
@@ -628,7 +668,14 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
     }
 
     if is_timed_out || any_still_running {
-        out.push_str(&format!("⚠️ 等待达到超时上限（{timeout_secs}s），部分子 Agent 可能仍在后台继续运行。\n\n"));
+        out.push_str(&format!(
+            "⚠️【重要系统指令 - 任务仍在执行中，严禁输出最终业务结案】\n\
+            等待达到单次超时上限（{timeout_secs}s），目标子 Agent 仍在后台推进中或等待用户审批，尚未产出最终结案成果！\n\
+            【模型行为准则】：\n\
+            1. 严禁向用户直接输出业务结案回答，严禁假设子任务已交付完毕！\n\
+            2. 若有子 Agent 处于「等待用户审批」，请简短提示用户在界面审批放行；\n\
+            3. 你必须在当前思考后【再次调用 wait_subagents】继续等待，直到所有子 Agent 均变为「🟢 已完成交付」！\n\n"
+        ));
     } else if any_interrupted_or_failed {
         out.push_str("⚠️ 部分子 Agent 执行中断或未完成交付（可在下一步调用 resume_subprocess 继续恢复推进）：\n\n");
     } else {
@@ -637,6 +684,10 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
 
     for sr in sub_results {
         out.push_str(&sr);
+    }
+
+    if is_timed_out || any_still_running {
+        out.push_str("⚠️ 再次提醒：子 Agent 尚未交付最终成果，请立即再次调用 `wait_subagents` 继续等待！\n");
     }
 
     Ok(out)
@@ -904,11 +955,19 @@ pub(crate) async fn wait_collaborators_tool(args: &Value, ctx: &ToolCtx) -> Resu
                 || m.tool_calls.as_ref().map(|t| t.is_null() || t.as_array().map(|a| a.is_empty()).unwrap_or(false)).unwrap_or(false)
         }).unwrap_or(false);
         let has_max_steps_msg = msgs.iter().rev().any(|m| m.role == "system" && m.content.as_deref().unwrap_or("").contains("已达到最大步数"));
+        let has_pending_approval = state
+            .approvals
+            .lock()
+            .unwrap()
+            .values()
+            .any(|p| p.session_id == s.id);
+
         let (_code, status_display) = determine_subagent_status(
             is_running,
             &s.status,
             has_terminal_reply,
             has_max_steps_msg,
+            has_pending_approval,
         );
 
         if let Some(m) = last_assistant {

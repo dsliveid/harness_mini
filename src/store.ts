@@ -599,6 +599,69 @@ export function resolveNewDraftConfig(
   };
 }
 
+interface StreamDeltaBuffer {
+  sessionId: string;
+  messageId: string;
+  contentDelta: string;
+  reasoningDelta: string;
+}
+
+let activeStreamBuffer: StreamDeltaBuffer | null = null;
+let streamFlushTimer: any = null;
+
+function flushStreamBuffer(
+  get: () => any,
+  set: (fn: (st: any) => any) => void
+) {
+  if (streamFlushTimer) {
+    clearTimeout(streamFlushTimer);
+    streamFlushTimer = null;
+  }
+  if (!activeStreamBuffer) return;
+  const { sessionId, messageId, contentDelta, reasoningDelta } = activeStreamBuffer;
+  activeStreamBuffer = null;
+
+  if (!contentDelta && !reasoningDelta) return;
+
+  set((st: any) => {
+    const list = st.messages[sessionId] ?? [];
+    const idx = list.findIndex((m: any) => m.id === messageId);
+    if (idx < 0) {
+      const placeholder: Message = {
+        id: messageId,
+        sessionId,
+        seq: Number.MAX_SAFE_INTEGER,
+        role: "assistant",
+        content: contentDelta,
+        reasoning: reasoningDelta || null,
+        queued: false,
+        createdAt: new Date().toISOString(),
+        toolEvents: [],
+      };
+      return { messages: { ...st.messages, [sessionId]: sortMessages([...list, placeholder]) } };
+    }
+    const next = list.slice();
+    const curr = next[idx];
+    next[idx] = {
+      ...curr,
+      content: contentDelta ? (curr.content ?? "") + contentDelta : curr.content,
+      reasoning: reasoningDelta ? (curr.reasoning ?? "") + reasoningDelta : curr.reasoning,
+    };
+    return { messages: { ...st.messages, [sessionId]: next } };
+  });
+}
+
+function scheduleStreamFlush(
+  get: () => any,
+  set: (fn: (st: any) => any) => void
+) {
+  if (streamFlushTimer) return;
+  streamFlushTimer = setTimeout(() => {
+    streamFlushTimer = null;
+    flushStreamBuffer(get, set);
+  }, 48); // ~20 FPS 节流聚合：保障视觉平滑流式，大幅降低超长 Markdown 重析与高频渲染带来的界面卡顿
+}
+
 export const useStore = create<Store>((set, get) => ({
   ready: false,
   settings: {
@@ -1333,6 +1396,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   setCurrent(id) {
+    flushStreamBuffer(get, set);
     if (!id) {
       set({ currentId: null, readOnly: false });
       return;
@@ -1507,28 +1571,15 @@ export const useStore = create<Store>((set, get) => ({
       get().markSessionDirty(sessionId);
       return;
     }
-    set((st) => {
-      const list = st.messages[sessionId] ?? [];
-      const idx = list.findIndex((m) => m.id === messageId);
-      if (idx < 0) {
-        // 流式占位消息
-        const placeholder: Message = {
-          id: messageId,
-          sessionId,
-          seq: Number.MAX_SAFE_INTEGER,
-          role: "assistant",
-          content: delta,
-          reasoning: null,
-          queued: false,
-          createdAt: new Date().toISOString(),
-          toolEvents: [],
-        };
-        return { messages: { ...st.messages, [sessionId]: sortMessages([...list, placeholder]) } };
-      }
-      const next = list.slice();
-      next[idx] = { ...next[idx], content: (next[idx].content ?? "") + delta };
-      return { messages: { ...st.messages, [sessionId]: next } };
-    });
+    if (activeStreamBuffer && (activeStreamBuffer.sessionId !== sessionId || activeStreamBuffer.messageId !== messageId)) {
+      flushStreamBuffer(get, set);
+    }
+    if (!activeStreamBuffer) {
+      activeStreamBuffer = { sessionId, messageId, contentDelta: delta, reasoningDelta: "" };
+    } else {
+      activeStreamBuffer.contentDelta += delta;
+    }
+    scheduleStreamFlush(get, set);
   },
 
   onMessageReasoningDelta(p) {
@@ -1537,31 +1588,19 @@ export const useStore = create<Store>((set, get) => ({
       get().markSessionDirty(sessionId);
       return;
     }
-    set((st) => {
-      const list = st.messages[sessionId] ?? [];
-      const idx = list.findIndex((m) => m.id === messageId);
-      if (idx < 0) {
-        // 流式占位消息（思考通常先于正文到达）
-        const placeholder: Message = {
-          id: messageId,
-          sessionId,
-          seq: Number.MAX_SAFE_INTEGER,
-          role: "assistant",
-          content: "",
-          reasoning: delta,
-          queued: false,
-          createdAt: new Date().toISOString(),
-          toolEvents: [],
-        };
-        return { messages: { ...st.messages, [sessionId]: sortMessages([...list, placeholder]) } };
-      }
-      const next = list.slice();
-      next[idx] = { ...next[idx], reasoning: (next[idx].reasoning ?? "") + delta };
-      return { messages: { ...st.messages, [sessionId]: next } };
-    });
+    if (activeStreamBuffer && (activeStreamBuffer.sessionId !== sessionId || activeStreamBuffer.messageId !== messageId)) {
+      flushStreamBuffer(get, set);
+    }
+    if (!activeStreamBuffer) {
+      activeStreamBuffer = { sessionId, messageId, contentDelta: "", reasoningDelta: delta };
+    } else {
+      activeStreamBuffer.reasoningDelta += delta;
+    }
+    scheduleStreamFlush(get, set);
   },
 
   onStepStarted(p) {
+    flushStreamBuffer(get, set);
     const { sessionId, runId, stepIndex, messageId } = p;
     set((st) => ({
       activeStepMap: {
@@ -1649,6 +1688,13 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   onMessageFinal(m) {
+    if (activeStreamBuffer && activeStreamBuffer.messageId === m.id) {
+      if (streamFlushTimer) {
+        clearTimeout(streamFlushTimer);
+        streamFlushTimer = null;
+      }
+      activeStreamBuffer = null;
+    }
     if (m.queued) return; // 待执行列表消息由 queue:update 呈现
     set((st) => {
       const list = st.messages[m.sessionId] ?? [];

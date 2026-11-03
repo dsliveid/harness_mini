@@ -765,11 +765,9 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
             // 实时广播：会话 Token 已在 finish_run 中聚合更新，第一时间向前端推送最新的会话状态（支持底栏实时刷新）
             if let Ok(Some(updated_session)) = store::get_session(&db, &session_id) {
                 let _ = app.emit("session:update", &updated_session);
-                let _ = app.emit("session:updated", &updated_session);
                 if let Some(ref pid) = updated_session.parent_session_id {
                     if let Ok(Some(parent_session)) = store::get_session(&db, pid) {
                         let _ = app.emit("session:update", &parent_session);
-                        let _ = app.emit("session:updated", &parent_session);
                     }
                 }
             }
@@ -1828,11 +1826,9 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             );
             if let Ok(Some(current_sess)) = store::get_session(&db, session_id) {
                 let _ = app.emit("session:update", &current_sess);
-                let _ = app.emit("session:updated", &current_sess);
                 if let Some(ref pid) = current_sess.parent_session_id {
                     if let Ok(Some(parent_sess)) = store::get_session(&db, pid) {
                         let _ = app.emit("session:update", &parent_sess);
-                        let _ = app.emit("session:updated", &parent_sess);
                     }
                 }
             }

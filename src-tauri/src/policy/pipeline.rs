@@ -154,7 +154,7 @@ impl PolicyEngine {
         }
     }
 
-    /// 针对包含文件路径的工具（read_file, write_file, edit_file 等）的评估逻辑
+    /// 针对包含文件路径的工具（read_file, write_file, edit_file, grep, glob, list_dir 等）的评估逻辑
     fn evaluate_path_tool(
         tool_name: &str,
         args: &Value,
@@ -162,45 +162,63 @@ impl PolicyEngine {
         path_arg: &str,
         ctx: &SecurityContext,
     ) -> PolicyDecision {
-        let zone = ZoneResolver::resolve_zone(path_arg, ctx.workspace_root, ctx.sandbox_root);
+        let is_git = ZoneResolver::is_git_dir(path_arg);
 
-        // 1. 若目标处于 Critical 核心禁区（越界或 .git）：强制单次审批
-        if zone == SecurityZone::Critical {
-            return PolicyDecision::RequireApproval {
-                risk: "path",
-                force_once: true,
-                risk_source: Some("outside_workspace".to_string()),
-                preview: build_preview(tool_name, args),
-            };
+        // 1. 严格保护 .git 核心元数据目录：
+        // 任何模式下篡改 .git 均属于高危，强制单次确认；
+        // 在 confirm 模式下读取 .git 也需单次确认；在 full_access 下只读则允许
+        if is_git {
+            if risk != Risk::ReadOnly || ctx.access_mode != "full_access" {
+                return PolicyDecision::RequireApproval {
+                    risk: "path",
+                    force_once: true,
+                    risk_source: Some(".git".to_string()),
+                    preview: build_preview(tool_name, args),
+                };
+            }
         }
 
-        // 2. 若目标处于 Ephemeral 暂存区：系统缓存/临时文件静默放行
+        let zone = ZoneResolver::resolve_zone(path_arg, ctx.workspace_root, ctx.sandbox_root);
+
+        // 2. 目标处于 Ephemeral 暂存区：系统缓存/临时文件静默放行
         if zone == SecurityZone::Ephemeral {
             return PolicyDecision::Allow {
                 scope: "ephemeral_exempt",
             };
         }
 
-        // 3. 目标处于常规 Workspace：根据访问模式与风险级别判定
+        // 3. 完全访问模式（full_access）：除 .git 篡改外，工作区内外读写与搜索全量放行
         if ctx.access_mode == "full_access" {
             return PolicyDecision::Allow {
                 scope: "mode",
             };
         }
 
+        // 4. 会话临时放行规则覆盖
         if Self::matches_session_rules(tool_name, args, ctx.session_rules) {
             return PolicyDecision::Allow {
                 scope: "session",
             };
         }
 
+        // 5. 工作区外越界访问（confirm 模式下）
+        if zone == SecurityZone::Critical {
+            return PolicyDecision::RequireApproval {
+                risk: if risk == Risk::ReadOnly { "read" } else { "write" },
+                force_once: risk != Risk::ReadOnly, // 读操作允许会话记忆放行；写操作越界强制单次确认
+                risk_source: Some("outside_workspace".to_string()),
+                preview: build_preview(tool_name, args),
+            };
+        }
+
+        // 6. 工作区内只读操作免审放行
         if risk == Risk::ReadOnly {
             return PolicyDecision::Allow {
                 scope: "none",
             };
         }
 
-        // 写操作且未被规则覆盖：请求审批（允许记住）
+        // 7. 工作区内写操作在 confirm 模式下请求审批（允许记住）
         PolicyDecision::RequireApproval {
             risk: "write",
             force_once: false,

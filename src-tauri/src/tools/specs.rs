@@ -533,7 +533,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "wait_subagents",
-            description: "等待一个或多个子 Agent 协作进程执行完毕，并自动获取汇总它们的执行结论、产出总结与改动文件清单。在调用 spawn_subagent 派生子任务后，应紧接着调用本工具等待汇聚。",
+            description: "等待一个或多个子 Agent 协作进程执行完毕，并自动获取汇总它们的执行结论、产出总结与改动文件清单。在调用 spawn_subagent 派生子任务后，应紧接着调用本工具等待汇聚。若返回提示部分子 Agent 仍处于运行中或等待审批状态，严禁直接输出最终业务结论，必须再次调用本工具继续等待，直到所有子 Agent 均达到已完成交付状态。",
             risk: Risk::ReadOnly,
             scope: ToolScope::MainOnly,
             schema: json!({

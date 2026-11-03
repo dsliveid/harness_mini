@@ -16,14 +16,14 @@ static CD_RE: OnceLock<Regex> = OnceLock::new();
 fn init_regexes() {
     UNCONDITIONAL_RE.get_or_init(|| {
         vec![
-            ("format", Regex::new(r"(?i)\bformat\s+[a-z]:").unwrap()),
-            ("mkfs", Regex::new(r"(?i)\bmkfs\b").unwrap()),
-            ("dd", Regex::new(r"(?i)\bdd\s+if=").unwrap()),
-            ("shutdown", Regex::new(r"(?i)\bshutdown\b").unwrap()),
-            ("reboot", Regex::new(r"(?i)\breboot\b").unwrap()),
-            ("reg_delete", Regex::new(r"(?i)\breg\s+delete\b").unwrap()),
-            ("git_force_push", Regex::new(r"(?i)\bgit\s+push\s+.*--force\b").unwrap()),
-            ("git_reset_hard", Regex::new(r"(?i)\bgit\s+reset\s+--hard\b").unwrap()),
+            ("format", Regex::new(r"(?i)(?:^|[;&|`\n\(\)])\s*(?:sudo\s+)?format(?:\.exe)?\s+[a-z]:").unwrap()),
+            ("mkfs", Regex::new(r"(?i)(?:^|[;&|`\n\(\)])\s*(?:sudo\s+)?(?:/(?:usr/)?s?bin/)?mkfs(?:\.[a-z0-9]+)?\s+").unwrap()),
+            ("dd", Regex::new(r"(?i)(?:^|[;&|`\n\(\)])\s*(?:sudo\s+)?(?:/(?:usr/)?bin/)?dd(?:\.exe)?\s+.*?\bif=").unwrap()),
+            ("shutdown", Regex::new(r"(?i)(?:^|[;&|`\n\(\)])\s*(?:sudo\s+)?(?:/(?:usr/)?s?bin/)?(?:shutdown(?:\.exe)?(?:\s+[/\\-][a-z0-9]+|\s+(?:now|\+\d+)|\s*$)|poweroff\b|halt\b)|(?:^|[;&|`\n\(\)])\s*Stop-Computer\b").unwrap()),
+            ("reboot", Regex::new(r"(?i)(?:^|[;&|`\n\(\)])\s*(?:sudo\s+)?(?:/(?:usr/)?s?bin/)?reboot(?:\.exe)?(?:\s+-[a-z0-9]+|\s*$|[;&|`\n\(\)])|(?:^|[;&|`\n\(\)])\s*Restart-Computer\b").unwrap()),
+            ("reg_delete", Regex::new(r"(?i)(?:^|[;&|`\n\(\)])\s*reg(?:\.exe)?\s+delete\b").unwrap()),
+            ("git_force_push", Regex::new(r"(?i)(?:^|[;&|`\n\(\)])\s*git\s+push\s+.*?(?:--force\b|-f\b|\+[a-zA-Z0-9_/.-]+)").unwrap()),
+            ("git_reset_hard", Regex::new(r"(?i)(?:^|[;&|`\n\(\)])\s*git\s+reset\s+.*--hard\b").unwrap()),
             ("kill_by_name", Regex::new(r"(?i)\b(killall|pkill)\b|Stop-Process\s+.*-(?:Process)?Name\b|Get-Process\s+.*\|\s*(?:Stop-Process|spps|kill)\b|taskkill\b.*[/\-]im\b").unwrap()),
         ]
     });
