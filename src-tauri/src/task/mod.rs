@@ -95,14 +95,14 @@ pub fn start_long_task(
         }
     }
 
-    let (workspace_path, task_id, subtask_max_steps) = {
+    let (workspace_path, task_id, long_task_max_steps) = {
         let db = state.db.lock().unwrap();
         let master = state.master_key.lock().unwrap();
         let s = store::get_session(&db, &session_id)?
             .ok_or_else(|| "会话不存在".to_string())?;
         let tid = format!("task-{}", uuid::Uuid::new_v4().simple());
         let settings = store::get_settings_with_secrets(&db, &master).unwrap_or_default();
-        let limit = settings.task_subtask_max_steps.max(1) as usize;
+        let limit = settings.max_steps.max(1) as usize;
         (s.workspace_path, tid, limit)
     };
 
@@ -122,7 +122,7 @@ pub fn start_long_task(
         prompt_tokens_used: 0,
         completion_tokens_used: 0,
         current_step: 1,
-        max_steps: subtask_max_steps.max(25),
+        max_steps: long_task_max_steps.max(50),
         created_at: now.clone(),
         updated_at: now,
     };

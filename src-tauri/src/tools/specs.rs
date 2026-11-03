@@ -504,17 +504,17 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         // ---------- 子 Agent 进程协作工具集 ----------
         ToolSpec {
             name: "spawn_subagent",
-            description: "创建并启动一个独立的子 Agent 进程并行协作（如前端开发、后端开发、多模块开发等）。子 Agent 拥有独立上下文与工具环境，不污染主会话上下文。通常与 wait_subagents 配合使用：总架构师连续派生多个子任务后，应紧接着调用 wait_subagents 等待完成并汇总结果。严禁子 Agent 递归嵌套调用本工具。",
+            description: "派生专职子 Agent 进程协助处理特定专业职责的独立模块任务（如 UI 组件、后端接口、数据迁移、测试编写等）。请按专业职责拆分任务并将工作量控制在单任务 50 步以内。注意：无需在任务描述中提醒子任务步数，系统记步器会自动把控其步数预算。",
             risk: Risk::ReadOnly,
             scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "role": {"type": "string", "description": "子 Agent 角色定位，例如：前端开发、后端开发、测试验证、文档编写"},
-                    "title": {"type": "string", "description": "子任务简明标题，如 编写用户中心页面组件"},
-                    "task": {"type": "string", "description": "分配给该子 Agent 的详细需求描述与任务要求"},
+                    "role": {"type": "string", "description": "子 Agent 角色定位（如前端开发、后端开发、测试验证等）"},
+                    "title": {"type": "string", "description": "子任务简明标题，在界面抽屉中呈现"},
+                    "task": {"type": "string", "description": "该子 Agent 的详细职责范围与交付验收要求（专注于业务职责与契约，无需叮嘱步数限制，系统记步器会自动把控）"},
                     "workspace": {"type": "string", "description": "可选：指定子 Agent 独立的工作区根目录绝对路径。缺省时默认继承当前主项目的完整工作区根目录。"},
-                    "subpath": {"type": "string", "description": "可选：该子 Agent 重点关注的工作区相对子目录（如 src/ 或 backend/）。注意：此项仅作为任务重点指引，子 Agent 的工作区根目录依然为完整项目根目录，仍能访问根目录下的构建配置（如 pom.xml/package.json 等）。"}
+                    "subpath": {"type": "string", "description": "可选：该子 Agent 重点关注的工作区相对子目录（如 src/ 或 backend/）。"}
                 },
                 "required": ["role", "title", "task"]
             }),
@@ -546,9 +546,33 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     },
                     "timeout_seconds": {
                         "type": "integer",
-                        "description": "最大等待超时秒数（默认 60 秒，最大 900 秒）"
+                        "description": "最大等待超时秒数（默认 600 秒/10分钟，最大 3600 秒）"
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "等待超时别名（兼容 timeout_seconds，默认 600 秒）"
                     }
                 }
+            }),
+        },
+        ToolSpec {
+            name: "reject_subagent",
+            description: "向指定子任务下达验收不通过的驳回指示并拉起子任务返工修复。当主架构师自检发现子任务代码有缺陷（如行数超标、逻辑漏洞、编译/测试不通过）时，严禁自己亲自动手修改子任务业务代码，必须调用本工具打回给子任务，并随后调用 wait_subagents 等待其整改交付。",
+            risk: Risk::Write,
+            scope: ToolScope::MainOnly,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "subagent_id": {
+                        "type": "string",
+                        "description": "需要打回整改的子 Agent 会话 ID"
+                    },
+                    "feedback": {
+                        "type": "string",
+                        "description": "具体的整改要求与打回原因（包括缺陷文件、错误现象、改进标准）"
+                    }
+                },
+                "required": ["subagent_id", "feedback"]
             }),
         },
         ToolSpec {

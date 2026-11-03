@@ -78,6 +78,7 @@ pub(crate) async fn dispatch_static(
         "wait_subagents" | "wait_subprocesses" => subagent::wait_subagents_tool(args, ctx).await,
         "stop_subagent" | "stop_subprocess" => subagent::stop_subagent_tool(args, ctx).await,
         "resume_subagent" | "resume_subprocess" => subagent::resume_subagent_tool(args, ctx).await,
+        "reject_subagent" | "reject_subprocess" => subagent::reject_subagent_tool(args, ctx).await,
         "dispatch_collaborator" => subagent::dispatch_collaborator_tool(args, ctx).await,
         "wait_collaborators" => subagent::wait_collaborators_tool(args, ctx).await,
         "get_collaborators" => subagent::get_collaborators_tool(ctx).await,

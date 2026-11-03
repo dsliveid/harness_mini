@@ -90,11 +90,11 @@ pub fn normalize_access_mode(mode: &str) -> String {
         "confirm".into()
     }
 }
-fn default_max_steps() -> u32 {
-    30
+pub fn default_max_steps() -> u32 {
+    100
 }
-fn default_task_subtask_max_steps() -> u32 {
-    30
+pub fn default_task_subtask_max_steps() -> u32 {
+    50
 }
 fn default_cmd_timeout() -> u64 {
     120
@@ -215,9 +215,10 @@ pub struct SettingsData {
     pub active_model: Option<String>,
     #[serde(default = "default_access_mode")]
     pub global_access_mode: String,
+    /// 全局新建主对话的默认最大工具调用步数（默认 100）
     #[serde(default = "default_max_steps")]
     pub max_steps: u32,
-    /// 长任务单子任务轮次预算硬上限（默认 30 轮）
+    /// 专职子任务默认最大工具调用步数（默认 50）
     #[serde(default = "default_task_subtask_max_steps")]
     pub task_subtask_max_steps: u32,
     #[serde(default = "default_cmd_timeout")]
@@ -1325,20 +1326,33 @@ pub struct RunTokenMetrics {
     pub cached_tokens: u64,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StepExtensionData {
+    pub current_steps: usize,
+    pub max_steps: usize,
+    #[serde(default)]
+    pub session_role: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalRequest {
     pub event_id: String,
     pub session_id: String,
     pub tool_name: String,
     pub params: serde_json::Value,
-    pub risk: String,    // write | execute | path
+    pub risk: String,    // write | execute | path | step_extension
     pub preview: String, // 命令文本或 diff 预览
     pub force_once: bool,
     #[serde(default)]
     pub risk_source: Option<String>,
     #[serde(default)]
     pub jev_reason: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>, // tool | step_extension
+    #[serde(default)]
+    pub step_data: Option<StepExtensionData>,
 }
 
 /// 意图对齐单轮历史记录

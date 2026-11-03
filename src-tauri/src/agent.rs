@@ -382,6 +382,43 @@ pub fn restart_subagent(app: &AppHandle, subagent_id: &str) -> Result<(), String
     Ok(())
 }
 
+/// 验收驳回并重启子任务（主架构师自检验收不通过，打回返工）
+pub fn reject_and_restart_subagent(app: &AppHandle, subagent_id: &str, feedback: &str) -> Result<(), String> {
+    let state = app.state::<crate::AppState>();
+    stop_session_ext(app, subagent_id, false);
+
+    let (parent_id, user_msg_id) = {
+        let db = state.db.lock().unwrap();
+        let s = store::get_session(&db, subagent_id)?.ok_or("子 Agent 不存在")?;
+        // 关键：驳回时清除旧交付结果与报告标记，状态重置为 running
+        let _ = store::set_kv(&db, subagent_id, "delivered_outcome", "");
+        let _ = store::set_session_status(&db, subagent_id, "running");
+
+        // 注入整改指示作为新 user 消息
+        let reject_prompt = format!(
+            "【↩️ 主架构师验收驳回与返工整改指示】：\n\n{}\n\n请严格对照上述整改要求进行修复并重新验证，修复完成后请再次生成交付报告结案！",
+            feedback.trim()
+        );
+        let nm = store::new_message(&db, subagent_id, "user", Some(reject_prompt), false)?;
+        let _ = app.emit("message:final", &nm);
+
+        (s.parent_session_id, nm.id)
+    };
+
+    let _ = app.emit("messages:changed", json!({"sessionId": subagent_id}));
+    spawn_session_task(app.clone(), subagent_id.to_string(), Some(user_msg_id));
+
+    if let Some(ref pid) = parent_id {
+        let _ = app.emit("subagent:update", json!({
+            "parentId": pid,
+            "subagentId": subagent_id,
+            "status": "running"
+        }));
+        let _ = app.emit("subagents:changed", json!({"parentId": pid}));
+    }
+    Ok(())
+}
+
 /// 重启主会话下的全部已停止子 Agent
 pub fn restart_all_subagents(app: &AppHandle, parent_session_id: &str) -> Result<usize, String> {
     let state = app.state::<crate::AppState>();
@@ -538,6 +575,7 @@ pub fn continue_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
             .map(|s| s.id)
             .collect::<Vec<_>>()
     };
+    let resumed_any_sub = !subs_to_resume.is_empty();
     for sub_id in subs_to_resume {
         let _ = restart_subagent(app, &sub_id);
     }
@@ -554,25 +592,35 @@ pub fn continue_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
         let msgs = store::all_messages(&db, session_id)?;
         let last_msg = msgs.last();
 
+        let tool_guide = if resumed_any_sub {
+            "关联的专职子任务已在后台拉起继续推进。请立即调用 wait_subagents 工具等待其交付最新成果，切勿自行并发修改业务代码！"
+        } else {
+            "请根据上述工具执行结果，继续推进并输出最终结论。"
+        };
+
+        let assistant_guide = if resumed_any_sub {
+            "关联的专职子任务已在后台拉起继续推进。请立即调用 wait_subagents 工具等待其交付最新成果，切勿自行并发修改业务代码！"
+        } else {
+            "请承接前文未完成的内容与思路，直接继续往下执行，无需重复前文已输出的内容。"
+        };
+
         match last_msg {
             Some(m) if m.role == "tool" => {
-                // 上一步工具执行完毕，注入引导让助手做总结回复
                 let new_m = store::new_message(
                     &db,
                     session_id,
                     "user",
-                    Some("请根据上述工具执行结果，继续推进并输出最终结论。".into()),
+                    Some(tool_guide.into()),
                     false,
                 )?;
                 (new_m.id.clone(), Some(new_m))
             }
             Some(m) if m.role == "assistant" => {
-                // 助手输出中途停止或已完成，注入接续提示词
                 let new_m = store::new_message(
                     &db,
                     session_id,
                     "user",
-                    Some("请承接前文未完成的内容与思路，直接继续往下执行，无需重复前文已输出的内容。".into()),
+                    Some(assistant_guide.into()),
                     false,
                 )?;
                 (new_m.id.clone(), Some(new_m))
@@ -1466,17 +1514,88 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
     loop {
         let current_max_steps = {
             let db = state.db.lock().unwrap();
-            store::get_session(&db, session_id)
-                .ok()
-                .flatten()
-                .and_then(|s| s.max_steps)
-                .map(|v| v as usize)
-                .unwrap_or(settings.max_steps.max(1) as usize)
+            let sess = store::get_session(&db, session_id).ok().flatten();
+            if let Some(ref s) = sess {
+                if let Some(ms) = s.max_steps {
+                    ms as usize
+                } else if s.parent_session_id.is_some() || s.session_type == "subprocess" {
+                    settings.task_subtask_max_steps.max(1) as usize
+                } else {
+                    settings.max_steps.max(1) as usize
+                }
+            } else {
+                settings.max_steps.max(1) as usize
+            }
         };
 
         if _step >= current_max_steps {
-            reached_max_steps = current_max_steps;
-            break;
+            // 步数耗尽原地挂起：向前端推送 step_extension 审批申请，无限期等待用户决策
+            let event_id = uuid::Uuid::new_v4().to_string();
+            let (session_role, session_title) = {
+                let db = state.db.lock().unwrap();
+                let sess = store::get_session(&db, session_id).ok().flatten();
+                (sess.as_ref().and_then(|s| s.subagent_role.clone()), sess.as_ref().map(|s| s.title.clone()))
+            };
+            let step_req = crate::models::ApprovalRequest {
+                event_id: event_id.clone(),
+                session_id: session_id.to_string(),
+                tool_name: "step_extension".into(),
+                params: serde_json::json!({
+                    "current_steps": _step,
+                    "max_steps": current_max_steps,
+                    "session_role": session_role,
+                    "session_title": session_title,
+                }),
+                risk: "step_extension".into(),
+                preview: format!("当前任务已达到最大工具步数上限（{}/{} 步）。是否追加步数并原地继续运行？", _step, current_max_steps),
+                force_once: true,
+                risk_source: Some("step_limit".into()),
+                jev_reason: None,
+                kind: Some("step_extension".into()),
+                step_data: Some(crate::models::StepExtensionData {
+                    current_steps: _step,
+                    max_steps: current_max_steps,
+                    session_role,
+                }),
+            };
+
+            let _ = app.emit("session:status_changed", serde_json::json!({
+                "sessionId": session_id,
+                "status": "pending_approval",
+                "reason": "step_limit_reached"
+            }));
+            let _ = state.emit("run:status", &serde_json::json!({
+                "sessionId": session_id,
+                "status": "pending_approval"
+            }));
+
+            let decision = crate::approval::request_step_approval(app, &state, step_req).await;
+            match decision {
+                crate::approval::Decision::AllowStepExtension(extra_steps) => {
+                    let new_max = (current_max_steps as u32).saturating_add(extra_steps);
+                    {
+                        let db = state.db.lock().unwrap();
+                        let _ = store::set_session_max_steps(&db, session_id, Some(new_max));
+                    }
+                    let _ = app.emit("session:status_changed", serde_json::json!({
+                        "sessionId": session_id,
+                        "status": "running",
+                        "reason": "step_extension_granted",
+                        "newMaxSteps": new_max,
+                    }));
+                    let _ = state.emit("run:status", &serde_json::json!({
+                        "sessionId": session_id,
+                        "status": "running"
+                    }));
+                    // 原地热续跑，继续下一轮循环
+                    continue;
+                }
+                _ => {
+                    // 用户拒绝追加步数或取消，退出循环结案收尾
+                    reached_max_steps = current_max_steps;
+                    break;
+                }
+            }
         }
         let current_sys = &sys;
 
@@ -1562,6 +1681,19 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             messages.push(json!({
                 "role": "user",
                 "content": warn_content,
+            }));
+        }
+
+        // 每 10 步后台无痕预算感知敲钟提醒（不落库，界面无垃圾气泡，仅供模型单轮感知预算收敛）
+        if _step > 0 && _step % 10 == 0 && remaining_steps > 2 {
+            let role_label = if is_subagent { "专职子任务" } else { "主对话任务" };
+            let reminder = format!(
+                "【⏱️ 步数预算感知】：当前{}已执行 {}/{} 步（剩余 {} 步预算）。请严格收敛工作，优先完成核心交付目标，避免非必要发散；若阶段目标已达成，请尽快输出交付成果。",
+                role_label, _step, current_max_steps, remaining_steps
+            );
+            messages.push(json!({
+                "role": "user",
+                "content": reminder,
             }));
         }
 
@@ -2264,7 +2396,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         _step += 1;
     }
 
-    let err_msg = format!("已达到最大步数（{reached_max_steps}），任务中止。可在会话设置或下方快捷操作中调整「最大步数」并继续推进。");
+    let err_msg = format!("已达到最大步数（{reached_max_steps}）且未追加步数，任务以当前进度结案。可在会话设置或下方操作栏中调整「运行步数」并继续推进。");
     emit_error(
         app,
         session_id,
@@ -2505,6 +2637,8 @@ async fn handle_tool_call(
             force_once,
             risk_source,
             jev_reason: None,
+            kind: Some("tool".into()),
+            step_data: None,
         };
         let decision = approval::request_approval(app, &state, req).await;
         match decision {
@@ -2774,11 +2908,13 @@ async fn handle_tool_call(
                 force_once: true,
                 risk_source: Some("jev".into()),
                 jev_reason: Some(jev_reason),
+                kind: Some("tool".into()),
+                step_data: None,
             };
 
             let decision = approval::request_approval(app, &state, req).await;
             match decision {
-                Decision::AllowOnce | Decision::AllowSession => {
+                Decision::AllowOnce | Decision::AllowSession | Decision::AllowStepExtension(_) => {
                     status = "success".into();
                     text = format!(
                         "{}\n\n【用户已人工确认采纳】用户已审阅方案并确认放行！请立即围绕当前方案推进后续执行，无需重复质检。",

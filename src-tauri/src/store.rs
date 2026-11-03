@@ -1788,6 +1788,33 @@ mod tests {
     }
 
     #[test]
+    fn test_completed_terminal_hardlock() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let s = create_session(&conn, "D:\\workspace", None, "终态测试会话", "confirm").unwrap();
+
+        // 1. 正常设置为 completed
+        set_session_status(&conn, &s.id, "completed").unwrap();
+        let fetched = get_session(&conn, &s.id).unwrap().unwrap();
+        assert_eq!(fetched.status, "completed");
+
+        // 2. 外部级联停止试图降级冲刷为 cancelled，应被硬锁拦截
+        set_session_status(&conn, &s.id, "cancelled").unwrap();
+        let locked = get_session(&conn, &s.id).unwrap().unwrap();
+        assert_eq!(locked.status, "completed");
+
+        // 3. 外部报错试图降级冲刷为 failed，同样被拦截
+        set_session_status(&conn, &s.id, "failed").unwrap();
+        let locked2 = get_session(&conn, &s.id).unwrap().unwrap();
+        assert_eq!(locked2.status, "completed");
+
+        // 4. 主动重置为 running（如驳回整改），允许正常流转
+        set_session_status(&conn, &s.id, "running").unwrap();
+        let reopened = get_session(&conn, &s.id).unwrap().unwrap();
+        assert_eq!(reopened.status, "running");
+    }
+
+    #[test]
     fn test_create_subprocess_session_inherits_parent_models_and_capabilities() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
@@ -1835,6 +1862,7 @@ mod tests {
         assert_eq!(sub.vision_model_id.as_deref(), Some("glm-5.3-flash"));
         assert_eq!(sub.decision_provider_id.as_deref(), Some("typesafe"));
         assert_eq!(sub.decision_model_id.as_deref(), Some("jev-latest"));
+        assert_eq!(sub.max_steps, Some(50));
 
         // 从 SQLite 重新加载验证持久化落库结果
         let loaded = get_session(&conn, &sub.id).unwrap().unwrap();
@@ -1848,6 +1876,7 @@ mod tests {
         assert_eq!(loaded.vision_model_id.as_deref(), Some("glm-5.3-flash"));
         assert_eq!(loaded.decision_provider_id.as_deref(), Some("typesafe"));
         assert_eq!(loaded.decision_model_id.as_deref(), Some("jev-latest"));
+        assert_eq!(loaded.max_steps, Some(50));
     }
 
     #[test]
@@ -2733,6 +2762,9 @@ pub fn create_subprocess_session(
     let decision_provider_id = parent_session.as_ref().and_then(|p| p.decision_provider_id.clone());
     let decision_model_id = parent_session.as_ref().and_then(|p| p.decision_model_id.clone());
     let context_token_limit = parent_session.as_ref().and_then(|p| p.context_token_limit);
+    let subtask_max_steps = get_settings(conn)
+        .map(|s| s.task_subtask_max_steps)
+        .unwrap_or_else(|_| default_task_subtask_max_steps());
 
     let s = Session {
         id: uuid::Uuid::new_v4().to_string(),
@@ -2776,7 +2808,7 @@ pub fn create_subprocess_session(
         forked_from_message_id: None,
         reasoning_effort,
         last_run_status: None,
-        max_steps: None,
+        max_steps: Some(subtask_max_steps),
     };
     conn.execute(
         "INSERT INTO sessions(
@@ -2788,8 +2820,8 @@ pub fn create_subprocess_session(
             image_provider_id, image_model_id,
             vision_provider_id, vision_model_id,
             decision_provider_id, decision_model_id,
-            context_token_limit
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'subprocess',?11,?12,NULL,0,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+            context_token_limit, max_steps
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'subprocess',?11,?12,NULL,0,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
         params![
             s.id,
             s.title,
@@ -2814,6 +2846,7 @@ pub fn create_subprocess_session(
             s.decision_provider_id,
             s.decision_model_id,
             s.context_token_limit,
+            s.max_steps.map(|v| v as i64),
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -3196,6 +3229,15 @@ pub fn delete_session(conn: &Connection, id: &str) -> Result<(), String> {
 }
 
 pub fn set_session_status(conn: &Connection, id: &str, status: &str) -> Result<(), String> {
+    // 终态硬锁（Terminal Hard-lock）：若当前会话已是 completed 终态，坚决禁止逆向降级冲刷为 cancelled / failed / interrupted
+    if status == "cancelled" || status == "failed" || status == "interrupted" {
+        let current_status: Option<String> = conn
+            .query_row("SELECT status FROM sessions WHERE id = ?1", params![id], |r| r.get(0))
+            .ok();
+        if current_status.as_deref() == Some("completed") {
+            return Ok(());
+        }
+    }
     conn.execute(
         "UPDATE sessions SET status = ?2 WHERE id = ?1",
         params![id, status],

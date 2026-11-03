@@ -121,6 +121,8 @@ pub const SUBAGENT_TOOL_NAMES: &[&str] = &[
     "stop_subprocess",
     "resume_subprocess",
     "resume_subagent",
+    "reject_subprocess",
+    "reject_subagent",
     "dispatch_collaborator",
     "wait_collaborators",
     "get_collaborators",

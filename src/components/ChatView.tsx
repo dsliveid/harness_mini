@@ -9,6 +9,7 @@ import { ExecutionProcessBlock, groupTimelineItems } from "./ExecutionProcessBlo
 import { ToolRetryBanner } from "./ToolRetryBanner";
 import { CompactionBanner, CompactedHistoryCard } from "./CompactionBanner";
 import { TruncationNoticeList } from "./TruncationNoticeCard";
+import { StepApprovalCard } from "./StepApprovalCard";
 import { Bot, Plus, Sprout, ShieldCheck, AlertTriangle, Loader2, Play, RotateCcw, Zap, ChevronDown } from "./Icons";
 
 const EMPTY_PROPOSALS: any[] = [];
@@ -38,6 +39,16 @@ export function ChatView() {
   const retryTurn = useStore((s) => s.retryTurn);
   const continueTurn = useStore((s) => s.continueTurn);
   const currentIntentAlignment = useStore((s) => (s.currentId ? s.intentAlignments[s.currentId] : undefined));
+  const approvals = useStore((s) => s.approvals);
+
+  const stepApprovalReq = useMemo(() => {
+    if (!currentId) return null;
+    return Object.values(approvals).find(
+      (a) =>
+        a.sessionId === currentId &&
+        (a.kind === "step_extension" || a.risk === "step_extension" || a.toolName === "step_extension")
+    ) ?? null;
+  }, [currentId, approvals]);
   const intentAlignments = useStore((s) => s.intentAlignments);
   // 临时空间对话：合并点（含）之前的消息永久不可编辑重发
   const mergedBoundary = session?.mergedSeq ?? null;
@@ -50,7 +61,7 @@ export function ChatView() {
 
   const lastMsg = msgs[msgs.length - 1];
   const isInterruptedOrFailed = useMemo(() => {
-    if (running || !currentId || msgs.length === 0) return false;
+    if (running || !currentId || msgs.length === 0 || stepApprovalReq) return false;
     // 0. 长任务防护：如果当前会话关联的长任务已完成 (completed) 或主动取消 (cancelled)，或在推进/暂停中，绝不展示异常恢复条
     const activeTask = activeTasks[currentId];
     if (activeTask) {
@@ -383,6 +394,10 @@ export function ChatView() {
               <ShieldCheck size={15} className="shrink-0 text-emerald-400" />
               <span>交付前 SOP 自检已通过 (<code className="bg-panel2 px-1.5 py-0.5 rounded text-[12px] font-mono text-emerald-300 border border-emerald-500/20">{currentSopStatus.command}</code>)</span>
             </div>
+          )}
+          {/* 步数耗尽原地挂起时的吸底审核卡片 */}
+          {stepApprovalReq && !readOnly && (
+            <StepApprovalCard request={stepApprovalReq} />
           )}
           {/* 中断或异常失败时的恢复操作栏 */}
           {isInterruptedOrFailed && !readOnly && currentId && (

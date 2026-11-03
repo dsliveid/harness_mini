@@ -9,6 +9,8 @@ pub enum Decision {
     AllowOnce,
     /// 本会话允许：写入该对话的审批规则并持久化，仅对该对话生效
     AllowSession,
+    /// 步数扩展申请允许，携带有追加步数载荷
+    AllowStepExtension(u32),
     Deny(Option<String>),
 }
 
@@ -17,8 +19,18 @@ impl Decision {
         match s {
             "allow_once" => Some(Decision::AllowOnce),
             "allow_session" => Some(Decision::AllowSession),
+            "allow_step_extension" => {
+                let extra = reason.as_deref().and_then(|r| r.parse::<u32>().ok()).unwrap_or(20);
+                Some(Decision::AllowStepExtension(extra))
+            }
             "deny" => Some(Decision::Deny(reason)),
-            _ => None,
+            _ => {
+                if let Some(extra_str) = s.strip_prefix("allow_step_extension:") {
+                    let extra = extra_str.parse::<u32>().unwrap_or(20);
+                    return Some(Decision::AllowStepExtension(extra));
+                }
+                None
+            }
         }
     }
 
@@ -26,6 +38,7 @@ impl Decision {
         match self {
             Decision::AllowOnce => "once",
             Decision::AllowSession => "session",
+            Decision::AllowStepExtension(_) => "step_extension",
             Decision::Deny(_) => "denied",
         }
     }
@@ -49,6 +62,27 @@ pub async fn request_approval(
         Ok(Ok(d)) => d,
         Ok(Err(_)) => Decision::Deny(None),
         Err(_) => Decision::Deny(None),
+    }
+}
+
+/// 向 UI 发起步数扩展审批并无限期挂起等待结果（方案 A：无超时拒绝，热续跑守卫）
+pub async fn request_step_approval(
+    _app: &tauri::AppHandle,
+    state: &crate::AppState,
+    req: ApprovalRequest,
+) -> Decision {
+    let (tx, rx) = oneshot::channel();
+    state
+        .approvals
+        .lock()
+        .unwrap()
+        .insert(req.event_id.clone(), crate::PendingApproval { session_id: req.session_id.clone(), tx });
+    state.emit("approval:request", &req);
+
+    // 无限期等待用户操作，不设超时（方案 A）
+    match rx.await {
+        Ok(d) => d,
+        Err(_) => Decision::Deny(Some("审批通道已关闭".into())),
     }
 }
 

@@ -1049,16 +1049,24 @@ export function computeTurnMetrics(messages: Message[], running: boolean): Map<s
   return map;
 }
 
+export interface StepExtensionData {
+  currentSteps: number;
+  maxSteps: number;
+  sessionRole?: string | null;
+}
+
 export interface ApprovalReq {
   eventId: string;
   sessionId: string;
   toolName: string;
   params: any;
-  risk: string; // write | execute | path
+  risk: string; // write | execute | path | step_extension
   preview: string;
   forceOnce: boolean;
   riskSource?: "rule" | "regex" | "jev" | string;
   jevReason?: string | null;
+  kind?: "tool" | "step_extension" | string;
+  stepData?: StepExtensionData | null;
 }
 
 /** 上下文自动压缩挂起请求（等待用户确认/补充） */

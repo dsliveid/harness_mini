@@ -417,7 +417,12 @@ pub(crate) async fn get_subagent_status_tool(args: &Value, ctx: &ToolCtx) -> Res
 
 pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
-    let timeout_secs = get_u64_arg(args, "timeout_seconds", 60).clamp(5, 900);
+    let timeout_secs = args
+        .get("timeout_secs")
+        .or_else(|| args.get("timeout_seconds"))
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .unwrap_or(600)
+        .clamp(5, 3600);
     let specified_ids: Option<Vec<String>> = args.get("subagent_ids")
         .or_else(|| args.get("subprocess_ids"))
         .and_then(|v| {
@@ -540,16 +545,22 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
             };
             let has_valid_report = report_content_opt.is_some();
 
+            let is_completed = has_valid_report
+                && s.status != "cancelled"
+                && s.status != "failed"
+                && !is_running
+                && !has_pending_approval;
+
             let (status_code, status_display) = if has_pending_approval {
-                ("pending_approval", "🟡 等待用户审批中 (pending_approval - 等待用户在界面确认放行)")
+                ("pending_approval", "🟡 等待用户步数审批中 (pending_approval - 协程已原地挂起，等待用户放行)")
             } else if is_running {
                 ("running", "🟡 仍在运行 (running)")
-            } else if has_valid_report {
+            } else if is_completed {
                 ("completed", "🟢 已完成交付 (completed)")
             } else if s.status == "cancelled" {
-                ("cancelled", "⚪ 已取消/停止 (cancelled)")
+                ("cancelled", "⚪ 已取消/中断 (cancelled - 注意：任务因步数耗尽或外部取消终结，未正常交付)")
             } else if s.status == "failed" {
-                ("failed", "🔴 运行失败出错 (failed - 可由主任务决定是否恢复)")
+                ("failed", "🔴 运行失败出错 (failed - 可由主架构师调用 reject_subagent 打回重试)")
             } else {
                 ("interrupted", "🟠 执行中断未交付报告 (interrupted)")
             };
@@ -752,6 +763,45 @@ pub(crate) async fn resume_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<
 
     Ok(format!(
         "已成功恢复并重新启动子 Agent【{}】。它正在后台继续推进执行，你可以调用 wait_subagents 工具等待其最新执行成果。",
+        subagent_id
+    ))
+}
+
+pub(crate) async fn reject_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
+    let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
+    let subagent_id = args.get("subagent_id")
+        .or_else(|| args.get("subprocess_id"))
+        .and_then(|v| v.as_str())
+        .ok_or("缺少 subagent_id 参数")?;
+    let feedback = args.get("feedback")
+        .or_else(|| args.get("reason"))
+        .and_then(|v| v.as_str())
+        .ok_or("缺少 feedback（驳回整改指示）参数")?;
+
+    let state = host.app.state::<crate::AppState>();
+    let parent_id = &host.session_id;
+
+    // 1. 校验子 Agent 是否存在且属于当前主会话
+    {
+        let db = state.db.lock().unwrap();
+        let s = crate::store::get_session(&db, subagent_id)?.ok_or("未找到指定的子 Agent")?;
+        if s.parent_session_id.as_deref() != Some(parent_id) {
+            return Err("指定的子 Agent 不属于当前主会话".into());
+        }
+    }
+
+    // 2. 如果子任务当前正在执行中，提醒主任务无需驳回，先等待其完成
+    if crate::agent::is_run_active(&state, subagent_id) {
+        return Ok(format!(
+            "子任务【{subagent_id}】当前正处于运行中，请直接调用 wait_subagents 工具等待其执行完毕后再行验收与驳回。"
+        ));
+    }
+
+    // 3. 驳回并拉起子 Agent
+    crate::agent::reject_and_restart_subagent(&host.app, subagent_id, feedback)?;
+
+    Ok(format!(
+        "已成功向子任务【{}】下发验收驳回与整改要求，子任务已重新进入后台执行状态。请调用 `wait_subagents` 工具等待其修复并交付最新报告！",
         subagent_id
     ))
 }

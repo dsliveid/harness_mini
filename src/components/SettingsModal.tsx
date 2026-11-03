@@ -1301,32 +1301,32 @@ export function SettingsModal() {
                     <label className="flex flex-col gap-1">
                       <span
                         className="text-inkdim whitespace-nowrap"
-                        title="全局新建对话的默认最大工具调用步数。在具体会话中可单独在「会话设置 -> 运行步数」中自由调整或一键追加"
+                        title="全局新建主对话的默认最大工具调用步数（可在单会话中单独覆盖），默认 100"
                       >
-                        最大步数
+                        主对话最大步数
+                      </span>
+                      <input
+                        className={inputCls}
+                        type="number"
+                        min={1}
+                        max={300}
+                        value={local.maxSteps}
+                        onChange={(e) => setLocal({ ...local, maxSteps: Number(e.target.value) || 100 })}
+                        title="全局新建主对话的默认最大工具调用步数（可在单会话中单独覆盖），默认 100"
+                      />
+                    </label>
+                    <label className="flex flex-col gap-1">
+                      <span className="text-inkdim" title="所有派生的专职子任务默认最大工具调用步数，默认 50">
+                        子任务最大步数
                       </span>
                       <input
                         className={inputCls}
                         type="number"
                         min={1}
                         max={200}
-                        value={local.maxSteps}
-                        onChange={(e) => setLocal({ ...local, maxSteps: Number(e.target.value) || 30 })}
-                        title="全局新建对话的默认最大工具调用步数（可在单会话中单独覆盖）"
-                      />
-                    </label>
-                    <label className="flex flex-col gap-1">
-                      <span className="text-inkdim" title="长任务中推进单个子任务时的执行与自愈轮次预算硬上限，默认30轮，防止死循环">
-                        单子任务轮次预算
-                      </span>
-                      <input
-                        className={inputCls}
-                        type="number"
-                        min={1}
-                        max={100}
-                        value={local.taskSubtaskMaxSteps ?? 30}
-                        onChange={(e) => setLocal({ ...local, taskSubtaskMaxSteps: Number(e.target.value) || 30 })}
-                        title="长任务中推进单个子任务时的执行与自愈轮次预算硬上限，默认30轮，防止死循环"
+                        value={local.taskSubtaskMaxSteps ?? 50}
+                        onChange={(e) => setLocal({ ...local, taskSubtaskMaxSteps: Number(e.target.value) || 50 })}
+                        title="所有派生的专职子任务默认最大工具调用步数，默认 50"
                       />
                     </label>
                     <label className="flex flex-col gap-1">
