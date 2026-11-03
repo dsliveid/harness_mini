@@ -8,7 +8,7 @@ import type { Message, ToolEvent, TurnMetrics } from "../types";
 
 import { Markdown } from "./Markdown";
 
-import { ToolCard } from "./ToolCard";
+import { ToolCard, resolveEffectiveTool } from "./ToolCard";
 
 import { SubprocessBranchTree } from "./SubprocessBranchTree";
 
@@ -97,29 +97,26 @@ function groupToolEvents(events: ToolEvent[]): ToolGroupItem[] {
 
 
   for (const ev of events) {
-
-    const isSub = ev.toolName === "spawn_subprocess" || ev.toolName === "spawn_subagent";
-
+    const effective = resolveEffectiveTool(ev);
+    const isSub = effective.name === "spawn_subprocess" || effective.name === "spawn_subagent";
     if (isSub) {
-
-      curSubprocGroup.push(ev);
-
+      const normalizedEv: ToolEvent = effective.isExtended
+        ? {
+            ...ev,
+            toolName: effective.name,
+            subprocessId: effective.subprocessId,
+            params: { ...effective.params, subprocess_id: effective.subprocessId },
+          }
+        : ev;
+      curSubprocGroup.push(normalizedEv);
     } else {
-
       flushSubprocs();
-
       groups.push({
-
         type: "single",
-
         event: ev,
-
         id: ev.id,
-
       });
-
     }
-
   }
 
   flushSubprocs();

@@ -296,21 +296,21 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "category": {
-                        "type": "string",
-                        "enum": ["tech_stack", "profile", "convention", "digest"],
-                        "description": "记忆类型：tech_stack/profile（项目技术大盘与框架体系，永久驻留）、convention（工程规范与避坑约定）、digest（阶段性探索碎记）"
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "简明标题，例如：Spring Boot与中间件架构、全局统一返回规范、JWT鉴权链路"
-                    },
                     "content": {
                         "type": "string",
                         "description": "提炼总结的高价值结构化 Markdown 知识内容"
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "简明标题，例如：Spring Boot与中间件架构、全局统一返回规范。如省略将自动从内容首行提炼"
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["profile", "tech_stack", "convention", "digest"],
+                        "description": "记忆类型：profile/tech_stack（项目技术大盘与框架体系，永久驻留）、convention（工程规范与避坑约定）、digest（阶段性探索碎记，默认值）"
                     }
                 },
-                "required": ["category", "title", "content"]
+                "required": ["content"]
             }),
         },
         ToolSpec {
@@ -941,6 +941,22 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     }
                 },
                 "required": ["status", "summary"]
+            }),
+        },
+        ToolSpec {
+            name: "lookup_tool",
+            description: "查询工具（特别是扩展工具目录中的专业工具，如子任务编排、浏览器自动化、长期记忆等）的详细功能说明与完整 JSON 参数 Schema。当你需要调用未列出完整参数的工具且不确定字段时，请先调用此工具查询。",
+            risk: Risk::ReadOnly,
+            scope: ToolScope::Universal,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "type": "string",
+                        "description": "需要查询的工具名称，例如 'spawn_subagent', 'record_memory', 'browser_navigate' 等"
+                    }
+                },
+                "required": ["tool_name"]
             }),
         },
         ToolSpec {

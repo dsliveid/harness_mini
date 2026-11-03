@@ -324,6 +324,7 @@ const handleClick = async () => {
         // 核心工具数量严格收敛
         assert_eq!(names.len(), CORE_TOOL_NAMES.len());
         assert!(names.contains(&"call_extended_tool"));
+        assert!(names.contains(&"lookup_tool"));
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"create_plan"));
         assert!(names.contains(&"update_plan"));
@@ -360,5 +361,21 @@ const handleClick = async () => {
         assert!(res.contains("browser_navigate"));
         assert!(res.contains("参数 Schema"));
         assert!(res.contains("Chromium"));
+
+        // 测试原生 lookup_tool
+        let lookup_args = json!({ "tool_name": "spawn_subagent" });
+        let lookup_res = super::dispatch_static("lookup_tool", &lookup_args, &ctx, &on_partial).await.unwrap();
+        assert!(lookup_res.contains("spawn_subagent"));
+        assert!(lookup_res.contains("参数 Schema"));
+
+        // 测试扩展工具执行失败时自动附加 Schema 纠错指引
+        let bad_args = json!({
+            "tool_name": "record_memory",
+            "arguments": {}
+        });
+        let bad_res = super::dispatch_static("call_extended_tool", &bad_args, &ctx, &on_partial).await.unwrap_err();
+        assert!(bad_res.contains("缺少 content 参数"));
+        assert!(bad_res.contains("【工具 `record_memory` 参数规范与纠错指引】"));
+
         let _ = std::fs::remove_dir_all(&ws);
     }

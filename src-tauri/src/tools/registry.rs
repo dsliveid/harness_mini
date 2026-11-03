@@ -31,6 +31,25 @@ impl ToolRegistry {
         map.remove(name);
     }
 
+    pub async fn get_tool_spec(&self, name: &str) -> Option<ToolSpec> {
+        if let Some(s) = super::specs::tool_specs().into_iter().find(|s| s.name == name) {
+            return Some(s);
+        }
+        let dyn_tools = self.dynamic_tools.read().await;
+        if let Some(tool) = dyn_tools.get(name) {
+            let name_str: &'static str = Box::leak(tool.name().into_boxed_str());
+            let desc_str: &'static str = Box::leak(tool.description().into_boxed_str());
+            return Some(ToolSpec {
+                name: name_str,
+                description: desc_str,
+                schema: tool.schema(),
+                risk: tool.risk(),
+                scope: ToolScope::Universal,
+            });
+        }
+        None
+    }
+
     pub async fn list_specs(&self, is_temp: bool, is_subagent: bool) -> Vec<ToolSpec> {
         let mut specs = super::specs::tool_specs();
         // 基于 ToolScope 进行严格作用域过滤：
@@ -85,4 +104,15 @@ impl ToolRegistry {
         // 2. Static tools dispatch
         super::dispatch_static(name, args, ctx, on_partial).await
     }
+}
+
+pub fn format_tool_doc(s: &ToolSpec) -> String {
+    format!(
+        "【工具 `{}` 详细参数规范】\n功能描述：{}\n适用范围：{}\n风险级别：{}\n参数 Schema：\n```json\n{}\n```",
+        s.name,
+        s.description,
+        s.scope.label(),
+        s.risk.as_str(),
+        serde_json::to_string_pretty(&s.schema).unwrap_or_default()
+    )
 }

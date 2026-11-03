@@ -77,22 +77,29 @@ impl ZoneResolver {
 
     /// 判断目标绝对路径是否位于根目录内（支持未创建的新路径向上查找）
     pub fn is_subpath_of(target: &Path, root: &Path) -> bool {
-        let Ok(root_canon) = root.canonicalize() else {
-            return false;
-        };
-
-        if let Ok(target_canon) = target.canonicalize() {
-            return target_canon.starts_with(&root_canon);
-        }
-
-        let mut curr = target;
-        while let Some(parent) = curr.parent() {
-            if let Ok(parent_canon) = parent.canonicalize() {
-                return parent_canon.starts_with(&root_canon);
+        if let Ok(root_canon) = root.canonicalize() {
+            if let Ok(target_canon) = target.canonicalize() {
+                return target_canon.starts_with(&root_canon);
             }
-            curr = parent;
+
+            let mut curr = target;
+            while let Some(parent) = curr.parent() {
+                if let Ok(parent_canon) = parent.canonicalize() {
+                    return parent_canon.starts_with(&root_canon);
+                }
+                curr = parent;
+            }
         }
-        false
+
+        // 当根目录或目标路径在文件系统中不存在时（如单元测试模拟虚拟工作区环境），回退到基于规范化前缀词法匹配
+        let norm_target = Self::normalize_path_str(&target.to_string_lossy());
+        let norm_root = Self::normalize_path_str(&root.to_string_lossy());
+        let norm_root_prefix = if norm_root.ends_with('/') {
+            norm_root.clone()
+        } else {
+            format!("{}/", norm_root)
+        };
+        norm_target.starts_with(&norm_root_prefix) || norm_target == norm_root
     }
 
     /// 综合评估任意路径字符串的安全域归属

@@ -93,6 +93,18 @@ pub(crate) async fn dispatch_static(
         "temp_snapshot" => temp::temp_snapshot(args, ctx).await,
         "temp_restore" => temp::temp_restore(args, ctx).await,
         "temp_merge" => temp::temp_merge(ctx).await,
+        "lookup_tool" => {
+            let target_name = args
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "缺少必需参数 `tool_name`".to_string())?;
+
+            if let Some(s) = global_registry().get_tool_spec(target_name).await {
+                Ok(registry::format_tool_doc(&s))
+            } else {
+                Err(format!("未找到工具 `{target_name}`。请核对工具名称是否正确。"))
+            }
+        },
         "call_extended_tool" => {
             let target_name = args
                 .get("tool_name")
@@ -104,19 +116,35 @@ pub(crate) async fn dispatch_static(
                 .unwrap_or(Value::Object(serde_json::Map::new()));
 
             if sub_args.get("help").and_then(|v| v.as_bool()).unwrap_or(false) {
-                let all_specs = specs::tool_specs();
-                if let Some(s) = all_specs.into_iter().find(|s| s.name == target_name) {
-                    return Ok(format!(
-                        "【扩展工具 `{target_name}` 详细参数规范】\n功能描述：{}\n参数 Schema：\n```json\n{}\n```",
-                        s.description,
-                        serde_json::to_string_pretty(&s.schema).unwrap_or_default()
-                    ));
+                if let Some(s) = global_registry().get_tool_spec(target_name).await {
+                    return Ok(registry::format_tool_doc(&s));
                 } else {
                     return Err(format!("未在扩展工具目录中找到工具 `{target_name}`"));
                 }
             }
 
-            Box::pin(dispatch_static(target_name, &sub_args, ctx, on_partial)).await
+            let exec_result = if target_name == "call_extended_tool" {
+                Err("禁止嵌套递归调用 `call_extended_tool`".to_string())
+            } else {
+                Box::pin(execute(target_name, &sub_args, ctx, on_partial)).await
+            };
+
+            match exec_result {
+                Ok(res) => Ok(res),
+                Err(err) => {
+                    if let Some(s) = global_registry().get_tool_spec(target_name).await {
+                        Err(format!(
+                            "执行失败: {}\n\n【工具 `{}` 参数规范与纠错指引】\n功能描述：{}\n参数 Schema：\n```json\n{}\n```\n请核对必填参数并修正后重试。",
+                            err,
+                            target_name,
+                            s.description,
+                            serde_json::to_string_pretty(&s.schema).unwrap_or_default()
+                        ))
+                    } else {
+                        Err(format!("执行失败: {}", err))
+                    }
+                }
+            }
         },
         _ => Err(format!("未知工具: {name}")),
     }

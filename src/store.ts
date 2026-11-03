@@ -160,6 +160,8 @@ interface Store {
   messages: Record<string, Message[]>;
   messagesLoaded: Record<string, boolean>;
   hasMore: Record<string, boolean>;
+  dirtySessions: Record<string, boolean>;
+  markSessionDirty: (id: string) => void;
   queues: Record<string, QueuedItem[]>;
   runStatus: Record<string, "idle" | "running">;
   activeStepMap: Record<string, ActiveStepState | null>;
@@ -639,6 +641,7 @@ export const useStore = create<Store>((set, get) => ({
   messages: {},
   messagesLoaded: {},
   hasMore: {},
+  dirtySessions: {},
   queues: {},
   runStatus: {},
   activeStepMap: {},
@@ -1186,13 +1189,18 @@ export const useStore = create<Store>((set, get) => ({
     const isTemp = Boolean(curSession?.isTemp);
 
     // 1. 立即乐观切换：侧边栏高亮、标题栏秒级同步，若内存已有缓存直出渲染
-    set((st) => ({
-      currentId: id,
-      readOnly,
-      editingMessage: null,
-      focusFloatingTaskId: null,
-      lastRunOutcome: initialOutcome ? { ...st.lastRunOutcome, [id]: initialOutcome } : st.lastRunOutcome,
-    }));
+    set((st) => {
+      const nextDirty = { ...st.dirtySessions };
+      delete nextDirty[id];
+      return {
+        currentId: id,
+        readOnly,
+        editingMessage: null,
+        focusFloatingTaskId: null,
+        lastRunOutcome: initialOutcome ? { ...st.lastRunOutcome, [id]: initialOutcome } : st.lastRunOutcome,
+        dirtySessions: nextDirty,
+      };
+    });
     localStorage.setItem(LAST_SESSION_KEY, id);
 
     // 2. 交互轮次语义分页：默认只拉取最后 2 轮对话
@@ -1325,7 +1333,24 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   setCurrent(id) {
-    set({ currentId: id, readOnly: false });
+    if (!id) {
+      set({ currentId: null, readOnly: false });
+      return;
+    }
+    const isDirty = Boolean(get().dirtySessions[id]);
+    set((st) => {
+      const nextDirty = { ...st.dirtySessions };
+      delete nextDirty[id];
+      return { currentId: id, readOnly: false, dirtySessions: nextDirty };
+    });
+    if (isDirty) {
+      void get().reloadMessages(id);
+    }
+  },
+
+  markSessionDirty(id: string) {
+    if (!id) return;
+    set((st) => (st.dirtySessions[id] ? st : { dirtySessions: { ...st.dirtySessions, [id]: true } }));
   },
 
   async reloadMessages(id) {
@@ -1478,6 +1503,10 @@ export const useStore = create<Store>((set, get) => ({
 
   onMessageDelta(p) {
     const { sessionId, messageId, delta } = p;
+    if (sessionId !== get().currentId) {
+      get().markSessionDirty(sessionId);
+      return;
+    }
     set((st) => {
       const list = st.messages[sessionId] ?? [];
       const idx = list.findIndex((m) => m.id === messageId);
@@ -1504,6 +1533,10 @@ export const useStore = create<Store>((set, get) => ({
 
   onMessageReasoningDelta(p) {
     const { sessionId, messageId, delta } = p;
+    if (sessionId !== get().currentId) {
+      get().markSessionDirty(sessionId);
+      return;
+    }
     set((st) => {
       const list = st.messages[sessionId] ?? [];
       const idx = list.findIndex((m) => m.id === messageId);
@@ -3168,7 +3201,7 @@ export function currentMessages(s: Store): Message[] {
   if (!s.currentId) return EMPTY_MESSAGES;
   const list = s.messages[s.currentId];
   if (!list || list.length === 0) return EMPTY_MESSAGES;
-  return sortMessages(list);
+  return list;
 }
 
 export function currentQueue(s: Store): QueuedItem[] {

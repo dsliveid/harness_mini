@@ -189,6 +189,10 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
                 "sessionId": sub.id,
                 "status": "cancelled"
             }));
+            let _ = state.emit("run:status", &json!({
+                "sessionId": sub.id,
+                "status": "idle"
+            }));
         }
         let _ = app.emit("subagents:changed", json!({"parentId": session_id}));
         let _ = app.emit("subprocesses:changed", json!({"parentId": session_id}));
@@ -255,6 +259,10 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
             "run:status",
             &json!({"sessionId": session_id, "runId": run_id, "status": "cancelled"}),
         );
+        state.emit(
+            "run:status",
+            &json!({"sessionId": session_id, "status": "idle"}),
+        );
     } else {
         // 会话本就空闲（如前端状态漂移后误点停止）：补发空闲事件让前端复位
         state.emit(
@@ -288,15 +296,18 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
     }
 
     // 仅在主会话主动停止且存在排队时消费队列；子会话停止时不自发恢复
-    let is_sub = {
+    let parent_id = {
         let db = state.db.lock().unwrap();
         store::get_session(&db, session_id)
             .ok()
             .flatten()
-            .map(|s| s.session_type == "subagent" || s.parent_session_id.is_some())
-            .unwrap_or(false)
+            .and_then(|s| s.parent_session_id)
     };
-    if !is_sub && cascade_subagents {
+    if let Some(ref pid) = parent_id {
+        let _ = app.emit("subprocesses:changed", json!({"parentId": pid}));
+        let _ = app.emit("subagents:changed", json!({"parentId": pid}));
+    }
+    if parent_id.is_none() && cascade_subagents {
         spawn_session_task(app.clone(), session_id.to_string(), None);
     }
 }
@@ -310,6 +321,10 @@ pub fn restart_subagent(app: &AppHandle, subagent_id: &str) -> Result<(), String
     let (parent_id, trigger_id) = {
         let db = state.db.lock().unwrap();
         let s = store::get_session(&db, subagent_id)?.ok_or("子 Agent 不存在")?;
+        // 终态硬锁：若子任务已完成交付结案，坚决禁止二次误唤醒重启！
+        if s.status == "completed" || store::get_kv(&db, subagent_id, "delivered_outcome").ok().flatten().is_some() {
+            return Err("子 Agent 已完成交付结案，禁止重复唤醒".into());
+        }
         // 关键修复：重启子任务时，同步将 SQLite 数据库中的生命周期状态由 cancelled/interrupted/failed 恢复为 running
         let _ = store::set_session_status(&db, subagent_id, "running");
         let msgs = store::all_messages(&db, subagent_id)?;
@@ -2584,7 +2599,7 @@ async fn handle_tool_call(
         Err(e) => ("failed".to_string(), format!("工具执行失败：{e}")),
     };
     let mut detected_sub_id: Option<String> = None;
-    if (tool_name == "spawn_subprocess" || tool_name == "spawn_subagent") && status == "success" {
+    if (eval_name == "spawn_subprocess" || eval_name == "spawn_subagent") && status == "success" {
         for line in text.lines() {
             if line.contains("ID:") {
                 let trimmed = line.trim();
@@ -2605,7 +2620,7 @@ async fn handle_tool_call(
             }
         }
     }
-    if matches!(tool_name, "create_plan" | "update_plan" | "switch_plan" | "read_plan") && status == "success" {
+    if matches!(eval_name, "create_plan" | "update_plan" | "switch_plan" | "read_plan") && status == "success" {
         let normalized = text.replace('\\', "/");
         if let Some(pos) = normalized.find(".harness/plans/") {
             let sub = &normalized[pos..];
@@ -2616,15 +2631,15 @@ async fn handle_tool_call(
             }
         }
     }
-    if tool_name == "record_memory" && status == "success" {
+    if eval_name == "record_memory" && status == "success" {
         let normalized = text.replace('\\', "/");
         let detected_path = if let Some(pos) = normalized.find(".harness/memory/") {
             let sub = &normalized[pos..];
             let end = sub.find(|c: char| c.is_whitespace() || c == '`' || c == ')' || c == '"' || c == '\'' || c == '。').unwrap_or(sub.len());
             Some(sub[..end].trim_end_matches('.').to_string())
         } else {
-            let cat = ev.params.get("category").and_then(|v| v.as_str()).unwrap_or("");
-            let title = ev.params.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            let cat = eval_args.get("category").and_then(|v| v.as_str()).unwrap_or("");
+            let title = eval_args.get("title").and_then(|v| v.as_str()).unwrap_or("");
             match cat {
                 "profile" | "tech_stack" => Some(".harness/memory/profile.md".to_string()),
                 "convention" | "notes" => Some(".harness/memory/conventions.md".to_string()),

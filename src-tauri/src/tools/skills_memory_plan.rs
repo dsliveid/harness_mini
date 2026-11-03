@@ -49,12 +49,41 @@ pub(crate) async fn run_skill_tool(
 // ---------- 项目专属知识与记忆工具实现 ----------
 
 pub(crate) async fn record_memory_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
-    let category = args.get("category").and_then(|v| v.as_str()).ok_or("缺少 category 参数")?;
-    let title = args.get("title").and_then(|v| v.as_str()).ok_or("缺少 title 参数")?;
     let content = args.get("content").and_then(|v| v.as_str()).ok_or("缺少 content 参数")?;
 
+    // title 容错回退：若未传则从首行 # 或前 30 字符提取
+    let title_owned = args
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if let Some(rest) = trimmed.strip_prefix('#') {
+                    let h = rest.trim_start_matches('#').trim();
+                    if !h.is_empty() {
+                        return h.chars().take(40).collect();
+                    }
+                }
+            }
+            let first_line = content.lines().next().unwrap_or("").trim();
+            if !first_line.is_empty() {
+                first_line.chars().take(30).collect()
+            } else {
+                "知识碎片".to_string()
+            }
+        });
 
-    let effect = crate::memory::record_memory_with_effect(&ctx.workspace, category, title, content)?;
+    // category 别名容错映射，默认 digest
+    let raw_category = args.get("category").and_then(|v| v.as_str()).unwrap_or("digest");
+    let category = match raw_category {
+        "architecture" | "profile" | "tech_stack" => "profile",
+        "convention" | "rules" | "notes" | "standard" => "convention",
+        _ => "digest",
+    };
+
+    let effect = crate::memory::record_memory_with_effect(&ctx.workspace, category, &title_owned, content)?;
     record_file_snapshot(ctx, &effect.rel_path, effect.old_bytes.as_deref(), &effect.new_bytes).await;
     Ok(effect.message)
 }

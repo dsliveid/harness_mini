@@ -43,7 +43,15 @@ export function useAppEvents() {
       listen<any>("sessions:changed", (e) => s.onSessionsChanged(e.payload)),
       listen<any>("projects:changed", () => s.onProjectsChanged()),
       listen<any>("temp:update", (e) => s.onTempUpdate(e.payload)),
-      listen<any>("messages:changed", (e) => s.reloadMessages(e.payload?.sessionId)),
+      listen<any>("messages:changed", (e) => {
+        const sid = e.payload?.sessionId;
+        if (!sid) return;
+        if (sid === useStore.getState().currentId) {
+          void s.reloadMessages(sid);
+        } else {
+          s.markSessionDirty(sid);
+        }
+      }),
       listen<any>("growth:proposed", (e) => s.onGrowthProposed(e.payload)),
       listen<any>("growth:status", (e) => s.onGrowthStatus(e.payload)),
       listen<any>("growth:updated", (e) => s.onGrowthUpdated(e.payload)),

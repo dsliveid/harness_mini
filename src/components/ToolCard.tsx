@@ -1579,9 +1579,55 @@ function VisionRecognizeView({
   );
 }
 
+export interface EffectiveToolInfo {
+  name: string;
+  params: Record<string, any>;
+  subprocessId?: string;
+  isExtended: boolean;
+}
+
+export function resolveEffectiveTool(ev: ToolEvent): EffectiveToolInfo {
+  if (ev.toolName === "call_extended_tool" && ev.params?.tool_name) {
+    const rawArgs = ev.params.arguments;
+    let parsedArgs: Record<string, any> = {};
+    if (typeof rawArgs === "string") {
+      try {
+        parsedArgs = JSON.parse(rawArgs);
+      } catch {
+        parsedArgs = {};
+      }
+    } else if (rawArgs && typeof rawArgs === "object") {
+      parsedArgs = rawArgs as Record<string, any>;
+    }
+    const innerSubId = ev.subprocessId || ev.params.subprocess_id || parsedArgs.subprocess_id;
+    return {
+      name: String(ev.params.tool_name),
+      params: parsedArgs,
+      subprocessId: innerSubId ? String(innerSubId) : undefined,
+      isExtended: true,
+    };
+  }
+  return {
+    name: ev.toolName,
+    params: (ev.params || {}) as Record<string, any>,
+    subprocessId: ev.subprocessId || ev.params?.subprocess_id ? String(ev.subprocessId || ev.params?.subprocess_id) : undefined,
+    isExtended: false,
+  };
+}
+
 export function ToolCard({ ev }: { ev: ToolEvent }) {
-  if (ev.toolName === "spawn_subprocess" || ev.toolName === "spawn_subagent") {
-    return <SubprocessBranchTree event={ev} />;
+  const effective = resolveEffectiveTool(ev);
+  const normalizedEv: ToolEvent = effective.isExtended
+    ? {
+        ...ev,
+        toolName: effective.name,
+        subprocessId: effective.subprocessId,
+        params: { ...effective.params, subprocess_id: effective.subprocessId },
+      }
+    : ev;
+
+  if (effective.name === "spawn_subprocess" || effective.name === "spawn_subagent") {
+    return <SubprocessBranchTree event={normalizedEv} />;
   }
 
   const output = useStore((s) => s.toolOutputs[ev.id]);
@@ -1592,16 +1638,16 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
   const lastRunOutcome = useStore((s) => (s.currentId ? s.lastRunOutcome[s.currentId] : undefined));
   const [terminating, setTerminating] = useState(false);
   const [copied, setCopied] = useState(false);
-  const title = paramTitle(ev);
-  const label = TOOL_LABELS[ev.toolName] ?? ev.toolName;
-  const isCommandTool = ev.toolName === "run_command";
-  const commandText = isCommandTool ? String(ev.params?.command ?? "") : "";
-  const isImageTool = ev.toolName === "generate_image";
-  const imagePrompt = isImageTool ? String(ev.params?.prompt ?? "") : "";
-  const isPlanTool = ["create_plan", "update_plan", "switch_plan"].includes(ev.toolName);
-  const isVisionTool = ev.toolName === "recognize_image";
-  const isDecisionTool = ["judge_decision", "choice_decision", "score_decision"].includes(ev.toolName);
-  const isCollabTool = ["dispatch_collaborator", "wait_collaborators", "wait_subprocesses", "wait_subagents"].includes(ev.toolName);
+  const title = paramTitle(normalizedEv);
+  const label = TOOL_LABELS[effective.name] ?? (effective.isExtended ? `扩展: ${effective.name}` : ev.toolName);
+  const isCommandTool = effective.name === "run_command";
+  const commandText = isCommandTool ? String(effective.params?.command ?? "") : "";
+  const isImageTool = effective.name === "generate_image";
+  const imagePrompt = isImageTool ? String(effective.params?.prompt ?? "") : "";
+  const isPlanTool = ["create_plan", "update_plan", "switch_plan"].includes(effective.name);
+  const isVisionTool = effective.name === "recognize_image";
+  const isDecisionTool = ["judge_decision", "choice_decision", "score_decision"].includes(effective.name);
+  const isCollabTool = ["dispatch_collaborator", "wait_collaborators", "wait_subprocesses", "wait_subagents"].includes(effective.name);
   const needsModelInfo = isImageTool || isVisionTool || isDecisionTool;
 
   // 关键解耦：只有生图/识图/决策工具才解析模型信息，常规工具不提取；使用等值判定切断无关配置变更导致的重渲染风暴
@@ -2205,14 +2251,14 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
         </div>
       </div>
 
-      {ev.toolName === "todo" && Array.isArray(ev.params?.todos) && (
-        <TodoList todos={ev.params.todos} isRunning={isRunning} lastRunOutcome={lastRunOutcome} />
+      {effective.name === "todo" && Array.isArray(effective.params?.todos) && (
+        <TodoList todos={effective.params.todos} isRunning={isRunning} lastRunOutcome={lastRunOutcome} />
       )}
 
       {/* 展开时：若是方案计划工具，展示专用计划卡片 */}
-      {expanded && ["create_plan", "update_plan", "switch_plan"].includes(ev.toolName) && (
+      {expanded && ["create_plan", "update_plan", "switch_plan"].includes(effective.name) && (
         <PlanCardView
-          ev={ev}
+          ev={normalizedEv}
           onOpenPlan={handleOpenPlanFile}
           planFilePath={resolvedPlanFilePath}
         />
@@ -2222,9 +2268,9 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
       {ev.status === "pending_approval" && <ApprovalSection ev={ev} />}
 
       {/* 展开时：若是记忆工具，展示专用记忆卡片 */}
-      {expanded && ["record_memory", "read_memory"].includes(ev.toolName) && (
+      {expanded && ["record_memory", "read_memory"].includes(effective.name) && (
         <MemoryCardView
-          ev={ev}
+          ev={normalizedEv}
           onOpenMemory={handleOpenMemoryFile}
           memoryFilePath={resolvedMemoryFilePath}
         />

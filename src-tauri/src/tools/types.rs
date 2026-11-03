@@ -95,6 +95,7 @@ pub const CORE_TOOL_NAMES: &[&str] = &[
     "todo",
     "create_plan",
     "update_plan",
+    "lookup_tool",
     "call_extended_tool",
 ];
 

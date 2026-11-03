@@ -302,6 +302,8 @@ pub(crate) fn determine_subagent_status(
 ) -> (&'static str, &'static str) {
     if is_running {
         ("running", "🟡 仍在运行 (running)")
+    } else if session_status == "completed" {
+        ("completed", "🟢 已完成交付 (completed)")
     } else if session_status == "cancelled" {
         ("cancelled", "⚪ 已取消/停止 (cancelled)")
     } else if session_status == "failed" {
@@ -439,7 +441,11 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
                         if ps.status == "cancelled" || ps.status == "stopped" || ps.status == "interrupted" {
                             false
                         } else if let Ok(Some(s)) = crate::store::get_session(&db, id) {
-                            if s.status == "interrupted" || s.status == "failed" {
+                            let is_already_delivered = s.status == "completed"
+                                || crate::store::get_kv(&db, id, "delivered_outcome").ok().flatten().is_some();
+                            if is_already_delivered {
+                                false
+                            } else if s.status == "interrupted" || s.status == "failed" {
                                 true
                             } else if s.status != "cancelled" && s.status != "stopped" {
                                 let msgs = crate::store::get_messages(&db, id, None, 10).unwrap_or_default();
