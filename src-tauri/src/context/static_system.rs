@@ -134,7 +134,7 @@ pub fn build_static_collaborator_section(
     if collabs.is_empty() {
         return None;
     }
-    let mut text = String::from("## 可用项目协作者名录 (Collaborators)\n你拥有以下常驻专业协作者团队。主进程作为总架构师，默认优先就地直接处理简单任务与局部改动；仅在遇到明确的跨模块并发、专职领域或大体量独立子任务时，根据下述职责定位按需委派给对应协作者。\n\n");
+    let mut text = String::from("## 可用项目协作者名录 (Collaborators)\n你拥有以下常驻专业协作者团队。根据下述职责定位与任务指示按需委派给对应协作者。\n\n");
     for c in collabs {
         let role_display = match c.subagent_role.as_deref() {
             Some("image_gen") => "AI 绘画师 / 图像生成",

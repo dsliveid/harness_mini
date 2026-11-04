@@ -368,7 +368,7 @@ export const AGENT_SOPS: AgentSopInfo[] = [
     scope: "universal",
     scopeLabel: "主/子对话可用",
     isHardRule: false,
-    description: "在涉及任何代码或文件变更时，无论任务大小（即使仅有 1 个任务项），均须调用 todo 工具列出计划，并随进展更新各项状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done，切勿遗留 in_progress 状态。",
+    description: "针对小的调整和探索，可以调用 todo 工具列出任务列表，并随进展更新各项任务状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done，切勿遗留 in_progress 状态。",
     disableEffect: "禁用后：允许 Agent 自由多步推进，不强制调用 todo 工具维护状态清单。",
   },
   {
@@ -381,7 +381,7 @@ export const AGENT_SOPS: AgentSopInfo[] = [
     scope: "main_only",
     scopeLabel: "仅主对话",
     isHardRule: false,
-    description: "面对复杂需求、多模块并发开发（如前后端分离、多独立模块并行）时，可按职责派生专职子 Agent 协同推进。主会话优先就地编写与修改代码，仅在确需并行加速时按需委派。",
+    description: "面对复杂需求、多模块并发开发（如前后端分离、多独立模块并行）时，可按职责派生专职子 Agent 协同推进。",
     disableEffect: "禁用后：停用多子进程协作编排指引，Agent 倾向于在单主进程内直接就地处理全部任务。",
   },
   {

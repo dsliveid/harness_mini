@@ -183,6 +183,47 @@ pub fn resolve_session_llm_cfg(
 }
 
 /// 集中评估当前会话的上下文视口指标（前后端统一唯一指标源）
+/// 针对未压缩消息流，评估可供压缩的候选历史消息
+///
+/// 核心准则：
+/// 1. 若当前会话正在运行中，或最后一条消息为等待回复的 user 消息：
+///    必须保护当前未决/进行中的轮次，只压缩该轮次之前的历史消息（..last_user_idx）；
+/// 2. 若当前会话处于空闲完成态（is_running = false 且末条非 user 消息）：
+///    末轮任务（如长任务或多步自治）已彻底交付收工，全量未压缩消息皆为可总结的历史工件，
+///    全部纳入候选，彻底释放自治执行积累的大量 Token 空间！
+pub fn partition_compaction_candidates<'a, T: std::borrow::Borrow<crate::models::Message>>(
+    uncompacted: &'a [T],
+    is_running: bool,
+) -> Vec<&'a crate::models::Message> {
+    if uncompacted.is_empty() {
+        return Vec::new();
+    }
+
+    let is_last_msg_user = uncompacted.last().map(|m| m.borrow().role == "user").unwrap_or(false);
+    let need_preserve_active_turn = is_running || is_last_msg_user;
+
+    if need_preserve_active_turn {
+        // 定位当前活跃/未决轮次起点（最后一个 user 消息）
+        let last_user_idx = uncompacted.iter().rposition(|m| m.borrow().role == "user");
+        match last_user_idx {
+            Some(idx) if idx > 0 => uncompacted[..idx].iter().map(|m| m.borrow()).collect(),
+            _ => {
+                if uncompacted.len() >= 2 {
+                    uncompacted[..uncompacted.len().saturating_sub(1)]
+                        .iter()
+                        .map(|m| m.borrow())
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    } else {
+        // 空闲完成态：末轮长任务已收工，全量未压缩消息皆为可总结的历史工件
+        uncompacted.iter().map(|m| m.borrow()).collect()
+    }
+}
+
 pub fn evaluate_context_viewport(
     conn: &rusqlite::Connection,
     settings: &crate::models::SettingsData,
@@ -258,18 +299,16 @@ pub fn evaluate_context_viewport(
         (est, true)
     };
 
-    // 寻找候选压缩历史消息（当前活跃轮次起点之前的已完成交互）
-    let last_user_idx = uncompacted.iter().rposition(|m| m.role == "user");
-    let candidate_msgs: Vec<&crate::models::Message> = match last_user_idx {
-        Some(idx) if idx > 0 => uncompacted[..idx].to_vec(),
-        _ => {
-            if uncompacted.len() >= 2 {
-                uncompacted[..uncompacted.len().saturating_sub(1)].to_vec()
-            } else {
-                Vec::new()
-            }
-        }
-    };
+    // 寻找候选压缩历史消息（当前活跃轮次起点之前的已完成交互，或空闲态下的已完结大历史）
+    let is_running = conn
+        .query_row(
+            "SELECT count(*) FROM runs WHERE session_id = ?1 AND status = 'running'",
+            rusqlite::params![session_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false);
+    let candidate_msgs = partition_compaction_candidates(&uncompacted, is_running);
 
     let candidate_messages_count = candidate_msgs.len();
     let candidate_tokens: usize = candidate_msgs
@@ -348,17 +387,12 @@ pub async fn propose_and_execute_compaction(
             .filter(|m| !m.queued && m.seq > max_compacted_seq && m.reverted_at.is_none())
             .collect();
 
-        let last_user_idx = uncompacted.iter().rposition(|m| m.role == "user");
-        let candidates = match last_user_idx {
-            Some(idx) if idx > 0 => uncompacted[..idx].to_vec(),
-            _ => {
-                if uncompacted.len() >= 2 {
-                    uncompacted[..uncompacted.len().saturating_sub(1)].to_vec()
-                } else {
-                    Vec::new()
-                }
-            }
-        };
+        let is_running = crate::agent::is_run_active(state, session_id);
+        let candidates: Vec<crate::models::Message> =
+            partition_compaction_candidates(&uncompacted, is_running)
+                .into_iter()
+                .cloned()
+                .collect();
 
         let tokens: usize = candidates
             .iter()
@@ -564,5 +598,33 @@ mod tests {
         assert_eq!(vp.candidate_messages_count, 2);
         assert!(vp.can_compact);
         assert_eq!(vp.compaction_count, 0);
+    }
+
+    #[test]
+    fn test_partition_compaction_candidates_idle_and_running() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        let s = crate::store::create_session(&conn, ".", None, "test", "confirm").unwrap();
+
+        let _ = crate::store::new_message(&conn, &s.id, "user", Some("长任务启动".into()), false).unwrap();
+        let _ = crate::store::new_message(&conn, &s.id, "assistant", Some("开始执行步骤1".into()), false).unwrap();
+        let _ = crate::store::new_message(&conn, &s.id, "tool", Some("步骤1结果".into()), false).unwrap();
+        let _ = crate::store::new_message(&conn, &s.id, "assistant", Some("长任务交付结案".into()), false).unwrap();
+
+        let msgs = crate::store::all_messages(&conn, &s.id).unwrap();
+
+        // 运行态：最后一条消息正在执行，保留正在生成的末条（候选为前 3 条）
+        let running_candidates = partition_compaction_candidates(&msgs, true);
+        assert_eq!(running_candidates.len(), 3);
+
+        // 空闲态（is_running = false 且最后一条为 assistant 交付结论）：全量 4 条消息全部纳入压缩候选
+        let idle_candidates = partition_compaction_candidates(&msgs, false);
+        assert_eq!(idle_candidates.len(), 4);
+
+        // 保护特性验证：若末条为刚发出、等待回复的 user 消息，严禁将其作为压缩候选（保护该未决轮次）
+        let _ = crate::store::new_message(&conn, &s.id, "user", Some("新一轮未决问题".into()), false).unwrap();
+        let msgs2 = crate::store::all_messages(&conn, &s.id).unwrap();
+        let candidates_with_pending = partition_compaction_candidates(&msgs2, false);
+        assert_eq!(candidates_with_pending.len(), 4);
     }
 }

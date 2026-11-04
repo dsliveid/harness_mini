@@ -173,7 +173,7 @@ fn get_all_sop_definitions() -> Vec<SopDefinition> {
             render_fn: |_session, rule_num| {
                 Some(format!(
                     "{rule_num}. 【方案先行与任务计划中枢治理规范（防需求失真）】：\n\
-                     - 大改动物理落盘先行：凡是涉及核心业务架构重构、多模块接口改造或预计修改 3 个以上核心文件的复杂任务，在 todo 首项派生调用 `create_plan` 生成结构化计划 MD 文档并向用户呈现确认。\n\
+                     - 大改动物理落盘先行：凡是涉及核心业务架构重构、多模块接口改造或预计修改 3 个以上核心文件的复杂任务，直接调用 `create_plan` 生成结构化方案文档；已有方案天然豁免 todo，执行阶段严格以方案 Checklist 为基准推进。\n\
                      - 需求变更优先更新计划：在多轮对话中，一旦用户提出需求调整或纠偏，改动代码前必须首先调用 `update_plan` 同步更新计划文档，彻底杜绝需求失真。\n\
                      - 按清单逐步推进与结案：执行阶段严格以计划 Checklist 为基准推进；全部任务完成并通过测试后，调用 `update_plan(status: \"completed\")` 结案归档。"
                 ))
@@ -191,12 +191,12 @@ fn get_all_sop_definitions() -> Vec<SopDefinition> {
                 scope: "universal".into(),
                 scope_label: "主/子对话可用".into(),
                 is_hard_rule: false,
-                description: "在涉及任何代码或文件变更时，无论任务大小（即使仅有 1 个任务项），均须调用 todo 工具列出计划，并随进展更新各项状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done，切勿遗留 in_progress 状态。".into(),
+                description: "针对小的调整和探索，可以调用 todo 工具列出任务列表，并随进展更新各项任务状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done，切勿遗留 in_progress 状态。".into(),
                 disable_effect: "禁用后：允许 Agent 自由多步推进，不强制调用 todo 工具维护状态清单。".into(),
             },
             render_fn: |_session, rule_num| {
                 Some(format!(
-                    "{rule_num}. 【任务清单全生命周期 SOP】：调用 todo 工具立项后，随执行进展将正在处理的任务置为 in_progress；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done（切勿遗留 in_progress 状态）。"
+                    "{rule_num}. 【任务清单全生命周期 SOP】：针对小的调整和探索，可以调用 todo 工具列出任务列表，并随进展更新各项任务状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done，切勿遗留 in_progress 状态。"
                 ))
             },
         },
@@ -213,13 +213,13 @@ fn get_all_sop_definitions() -> Vec<SopDefinition> {
                 scope: "main_only".into(),
                 scope_label: "仅主对话".into(),
                 is_hard_rule: false,
-                description: "面对复杂需求、多模块并发开发（如前后端分离、多独立模块并行）时，可按职责派生专职子 Agent 协同推进。主会话优先就地编写与修改代码，仅在确需并行加速时按需委派。".into(),
+                description: "面对复杂需求、多模块并发开发（如前后端分离、多独立模块并行）时，可按职责派生专职子 Agent 协同推进。".into(),
                 disable_effect: "禁用后：停用多子进程协作编排指引，Agent 倾向于在单主进程内直接就地处理全部任务。".into(),
             },
             render_fn: |_session, rule_num| {
                 Some(format!(
                     "{rule_num}. 【团队协同委派原则、弹性多并发与职责拆分准则】：\n\
-                     - 本地优先自决准则：主会话默认优先亲自就地阅读、分析与修改代码，快速高效闭环。面对跨模块、多领域（如前后端并行开发、独立脚本与界面改造等）大体量任务时，可按需调用 `spawn_subagent` 委派专职子 Agent 并行推进。\n\
+                     - 面对跨模块、多领域（如前后端并行开发、独立脚本与界面改造等）大体量任务时，可按需调用 `spawn_subagent` 委派专职子 Agent 并行推进。\n\
                      - 🎯【按职责拆分与工作量控制原则（必须严格遵守）】：\n\
                        ① 【按职责拆分，严禁按步数生硬切分】：子任务拆分必须严格按照系统架构、关注点分离与模块职责进行拆解（例如前端 UI 交互、后端接口逻辑、数据持久化、测试编写等），严禁按“第 1~50 步做什么、第 51~100 步做什么”这种步数阶段来切分任务；\n\
                        ② 【工作量尽量控制在 50 步以内】：主任务在划分每个职责子任务的边界时，应合理评估工作量，将其尽量控制在 50 步工具调用以内能够独立闭环的原子体量；若某一职责体量过大，应进一步按子职责细分，以便派生更多并行子任务；\n\

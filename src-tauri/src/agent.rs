@@ -56,6 +56,33 @@ impl ToolErrorTracker {
     }
 }
 
+/// 前置意图门禁状态（持有活跃 Todo 清单或已生效 Plan 方案二选一即满足）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntentGateStatus {
+    pub has_plan: bool,
+    pub has_todo: bool,
+}
+
+impl IntentGateStatus {
+    pub fn is_satisfied(&self) -> bool {
+        self.has_plan || self.has_todo
+    }
+}
+
+pub fn evaluate_intent_gate(db: &rusqlite::Connection, session_id: &str) -> IntentGateStatus {
+    let has_plan = store::get_kv(db, session_id, "active_plan_id")
+        .ok()
+        .flatten()
+        .map(|id| !id.trim().is_empty())
+        .unwrap_or(false);
+    let has_todo = store::get_kv(db, session_id, "todos")
+        .ok()
+        .flatten()
+        .map(|raw| raw.contains(r#""in_progress""#) || raw.contains(r#""pending""#))
+        .unwrap_or(false);
+    IntentGateStatus { has_plan, has_todo }
+}
+
 pub fn build_tool_reflexion_prompt(
     tool_name: &str,
     error_msg: &str,
@@ -1677,37 +1704,27 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             }
         };
 
-        // 第 8 步阶梯门禁拦截：当只读勘察达 8 步且尚未建立 Todo 时，注入强制对齐/立项提示
+        // 第 8 步阶梯门禁拦截：当只读勘察达 8 步且尚未声明施工意图时，注入强制对齐/意图声明提示
         let todo_first_enabled = !settings.disabled_sops.iter().any(|s| s == "todo_first_gate");
         if todo_first_enabled && _step == 8 {
-            let has_active_plan_or_todo = {
+            let intent_status = {
                 let db = state.db.lock().unwrap();
-                let has_plan = store::get_kv(&db, session_id, "active_plan_id")
-                    .ok()
-                    .flatten()
-                    .map(|id| !id.trim().is_empty())
-                    .unwrap_or(false);
-                let has_todo = store::get_kv(&db, session_id, "todos")
-                    .ok()
-                    .flatten()
-                    .map(|raw| raw.contains(r#""in_progress""#) || raw.contains(r#""pending""#))
-                    .unwrap_or(false);
-                has_plan || has_todo
+                evaluate_intent_gate(&db, session_id)
             };
-            if !has_active_plan_or_todo {
+            if !intent_status.is_satisfied() {
                 let gate_msg = if is_subagent {
                     let report_filename = format!("{}_report.md", session_id.replace('-', "_"));
                     format!(
-                        "【🛑 第 8 步门禁拦截（子任务施工/探索门禁）】：只读勘察已达 8 步上限且当前未创建 Todo 任务！\n\
-                        1. 若本任务需要修改代码且施工目标明确，必须在下一步立即调用 todo 工具声明施工步骤清单（哪怕只有 1 个任务），方可开始调用 write_file / edit_file 施工；\n\
+                        "【🛑 第 8 步门禁拦截（子任务施工/探索门禁）】：只读勘察已达 8 步上限且当前未声明施工意图！\n\
+                        1. 若本任务需要修改代码且施工目标明确，必须在下一步声明意图（小型任务调用 todo 工具声明步骤清单，复杂架构任务调用 create_plan 工具生成方案，二选一即可），方可开始调用 write_file / edit_file 施工；\n\
                         2. 若为纯探索/调研类任务且事实已查明，严禁盲目漫游，直接调用 write_file 将详尽报告写入 `.harness/subtasks/{report_filename}` 并结案交付；\n\
                         3. 若在 8 步内探索受阻、无法梳理出可行方案或缺少前置条件，严禁继续漫游或盲目重试，必须立即调用 write_file 写入 `.harness/subtasks/{report_filename}` 汇报遇到的具体阻碍并交回主会话！"
                     )
                 } else {
-                    "【🛑 第 8 步门禁拦截】：只读勘察已达 8 步上限且当前未创建 Todo 任务！\n\
+                    "【🛑 第 8 步门禁拦截】：只读勘察已达 8 步上限且当前未声明施工意图！\n\
                     1. 若已查明事实且无需修改代码（如咨询答疑），必须立即在正式回复（Content）中输出完整答复并直接结案；\n\
-                    2. 若需要修改代码且方向明确，必须在下一步先调用 todo 工具声明任务清单（哪怕只有 1 个任务），方可进行代码修改；\n\
-                    3. 若依然方向模糊、无法梳理出清晰的 todo 计划，严禁盲目漫游或脑补计划，必须立即停止调用工具，在正式回复中向用户汇报当前事实并对齐目标！".to_string()
+                    2. 若需要修改代码且方向明确，必须在下一步声明意图（小型调整/探索调用 todo 工具声明任务列表，复杂跨模块工程调用 create_plan 工具生成实施方案，二选一即可，严禁重复创建），方可进行代码修改；\n\
+                    3. 若依然方向模糊、无法梳理出清晰的执行路线，严禁盲目漫游或脑补计划，必须立即停止调用工具，在正式回复中向用户汇报当前事实并对齐目标！".to_string()
                 };
                 messages.push(json!({
                     "role": "user",
@@ -2501,7 +2518,7 @@ async fn handle_tool_call(
             || p.contains(".harness/memory") || p.contains(".harness\\memory")
     };
     if (check_name == "write_file" || check_name == "edit_file") && !is_internal_harness_artifact {
-        let (is_sub, is_sop_enabled, has_active_plan_or_todo) = {
+        let (is_sub, is_sop_enabled, is_intent_satisfied) = {
             let db = state.db.lock().unwrap();
             let sop_enabled = store::get_settings(&db)
                 .map(|s| !s.disabled_sops.iter().any(|sop| sop == "todo_first_gate"))
@@ -2513,23 +2530,14 @@ async fn handle_tool_call(
                     || s.session_type == "collaborator"
                     || s.parent_session_id.is_some()
             }).unwrap_or(false);
-            let has_plan = store::get_kv(&db, session_id, "active_plan_id")
-                .ok()
-                .flatten()
-                .map(|id| !id.trim().is_empty())
-                .unwrap_or(false);
-            let has_todo = store::get_kv(&db, session_id, "todos")
-                .ok()
-                .flatten()
-                .map(|raw| raw.contains(r#""in_progress""#) || raw.contains(r#""pending""#))
-                .unwrap_or(false);
-            (sub, sop_enabled, has_plan || has_todo)
+            let intent_status = evaluate_intent_gate(&db, session_id);
+            (sub, sop_enabled, intent_status.is_satisfied())
         };
-        if is_sop_enabled && !has_active_plan_or_todo {
+        if is_sop_enabled && !is_intent_satisfied {
             let reason = if is_sub {
-                "【Todo 先行门禁拦截（子任务施工门禁）】：修改代码或文件前必须先调用 todo 工具声明任务步骤清单（哪怕只有 1 个任务）。主进程交接书为总体目标，施工前请先调用 todo 明确具体施工步骤，然后再调用编辑或写入工具。".to_string()
+                "【前置意图门禁拦截（子任务施工门禁）】：修改代码或文件前必须先声明施工意图。主进程交接书为总体目标，施工前请先调用 todo（小型施工）或 create_plan（复杂方案）明确具体任务设计，然后再调用编辑或写入工具。".to_string()
             } else {
-                "【Todo 先行门禁拦截】：修改代码或文件前必须先调用 todo 工具声明任务清单（哪怕只有 1 个任务）。请先调用 todo 工具明确你将要执行的具体修改，然后再调用编辑或写入工具。".to_string()
+                "【前置意图门禁拦截】：修改代码或文件前必须先声明施工意图（二选一即可）。小型局部改动请先调用 todo 工具声明任务清单；复杂架构改造请先调用 create_plan 工具创建结构化实施方案。完成意图声明后方可调用编辑或写入工具。".to_string()
             };
             ev.status = "failed".into();
             ev.result_text = Some(reason.clone());
