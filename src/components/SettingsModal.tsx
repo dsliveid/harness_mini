@@ -1,13 +1,14 @@
 import { useEffect, useState, useRef } from "react";
 import { ipc } from "../ipc";
 import { useStore } from "../store";
-import type { Provider, Settings, ToolInfo, AgentSopInfo, RequestProtocol } from "../types";
+import type { Provider, Settings, ToolInfo, AgentSopInfo, RequestProtocol, AgentSopDetail } from "../types";
 import { formatTokens, resolveModelContextLimit, resolveModelCapabilities, hasModelCapability, AGENT_SOPS, getModelProtocol, inferRequestProtocol } from "../types";
 import { DataDirSection } from "./DataDirSection";
 import { ModalActions, ModalClose } from "./ModalActions";
 import { ModelContextModal } from "./ModelContextModal";
 import { ModelCapabilitySelect } from "./ModelCapabilitySelect";
 import { McpSection } from "./McpSection";
+import { Markdown } from "./Markdown";
 
 import {
   Cpu,
@@ -36,6 +37,9 @@ import {
   Search,
   X,
   Server,
+  ChevronDown,
+  ChevronUp,
+  RotateCcw,
 } from "./Icons";
 
 const MODEL_CAP_OPTIONS = [
@@ -110,6 +114,10 @@ export function SettingsModal() {
   const [local, setLocal] = useState<Settings>(storeSettings);
   const [toolList, setToolList] = useState<ToolInfo[]>([]);
   const [sopList, setSopList] = useState<AgentSopInfo[]>(AGENT_SOPS);
+  const [expandedSopIds, setExpandedSopIds] = useState<Record<string, boolean>>({});
+  const [sopDetails, setSopDetails] = useState<Record<string, AgentSopDetail>>({});
+  const [loadingSopDetails, setLoadingSopDetails] = useState<Record<string, boolean>>({});
+  const [sopDetailErrors, setSopDetailErrors] = useState<Record<string, string>>({});
   const [testing, setTesting] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const [visibleKeys, setVisibleKeys] = useState<Record<string, boolean>>({});
@@ -539,6 +547,32 @@ export function SettingsModal() {
     setLocal((cur) => ({ ...cur, disabledSops: next }));
   };
 
+  const toggleSopExpand = async (id: string) => {
+    const isExpanded = !!expandedSopIds[id];
+    const nextExpanded = !isExpanded;
+    setExpandedSopIds((prev) => ({ ...prev, [id]: nextExpanded }));
+
+    if (nextExpanded && !sopDetails[id] && !loadingSopDetails[id]) {
+      setLoadingSopDetails((prev) => ({ ...prev, [id]: true }));
+      setSopDetailErrors((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      try {
+        const detail = await ipc.getAgentSopDetail(id);
+        setSopDetails((prev) => ({ ...prev, [id]: detail }));
+      } catch (err: any) {
+        setSopDetailErrors((prev) => ({
+          ...prev,
+          [id]: String(err?.message || err || "加载规范详情失败"),
+        }));
+      } finally {
+        setLoadingSopDetails((prev) => ({ ...prev, [id]: false }));
+      }
+    }
+  };
+
   const enableAllSops = () => {
     setLocal((cur) => ({ ...cur, disabledSops: [] }));
   };
@@ -597,89 +631,147 @@ export function SettingsModal() {
   const renderSopItem = (s: AgentSopInfo) => {
     const isHard = !!s.isHardRule;
     const enabled = isHard || isSopEnabled(s.id);
+    const isExpanded = !!expandedSopIds[s.id];
+    const detail = sopDetails[s.id];
+    const isLoading = !!loadingSopDetails[s.id];
+    const error = sopDetailErrors[s.id];
+
     return (
       <div
         key={s.id}
-        className={`border rounded-xl p-3 flex items-start justify-between gap-3 transition-colors ${
+        className={`border rounded-xl p-3 flex flex-col gap-2.5 transition-colors ${
           enabled ? "border-edge bg-panel" : "border-edge/50 bg-panel/40 opacity-75"
         }`}
       >
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 flex-wrap">
-            <code className="text-[13px] font-mono font-medium text-ink bg-panel3 px-1.5 py-0.5 rounded border border-edge/60">
-              {s.id}
-            </code>
-            <span className="text-[12px] text-ink font-medium">{s.name}</span>
-            <span
-              className={`text-[11px] px-2 py-0.5 rounded-full font-medium inline-flex items-center gap-1 ${
-                s.phase === 1
-                  ? "bg-purple-500/20 text-purple-300 border border-purple-500/40"
-                  : s.phase === 2
-                  ? "bg-blue-500/10 text-blue-300/80 border border-blue-500/25"
-                  : "bg-emerald-500/15 text-emerald-300 border border-emerald-500/30"
-              }`}
-            >
-              {s.phase === 1 && <span className="w-1.5 h-1.5 rounded-full bg-purple-400"></span>}
-              {s.phase === 2 && <span className="w-1.5 h-1.5 rounded-full bg-blue-400"></span>}
-              {s.phase === 3 && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>}
-              {s.phaseLabel}
-            </span>
-            {renderSopCategoryBadge(s.category, s.categoryLabel)}
-            {s.scopeLabel && (
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <code className="text-[13px] font-mono font-medium text-ink bg-panel3 px-1.5 py-0.5 rounded border border-edge/60">
+                {s.id}
+              </code>
+              <span className="text-[12px] text-ink font-medium">{s.name}</span>
               <span
-                className={`text-[11px] px-1.5 py-0.5 rounded font-medium border ${
-                  s.scope === "sub_only"
-                    ? "bg-amber-500/15 text-amber-300 border-amber-500/30"
-                    : s.scope === "main_only"
-                    ? "bg-sky-500/15 text-sky-300 border-sky-500/30"
-                    : "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                className={`text-[11px] px-2 py-0.5 rounded-full font-medium inline-flex items-center gap-1 ${
+                  s.phase === 1
+                    ? "bg-purple-500/20 text-purple-300 border border-purple-500/40"
+                    : s.phase === 2
+                    ? "bg-blue-500/10 text-blue-300/80 border border-blue-500/25"
+                    : "bg-emerald-500/15 text-emerald-300 border border-emerald-500/30"
                 }`}
               >
-                {s.scopeLabel}
+                {s.phase === 1 && <span className="w-1.5 h-1.5 rounded-full bg-purple-400"></span>}
+                {s.phase === 2 && <span className="w-1.5 h-1.5 rounded-full bg-blue-400"></span>}
+                {s.phase === 3 && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>}
+                {s.phaseLabel}
               </span>
-            )}
-            {isHard && (
-              <span className="text-[11px] px-1.5 py-0.5 rounded font-medium border bg-rose-500/15 text-rose-300 border-rose-500/30">
-                核心底线
-              </span>
-            )}
+              {renderSopCategoryBadge(s.category, s.categoryLabel)}
+              {s.scopeLabel && (
+                <span
+                  className={`text-[11px] px-1.5 py-0.5 rounded font-medium border ${
+                    s.scope === "sub_only"
+                      ? "bg-amber-500/15 text-amber-300 border-amber-500/30"
+                      : s.scope === "main_only"
+                      ? "bg-sky-500/15 text-sky-300 border-sky-500/30"
+                      : "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                  }`}
+                >
+                  {s.scopeLabel}
+                </span>
+              )}
+              {isHard && (
+                <span className="text-[11px] px-1.5 py-0.5 rounded font-medium border bg-rose-500/15 text-rose-300 border-rose-500/30">
+                  核心底线
+                </span>
+              )}
+            </div>
+            <div className="text-[12px] text-inkdim mt-1.5 leading-relaxed">{s.description}</div>
+            <div className="text-[11px] text-inkdim/60 mt-1.5 flex items-center gap-1 font-mono">
+              <span>↳</span>
+              <span>{s.disableEffect}</span>
+            </div>
           </div>
-          <div className="text-[12px] text-inkdim mt-1.5 leading-relaxed">{s.description}</div>
-          <div className="text-[11px] text-inkdim/60 mt-1.5 flex items-center gap-1 font-mono">
-            <span>↳</span>
-            <span>{s.disableEffect}</span>
+
+          <div className="flex items-center gap-2 shrink-0 pt-0.5">
+            {isHard ? (
+              <span className="text-[11px] text-inkdim/70 px-2 py-0.5 rounded bg-panel3 border border-edge/60 select-none whitespace-nowrap">
+                常驻生效
+              </span>
+            ) : (
+              <>
+                <span className={`text-[12px] select-none whitespace-nowrap ${enabled ? "text-green-400 font-medium" : "text-inkdim"}`}>
+                  {enabled ? "启用" : "禁用"}
+                </span>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={enabled}
+                  title={enabled ? `点击禁用 ${s.name}` : `点击启用 ${s.name}`}
+                  onClick={() => toggleSop(s.id)}
+                  className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                    enabled ? "bg-accent" : "bg-panel3 border-edge"
+                  }`}
+                >
+                  <span
+                    className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
+                      enabled ? "translate-x-4" : "translate-x-0"
+                    }`}
+                  />
+                </button>
+              </>
+            )}
           </div>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0 pt-0.5">
-          {isHard ? (
-            <span className="text-[11px] text-inkdim/70 px-2 py-0.5 rounded bg-panel3 border border-edge/60 select-none whitespace-nowrap">
-              常驻生效
+        {/* 展开/收起规约详情触发器 */}
+        <div className="flex items-center justify-between pt-1 border-t border-edge/40">
+          <button
+            type="button"
+            onClick={() => toggleSopExpand(s.id)}
+            className="inline-flex items-center gap-1.5 text-[11px] text-inkdim/80 hover:text-ink px-2 py-1 rounded hover:bg-panel3/70 transition-colors cursor-pointer select-none"
+          >
+            {isLoading ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-accent" />
+            ) : isExpanded ? (
+              <ChevronUp className="w-3.5 h-3.5 text-accent" />
+            ) : (
+              <ChevronDown className="w-3.5 h-3.5" />
+            )}
+            <span>{isExpanded ? "收起规约详情" : "展开规约详情"}</span>
+          </button>
+          {isExpanded && !isLoading && detail && (
+            <span className="text-[10px] text-inkdim/50 font-mono">
+              Prompt 标准执行细则
             </span>
-          ) : (
-            <>
-              <span className={`text-[12px] select-none whitespace-nowrap ${enabled ? "text-green-400 font-medium" : "text-inkdim"}`}>
-                {enabled ? "启用" : "禁用"}
-              </span>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={enabled}
-                title={enabled ? `点击禁用 ${s.name}` : `点击启用 ${s.name}`}
-                onClick={() => toggleSop(s.id)}
-                className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                  enabled ? "bg-accent" : "bg-panel3 border-edge"
-                }`}
-              >
-                <span
-                  className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
-                    enabled ? "translate-x-4" : "translate-x-0"
-                  }`}
-                />
-              </button>
-            </>
           )}
         </div>
+
+        {/* 详情内容区域（懒加载/缓存） */}
+        {isExpanded && (
+          <div className="rounded-lg bg-panel3/60 border border-edge/60 p-3 mt-0.5 text-[12px] text-ink">
+            {isLoading ? (
+              <div className="flex items-center justify-center gap-2 py-4 text-inkdim text-[12px]">
+                <Loader2 className="w-4 h-4 animate-spin text-accent" />
+                <span>正在按需加载 SOP 规约详情...</span>
+              </div>
+            ) : error ? (
+              <div className="flex items-center justify-between py-2 px-1 text-red-400 text-[12px]">
+                <span>加载失败: {error}</span>
+                <button
+                  type="button"
+                  onClick={() => toggleSopExpand(s.id)}
+                  className="inline-flex items-center gap-1 text-[11px] text-accent hover:underline cursor-pointer"
+                >
+                  <RotateCcw className="w-3 h-3" />
+                  <span>重试</span>
+                </button>
+              </div>
+            ) : detail ? (
+              <div className="prose prose-invert prose-sm max-w-none leading-relaxed overflow-x-auto text-[12px]">
+                <Markdown content={detail.content} enableAutolink={false} />
+              </div>
+            ) : null}
+          </div>
+        )}
       </div>
     );
   };

@@ -576,7 +576,7 @@ pub fn create_plan_with_effect(
     };
 
     let msg = format!(
-        "已成功在 `.harness/plans/{filename}` 创建专属任务计划【{title}】（版本 v1）。\n- 方案文件物理路径: `.harness/plans/{filename}`\n- 活动计划ID: `{plan_id}`\n- 任务步骤与清单已同步至待办池。"
+        "已成功在 `.harness/plans/{filename}` 创建专属任务计划【{title}】（版本 v1）。\n- 方案文件物理路径: `.harness/plans/{filename}`\n- 活动计划ID: `{plan_id}`\n- 任务步骤与清单已同步至待办池（已自动满足意图门禁，无需重复调用 todo，可直接按清单推进施工）。"
     );
 
     Ok(PlanEffect {

@@ -225,7 +225,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "todo",
-            description: "维护当前任务清单（全量覆盖）。多步任务开始时列出计划，随进展更新各项状态。",
+            description: "维护当前任务清单（全量覆盖）。多步任务开始时列出计划，随进展更新各项状态。适用于小型调整/探索任务；复杂工程请优先使用 create_plan 方案，二者二选一即可。",
             risk: Risk::ReadOnly,
             scope: ToolScope::Universal,
             schema: json!({
@@ -379,7 +379,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         // ---------- 任务方案计划中枢工具集 (.harness/plans/) ----------
         ToolSpec {
             name: "create_plan",
-            description: "针对大改动任务（3个以上文件变动/重构）或多轮对话任务，在 .harness/plans/ 下建立规范的结构化计划 MD 文档，作为权威执行锚点。防止需求在多轮对话中失真或遗失。",
+            description: "针对大改动任务（3个以上文件变动/重构）或多轮对话任务，在 .harness/plans/ 下建立规范的结构化计划 MD 文档，作为权威执行锚点。防止需求在多轮对话中失真或遗失。创建计划后自动满足代码写入门禁，无需重复调用 todo 工具。",
             risk: Risk::Write,
             scope: ToolScope::Universal,
             schema: json!({

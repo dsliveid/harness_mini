@@ -331,6 +331,21 @@ export interface AgentSopInfo {
   disableEffect: string;
 }
 
+export interface AgentSopDetail {
+  id: string;
+  name: string;
+  phase: number;
+  phaseLabel: string;
+  category: "thinking" | "memory" | "orchestration" | "quality" | "workflow" | "safety" | string;
+  categoryLabel: string;
+  scope: "universal" | "main_only" | "sub_only" | string;
+  scopeLabel: string;
+  isHardRule?: boolean;
+  description: string;
+  disableEffect: string;
+  content: string;
+}
+
 export const AGENT_SOPS: AgentSopInfo[] = [
   {
     id: "todo_first_gate",
@@ -342,7 +357,7 @@ export const AGENT_SOPS: AgentSopInfo[] = [
     scope: "universal",
     scopeLabel: "主/子对话可用",
     isHardRule: false,
-    description: "动代码前必须先调用 todo 工具声明任务清单（哪怕只有 1 个微小改动任务亦须立项）；只读勘察严格限制在 ≤8 步以内，查清直接答复；若达 8 步仍无法梳理 todo 必须立即停下向用户/父进程汇报事实并对齐阻碍；落盘计划与子进程施工统一遵守此项门禁。",
+    description: "动代码前必须先声明施工意图（小型任务调用 todo，复杂工程调用 create_plan，二选一即可）；只读勘察严格限制在 ≤8 步以内，查清直接答复；若达 8 步仍无法梳理意图必须立即停下向用户/父进程汇报事实并对齐阻碍；落盘计划与子进程施工统一遵守此项门禁。",
     disableEffect: "禁用后：Agent 免除动代码前的强制 todo 立项约束，且不触发 8 步勘察上限熔断，可自由读写探索。",
   },
   {

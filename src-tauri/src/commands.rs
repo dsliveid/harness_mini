@@ -4587,6 +4587,12 @@ pub fn list_agent_sops() -> Result<Vec<crate::sop_catalog::SopItem>, String> {
     Ok(crate::sop_catalog::get_sop_catalog())
 }
 
+#[tauri::command]
+pub fn get_agent_sop_detail(id: String) -> Result<crate::sop_catalog::AgentSopDetail, String> {
+    crate::sop_catalog::get_sop_detail(&id)
+        .ok_or_else(|| format!("SOP '{}' not found", id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -449,6 +449,7 @@ pub fn run() {
             commands::set_session_reasoning_effort,
             commands::set_collaborator_auto_report,
             commands::list_agent_sops,
+            commands::get_agent_sop_detail,
             commands::report_collaborator_increment,
             commands::spawn_subagent,
             commands::stop_subagent,

@@ -26,6 +26,7 @@ export const ipc = {
   setSettings: (settings: Settings) => invoke<void>("set_settings", { settings }),
   listTools: () => deduplicatedInvoke<ToolInfo[]>("list_tools"),
   listAgentSops: () => deduplicatedInvoke<import("./types").AgentSopInfo[]>("list_agent_sops"),
+  getAgentSopDetail: (id: string) => deduplicatedInvoke<import("./types").AgentSopDetail>("get_agent_sop_detail", { id }),
   testProvider: (provider: any) => invoke<string>("test_provider", { provider }),
   listProviderModels: (provider: any) => invoke<string[]>("list_provider_models", { provider }),
   testProxyConnection: (proxyUrl: string) => invoke<number>("test_proxy_connection", { proxyUrl }),
