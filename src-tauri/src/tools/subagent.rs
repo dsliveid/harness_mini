@@ -191,9 +191,38 @@ pub(crate) fn extract_compact_summary(text: &str, max_chars: usize) -> String {
 
 pub(crate) async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let host = ctx.host.as_ref().ok_or("内部错误：缺少宿主上下文")?;
-    let role = args.get("role").and_then(|v| v.as_str()).ok_or("缺少 role 参数")?;
-    let title = args.get("title").and_then(|v| v.as_str()).ok_or("缺少 title 参数")?;
-    let task = args.get("task").and_then(|v| v.as_str()).ok_or("缺少 task 参数")?;
+
+    // 1. 角色提取（兼容 subagent_type / subagent_role 别名）
+    let role = args.get("role")
+        .or_else(|| args.get("subagent_type"))
+        .or_else(|| args.get("subagent_role"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("缺少 role 参数（子 Agent 角色定位）")?;
+
+    // 2. 任务提取
+    let task = args.get("task")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("缺少 task 参数（详细职责与交付验收要求）")?;
+
+    // 3. 标题智能提取与容错兜底：优先使用显式 title；若缺省，自动从 task 提取首句或截取，杜绝直接抛错
+    let fallback_title;
+    let title = if let Some(t) = args.get("title").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
+        t
+    } else {
+        let clean_task = task.lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or(task)
+            .trim_start_matches(|c: char| c == '#' || c == '*' || c == '-' || c == ' ' || c == '【' || c == '】');
+        let truncated: String = clean_task.chars().take(25).collect();
+        fallback_title = if truncated.is_empty() {
+            format!("{role}协同任务")
+        } else {
+            truncated
+        };
+        &fallback_title
+    };
 
     let state = host.app.state::<crate::AppState>();
     let parent_id = &host.session_id;
@@ -234,6 +263,9 @@ pub(crate) async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<S
             let mut params_with_id = args.clone();
             if let Some(obj) = params_with_id.as_object_mut() {
                 obj.insert("subprocess_id".into(), json!(sub.id));
+                if !obj.contains_key("title") {
+                    obj.insert("title".into(), json!(title));
+                }
             }
             let _ = crate::store::set_tool_event_subprocess_id(
                 &db,

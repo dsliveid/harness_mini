@@ -205,6 +205,9 @@ function paramTitle(ev: ToolEvent): string {
       return `${p.category ? `[${p.category}] ` : ""}${p.title ?? "沉淀记忆"}`;
     case "read_memory":
       return p.topic ? `主题: ${p.topic}` : "记忆总览清单";
+    case "spawn_subprocess":
+    case "spawn_subagent":
+      return `${p.role ? `[${p.role}] ` : ""}${p.title ?? p.task ?? "派生子进程"}`;
     case "wait_subprocesses":
     case "wait_subagents":
       return "等待子进程完成汇聚";
@@ -1688,12 +1691,12 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
   }, [isImageTool, isVisionTool, isPlanTool, isDecisionTool, isCollabTool, ev.status]);
 
   const generatedImagePath = useMemo(() => {
-    if (ev.toolName !== "generate_image" || !ev.resultText) return null;
+    if (effective.name !== "generate_image" || !ev.resultText) return null;
     const match = ev.resultText.match(/!\[.*?\]\((.*?)\)/);
     if (match) return match[1];
     const pathMatch = ev.resultText.match(/保存路径:\s*`?([^`\n]+)`?/);
     return pathMatch ? pathMatch[1].trim() : null;
-  }, [ev.toolName, ev.resultText]);
+  }, [effective.name, ev.resultText]);
 
   const imageMetadata = useMemo(() => {
     if (!isImageTool || !ev.resultText) return null;
@@ -1811,13 +1814,13 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
 
   // 提取方案文件的物理路径（.harness/plans/*.md）
   const resolvedPlanFilePath = useMemo(() => {
-    if (!["create_plan", "update_plan", "switch_plan", "read_plan"].includes(ev.toolName)) {
+    if (!["create_plan", "update_plan", "switch_plan", "read_plan"].includes(effective.name)) {
       return null;
     }
     // 1. 显式参数传递（如 params 中注入 plan_file_path / planFilePath / path）
-    if (ev.params?.plan_file_path) return String(ev.params.plan_file_path);
-    if (ev.params?.planFilePath) return String(ev.params.planFilePath);
-    if (typeof ev.params?.path === "string" && (ev.params.path.includes(".harness/plans/") || ev.params.path.includes(".harness\\plans\\"))) {
+    if (effective.params?.plan_file_path) return String(effective.params.plan_file_path);
+    if (effective.params?.planFilePath) return String(effective.params.planFilePath);
+    if (typeof effective.params?.path === "string" && (ev.params.path.includes(".harness/plans/") || ev.params.path.includes(".harness\\plans\\"))) {
       return ev.params.path.replace(/\\/g, "/");
     }
     // 2. 从 resultText 中提取，支持 Windows 反斜杠、全路径、相对路径
@@ -1827,7 +1830,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
       if (match) return `.harness/plans/${match[1]}`;
     }
     return null;
-  }, [ev.toolName, ev.resultText, ev.params]);
+  }, [effective.name, ev.resultText, effective.params]);
 
   const currentSessionId = useStore((s) => s.currentId);
 
@@ -1874,7 +1877,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
 
   const handleFocusFloating = (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (ev.toolName === "todo") {
+    if (effective.name === "todo") {
       useStore.getState().setFocusFloatingTaskId({
         eventId: ev.id,
       });
@@ -1882,8 +1885,8 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
     }
 
     const filename = resolvedPlanFilePath ? resolvedPlanFilePath.replace(/\\/g, "/").split("/").pop() : undefined;
-    let planId = ev.params?.plan_id ? String(ev.params.plan_id) : undefined;
-    let title = ev.params?.title ? String(ev.params.title) : undefined;
+    let planId = effective.params?.plan_id ? String(effective.params.plan_id) : undefined;
+    let title = effective.params?.title ? String(effective.params.title) : undefined;
 
     if (!planId && ev.resultText) {
       const idMatch = ev.resultText.match(/(?:活动计划ID|计划ID|plan_id)[:：\s`]+([a-zA-Z0-9_\-]+)/i);
@@ -1904,7 +1907,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
 
   // 提取子任务/协作者交付报告工件的物理路径列表（.harness/subtasks/*_report.md），支持单任务与多任务并行返回
   const resolvedSubtaskReports = useMemo(() => {
-    if (!["wait_subprocesses", "wait_subagents", "wait_collaborators"].includes(ev.toolName)) {
+    if (!["wait_subprocesses", "wait_subagents", "wait_collaborators"].includes(effective.name)) {
       return [];
     }
     if (!ev.resultText) return [];
@@ -1964,11 +1967,11 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
     }
 
     return items;
-  }, [ev.toolName, ev.resultText, currentWorkspace]);
+  }, [effective.name, ev.resultText, currentWorkspace]);
 
   // 提取子任务/协作者任务知识交接书工件的物理路径（.harness/subtasks/*_knowledge.md）
   const resolvedSubtaskKnowledgePath = useMemo(() => {
-    if (!["spawn_subprocess", "spawn_subagent", "dispatch_collaborator"].includes(ev.toolName)) {
+    if (!["spawn_subprocess", "spawn_subagent", "dispatch_collaborator"].includes(effective.name)) {
       return null;
     }
     if (ev.resultText) {
@@ -1977,7 +1980,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
       if (match) return `.harness/subtasks/${match[1]}`;
     }
     return null;
-  }, [ev.toolName, ev.resultText]);
+  }, [effective.name, ev.resultText]);
 
   const handleOpenSubtaskKnowledge = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -2003,13 +2006,13 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
 
   // 提取长期认知记忆文档（.harness/memory/...）的物理文件路径
   const resolvedMemoryFilePath = useMemo(() => {
-    if (!["record_memory", "read_memory"].includes(ev.toolName)) {
+    if (!["record_memory", "read_memory"].includes(effective.name)) {
       return null;
     }
     // 1. 显式参数传递（如 params 中注入 memory_file_path / memoryFilePath / path）
-    if (ev.params?.memory_file_path) return String(ev.params.memory_file_path);
-    if (ev.params?.memoryFilePath) return String(ev.params.memoryFilePath);
-    if (typeof ev.params?.path === "string" && (ev.params.path.includes(".harness/memory/") || ev.params.path.includes(".harness\\memory\\"))) {
+    if (effective.params?.memory_file_path) return String(effective.params.memory_file_path);
+    if (effective.params?.memoryFilePath) return String(effective.params.memoryFilePath);
+    if (typeof effective.params?.path === "string" && (ev.params.path.includes(".harness/memory/") || ev.params.path.includes(".harness\\memory\\"))) {
       return ev.params.path.replace(/\\/g, "/");
     }
     // 2. 从 resultText 中提取
@@ -2019,15 +2022,15 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
       if (match) return `.harness/memory/${match[1]}`;
     }
     // 3. 根据工具参数反推路径
-    if (ev.toolName === "record_memory") {
-      const cat = ev.params?.category ? String(ev.params.category).trim() : "";
+    if (effective.name === "record_memory") {
+      const cat = effective.params?.category ? String(effective.params.category).trim() : "";
       if (cat === "profile" || cat === "tech_stack") {
         return ".harness/memory/profile.md";
       }
       if (cat === "convention" || cat === "notes") {
         return ".harness/memory/conventions.md";
       }
-      const title = ev.params?.title ? String(ev.params.title).trim() : "";
+      const title = effective.params?.title ? String(effective.params.title).trim() : "";
       if (title) {
         const slug = title
           .split("")
@@ -2038,8 +2041,8 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
         const finalSlug = slug || "memory-item";
         return `.harness/memory/digests/${finalSlug}.md`;
       }
-    } else if (ev.toolName === "read_memory") {
-      const topic = ev.params?.topic ? String(ev.params.topic).trim() : "";
+    } else if (effective.name === "read_memory") {
+      const topic = effective.params?.topic ? String(effective.params.topic).trim() : "";
       if (topic === "profile" || topic === "tech_stack") {
         return ".harness/memory/profile.md";
       }
@@ -2058,7 +2061,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
       }
     }
     return null;
-  }, [ev.toolName, ev.resultText, ev.params]);
+  }, [effective.name, ev.resultText, effective.params]);
 
   const handleOpenMemoryFile = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -2094,7 +2097,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
   const showResult =
     !isImageTool &&
     !isVisionTool &&
-    !["record_memory", "read_memory", "create_plan", "update_plan", "switch_plan"].includes(ev.toolName) &&
+    !["record_memory", "read_memory", "create_plan", "update_plan", "switch_plan"].includes(effective.name) &&
     !!ev.resultText &&
     (ev.status === "success" || ev.status === "failed" || ev.status === "timeout" || ev.status === "denied");
 
@@ -2123,13 +2126,13 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
           size={13}
           className={`transition-transform duration-150 text-inkdim shrink-0 ${expanded ? "rotate-90" : ""}`}
         />
-        <ToolIcon name={ev.toolName} />
+        <ToolIcon name={effective.name} />
         <div className="flex items-center gap-1.5 shrink-0">
           <span className="text-[12px] text-ink font-medium">{label}</span>
-          {toolCategoryBadge(ev.toolName)}
+          {toolCategoryBadge(effective.name)}
         </div>
 
-        {ev.toolName !== "todo" && (
+        {effective.name !== "todo" && (
           <span
             className="text-[12px] font-mono text-inkdim truncate flex-1 min-w-0"
             title={title}
@@ -2158,7 +2161,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
               {copied ? <Check size={12} className="text-green-400" /> : <Copy size={12} />}
             </button>
           )}
-          {ev.toolName === "run_command" && ev.status === "running" && (
+          {effective.name === "run_command" && ev.status === "running" && (
             <button
               type="button"
               className="text-[10px] px-2 py-0.5 rounded bg-red-600/80 hover:bg-red-500 text-white disabled:opacity-50 disabled:cursor-not-allowed transition-all"
@@ -2169,7 +2172,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
               {terminating ? "终止中…" : "终止"}
             </button>
           )}
-          {ev.toolName === "read_file" && filePath && (
+          {effective.name === "read_file" && filePath && (
             <button
               type="button"
               className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-blue-500/10 hover:bg-blue-500/20 text-blue-300 transition-colors"
@@ -2180,7 +2183,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
               <span>查看</span>
             </button>
           )}
-          {(ev.toolName === "write_file" || ev.toolName === "edit_file") && filePath && (
+          {(effective.name === "write_file" || effective.name === "edit_file") && filePath && (
             <button
               type="button"
               className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 transition-colors cursor-pointer"
@@ -2191,7 +2194,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
               <span>对比 Diff</span>
             </button>
           )}
-          {["create_plan", "update_plan", "switch_plan", "read_plan"].includes(ev.toolName) && (
+          {["create_plan", "update_plan", "switch_plan", "read_plan"].includes(effective.name) && (
             <button
               type="button"
               className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded transition-colors ${
@@ -2211,7 +2214,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
               <span>{ev.status === "running" ? "方案生成中..." : "方案文档 (MD)"}</span>
             </button>
           )}
-          {(ev.toolName === "todo" || ["create_plan", "update_plan", "switch_plan"].includes(ev.toolName)) && (
+          {(effective.name === "todo" || ["create_plan", "update_plan", "switch_plan"].includes(effective.name)) && (
             <button
               type="button"
               className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-purple-500/10 hover:bg-purple-500/20 text-purple-300 transition-colors cursor-pointer border border-purple-500/30"
@@ -2222,7 +2225,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
               <span>浮窗查看</span>
             </button>
           )}
-          {["record_memory", "read_memory"].includes(ev.toolName) && resolvedMemoryFilePath && (
+          {["record_memory", "read_memory"].includes(effective.name) && resolvedMemoryFilePath && (
             <button
               type="button"
               className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded transition-colors ${
@@ -2323,12 +2326,12 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
       )}
 
       {/* 展开时：若是决策工具，展示专用决策卡片 */}
-      {expanded && ["judge_decision", "choice_decision", "score_decision"].includes(ev.toolName) && (
-        <DecisionCardView ev={ev} modelInfo={toolModelInfo} />
+      {expanded && ["judge_decision", "choice_decision", "score_decision"].includes(effective.name) && (
+        <DecisionCardView ev={normalizedEv} modelInfo={toolModelInfo} />
       )}
 
       {/* 浏览器鉴权拦截 HITL 交互卡片 */}
-      {ev.toolName.startsWith("browser_") && ev.resultText && (ev.resultText.includes("鉴权拦截提示") || ev.resultText.includes("未登录或鉴权已失效") || ev.resultText.includes("Unauthenticated")) && (
+      {effective.name.startsWith("browser_") && ev.resultText && (ev.resultText.includes("鉴权拦截提示") || ev.resultText.includes("未登录或鉴权已失效") || ev.resultText.includes("Unauthenticated")) && (
         <AuthCard
           sessionId={currentSessionId || ""}
           reason={
@@ -2342,9 +2345,9 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
         />
       )}
 
-      {/* 展开时：若是派发协作者，展示专用任务交接文档单行卡片 */}
+      {/* 展开时：若是派发协作者或派生子任务，展示专用任务交接文档单行卡片 */}
       {expanded &&
-        ev.toolName === "dispatch_collaborator" &&
+        (effective.name === "dispatch_collaborator" || effective.name === "spawn_subagent" || effective.name === "spawn_subprocess") &&
         resolvedSubtaskKnowledgePath && (
           <div className="mt-2.5 rounded-lg border border-indigo-500/25 bg-panel3/30 overflow-hidden">
             <div className="flex items-center justify-between px-3 py-1.5 bg-panel3/40 border-b border-edge/40 text-[11px] text-inkdim select-none">
@@ -2378,7 +2381,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
 
       {/* 展开时：若是等待子任务/协作者汇聚且已产出报告，展示专用交付报告单行卡片（仅在完成后统一展示） */}
       {expanded &&
-        ["wait_subprocesses", "wait_subagents", "wait_collaborators"].includes(ev.toolName) &&
+        ["wait_subprocesses", "wait_subagents", "wait_collaborators"].includes(effective.name) &&
         ev.status !== "running" &&
         ev.status !== "pending_approval" &&
         resolvedSubtaskReports.length > 0 && (
@@ -2435,7 +2438,7 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
           </div>
         )}
 
-      {expanded && showResult && !["judge_decision", "choice_decision", "score_decision"].includes(ev.toolName) && (
+      {expanded && showResult && !["judge_decision", "choice_decision", "score_decision"].includes(effective.name) && (
         <CollapsibleResult text={ev.resultText!} />
       )}
     </div>
