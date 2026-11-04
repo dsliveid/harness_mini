@@ -386,8 +386,8 @@ const handleClick = async () => {
         let subtasks_dir = ws.join(".harness").join("subtasks");
         let _ = std::fs::create_dir_all(&subtasks_dir);
 
-        let subagent_id = "test-sub-456";
-        let knowledge_filename = format!("{}_knowledge.md", subagent_id.replace('-', "_"));
+        let subagent_id = "test_sub_456";
+        let knowledge_filename = format!("{}_knowledge.md", subagent_id);
         let knowledge_file = subtasks_dir.join(&knowledge_filename);
         std::fs::write(&knowledge_file, "# 知识交接书内容\n- 目标：全面调研架构\n- 验收标准：完成报告").unwrap();
 

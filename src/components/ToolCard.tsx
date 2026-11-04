@@ -1591,7 +1591,7 @@ export interface EffectiveToolInfo {
 
 export function resolveEffectiveTool(ev: ToolEvent): EffectiveToolInfo {
   if (ev.toolName === "call_extended_tool" && ev.params?.tool_name) {
-    const rawArgs = ev.params.arguments;
+    const rawArgs = ev.params.tool_params ?? ev.params.arguments;
     let parsedArgs: Record<string, any> = {};
     if (typeof rawArgs === "string") {
       try {

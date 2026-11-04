@@ -2434,7 +2434,7 @@ pub fn create_session_with_models(
 ) -> Result<Session, String> {
     let t = now();
     let s = Session {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: uuid::Uuid::new_v4().simple().to_string(),
         title: title.to_string(),
         workspace_path: workspace_path.to_string(),
         // 访问模式为会话级：创建时必须给定具体值（由前端按“上一条对话”继承或传默认值）
@@ -2537,7 +2537,7 @@ pub fn create_collaborator_session(
     let t = now();
     let norm_mode = access_mode.map(normalize_access_mode).unwrap_or_else(|| "confirm".into());
     let s = Session {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: uuid::Uuid::new_v4().simple().to_string(),
         title: title.to_string(),
         workspace_path: workspace_path.to_string(),
         access_mode: Some(norm_mode),
@@ -2767,7 +2767,7 @@ pub fn create_subprocess_session(
         .unwrap_or_else(|_| default_task_subtask_max_steps());
 
     let s = Session {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: uuid::Uuid::new_v4().simple().to_string(),
         title: title.to_string(),
         workspace_path: workspace_path.to_string(),
         access_mode: Some(norm_mode),
@@ -2927,7 +2927,7 @@ pub fn fork_session_at_message(
         format!("[分支] {}", source_session.title)
     };
 
-    let new_session_id = uuid::Uuid::new_v4().to_string();
+    let new_session_id = uuid::Uuid::new_v4().simple().to_string();
     let now_str = now();
 
     let ws_path = if source_session.is_temp {

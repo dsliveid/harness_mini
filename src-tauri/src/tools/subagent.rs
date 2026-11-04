@@ -127,7 +127,7 @@ pub(crate) fn save_subtask_knowledge_artifact(
     }
     let subtasks_dir = workspace.join(".harness").join("subtasks");
     let _ = std::fs::create_dir_all(&subtasks_dir);
-    let filename = format!("{}_knowledge.md", subagent_id.replace('-', "_"));
+    let filename = format!("{}_knowledge.md", subagent_id);
     let file_path = subtasks_dir.join(&filename);
 
     let doc_md = format!(
@@ -152,7 +152,7 @@ pub(crate) fn save_subtask_report_artifact(
     }
     let subtasks_dir = workspace.join(".harness").join("subtasks");
     let _ = std::fs::create_dir_all(&subtasks_dir);
-    let filename = format!("{}_report.md", subagent_id.replace('-', "_"));
+    let filename = format!("{}_report.md", subagent_id);
     let file_path = subtasks_dir.join(&filename);
 
     let files_section = if touched_files.is_empty() {
@@ -293,13 +293,13 @@ pub(crate) async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<S
         None
     };
 
-    let report_filename = format!("{}_report.md", sub.id.replace('-', "_"));
+    let report_filename = format!("{}_report.md", sub.id);
     let trigger_prompt = format!(
         "【协同子任务指令】：你已受命启动专职协同任务【{title}】（角色定位：{role}）。\n\
         核心目标：{task}\n\n\
         ⚠️ 你的完整任务知识交接书（含探查入口锚点、交付验收标准与严格负向禁区）已作为最高权威基准挂载在系统上下文【黑板交接书】中，并已物理落盘至 `.harness/subtasks/{}_knowledge.md`。\n\
         请立即围绕交接书目标展开分析与推进。完成任务或遇到阻碍时，唯一硬性交付标准是调用 `write_file` 工具将详尽报告写入 `.harness/subtasks/{report_filename}` 并做简短收敛宣告。",
-        sub.id.replace('-', "_")
+        sub.id
     );
     let user_msg = {
         let db = state.db.lock().unwrap();
@@ -512,7 +512,7 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
                 return false;
             }
             // 已生成有效交付报告，履约完成，不应继续阻塞等待
-            let report_filename = format!("{}_report.md", id.replace('-', "_"));
+            let report_filename = format!("{}_report.md", id);
             let report_full_path = ctx.workspace.join(".harness").join("subtasks").join(&report_filename);
             let has_valid_report = !ctx.workspace.as_os_str().is_empty()
                 && report_full_path.exists()
@@ -593,7 +593,7 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
                 .values()
                 .any(|p| p.session_id == *id);
 
-            let report_filename = format!("{}_report.md", id.replace('-', "_"));
+            let report_filename = format!("{}_report.md", id);
             let report_rel_path = format!(".harness/subtasks/{}", report_filename);
             let report_full_path = ctx.workspace.join(&report_rel_path);
             let report_content_opt = if !ctx.workspace.as_os_str().is_empty() && report_full_path.exists() {
@@ -704,7 +704,7 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
                 (art_line, title, summary)
             };
 
-            let knowledge_file_rel = format!(".harness/subtasks/{}_knowledge.md", id.replace('-', "_"));
+            let knowledge_file_rel = format!(".harness/subtasks/{}_knowledge.md", id);
             let knowledge_line = if !ctx.workspace.as_os_str().is_empty() && ctx.workspace.join(&knowledge_file_rel).exists() {
                 format!("- 📋 任务知识交接工件: [查看原始交接文档](file:///{})\n", knowledge_file_rel.replace('\\', "/"))
             } else {
@@ -1057,7 +1057,7 @@ pub(crate) async fn wait_collaborators_tool(args: &Value, ctx: &ToolCtx) -> Resu
             String::new()
         };
 
-        let knowledge_file_rel = format!(".harness/subtasks/{}_knowledge.md", id.replace('-', "_"));
+        let knowledge_file_rel = format!(".harness/subtasks/{}_knowledge.md", id);
         let knowledge_line = if !ctx.workspace.as_os_str().is_empty() && ctx.workspace.join(&knowledge_file_rel).exists() {
             format!("- 📋 任务知识交接工件: [查看原始交接文档](file:///{})\n", knowledge_file_rel.replace('\\', "/"))
         } else {

@@ -110,10 +110,38 @@ pub(crate) async fn dispatch_static(
                 .get("tool_name")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "缺少必需参数 `tool_name`".to_string())?;
-            let sub_args = args
-                .get("arguments")
+            let mut sub_args = args
+                .get("tool_params")
+                .or_else(|| args.get("arguments"))
+                .or_else(|| args.get("payload"))
+                .or_else(|| args.get("target_args"))
                 .cloned()
-                .unwrap_or(Value::Object(serde_json::Map::new()));
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+
+            // 确定性拍平（Defensive Flattening）：
+            // 1. 若 sub_args 内部由于模型幻觉继续嵌套 arguments/tool_params/payload，递归提取并合并至顶层
+            if let Some(map) = sub_args.as_object_mut() {
+                for nested_key in ["tool_params", "arguments", "payload", "target_args"] {
+                    if let Some(nested_val) = map.remove(nested_key) {
+                        if let Some(nested_map) = nested_val.as_object() {
+                            for (k, v) in nested_map {
+                                map.entry(k).or_insert(v.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. 若模型将部分业务参数（如 title/task 等）放在顶层与 tool_name 平级，将其补充合并进 sub_args
+            if let Some(args_map) = args.as_object() {
+                if let Some(sub_map) = sub_args.as_object_mut() {
+                    for (k, v) in args_map {
+                        if k != "tool_name" && k != "tool_params" && k != "arguments" && k != "payload" && k != "target_args" {
+                            sub_map.entry(k.clone()).or_insert(v.clone());
+                        }
+                    }
+                }
+            }
 
             if sub_args.get("help").and_then(|v| v.as_bool()).unwrap_or(false) {
                 if let Some(s) = global_registry().get_tool_spec(target_name).await {

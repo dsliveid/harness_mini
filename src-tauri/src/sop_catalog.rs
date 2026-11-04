@@ -123,7 +123,7 @@ fn get_all_sop_definitions() -> Vec<SopDefinition> {
                     || session.session_type == "subagent"
                     || session.parent_session_id.is_some();
                 if is_sub {
-                    let report_filename = format!("{}_report.md", session.id.replace('-', "_"));
+                    let report_filename = format!("{}_report.md", session.id);
                     Some(format!(
                         "{rule_num}. 【Todo 先行与阶梯门禁公理（所有交互必须严格遵守）】：\n\
                          - 门禁 ①【Todo 先行与写入前置拦截】：\n\
@@ -247,7 +247,7 @@ fn get_all_sop_definitions() -> Vec<SopDefinition> {
                 disable_effect: "子对话专属交付规范，主对话天然跳过。".into(),
             },
             render_fn: |session, rule_num| {
-                let report_filename = format!("{}_report.md", session.id.replace('-', "_"));
+                let report_filename = format!("{}_report.md", session.id);
                 Some(format!(
                     "{rule_num}. 【纯黑板交付规范与结案硬性标准】：\n\
                      - 任务目标、验收标准与负向禁区已在下方【黑板交接书】中权威定义；\n\
@@ -280,7 +280,7 @@ fn get_all_sop_definitions() -> Vec<SopDefinition> {
                 if is_collab {
                     return None;
                 }
-                let report_filename = format!("{}_report.md", session.id.replace('-', "_"));
+                let report_filename = format!("{}_report.md", session.id);
                 Some(format!(
                     "{rule_num}. 【施工工人准则与架构遵从（必须严格遵守）】：\n\
                      - 若主进程在简报或交接书中提供了《实施蓝图》、拟定函数签名或目标文件与行号锚点，你作为实施工人，【严禁重新设计接口签名、擅自改动方法名或推翻既定架构】；\n\

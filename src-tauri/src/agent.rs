@@ -934,7 +934,7 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
                 let mut has_valid_report = false;
                 if !ws_path_str.is_empty() {
                     let ws_path = std::path::Path::new(&ws_path_str);
-                    let report_filename = format!("{}_report.md", session_id.replace('-', "_"));
+                    let report_filename = format!("{}_report.md", session_id);
                     let report_path = ws_path.join(".harness").join("subtasks").join(&report_filename);
                     has_valid_report = report_path.exists()
                         && std::fs::metadata(&report_path).map(|m| m.len() > 10).unwrap_or(false);
@@ -1582,7 +1582,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                             String::new()
                         };
                         if !ws.is_empty() {
-                            let report_filename = format!("{}_report.md", session_id.replace('-', "_"));
+                            let report_filename = format!("{}_report.md", session_id);
                             let rep_path = std::path::Path::new(&ws).join(".harness").join("subtasks").join(&report_filename);
                             rep_path.exists() && std::fs::metadata(&rep_path).map(|m| m.len() > 10).unwrap_or(false)
                         } else {
@@ -1713,7 +1713,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             };
             if !intent_status.is_satisfied() {
                 let gate_msg = if is_subagent {
-                    let report_filename = format!("{}_report.md", session_id.replace('-', "_"));
+                    let report_filename = format!("{}_report.md", session_id);
                     format!(
                         "【🛑 第 8 步门禁拦截（子任务施工/探索门禁）】：只读勘察已达 8 步上限且当前未声明施工意图！\n\
                         1. 若本任务需要修改代码且施工目标明确，必须在下一步声明意图（小型任务调用 todo 工具声明步骤清单，复杂架构任务调用 create_plan 工具生成方案，二选一即可），方可开始调用 write_file / edit_file 施工；\n\
@@ -2507,7 +2507,7 @@ async fn handle_tool_call(
     // 主会话中，若启用 todo_first_gate，在没有 active todo 且没有 active plan 的情况下，严禁调用 write_file 或 edit_file 修改业务代码
     // 写入内部工件（.harness/subtasks/ 黑板交接与报告、.harness/plans/ 等）天然豁免 Todo 先行门禁
     let check_params = if tool_name == "call_extended_tool" {
-        args.get("arguments").unwrap_or(args)
+        args.get("tool_params").or_else(|| args.get("arguments")).unwrap_or(args)
     } else {
         args
     };
@@ -2568,7 +2568,7 @@ async fn handle_tool_call(
     };
     let (eval_name, eval_args, risk, eval_scope) = if tool_name == "call_extended_tool" {
         let t_name = args.get("tool_name").and_then(|v| v.as_str()).unwrap_or("unknown");
-        let t_args = args.get("arguments").unwrap_or(args);
+        let t_args = args.get("tool_params").or_else(|| args.get("arguments")).unwrap_or(args);
         let all_specs = tools::specs::tool_specs();
         let target_spec = all_specs.into_iter().find(|s| s.name == t_name);
         let t_risk = target_spec.as_ref().map(|s| s.risk).unwrap_or(spec.risk);
