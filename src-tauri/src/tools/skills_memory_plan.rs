@@ -418,12 +418,19 @@ pub(crate) async fn recognize_image_tool(args: &Value, ctx: &ToolCtx) -> Result<
 
     // 1. 寻找图片文件的真实物理路径（支持绝对路径、工作区相对路径、generated_images 相对路径）
     let file_path = Path::new(raw_path);
+    let trimmed_rel = raw_path.trim_start_matches(|c| c == '/' || c == '\\');
+    let trimmed_path = Path::new(trimmed_rel);
     let target_path = if file_path.is_absolute() && file_path.exists() {
         file_path.to_path_buf()
     } else {
         let in_workspace = if !ctx.workspace.as_os_str().is_empty() {
             let p = ctx.workspace.join(file_path);
-            if p.exists() { Some(p) } else { None }
+            if p.exists() {
+                Some(p)
+            } else {
+                let p2 = ctx.workspace.join(trimmed_path);
+                if p2.exists() { Some(p2) } else { None }
+            }
         } else {
             None
         };
@@ -432,9 +439,9 @@ pub(crate) async fn recognize_image_tool(args: &Value, ctx: &ToolCtx) -> Result<
             p
         } else {
             let data_dir = state.data_dir.lock().unwrap().clone().unwrap_or_else(|| state.default_data_dir.clone());
-            let in_session_artifacts = data_dir.join("sessions").join(session_id).join("artifacts").join(file_path);
-            let in_session_gen = data_dir.join("generated_images").join(session_id).join(file_path);
-            let in_gen_root = data_dir.join(file_path);
+            let in_session_artifacts = data_dir.join("sessions").join(session_id).join("artifacts").join(trimmed_path);
+            let in_session_gen = data_dir.join("generated_images").join(session_id).join(trimmed_path);
+            let in_gen_root = data_dir.join(trimmed_path);
             if in_session_artifacts.exists() {
                 in_session_artifacts
             } else if in_session_gen.exists() {
@@ -443,6 +450,8 @@ pub(crate) async fn recognize_image_tool(args: &Value, ctx: &ToolCtx) -> Result<
                 in_gen_root
             } else if file_path.exists() {
                 file_path.to_path_buf()
+            } else if trimmed_path.exists() {
+                trimmed_path.to_path_buf()
             } else {
                 return Err(format!("图片文件不存在: `{raw_path}`。请检查路径是否正确（支持绝对路径或工作区相对路径）。"));
             }

@@ -9,11 +9,20 @@ pub struct PolicyEngine;
 impl PolicyEngine {
     /// 评估工具调用的安全合规性与执行决议
     pub fn evaluate(tool: &ToolInvocation, ctx: &SecurityContext) -> PolicyDecision {
-        // 1. 未绑定工作区校验：除少数纯对话/媒体工具外，其余工具必须绑定工作区
+        // 1. 未绑定工作区校验：除少数纯对话/媒体/治理/查询工具外，其余工具必须绑定工作区
         if ctx.workspace_root.as_os_str().is_empty()
-            && tool.name != "todo"
-            && tool.name != "generate_image"
-            && tool.name != "recognize_image"
+            && !matches!(
+                tool.name,
+                "todo"
+                    | "lookup_tool"
+                    | "fetch_web_page"
+                    | "generate_image"
+                    | "recognize_image"
+                    | "score_decision"
+                    | "judge_decision"
+                    | "choice_decision"
+                    | "list_skills"
+            )
         {
             return PolicyDecision::Deny {
                 reason: "当前会话未绑定工作区，文件与命令工具不可用。请直接以文字回答用户，并提示：如需读写文件或执行命令，可在顶栏选择工作区目录后重试。".into(),

@@ -2228,21 +2228,13 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         }
 
         for tc in &tcs {
-            let args: Value = serde_json::from_str(&tc.args).unwrap_or_else(|_| {
-                json!({"__parse_error": "工具参数不是有效 JSON"})
-            });
+            let ctc = tools::CanonicalToolCall::from_raw(&tc.id, &tc.name, &tc.args);
 
-            let target_sub_tool = if tc.name == "call_extended_tool" {
-                args.get("tool_name").and_then(|v| v.as_str())
-            } else {
-                None
-            };
-            let is_modifying = tc.name == "write_file"
-                || tc.name == "edit_file"
-                || tc.name == "run_command"
-                || tc.name == "delete_file"
-                || tc.name == "apply_diff"
-                || matches!(target_sub_tool, Some("write_file" | "edit_file" | "run_command" | "delete_file" | "apply_diff"));
+            let is_modifying = ctc.name == "write_file"
+                || ctc.name == "edit_file"
+                || ctc.name == "run_command"
+                || ctc.name == "delete_file"
+                || ctc.name == "apply_diff";
             let guard_denied: Option<String> = if is_modifying {
                 if project_plan_mode == "always_plan" && created_plan_in_this_turn {
                     Some("【模式守卫拦截】: 当前项目启用了「Always Plan 模式」，执行方案刚刚生成，严禁在同一轮次中未经用户确认直接修改代码。请停止调用写入工具，向用户汇报当前计划核心并请求确认。".to_string())
@@ -2260,9 +2252,9 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 let ev = ToolEvent {
                     id: uuid::Uuid::new_v4().to_string(),
                     message_id: assistant_id.clone(),
-                    tool_name: tc.name.clone(),
-                    tool_call_id: Some(tc.id.clone()),
-                    params: args.clone(),
+                    tool_name: ctc.name.clone(),
+                    tool_call_id: Some(ctc.call_id.clone()),
+                    params: ctc.params.clone(),
                     result_text: Some(reason.clone()),
                     status: "denied".into(),
                     approval_scope: Some("guard_blocked".into()),
@@ -2281,10 +2273,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                     app,
                     session_id,
                     &assistant_id,
-                    &tc.id,
-                    &tc.name,
-                    &args,
-                    &specs,
+                    &ctc,
                     &tool_ctx,
                     &settings.disabled_tools,
                 )
@@ -2293,13 +2282,13 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
 
             // 工具自动自纠错机制：非用户审批拒绝的执行失败触发内部微反思引导
             if status == "failed" {
-                let (can_retry, count) = tool_tracker.record_failure(&tc.name);
+                let (can_retry, count) = tool_tracker.record_failure(&ctc.name);
                 if can_retry {
                     let _ = app.emit(
                         "tool:retry_guidance",
                         json!({
                             "sessionId": session_id,
-                            "toolName": tc.name,
+                            "toolName": ctc.name,
                             "status": "retrying",
                             "attempt": count,
                             "maxRetries": tool_tracker.max_retry_limit,
@@ -2307,7 +2296,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                         }),
                     );
                     result_text = build_tool_reflexion_prompt(
-                        &tc.name,
+                        &ctc.name,
                         &result_text,
                         count,
                         tool_tracker.max_retry_limit,
@@ -2317,39 +2306,39 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                         "tool:retry_guidance",
                         json!({
                             "sessionId": session_id,
-                            "toolName": tc.name,
+                            "toolName": ctc.name,
                             "status": "failed",
                             "attempt": count,
                             "maxRetries": tool_tracker.max_retry_limit,
                             "error": result_text,
-                            "message": format!("工具 `{}` 已连续失败 {} 次，达到自纠错上限", tc.name, tool_tracker.max_retry_limit),
+                            "message": format!("工具 `{}` 已连续失败 {} 次，达到自纠错上限", ctc.name, tool_tracker.max_retry_limit),
                         }),
                     );
                     result_text = format!(
                         "{result_text}\n\n【提示】: 工具 `{}` 已连续失败 {} 次（达到自纠错上限），请停止重复尝试，向用户如实陈述原因或尝试其他方案。",
-                        tc.name, tool_tracker.max_retry_limit
+                        ctc.name, tool_tracker.max_retry_limit
                     );
                 }
             } else if status == "success" {
-                if tool_tracker.record_success(&tc.name) {
+                if tool_tracker.record_success(&ctc.name) {
                     let _ = app.emit(
                         "tool:retry_guidance",
                         json!({
                             "sessionId": session_id,
-                            "toolName": tc.name,
+                            "toolName": ctc.name,
                             "status": "success",
                             "attempt": 0,
                             "maxRetries": tool_tracker.max_retry_limit,
-                            "message": format!("工具 `{}` 内部自纠修正成功，已恢复正常执行", tc.name),
+                            "message": format!("工具 `{}` 内部自纠修正成功，已恢复正常执行", ctc.name),
                         }),
                     );
                 }
+            }
 
-                }
             // 工具结果作为 tool 消息进入上下文
             let tool_msg = {
                 let db = state.db.lock().unwrap();
-                let tool_attachments = if tc.name == "recognize_image" && status == "success" {
+                let tool_attachments = if (ctc.name == "recognize_image" || result_text.contains("<!-- MULTIMODAL_IMAGE_DIRECT:")) && status == "success" {
                     if let Some(start) = result_text.find("<!-- MULTIMODAL_IMAGE_DIRECT:") {
                         let rest = &result_text[start + "<!-- MULTIMODAL_IMAGE_DIRECT:".len()..];
                         if let Some(end) = rest.find(" -->") {
@@ -2385,19 +2374,19 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 } else {
                     None
                 };
-                let normalized_result = crate::context::normalize_tool_output_for_ingress(&tc.name, &result_text);
+                let normalized_result = crate::context::normalize_tool_output_for_ingress(&ctc.name, &result_text);
                 let r = store::new_message_with_attachments(&db, session_id, "tool", Some(normalized_result), tool_attachments, false, None);
                 if let Ok(ref m) = r {
-                    let _ = store::set_message_tool_call_id(&db, &m.id, &tc.id);
+                    let _ = store::set_message_tool_call_id(&db, &m.id, &ctc.call_id);
                 }
                 r
             };
             if let Ok(m) = tool_msg {
                 let _ = app.emit("message:final", &m);
             }
-            if (tc.name == "write_file" || tc.name == "edit_file" || tc.name == "apply_diff") && status == "success" {
+            if (ctc.name == "write_file" || ctc.name == "edit_file" || ctc.name == "apply_diff") && status == "success" {
                 files_modified = true;
-                if let Some(rel) = args.get("path").and_then(|v| v.as_str()) {
+                if let Some(rel) = ctc.params.get("path").and_then(|v| v.as_str()) {
                     let p = std::path::Path::new(rel);
                     let full_path = if p.is_absolute() {
                         p.to_path_buf()
@@ -2429,10 +2418,10 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                     sop_verified = false;
                 }
             }
-            if tc.name == "create_plan" && status == "success" {
+            if ctc.name == "create_plan" && status == "success" {
                 created_plan_in_this_turn = true;
             }
-            if matches!(tc.name.as_str(), "create_plan" | "update_plan" | "switch_plan") && status == "success" {
+            if matches!(ctc.name.as_str(), "create_plan" | "update_plan" | "switch_plan") && status == "success" {
                 let _ = app.emit("file_viewer:file_changed", serde_json::json!({
                     "path": format!("{}/.harness/plans", session.workspace_path)
                 }));
@@ -2474,10 +2463,7 @@ async fn handle_tool_call(
     app: &AppHandle,
     session_id: &str,
     assistant_msg_id: &str,
-    tool_call_id: &str,
-    tool_name: &str,
-    args: &Value,
-    specs: &[ToolSpec],
+    ctc: &tools::CanonicalToolCall,
     ctx: &ToolCtx,
     disabled_tools: &[String],
 ) -> (String, String) {
@@ -2486,9 +2472,9 @@ async fn handle_tool_call(
     let mut ev = ToolEvent {
         id: uuid::Uuid::new_v4().to_string(),
         message_id: assistant_msg_id.to_string(),
-        tool_name: tool_name.to_string(),
-        tool_call_id: Some(tool_call_id.to_string()),
-        params: args.clone(),
+        tool_name: ctc.name.clone(),
+        tool_call_id: Some(ctc.call_id.clone()),
+        params: ctc.params.clone(),
         result_text: None,
         status: "running".into(),
         approval_scope: Some("none".into()),
@@ -2497,27 +2483,16 @@ async fn handle_tool_call(
         reverted_at: None,
     };
 
-    let check_name = if tool_name == "call_extended_tool" {
-        args.get("tool_name").and_then(|v| v.as_str()).unwrap_or(tool_name)
-    } else {
-        tool_name
-    };
-
     // Todo 先行门禁校验：
-    // 主会话中，若启用 todo_first_gate，在没有 active todo 且没有 active plan 的情况下，严禁调用 write_file 或 edit_file 修改业务代码
+    // 主会话中，若启用 todo_first_gate，在没有 active todo 且没有 active plan 的情况下，严禁调用 write_file、edit_file 或 apply_diff 修改业务代码
     // 写入内部工件（.harness/subtasks/ 黑板交接与报告、.harness/plans/ 等）天然豁免 Todo 先行门禁
-    let check_params = if tool_name == "call_extended_tool" {
-        args.get("tool_params").or_else(|| args.get("arguments")).unwrap_or(args)
-    } else {
-        args
-    };
     let is_internal_harness_artifact = {
-        let p = check_params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let p = ctc.params.get("path").and_then(|v| v.as_str()).unwrap_or("");
         p.contains(".harness/subtasks") || p.contains(".harness\\subtasks")
             || p.contains(".harness/plans") || p.contains(".harness\\plans")
             || p.contains(".harness/memory") || p.contains(".harness\\memory")
     };
-    if (check_name == "write_file" || check_name == "edit_file") && !is_internal_harness_artifact {
+    if (ctc.name == "write_file" || ctc.name == "edit_file" || ctc.name == "apply_diff") && !is_internal_harness_artifact {
         let (is_sub, is_sop_enabled, is_intent_satisfied) = {
             let db = state.db.lock().unwrap();
             let sop_enabled = store::get_settings(&db)
@@ -2550,33 +2525,32 @@ async fn handle_tool_call(
         }
     }
 
-    let spec = specs.iter().find(|s| s.name == tool_name);
-    let Some(spec) = spec else {
+    if disabled_tools.iter().any(|t| t == &ctc.name) {
         ev.status = "failed".into();
-        let reason = if disabled_tools.iter().any(|t| t == tool_name) {
-            format!("工具已在设置中禁用: {tool_name}")
-        } else {
-            format!("未知工具: {tool_name}")
-        };
-        ev.result_text = Some(reason);
+        let reason = format!("工具已在设置中禁用: {}", ctc.name);
+        ev.result_text = Some(reason.clone());
         {
             let db = state.db.lock().unwrap();
             let _ = store::insert_tool_event(&db, &ev);
         }
         emit_tool(app, session_id, &ev);
-        return (ev.status.clone(), ev.result_text.clone().unwrap_or_default());
+        return ("failed".into(), reason);
+    }
+
+    let Some(spec) = tools::global_registry().get_tool_spec(&ctc.name).await else {
+        ev.status = "failed".into();
+        let reason = format!("未知工具: {}", ctc.name);
+        ev.result_text = Some(reason.clone());
+        {
+            let db = state.db.lock().unwrap();
+            let _ = store::insert_tool_event(&db, &ev);
+        }
+        emit_tool(app, session_id, &ev);
+        return ("failed".into(), reason);
     };
-    let (eval_name, eval_args, risk, eval_scope) = if tool_name == "call_extended_tool" {
-        let t_name = args.get("tool_name").and_then(|v| v.as_str()).unwrap_or("unknown");
-        let t_args = args.get("tool_params").or_else(|| args.get("arguments")).unwrap_or(args);
-        let all_specs = tools::specs::tool_specs();
-        let target_spec = all_specs.into_iter().find(|s| s.name == t_name);
-        let t_risk = target_spec.as_ref().map(|s| s.risk).unwrap_or(spec.risk);
-        let t_scope = target_spec.as_ref().map(|s| s.scope).unwrap_or(tools::ToolScope::Universal);
-        (t_name, t_args, t_risk, t_scope)
-    } else {
-        (tool_name, args, spec.risk, spec.scope)
-    };
+
+    let risk = spec.risk;
+    let eval_scope = spec.scope;
 
     let is_subagent_session = {
         let db = state.db.lock().unwrap();
@@ -2589,7 +2563,7 @@ async fn handle_tool_call(
     };
     if is_subagent_session && eval_scope == tools::ToolScope::MainOnly {
         ev.status = "failed".into();
-        let reason = format!("【工具作用域拦截】：当前子任务会话不支持调用主会话专属工具 `{eval_name}`");
+        let reason = format!("【工具作用域拦截】：当前子任务会话不支持调用主会话专属工具 `{}`", ctc.name);
         ev.result_text = Some(reason.clone());
         {
             let db = state.db.lock().unwrap();
@@ -2600,7 +2574,7 @@ async fn handle_tool_call(
     }
     if !is_subagent_session && eval_scope == tools::ToolScope::SubOnly {
         ev.status = "failed".into();
-        let reason = format!("【工具作用域拦截】：主会话不支持调用子任务专属工具 `{eval_name}`");
+        let reason = format!("【工具作用域拦截】：主会话不支持调用子任务专属工具 `{}`", ctc.name);
         ev.result_text = Some(reason.clone());
         {
             let db = state.db.lock().unwrap();
@@ -2626,8 +2600,8 @@ async fn handle_tool_call(
 
     let policy_decision = crate::policy::PolicyEngine::evaluate(
         &crate::policy::ToolInvocation {
-            name: eval_name,
-            args: eval_args,
+            name: &ctc.name,
+            args: &ctc.params,
             risk,
         },
         &crate::policy::SecurityContext {
@@ -2675,16 +2649,16 @@ async fn handle_tool_call(
         already_inserted = true;
         emit_tool(app, session_id, &ev);
 
-        let display_tool_name = if tool_name == "call_extended_tool" {
-            format!("call_extended_tool ({eval_name})")
+        let display_tool_name = if ctc.is_extended {
+            format!("{} ({})", ctc.protocol_name, ctc.name)
         } else {
-            tool_name.to_string()
+            ctc.name.clone()
         };
         let req = ApprovalRequest {
             event_id: ev.id.clone(),
             session_id: session_id.to_string(),
             tool_name: display_tool_name,
-            params: eval_args.clone(),
+            params: ctc.params.clone(),
             risk: ask_risk.into(),
             preview,
             force_once,
@@ -2699,8 +2673,8 @@ async fn handle_tool_call(
                 crate::growth::trigger_reflection_on_denial(
                     app.clone(),
                     session_id.to_string(),
-                    tool_name.to_string(),
-                    args.clone(),
+                    ctc.name.clone(),
+                    ctc.params.clone(),
                     reason.clone(),
                 );
                 let text = format!(
@@ -2721,7 +2695,7 @@ async fn handle_tool_call(
                 // 记忆放行规则：「本会话允许」把规则写入当前对话并落库，
                 // 仅对该对话生效、重启后仍保留
                 if let Decision::AllowSession = d {
-                    let (kind, pattern) = approval::rule_for(tool_name, args);
+                    let (kind, pattern) = approval::rule_for(&ctc.name, &ctc.params);
                     if !pattern.is_empty() {
                         let rules = {
                             let db = state.db.lock().unwrap();
@@ -2749,7 +2723,7 @@ async fn handle_tool_call(
             let _ = store::insert_tool_event(&db, &ev);
         }
     }
-    state.snapshot.start_tool_executing(session_id, tool_call_id, tool_name, &ev.id);
+    state.snapshot.start_tool_executing(session_id, &ctc.call_id, &ctc.name, &ev.id);
     emit_tool(app, session_id, &ev);
 
     let ev_id = ev.id.clone();
@@ -2767,15 +2741,42 @@ async fn handle_tool_call(
     let mut call_ctx = ctx.clone();
     call_ctx.event_id = Some(ev.id.clone());
     call_ctx.message_id = Some(assistant_msg_id.to_string());
-    let exec = tools::execute(tool_name, args, &call_ctx, &on_partial).await;
+    let exec = if ctc.params.get("help").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if let Some(s) = tools::global_registry().get_tool_spec(&ctc.name).await {
+            Ok(tools::registry::format_tool_doc(&s))
+        } else {
+            Err(format!("未在工具目录中找到工具 `{}`", ctc.name))
+        }
+    } else {
+        tools::execute(&ctc.name, &ctc.params, &call_ctx, &on_partial).await
+    };
     let elapsed = started.elapsed().as_millis() as u64;
 
     let (mut status, mut text) = match exec {
         Ok(t) => ("success".to_string(), t),
-        Err(e) => ("failed".to_string(), format!("工具执行失败：{e}")),
+        Err(e) => {
+            if ctc.is_extended {
+                if let Some(s) = tools::global_registry().get_tool_spec(&ctc.name).await {
+                    (
+                        "failed".to_string(),
+                        format!(
+                            "工具执行失败：{}\n\n【工具 `{}` 参数规范与纠错指引】\n功能描述：{}\n参数 Schema：\n```json\n{}\n```\n请核对必填参数并修正后重试。",
+                            e,
+                            ctc.name,
+                            s.description,
+                            serde_json::to_string_pretty(&s.schema).unwrap_or_default()
+                        ),
+                    )
+                } else {
+                    ("failed".to_string(), format!("工具执行失败：{e}"))
+                }
+            } else {
+                ("failed".to_string(), format!("工具执行失败：{e}"))
+            }
+        }
     };
     let mut detected_sub_id: Option<String> = None;
-    if (eval_name == "spawn_subprocess" || eval_name == "spawn_subagent") && status == "success" {
+    if (ctc.name == "spawn_subprocess" || ctc.name == "spawn_subagent") && status == "success" {
         for line in text.lines() {
             if line.contains("ID:") {
                 let trimmed = line.trim();
@@ -2796,7 +2797,7 @@ async fn handle_tool_call(
             }
         }
     }
-    if matches!(eval_name, "create_plan" | "update_plan" | "switch_plan" | "read_plan") && status == "success" {
+    if matches!(ctc.name.as_str(), "create_plan" | "update_plan" | "switch_plan" | "read_plan") && status == "success" {
         let normalized = text.replace('\\', "/");
         if let Some(pos) = normalized.find(".harness/plans/") {
             let sub = &normalized[pos..];
@@ -2807,15 +2808,15 @@ async fn handle_tool_call(
             }
         }
     }
-    if eval_name == "record_memory" && status == "success" {
+    if ctc.name == "record_memory" && status == "success" {
         let normalized = text.replace('\\', "/");
         let detected_path = if let Some(pos) = normalized.find(".harness/memory/") {
             let sub = &normalized[pos..];
             let end = sub.find(|c: char| c.is_whitespace() || c == '`' || c == ')' || c == '"' || c == '\'' || c == '。').unwrap_or(sub.len());
             Some(sub[..end].trim_end_matches('.').to_string())
         } else {
-            let cat = eval_args.get("category").and_then(|v| v.as_str()).unwrap_or("");
-            let title = eval_args.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            let cat = ctc.params.get("category").and_then(|v| v.as_str()).unwrap_or("");
+            let title = ctc.params.get("title").and_then(|v| v.as_str()).unwrap_or("");
             match cat {
                 "profile" | "tech_stack" => Some(".harness/memory/profile.md".to_string()),
                 "convention" | "notes" => Some(".harness/memory/conventions.md".to_string()),
@@ -2832,8 +2833,8 @@ async fn handle_tool_call(
             }
         }
     }
-    if tool_name == "read_memory" && status == "success" {
-        let topic = ev.params.get("topic").and_then(|v| v.as_str()).map(|s| s.trim());
+    if ctc.name == "read_memory" && status == "success" {
+        let topic = ev.params.get("topic").or_else(|| ev.params.get("query")).and_then(|v| v.as_str()).map(|s| s.trim());
         let path_str = match topic {
             Some("profile") | Some("tech_stack") => Some(".harness/memory/profile.md".to_string()),
             Some("conventions") | Some("convention") => Some(".harness/memory/conventions.md".to_string()),
@@ -2851,7 +2852,7 @@ async fn handle_tool_call(
     }
 
     // ---- 决策工具结果质检与人机协同审批挂起 ----
-    if matches!(tool_name, "score_decision" | "judge_decision" | "choice_decision") && status == "success" {
+    if matches!(ctc.name.as_str(), "score_decision" | "judge_decision" | "choice_decision") && status == "success" {
         let parsed_json: Option<Value> = serde_json::from_str::<Value>(&text).ok().or_else(|| {
             let t = text.trim();
             let first_brace = t.find('{');
@@ -2867,7 +2868,7 @@ async fn handle_tool_call(
             }
         });
 
-        let (is_passed, decision_summary, reason_str) = match tool_name {
+        let (is_passed, decision_summary, reason_str) = match ctc.name.as_str() {
             "score_decision" => {
                 if let Some(ref val) = parsed_json {
                     let score_val = val.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
@@ -2928,25 +2929,25 @@ async fn handle_tool_call(
             }
             emit_tool(app, session_id, &ev);
 
-            let preview = match tool_name {
+            let preview = match ctc.name.as_str() {
                 "score_decision" => format!(
                     "【核心意图】{}\n【交付边界】{}",
-                    args.get("understanding").and_then(|v| v.as_str()).unwrap_or(""),
-                    args.get("plan").and_then(|v| v.as_str()).unwrap_or("")
+                    ctc.params.get("understanding").and_then(|v| v.as_str()).unwrap_or(""),
+                    ctc.params.get("plan").and_then(|v| v.as_str()).unwrap_or("")
                 ),
                 "judge_decision" => format!(
                     "【待判定事项】{}",
-                    args.get("state")
-                        .or_else(|| args.get("statement"))
-                        .or_else(|| args.get("understanding"))
-                        .or_else(|| args.get("instruction"))
+                    ctc.params.get("state")
+                        .or_else(|| ctc.params.get("statement"))
+                        .or_else(|| ctc.params.get("understanding"))
+                        .or_else(|| ctc.params.get("instruction"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                 ),
                 _ => format!(
                     "【决策问题】{}\n【备选分支】{}",
-                    args.get("instruction").or_else(|| args.get("question")).and_then(|v| v.as_str()).unwrap_or(""),
-                    args.get("options").or_else(|| args.get("choices")).map(|v| v.to_string()).unwrap_or_default()
+                    ctc.params.get("instruction").or_else(|| ctc.params.get("question")).and_then(|v| v.as_str()).unwrap_or(""),
+                    ctc.params.get("options").or_else(|| ctc.params.get("choices")).map(|v| v.to_string()).unwrap_or_default()
                 ),
             };
 
@@ -2954,8 +2955,8 @@ async fn handle_tool_call(
             let req = ApprovalRequest {
                 event_id: ev.id.clone(),
                 session_id: session_id.to_string(),
-                tool_name: tool_name.to_string(),
-                params: args.clone(),
+                tool_name: ctc.name.clone(),
+                params: ctc.params.clone(),
                 risk: "intent_decision".into(),
                 preview,
                 force_once: true,
@@ -2994,8 +2995,8 @@ async fn handle_tool_call(
     {
         let db = state.db.lock().unwrap();
         // todo 工具：保存会话任务清单快照
-        if tool_name == "todo" && status == "success" {
-            let _ = store::set_kv(&db, session_id, "todos", &args.to_string());
+        if ctc.name == "todo" && status == "success" {
+            let _ = store::set_kv(&db, session_id, "todos", &ctc.params.to_string());
         }
         let params_str = serde_json::to_string(&ev.params).ok();
         let _ = store::update_tool_event_full(
@@ -3009,7 +3010,7 @@ async fn handle_tool_call(
         );
     }
     emit_tool_with(app, session_id, &ev, json!({ "elapsedMs": elapsed }));
-    if matches!(tool_name, "todo" | "create_plan" | "update_plan" | "switch_plan") && status == "success" {
+    if matches!(ctc.name.as_str(), "todo" | "create_plan" | "update_plan" | "switch_plan") && status == "success" {
         let db = state.db.lock().unwrap();
         crate::plan::emit_board_updated(app, &db, session_id);
     }

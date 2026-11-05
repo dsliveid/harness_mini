@@ -18,7 +18,7 @@ pub use file::record_file_snapshot_raw;
 pub use helpers::{inside_workspace, is_high_danger};
 pub use registry::ToolRegistry;
 pub use specs::tool_specs;
-pub use types::{HostCtx, PartialCb, Risk, Tool, ToolCtx, ToolScope, ToolSpec, TEMP_TOOL_NAMES};
+pub use types::{CanonicalToolCall, HostCtx, PartialCb, Risk, Tool, ToolCtx, ToolScope, ToolSpec, TEMP_TOOL_NAMES};
 
 use serde_json::Value;
 use std::sync::OnceLock;

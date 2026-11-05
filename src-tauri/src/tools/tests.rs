@@ -414,3 +414,49 @@ const handleClick = async () => {
 
         let _ = std::fs::remove_dir_all(&ws);
     }
+
+    #[test]
+    fn test_canonical_tool_call_normalization_and_defensive_flattening() {
+        use super::types::CanonicalToolCall;
+
+        // 1. 原生核心工具调用
+        let c1 = CanonicalToolCall::from_raw("c1", "read_file", r#"{"path": "src/main.rs"}"#);
+        assert_eq!(c1.call_id, "c1");
+        assert_eq!(c1.protocol_name, "read_file");
+        assert_eq!(c1.name, "read_file");
+        assert_eq!(c1.params["path"], "src/main.rs");
+        assert!(!c1.is_extended);
+
+        // 2. 标准扩展工具调用
+        let c2 = CanonicalToolCall::from_raw(
+            "c2",
+            "call_extended_tool",
+            r#"{"tool_name": "recognize_image", "tool_params": {"path": "img.png", "prompt": "describe"}}"#,
+        );
+        assert_eq!(c2.call_id, "c2");
+        assert_eq!(c2.protocol_name, "call_extended_tool");
+        assert_eq!(c2.name, "recognize_image");
+        assert_eq!(c2.params["path"], "img.png");
+        assert_eq!(c2.params["prompt"], "describe");
+        assert!(c2.is_extended);
+
+        // 3. 模型幻觉嵌套结构防卫拍平 (Defensive Flattening)
+        let c3 = CanonicalToolCall::from_raw(
+            "c3",
+            "call_extended_tool",
+            r#"{"tool_name": "recognize_image", "tool_params": {"arguments": {"path": "nested.png"}}}"#,
+        );
+        assert_eq!(c3.name, "recognize_image");
+        assert_eq!(c3.params["path"], "nested.png");
+        assert!(c3.is_extended);
+
+        // 4. 模型将业务参数放置在外层与 tool_name 平级
+        let c4 = CanonicalToolCall::from_raw(
+            "c4",
+            "call_extended_tool",
+            r#"{"tool_name": "recognize_image", "path": "top_level.png"}"#,
+        );
+        assert_eq!(c4.name, "recognize_image");
+        assert_eq!(c4.params["path"], "top_level.png");
+        assert!(c4.is_extended);
+    }
