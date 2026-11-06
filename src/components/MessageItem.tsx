@@ -16,7 +16,7 @@ import { SafeImage } from "./SafeImage";
 
 import { TurnDiffModal } from "./TurnDiffModal";
 
-import { Brain, ChevronRight, Pencil, Copy, Check, Clock, Zap, File, GitBranch, GitFork, RotateCcw, RotateCw, GitCompare } from "./Icons";
+import { Brain, ChevronRight, Pencil, Copy, Check, Clock, Zap, File, GitBranch, GitFork, RotateCcw, RotateCw, GitCompare, Trash2 } from "./Icons";
 
 import { toAssetUrl, formatFileSize } from "../utils/image";
 
@@ -331,6 +331,10 @@ export function MessageItem({
 
   const reapplyFromMessage = useStore((s) => s.reapplyFromMessage);
 
+  const purgeWithdrawn = useStore((s) => s.purgeWithdrawn);
+
+  const [purging, setPurging] = useState(false);
+
   const [copied, setCopied] = useState(false);
 
   const [forking, setForking] = useState(false);
@@ -619,6 +623,32 @@ export function MessageItem({
 
               )
 
+            )}
+
+            {/* 删除已撤回内容：紧跟在「重新应用」之后，二次确认后物理删除 */}
+            {!running && !readOnly && !editBlocked && !!msg.revertedAt && (
+              <button
+                className="w-7 h-7 rounded-lg hover:bg-panel3 flex items-center justify-center text-rose-400 shrink-0 transition-opacity opacity-100 bg-rose-500/10 hover:bg-rose-500/20"
+                title="删除已撤回内容（物理删除本对话及其后的所有对话、执行过程与快照，不可恢复）"
+                disabled={purging}
+                onClick={async () => {
+                  const ok = window.confirm(
+                    "确定删除所有已撤回的对话内容吗？\n\n" +
+                      "将永久删除：该对话及其后全部对话、执行过程、工具事件、\n" +
+                      "文件快照元数据与不再被引用的快照文件。\n\n" +
+                      "此操作不可恢复，「重新应用」也将失效。"
+                  );
+                  if (!ok) return;
+                  setPurging(true);
+                  try {
+                    await purgeWithdrawn(msg.sessionId);
+                  } finally {
+                    setPurging(false);
+                  }
+                }}
+              >
+                <Trash2 size={13} className={purging ? "animate-pulse" : ""} />
+              </button>
             )}
 
           </div>

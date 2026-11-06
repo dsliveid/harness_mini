@@ -97,7 +97,8 @@ pub fn init_session_bundle_schema(conn: &Connection) -> Result<(), String> {
           duration_ms INTEGER DEFAULT 0,
           turn_duration_ms INTEGER DEFAULT 0,
           attachments_json TEXT,
-          reverted_at TEXT
+          reverted_at TEXT,
+          runtime_anchor TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_bundle_messages_session ON messages(session_id, seq);
         CREATE INDEX IF NOT EXISTS idx_bundle_messages_run ON messages(run_id);
@@ -198,16 +199,78 @@ pub fn init_session_bundle_schema(conn: &Connection) -> Result<(), String> {
           completion_tokens INTEGER DEFAULT 0,
           cached_tokens INTEGER DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS llm_requests (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          message_id TEXT NOT NULL,
+          run_id TEXT,
+          model TEXT NOT NULL,
+          endpoint TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_bundle_llm_requests_msg ON llm_requests(message_id);
+        CREATE INDEX IF NOT EXISTS idx_bundle_llm_requests_session ON llm_requests(session_id);
         "#,
     )
     .map_err(|e| format!("初始化会话专属数据库 Schema 失败: {e}"))?;
     Ok(())
 }
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+/// 活跃会话数据库连接池（线程安全且复用连接，避免高频创建销毁连接句柄）
+#[derive(Default)]
+pub struct SessionPool {
+    pool: Mutex<HashMap<String, Arc<Mutex<Connection>>>>,
+}
+
+impl SessionPool {
+    pub fn new() -> Self {
+        Self {
+            pool: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 获取或打开指定会话的数据库连接（线程安全，同一会话复用同一连接句柄）
+    pub fn get_or_open(&self, data_dir: &Path, session_id: &str) -> Result<Arc<Mutex<Connection>>, String> {
+        let mut pool = self.pool.lock().unwrap();
+        if let Some(conn) = pool.get(session_id) {
+            return Ok(conn.clone());
+        }
+
+        let bundle = SessionBundle::new(session_id, data_dir);
+        let conn = bundle.open_db()?;
+        let conn_arc = Arc::new(Mutex::new(conn));
+        pool.insert(session_id.to_string(), conn_arc.clone());
+        Ok(conn_arc)
+    }
+
+    /// 会话删除或归档时，关闭并移出会话连接
+    pub fn evict(&self, session_id: &str) {
+        let mut pool = self.pool.lock().unwrap();
+        pool.remove(session_id);
+    }
+
+    /// 清空所有连接（例如热切换数据目录时）
+    pub fn clear(&self) {
+        let mut pool = self.pool.lock().unwrap();
+        pool.clear();
+    }
+
+    pub fn active_session_ids(&self) -> Vec<String> {
+        let pool = self.pool.lock().unwrap();
+        pool.keys().cloned().collect()
+    }
+}
+
 /// 自适应会话连接路由：
 /// 1. 若该会话已有专属 session.db，优先在其专属库执行
 /// 2. 若尚未切片迁移，则平滑回退到全局主库执行
 pub fn with_session_db<F, R>(
+    session_pool: Option<&SessionPool>,
     catalog_conn: &Connection,
     data_dir_opt: Option<&Path>,
     session_id: &str,
@@ -219,10 +282,25 @@ where
     if let Some(data_dir) = data_dir_opt {
         let bundle = SessionBundle::new(session_id, data_dir);
         if bundle.exists() {
-            let conn = bundle.open_db()?;
-            return f(&conn);
+            if let Some(pool) = session_pool {
+                let conn_arc = pool.get_or_open(data_dir, session_id)?;
+                let conn = conn_arc.lock().unwrap();
+                return f(&conn);
+            } else {
+                let conn = bundle.open_db()?;
+                return f(&conn);
+            }
         } else if bundle.is_archived() {
             if let Ok(conn) = bundle.open_db_readonly() {
+                return f(&conn);
+            }
+        } else {
+            if let Some(pool) = session_pool {
+                let conn_arc = pool.get_or_open(data_dir, session_id)?;
+                let conn = conn_arc.lock().unwrap();
+                return f(&conn);
+            } else {
+                let conn = bundle.open_db()?;
                 return f(&conn);
             }
         }

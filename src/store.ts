@@ -371,6 +371,8 @@ interface Store {
   turnReapply: (messageId: string, force?: boolean) => Promise<void>;
   revertToMessage: (messageId: string, force?: boolean) => Promise<void>;
   reapplyFromMessage: (messageId: string, force?: boolean) => Promise<void>;
+  /** 物理删除会话中所有已撤回内容（不可恢复） */
+  purgeWithdrawn: (sessionId: string) => Promise<void>;
   /** 能力模型分配矩阵弹窗 */
   showModelMatrixModal: boolean;
   modelMatrixSessionId: string | null;
@@ -2514,6 +2516,31 @@ export const useStore = create<Store>((set, get) => ({
       st.pushToast("已重新应用对话至最新状态");
     } catch (err: any) {
       st.pushToast(String(err) || "重新应用失败", "error");
+    }
+  },
+
+  async purgeWithdrawn(sessionId: string) {
+    const st = get();
+    try {
+      const res = await ipc.purgeWithdrawnMessages(sessionId);
+      if (st.editingMessage) {
+        st.setEditingMessage(null);
+      }
+      await st.reloadMessages(sessionId);
+      st.triggerPlansRefresh();
+      const total =
+        res.deletedMessages +
+        res.deletedToolEvents +
+        res.deletedSnapshots +
+        res.deletedRuns +
+        res.deletedBlobs;
+      st.pushToast(
+        total > 0
+          ? `已删除 ${res.deletedMessages} 条对话及 ${total - res.deletedMessages} 项关联记录/文件`
+          : "没有可删除的已撤回内容"
+      );
+    } catch (err: any) {
+      st.pushToast(String(err) || "删除已撤回内容失败", "error");
     }
   },
 

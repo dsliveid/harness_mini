@@ -577,6 +577,11 @@ export function groupTimelineItems(
 
     } else {
 
+      // 排队中的消息不提前切割当前轮次的执行抽屉，仅由 PendingQueue 挂起条展示
+      if (item.msg.queued) {
+        continue;
+      }
+
       // user 消息或其他非 assistant 角色
 
       flushTurn(false);

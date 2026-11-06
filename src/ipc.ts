@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, ContextViewport, CurrentBoard, DataStatus, DbStats, OptimizeResult, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult, JevCfg, PlanReviewReport, ToolLogFilter, ToolLogQueryResult, LlmRequestTrace, DirectDecisionResult, BrowserDebugState, ViewportInfo, InteractiveElement, McpServerConfig, McpToolDefinition, StorageStateSummary, PageHealthState } from "./types";
+import type { ActivePlanDetail, ApprovalRule, Attachment, CollaboratorCreateInput, CollaboratorUpdateInput, ContextViewport, CurrentBoard, DataStatus, DbStats, OptimizeResult, FileTextContent, GrowthItem, Message, MergeSummary, PlanSummary, TimelineTask, TimelineTaskItem, TaskType, TaskStatus, FocusFloatingTarget, Project, ProjectLink, ProjectSopInfo, RunningSession, Session, SessionActiveState, SessionCompaction, SessionCreateInput, SessionModelsUpdateInput, Settings, SkillItem, TempAlloc, TempChanges, TempFileDiff, TempInfo, TokenStatsReport, ToolEvent, ToolInfo, ViewerTabItem, DiffHunk, FileOutlineItem, LongTask, TaskCheckpoint, TaskSubItem, PathInspectResult, SnapshotFileDiff, RevertResult, ReapplyResult, PurgeResult, JevCfg, PlanReviewReport, ToolLogFilter, ToolLogQueryResult, LlmRequestTrace, DirectDecisionResult, BrowserDebugState, ViewportInfo, InteractiveElement, McpServerConfig, McpToolDefinition, StorageStateSummary, PageHealthState } from "./types";
 
 /**
  * 读请求防重入去重拦截器：
@@ -454,6 +454,8 @@ export const ipc = {
     invoke<RevertResult>("revert_to_message", { messageId, force: force ?? null }),
   reapplyFromMessage: (messageId: string, force?: boolean) =>
     invoke<ReapplyResult>("reapply_from_message", { messageId, force: force ?? null }),
+  purgeWithdrawnMessages: (sessionId: string) =>
+    invoke<PurgeResult>("purge_withdrawn_messages", { sessionId }),
   revertMessageTurn: (messageId: string, force?: boolean) =>
     invoke<RevertResult>("revert_message_turn", { messageId, force: force ?? null }),
   reapplyMessageTurn: (messageId: string, force?: boolean) =>

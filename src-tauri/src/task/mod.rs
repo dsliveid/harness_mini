@@ -316,10 +316,7 @@ pub fn complete_long_task(
         let _ = app.emit("task:checkpoint", &cp);
     }
     let _ = app.emit("task:update", &task);
-    {
-        let db = state.db.lock().unwrap();
-        crate::plan::emit_board_updated(app, &db, &task.session_id);
-    }
+    crate::plan::emit_board_updated(app, &state, &task.session_id);
     Ok(task)
 }
 

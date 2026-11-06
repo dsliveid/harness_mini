@@ -57,7 +57,7 @@ impl ToolErrorTracker {
 }
 
 /// 前置意图门禁状态（持有活跃 Todo 清单或已生效 Plan 方案二选一即满足）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct IntentGateStatus {
     pub has_plan: bool,
     pub has_todo: bool,
@@ -272,10 +272,8 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
         // starting = 任务尚未拿到 run_id；无论哪种情况都把库中残留的 running 记录收尾，
         // 避免停止后数据库里留下永久“运行中”的 run（运行状态恢复以数据库为准）
         {
-            let db = state.db.lock().unwrap();
-            let _ = store::cancel_open_runs(&db, session_id);
-            if let Ok(events) = store::fail_open_tool_events(&db, session_id) {
-                drop(db);
+            let _ = state.with_session_db(session_id, |conn| store::cancel_open_runs(conn, session_id));
+            if let Ok(events) = state.with_session_db(session_id, |conn| store::fail_open_tool_events(conn, session_id)) {
                 for ev in events {
                     state.emit(
                         "tool:update",
@@ -348,24 +346,36 @@ pub fn restart_subagent(app: &AppHandle, subagent_id: &str) -> Result<(), String
     stop_session_ext(app, subagent_id, false);
 
     let (parent_id, trigger_id) = {
-        let db = state.db.lock().unwrap();
-        let s = store::get_session(&db, subagent_id)?.ok_or("子 Agent 不存在")?;
-        // 终态硬锁：若子任务已完成交付结案，坚决禁止二次误唤醒重启！
-        if s.status == "completed" || store::get_kv(&db, subagent_id, "delivered_outcome").ok().flatten().is_some() {
+        let s = {
+            let db = state.db.lock().unwrap();
+            store::get_session(&db, subagent_id)?.ok_or("子 Agent 不存在")?
+        };
+        let delivered = state.with_session_db(subagent_id, |conn| {
+            store::get_kv(conn, subagent_id, "delivered_outcome")
+        }).ok().flatten();
+        if s.status == "completed" || delivered.is_some() {
             return Err("子 Agent 已完成交付结案，禁止重复唤醒".into());
         }
-        // 关键修复：重启子任务时，同步将 SQLite 数据库中的生命周期状态由 cancelled/interrupted/failed 恢复为 running
-        let _ = store::set_session_status(&db, subagent_id, "running");
-        let msgs = store::all_messages(&db, subagent_id)?;
+        {
+            let db = state.db.lock().unwrap();
+            let _ = store::set_session_status(&db, subagent_id, "running");
+        }
+        let msgs = state.with_session_db(subagent_id, |conn| store::all_messages(conn, subagent_id))?;
         let last_msg = msgs.last();
         let user_msg_id = match last_msg {
             Some(m) if m.role == "tool" => {
-                let nm = store::new_message(&db, subagent_id, "user", Some("请根据上述工具执行结果，继续推进并输出最终结论。".into()), false)?;
+                let nm = state.with_session_db(subagent_id, |conn| {
+                    store::new_message(conn, subagent_id, "user", Some("请根据上述工具执行结果，继续推进并输出最终结论。".into()), false)
+                })?;
+                state.cache_message_session(&nm.id, subagent_id);
                 let _ = app.emit("message:final", &nm);
                 nm.id
             }
             Some(m) if m.role == "assistant" => {
-                let nm = store::new_message(&db, subagent_id, "user", Some("请承接前文未完成的内容与思路，直接继续往下执行，无需重复前文已输出的内容。".into()), false)?;
+                let nm = state.with_session_db(subagent_id, |conn| {
+                    store::new_message(conn, subagent_id, "user", Some("请承接前文未完成的内容与思路，直接继续往下执行，无需重复前文已输出的内容。".into()), false)
+                })?;
+                state.cache_message_session(&nm.id, subagent_id);
                 let _ = app.emit("message:final", &nm);
                 nm.id
             }
@@ -379,7 +389,10 @@ pub fn restart_subagent(app: &AppHandle, subagent_id: &str) -> Result<(), String
                     .map(|t| t.trim())
                     .filter(|t| !t.is_empty())
                     .unwrap_or("请继续推进并执行任务。");
-                let nm = store::new_message(&db, subagent_id, "user", Some(prompt.into()), false)?;
+                let nm = state.with_session_db(subagent_id, |conn| {
+                    store::new_message(conn, subagent_id, "user", Some(prompt.into()), false)
+                })?;
+                state.cache_message_session(&nm.id, subagent_id);
                 let _ = app.emit("message:final", &nm);
                 nm.id
             }
@@ -415,18 +428,22 @@ pub fn reject_and_restart_subagent(app: &AppHandle, subagent_id: &str, feedback:
     stop_session_ext(app, subagent_id, false);
 
     let (parent_id, user_msg_id) = {
-        let db = state.db.lock().unwrap();
-        let s = store::get_session(&db, subagent_id)?.ok_or("子 Agent 不存在")?;
-        // 关键：驳回时清除旧交付结果与报告标记，状态重置为 running
-        let _ = store::set_kv(&db, subagent_id, "delivered_outcome", "");
-        let _ = store::set_session_status(&db, subagent_id, "running");
+        let s = {
+            let db = state.db.lock().unwrap();
+            store::get_session(&db, subagent_id)?.ok_or("子 Agent 不存在")?
+        };
+        let _ = state.with_session_db(subagent_id, |conn| store::set_kv(conn, subagent_id, "delivered_outcome", ""));
+        {
+            let db = state.db.lock().unwrap();
+            let _ = store::set_session_status(&db, subagent_id, "running");
+        }
 
-        // 注入整改指示作为新 user 消息
         let reject_prompt = format!(
             "【↩️ 主架构师验收驳回与返工整改指示】：\n\n{}\n\n请严格对照上述整改要求进行修复并重新验证，修复完成后请再次生成交付报告结案！",
             feedback.trim()
         );
-        let nm = store::new_message(&db, subagent_id, "user", Some(reject_prompt), false)?;
+        let nm = state.with_session_db(subagent_id, |conn| store::new_message(conn, subagent_id, "user", Some(reject_prompt), false))?;
+        state.cache_message_session(&nm.id, subagent_id);
         let _ = app.emit("message:final", &nm);
 
         (s.parent_session_id, nm.id)
@@ -482,29 +499,38 @@ pub fn retry_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
     stop_session_ext(app, session_id, false);
 
     let (trigger_id, user_seq, child_ids_to_clean) = {
-        let db = state.db.lock().unwrap();
-        let msgs = store::all_messages(&db, session_id)?;
-        // 寻找最后一个非排队的 user 消息作为本轮重试的起点
+        let msgs = state.with_session_db(session_id, |conn| store::all_messages(conn, session_id))?;
         let last_user = msgs.iter()
             .rev()
             .find(|m| m.role == "user" && !m.queued)
             .ok_or("未找到可重试的用户消息")?;
 
+        let ev_ids: Vec<String> = state.with_session_db(session_id, |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM tool_events WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1 AND seq > ?2)"
+            ).map_err(|e| e.to_string())?;
+            let rows = stmt.query_map(rusqlite::params![session_id, last_user.seq], |r| r.get(0)).map_err(|e| e.to_string())?;
+            Ok(rows.flatten().collect())
+        }).unwrap_or_default();
+
         let mut child_ids: Vec<String> = Vec::new();
-        // 查找通过本轮产生（即父消息 seq > user_seq）的 tool_event 派生的子会话，
-        // 或在该 user 消息创建时间之后创建的关联子任务/子进程
+        let db = state.db.lock().unwrap();
         if let Ok(mut stmt) = db.prepare(
             "SELECT id FROM sessions 
-             WHERE trigger_tool_event_id IN (
-                 SELECT id FROM tool_events WHERE message_id IN (
-                     SELECT id FROM messages WHERE session_id = ?1 AND seq > ?2
-                 )
-             )
-             OR (parent_session_id = ?1 AND session_type IN ('subprocess', 'subagent') AND created_at >= ?3)"
+             WHERE (parent_session_id = ?1 AND session_type IN ('subprocess', 'subagent') AND created_at >= ?2)"
         ) {
-            if let Ok(rows) = stmt.query_map(rusqlite::params![session_id, last_user.seq, last_user.created_at], |r| r.get(0)) {
+            if let Ok(rows) = stmt.query_map(rusqlite::params![session_id, last_user.created_at], |r| r.get(0)) {
                 for r in rows.flatten() {
                     child_ids.push(r);
+                }
+            }
+        }
+        for eid in ev_ids {
+            if let Ok(mut stmt) = db.prepare("SELECT id FROM sessions WHERE trigger_tool_event_id = ?1") {
+                if let Ok(rows) = stmt.query_map(rusqlite::params![eid], |r| r.get(0)) {
+                    for r in rows.flatten() {
+                        child_ids.push(r);
+                    }
                 }
             }
         }
@@ -530,8 +556,8 @@ pub fn retry_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
     // 2. 清理该 user 消息之后产生的所有残留消息（包括旧的 assistant 消息、工具事件等）
     // 防止 LLM 看到末尾的 assistant 消息判定该轮已回答完毕而返回空回复
     {
+        state.with_session_db(session_id, |conn| store::delete_messages_after(conn, session_id, user_seq))?;
         let db = state.db.lock().unwrap();
-        store::delete_messages_after(&db, session_id, user_seq)?;
         store::touch_session(&db, session_id)?;
 
         // 3. 长任务子任务状态协同重置：若当前长任务子步骤处于失败或中断态，重置为 pending
@@ -609,14 +635,14 @@ pub fn continue_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
 
     // 2. 为主会话准备触发消息
     let (trigger_id, new_msg) = {
-        let db = state.db.lock().unwrap();
-        // 清理末尾悬挂的报错系统消息
-        let _ = db.execute(
-            "DELETE FROM messages WHERE session_id = ?1 AND role = 'system' AND content LIKE '⚠️%'",
-            rusqlite::params![session_id],
-        );
+        let _ = state.with_session_db(session_id, |conn| {
+            conn.execute(
+                "DELETE FROM messages WHERE session_id = ?1 AND role = 'system' AND content LIKE '⚠️%'",
+                rusqlite::params![session_id],
+            ).map_err(|e| e.to_string())
+        });
 
-        let msgs = store::all_messages(&db, session_id)?;
+        let msgs = state.with_session_db(session_id, |conn| store::all_messages(conn, session_id))?;
         let last_msg = msgs.last();
 
         let tool_guide = if resumed_any_sub {
@@ -633,36 +659,27 @@ pub fn continue_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
 
         match last_msg {
             Some(m) if m.role == "tool" => {
-                let new_m = store::new_message(
-                    &db,
-                    session_id,
-                    "user",
-                    Some(tool_guide.into()),
-                    false,
-                )?;
+                let new_m = state.with_session_db(session_id, |conn| {
+                    store::new_message(conn, session_id, "user", Some(tool_guide.into()), false)
+                })?;
+                state.cache_message_session(&new_m.id, session_id);
                 (new_m.id.clone(), Some(new_m))
             }
             Some(m) if m.role == "assistant" => {
-                let new_m = store::new_message(
-                    &db,
-                    session_id,
-                    "user",
-                    Some(assistant_guide.into()),
-                    false,
-                )?;
+                let new_m = state.with_session_db(session_id, |conn| {
+                    store::new_message(conn, session_id, "user", Some(assistant_guide.into()), false)
+                })?;
+                state.cache_message_session(&new_m.id, session_id);
                 (new_m.id.clone(), Some(new_m))
             }
             Some(m) if m.role == "user" => {
                 (m.id.clone(), None)
             }
             _ => {
-                let new_m = store::new_message(
-                    &db,
-                    session_id,
-                    "user",
-                    Some("请继续执行任务。".into()),
-                    false,
-                )?;
+                let new_m = state.with_session_db(session_id, |conn| {
+                    store::new_message(conn, session_id, "user", Some("请继续执行任务。".into()), false)
+                })?;
+                state.cache_message_session(&new_m.id, session_id);
                 (new_m.id.clone(), Some(new_m))
             }
         }
@@ -705,8 +722,7 @@ pub fn continue_turn_autonomous(app: &AppHandle, session_id: &str) -> Result<(),
 
     // 2. 注入轻量自治推进脉冲
     let (trigger_id, new_msg) = {
-        let db = state.db.lock().unwrap();
-        let msgs = store::all_messages(&db, session_id)?;
+        let msgs = state.with_session_db(session_id, |conn| store::all_messages(conn, session_id))?;
         let last_msg = msgs.last();
 
         let prompt = match last_msg {
@@ -721,7 +737,8 @@ pub fn continue_turn_autonomous(app: &AppHandle, session_id: &str) -> Result<(),
             }
         };
 
-        let new_m = store::new_message(&db, session_id, "user", Some(prompt), false)?;
+        let new_m = state.with_session_db(session_id, |conn| store::new_message(conn, session_id, "user", Some(prompt), false))?;
+        state.cache_message_session(&new_m.id, session_id);
         (new_m.id.clone(), new_m)
     };
 
@@ -768,12 +785,12 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
         let trigger_id = match trigger.take() {
             Some(t) => Some(t),
             None => {
-                let popped = {
-                    let db = state.db.lock().unwrap();
-                    store::pop_queued(&db, &session_id)
-                };
+                let popped = state.with_session_db(&session_id, |conn| {
+                    store::pop_queued(conn, &session_id)
+                });
                 match popped {
                     Ok(Some(m)) => {
+                        state.cache_message_session(&m.id, &session_id);
                         let _ = app.emit("message:final", &m);
                         let _ = app.emit(
                             "queue:update",
@@ -789,14 +806,13 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
 
         // 2. 创建 Run 并记录开始时间与关联触发消息
         let run_start_instant = Instant::now();
-        let run_id = {
-            let db = state.db.lock().unwrap();
-            let rid = store::create_run(&db, &session_id, Some(&trigger_id)).ok();
+        let run_id = state.with_session_db(&session_id, |conn| {
+            let rid = store::create_run(conn, &session_id, Some(&trigger_id)).ok();
             if let Some(ref r) = rid {
-                let _ = store::set_message_run_id(&db, &trigger_id, r);
+                let _ = store::set_message_run_id(conn, &trigger_id, r);
             }
-            rid
-        };
+            Ok(rid)
+        }).ok().flatten();
         let Some(run_id) = run_id else { break };
         if let Some(h) = state.handles.lock().unwrap().get(&session_id) {
             *h.active_run.lock().unwrap() = Some(run_id.clone());
@@ -821,25 +837,36 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
             RunOutcome::Failed => "failed",
         };
         {
-            let db = state.db.lock().unwrap();
-            let _ = store::finish_run(
-                &db,
-                &run_id,
-                status,
-                Some(run_duration_ms),
-                Some(run_tokens.total_tokens),
-                Some(run_tokens.prompt_tokens),
-                Some(run_tokens.completion_tokens),
-                Some(run_tokens.cached_tokens),
-            );
-            if let Some(ref aid) = last_assistant_id {
-                let _ = store::update_message_turn_duration(&db, aid, run_duration_ms);
-                if let Ok(Some(m)) = store::get_message(&db, aid) {
-                    let _ = app.emit("message:final", &m);
+            let _ = state.with_session_db(&session_id, |conn| {
+                let _ = store::finish_run(
+                    conn,
+                    &run_id,
+                    status,
+                    Some(run_duration_ms),
+                    Some(run_tokens.total_tokens),
+                    Some(run_tokens.prompt_tokens),
+                    Some(run_tokens.completion_tokens),
+                    Some(run_tokens.cached_tokens),
+                );
+                if let Some(ref aid) = last_assistant_id {
+                    let _ = store::update_message_turn_duration(conn, aid, run_duration_ms);
+                    if let Ok(Some(m)) = store::get_message(conn, aid) {
+                        let _ = app.emit("message:final", &m);
+                    }
                 }
-            }
+                Ok::<(), String>(())
+            });
 
-            // 实时广播：会话 Token 已在 finish_run 中聚合更新，第一时间向前端推送最新的会话状态（支持底栏实时刷新）
+            let db = state.db.lock().unwrap();
+            let _ = store::set_session_last_run_status(&db, &session_id, status);
+            let _ = store::increment_session_tokens(
+                &db,
+                &session_id,
+                run_tokens.prompt_tokens,
+                run_tokens.completion_tokens,
+                run_tokens.total_tokens,
+                run_tokens.cached_tokens,
+            );
             if let Ok(Some(updated_session)) = store::get_session(&db, &session_id) {
                 let _ = app.emit("session:update", &updated_session);
                 if let Some(ref pid) = updated_session.parent_session_id {
@@ -877,10 +904,8 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
     // 兜底：任务被中止（stop）时走不到 finish_run，把残留的 running run 标记为 interrupted，
     // 否则以数据库为准的运行状态恢复会把该会话永远显示为“运行中”
     {
-        let db = state.db.lock().unwrap();
-        let _ = store::fail_open_runs(&db, &session_id);
-        if let Ok(events) = store::fail_open_tool_events(&db, &session_id) {
-            drop(db);
+        let _ = state.with_session_db(&session_id, |conn| store::fail_open_runs(conn, &session_id));
+        if let Ok(events) = state.with_session_db(&session_id, |conn| store::fail_open_tool_events(conn, &session_id)) {
             for ev in events {
                 let _ = state.emit(
                     "tool:update",
@@ -1020,8 +1045,7 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
 }
 
 fn queued_payload(state: &crate::AppState, session_id: &str) -> Vec<Value> {
-    let db = state.db.lock().unwrap();
-    store::list_queued(&db, session_id)
+    state.with_session_db(session_id, |conn| store::list_queued(conn, session_id))
         .unwrap_or_default()
         .iter()
         .map(|m| json!({"id": m.id, "content": m.content.clone().unwrap_or_default(), "createdAt": m.created_at}))
@@ -1167,7 +1191,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
     let mut last_assistant_id: Option<String> = None;
     let mut run_tokens = RunTokenMetrics::default();
     let state = app.state::<crate::AppState>();
-    let (session, settings, trigger_msg, parent_session) = {
+    let (session, settings, parent_session) = {
         let db = state.db.lock().unwrap();
         let master = state.master_key.lock().unwrap();
         let s = store::get_session(&db, session_id).ok().flatten();
@@ -1177,12 +1201,11 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             .and_then(|pid| store::get_session(&db, pid).ok().flatten());
         (
             s,
-            // 必须注入加密 secrets 表中的 API Key，否则以空 Key 请求导致 401
             store::get_settings_with_secrets(&db, &master).unwrap_or_default(),
-            store::get_message(&db, trigger_id).ok().flatten(),
             p,
         )
     };
+    let trigger_msg = state.with_session_db(session_id, |conn| store::get_message(conn, trigger_id)).ok().flatten();
     let Some(session) = session else { return (RunOutcome::Failed, None, run_tokens); };
     let data_dir = state.data_dir.lock().unwrap().clone();
     let workspace = if session.is_temp {
@@ -1209,10 +1232,10 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
 
     // 检查当前会话是否包含图片附件
     let has_images = {
-        let db = state.db.lock().unwrap();
-        store::all_messages(&db, session_id).unwrap_or_default().iter().any(|m| {
-            m.attachments.as_ref().map(|atts| atts.iter().any(|a| a.is_image)).unwrap_or(false)
-        })
+        state.with_session_db(session_id, |conn| store::all_messages(conn, session_id))
+            .unwrap_or_default().iter().any(|m| {
+                m.attachments.as_ref().map(|atts| atts.iter().any(|a| a.is_image)).unwrap_or(false)
+            })
     };
 
     // 动态向上继承模型配置（若当前会话未显式指定，且存在父会话，则继承父会话配置）
@@ -1522,7 +1545,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         if let Some(ref um) = trigger_user_msg {
             if um.runtime_anchor.is_none() {
                 if let Some(anchor) = crate::context::build_runtime_anchor(&db, &session, um.content.as_deref()) {
-                    let _ = store::update_message_runtime_anchor(&db, &um.id, &anchor);
+                    let _ = state.with_session_db(session_id, |conn| store::update_message_runtime_anchor(conn, &um.id, &anchor));
                 }
             }
         }
@@ -1690,8 +1713,9 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
 
         // ---- 步骤 1/2：组装上下文（含运行中被"引导"注入的新消息） ----
         let (messages, est_in, truncation_notice) = {
-            let db = state.db.lock().unwrap();
-            build_context(&db, session_id, current_sys, effective_ctx_limit)
+            state.with_session_db(session_id, |conn| {
+                Ok(build_context(conn, session_id, current_sys, effective_ctx_limit))
+            }).unwrap_or_else(|e| (Err(e), 0, None))
         };
         if let Some(ref notice) = truncation_notice {
             let _ = app.emit("context:truncated", notice);
@@ -1708,8 +1732,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         let todo_first_enabled = !settings.disabled_sops.iter().any(|s| s == "todo_first_gate");
         if todo_first_enabled && _step == 8 {
             let intent_status = {
-                let db = state.db.lock().unwrap();
-                evaluate_intent_gate(&db, session_id)
+                state.with_session_db(session_id, |conn| Ok(evaluate_intent_gate(conn, session_id))).unwrap_or_default()
             };
             if !intent_status.is_satisfied() {
                 let gate_msg = if is_subagent {
@@ -1762,9 +1785,11 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         // ---- 步骤 3：流式调用 LLM（先预占 assistant 消息位，供增量事件引用） ----
         let step_start = Instant::now();
         let assistant_id = {
-            let db = state.db.lock().unwrap();
-            match store::new_message_with_run(&db, session_id, "assistant", Some(String::new()), false, Some(run_id)) {
-                Ok(m) => m.id,
+            match state.with_session_db(session_id, |conn| store::new_message_with_run(conn, session_id, "assistant", Some(String::new()), false, Some(run_id))) {
+                Ok(m) => {
+                    state.cache_message_session(&m.id, session_id);
+                    m.id
+                }
                 Err(e) => {
                     emit_error(app, session_id, "db", e);
                     return (RunOutcome::Failed, last_assistant_id, run_tokens);
@@ -1795,11 +1820,11 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 // 回滚上一次尝试中刷入数据库与界面的半截内容
                 buf2.lock().unwrap().clear();
                 rbuf2.lock().unwrap().clear();
-                {
-                    let db = state.db.lock().unwrap();
-                    let _ = store::update_message_content(&db, &assistant_id, "", None);
-                    let _ = store::update_message_reasoning(&db, &assistant_id, "");
-                }
+                let _ = state.with_session_db(session_id, |conn| {
+                    let _ = store::update_message_content(conn, &assistant_id, "", None);
+                    let _ = store::update_message_reasoning(conn, &assistant_id, "");
+                    Ok::<(), String>(())
+                });
                 let _ = app.emit(
                     "message:reset",
                     json!({"sessionId": session_id, "messageId": assistant_id}),
@@ -1833,17 +1858,17 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                     "messages": &messages,
                     "tools": &schemas,
                 });
-                if let Ok(db) = state.db.lock() {
-                    let _ = store::save_llm_request_trace(
-                        &db,
+                let _ = state.with_session_db(session_id, |conn| {
+                    store::save_llm_request_trace(
+                        conn,
                         session_id,
                         &assistant_id,
                         Some(run_id),
                         &cfg.model,
                         &cfg.base_url,
                         &trace_payload.to_string(),
-                    );
-                }
+                    )
+                });
             }
 
             let app_tool = app2.clone();
@@ -1969,13 +1994,12 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 );
             } else {
                 // 清理本次为该步骤预占位的空 assistant 消息，防止留在数据库中变成僵尸占位
-                {
-                    let db = state.db.lock().unwrap();
-                    let _ = db.execute(
+                let _ = state.with_session_db(session_id, |conn| {
+                    conn.execute(
                         "DELETE FROM messages WHERE id = ?1 AND (content IS NULL OR content = '') AND tool_calls_json IS NULL",
                         rusqlite::params![assistant_id],
-                    );
-                }
+                    ).map_err(|e| e.to_string())
+                });
                 emit_error(
                     app,
                     session_id,
@@ -2109,15 +2133,19 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                                 );
 
                                 {
-                                    let db = state.db.lock().unwrap();
-                                    let _ = store::update_message_content(&db, &assistant_id, &result.content, Some(&usage));
-                                    if !result.reasoning.is_empty() {
-                                        let _ = store::update_message_reasoning(&db, &assistant_id, &result.reasoning);
-                                    }
-                                    let err_prompt = format!(
-                                        "【🛡️ 交付前 SOP 自检未通过】\n自检命令：`{cmd}`\n执行输出：\n```\n{out}\n```\n检测到上述构建或测试报错。请分析原因并修改代码进行自愈修复，确保自检通过后再交付完成任务。"
-                                    );
-                                    let _ = store::new_message(&db, session_id, "user", Some(err_prompt), false);
+                                    let _ = state.with_session_db(session_id, |conn| {
+                                        let _ = store::update_message_content(conn, &assistant_id, &result.content, Some(&usage));
+                                        if !result.reasoning.is_empty() {
+                                            let _ = store::update_message_reasoning(conn, &assistant_id, &result.reasoning);
+                                        }
+                                        let err_prompt = format!(
+                                            "【🛡️ 交付前 SOP 自检未通过】\n自检命令：`{cmd}`\n执行输出：\n```\n{out}\n```\n检测到上述构建或测试报错。请分析原因并修改代码进行自愈修复，确保自检通过后再交付完成任务。"
+                                        );
+                                        if let Ok(m) = store::new_message(conn, session_id, "user", Some(err_prompt), false) {
+                                            state.cache_message_session(&m.id, session_id);
+                                        }
+                                        Ok::<(), String>(())
+                                    });
                                 }
                                 _step += 1;
                                 continue;
@@ -2156,17 +2184,13 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             }
 
             // ---- 正常交付：文本消息落库并结束 run_once ----
-            {
-                let db = state.db.lock().unwrap();
-                let _ = store::update_message_content(&db, &assistant_id, &result.content, Some(&usage));
+            let final_msg = state.with_session_db(session_id, |conn| {
+                let _ = store::update_message_content(conn, &assistant_id, &result.content, Some(&usage));
                 if !result.reasoning.is_empty() {
-                    let _ = store::update_message_reasoning(&db, &assistant_id, &result.reasoning);
+                    let _ = store::update_message_reasoning(conn, &assistant_id, &result.reasoning);
                 }
-            }
-            let final_msg = {
-                let db = state.db.lock().unwrap();
-                store::get_message(&db, &assistant_id).ok().flatten()
-            };
+                store::get_message(conn, &assistant_id)
+            }).ok().flatten();
             if let Some(m) = final_msg {
                 let _ = app.emit("message:final", &m);
             }
@@ -2199,23 +2223,19 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 })
             })
             .collect();
-        {
-            let db = state.db.lock().unwrap();
+        let final_msg = state.with_session_db(session_id, |conn| {
             let _ = store::update_message_tool_calls(
-                &db,
+                conn,
                 &assistant_id,
                 &Value::Array(tc_json),
                 &result.content,
                 Some(&usage),
             );
             if !result.reasoning.is_empty() {
-                let _ = store::update_message_reasoning(&db, &assistant_id, &result.reasoning);
+                let _ = store::update_message_reasoning(conn, &assistant_id, &result.reasoning);
             }
-        }
-        let final_msg = {
-            let db = state.db.lock().unwrap();
-            store::get_message(&db, &assistant_id).ok().flatten()
-        };
+            store::get_message(conn, &assistant_id)
+        }).ok().flatten();
         if let Some(m) = final_msg {
             let _ = app.emit("message:final", &m);
         }
@@ -2262,10 +2282,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                     subprocess_id: None,
                     reverted_at: None,
                 };
-                {
-                    let db = state.db.lock().unwrap();
-                    let _ = store::insert_tool_event(&db, &ev);
-                }
+                let _ = state.with_session_db(session_id, |conn| store::insert_tool_event(conn, &ev));
                 emit_tool(app, session_id, &ev);
                 ("denied".into(), reason)
             } else {
@@ -2336,35 +2353,30 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             }
 
             // 工具结果作为 tool 消息进入上下文
-            let tool_msg = {
-                let db = state.db.lock().unwrap();
-                let tool_attachments = if (ctc.name == "recognize_image" || result_text.contains("<!-- MULTIMODAL_IMAGE_DIRECT:")) && status == "success" {
-                    if let Some(start) = result_text.find("<!-- MULTIMODAL_IMAGE_DIRECT:") {
-                        let rest = &result_text[start + "<!-- MULTIMODAL_IMAGE_DIRECT:".len()..];
-                        if let Some(end) = rest.find(" -->") {
-                            let img_path = rest[..end].trim();
-                            let p = std::path::Path::new(img_path);
-                            if let Ok(meta) = std::fs::metadata(p) {
-                                let name = p.file_name().and_then(|f| f.to_str()).unwrap_or("image.png").to_string();
-                                let ext = p.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()).unwrap_or_default();
-                                let mime = match ext.as_str() {
-                                    "jpg" | "jpeg" => "image/jpeg",
-                                    "webp" => "image/webp",
-                                    "gif" => "image/gif",
-                                    "svg" => "image/svg+xml",
-                                    _ => "image/png",
-                                };
-                                Some(vec![crate::models::Attachment {
-                                    id: uuid::Uuid::new_v4().to_string(),
-                                    name,
-                                    mime_type: mime.to_string(),
-                                    size: meta.len(),
-                                    path: img_path.to_string(),
-                                    is_image: true,
-                                }])
-                            } else {
-                                None
-                            }
+            let tool_attachments = if (ctc.name == "recognize_image" || result_text.contains("<!-- MULTIMODAL_IMAGE_DIRECT:")) && status == "success" {
+                if let Some(start) = result_text.find("<!-- MULTIMODAL_IMAGE_DIRECT:") {
+                    let rest = &result_text[start + "<!-- MULTIMODAL_IMAGE_DIRECT:".len()..];
+                    if let Some(end) = rest.find(" -->") {
+                        let img_path = rest[..end].trim();
+                        let p = std::path::Path::new(img_path);
+                        if let Ok(meta) = std::fs::metadata(p) {
+                            let name = p.file_name().and_then(|f| f.to_str()).unwrap_or("image.png").to_string();
+                            let ext = p.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()).unwrap_or_default();
+                            let mime = match ext.as_str() {
+                                "jpg" | "jpeg" => "image/jpeg",
+                                "webp" => "image/webp",
+                                "gif" => "image/gif",
+                                "svg" => "image/svg+xml",
+                                _ => "image/png",
+                            };
+                            Some(vec![crate::models::Attachment {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                name,
+                                mime_type: mime.to_string(),
+                                size: meta.len(),
+                                path: img_path.to_string(),
+                                is_image: true,
+                            }])
                         } else {
                             None
                         }
@@ -2373,16 +2385,21 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                     }
                 } else {
                     None
-                };
-                let normalized_result = crate::context::normalize_tool_output_for_ingress(&ctc.name, &result_text);
-                let r = store::new_message_with_attachments(&db, session_id, "tool", Some(normalized_result), tool_attachments, false, None);
+                }
+            } else {
+                None
+            };
+            let normalized_result = crate::context::normalize_tool_output_for_ingress(&ctc.name, &result_text);
+            let tool_msg = state.with_session_db(session_id, |conn| {
+                let r = store::new_message_with_attachments(conn, session_id, "tool", Some(normalized_result), tool_attachments, false, None);
                 if let Ok(ref m) = r {
-                    let _ = store::set_message_tool_call_id(&db, &m.id, &ctc.call_id);
+                    let _ = store::set_message_tool_call_id(conn, &m.id, &ctc.call_id);
                 }
                 r
-            };
-            if let Ok(m) = tool_msg {
-                let _ = app.emit("message:final", &m);
+            });
+            if let Ok(ref m) = tool_msg {
+                state.cache_message_session(&m.id, session_id);
+                let _ = app.emit("message:final", m);
             }
             if (ctc.name == "write_file" || ctc.name == "edit_file" || ctc.name == "apply_diff") && status == "success" {
                 files_modified = true;
@@ -2505,7 +2522,7 @@ async fn handle_tool_call(
                     || s.session_type == "collaborator"
                     || s.parent_session_id.is_some()
             }).unwrap_or(false);
-            let intent_status = evaluate_intent_gate(&db, session_id);
+            let intent_status = state.with_session_db(session_id, |conn| Ok(evaluate_intent_gate(conn, session_id))).unwrap_or_default();
             (sub, sop_enabled, intent_status.is_satisfied())
         };
         if is_sop_enabled && !is_intent_satisfied {
@@ -2516,10 +2533,7 @@ async fn handle_tool_call(
             };
             ev.status = "failed".into();
             ev.result_text = Some(reason.clone());
-            {
-                let db = state.db.lock().unwrap();
-                let _ = store::insert_tool_event(&db, &ev);
-            }
+            let _ = state.with_session_db(session_id, |conn| store::insert_tool_event(conn, &ev));
             emit_tool(app, session_id, &ev);
             return ("failed".into(), reason);
         }
@@ -2529,10 +2543,7 @@ async fn handle_tool_call(
         ev.status = "failed".into();
         let reason = format!("工具已在设置中禁用: {}", ctc.name);
         ev.result_text = Some(reason.clone());
-        {
-            let db = state.db.lock().unwrap();
-            let _ = store::insert_tool_event(&db, &ev);
-        }
+        let _ = state.with_session_db(session_id, |conn| store::insert_tool_event(conn, &ev));
         emit_tool(app, session_id, &ev);
         return ("failed".into(), reason);
     }
@@ -2541,10 +2552,7 @@ async fn handle_tool_call(
         ev.status = "failed".into();
         let reason = format!("未知工具: {}", ctc.name);
         ev.result_text = Some(reason.clone());
-        {
-            let db = state.db.lock().unwrap();
-            let _ = store::insert_tool_event(&db, &ev);
-        }
+        let _ = state.with_session_db(session_id, |conn| store::insert_tool_event(conn, &ev));
         emit_tool(app, session_id, &ev);
         return ("failed".into(), reason);
     };
@@ -2565,10 +2573,7 @@ async fn handle_tool_call(
         ev.status = "failed".into();
         let reason = format!("【工具作用域拦截】：当前子任务会话不支持调用主会话专属工具 `{}`", ctc.name);
         ev.result_text = Some(reason.clone());
-        {
-            let db = state.db.lock().unwrap();
-            let _ = store::insert_tool_event(&db, &ev);
-        }
+        let _ = state.with_session_db(session_id, |conn| store::insert_tool_event(conn, &ev));
         emit_tool(app, session_id, &ev);
         return ("failed".into(), reason);
     }
@@ -2576,27 +2581,21 @@ async fn handle_tool_call(
         ev.status = "failed".into();
         let reason = format!("【工具作用域拦截】：主会话不支持调用子任务专属工具 `{}`", ctc.name);
         ev.result_text = Some(reason.clone());
-        {
-            let db = state.db.lock().unwrap();
-            let _ = store::insert_tool_event(&db, &ev);
-        }
+        let _ = state.with_session_db(session_id, |conn| store::insert_tool_event(conn, &ev));
         emit_tool(app, session_id, &ev);
         return ("failed".into(), reason);
     }
 
     // ---- 策略引擎安全评估（访问模式、安全域、规则判定） ----
-    let (access_mode, session_rules) = {
+    let access_mode = {
         let db = state.db.lock().unwrap();
-        let mode = store::get_session(&db, session_id)
+        store::get_session(&db, session_id)
             .ok()
             .flatten()
             .and_then(|s| s.access_mode)
-            .unwrap_or_else(|| "confirm".into());
-        (
-            mode,
-            store::list_session_rules(&db, session_id).unwrap_or_default(),
-        )
+            .unwrap_or_else(|| "confirm".into())
     };
+    let session_rules = state.with_session_db(session_id, |conn| store::list_session_rules(conn, session_id)).unwrap_or_default();
 
     let policy_decision = crate::policy::PolicyEngine::evaluate(
         &crate::policy::ToolInvocation {
@@ -2620,10 +2619,7 @@ async fn handle_tool_call(
         crate::policy::PolicyDecision::Deny { reason } => {
             ev.status = "failed".into();
             ev.result_text = Some(reason.clone());
-            {
-                let db = state.db.lock().unwrap();
-                let _ = store::insert_tool_event(&db, &ev);
-            }
+            let _ = state.with_session_db(session_id, |conn| store::insert_tool_event(conn, &ev));
             emit_tool(app, session_id, &ev);
             return ("failed".into(), reason);
         }
@@ -2642,10 +2638,7 @@ async fn handle_tool_call(
     if scope.is_none() {
         ev.status = "pending_approval".into();
         ev.approval_scope = None;
-        {
-            let db = state.db.lock().unwrap();
-            let _ = store::insert_tool_event(&db, &ev);
-        }
+        let _ = state.with_session_db(session_id, |conn| store::insert_tool_event(conn, &ev));
         already_inserted = true;
         emit_tool(app, session_id, &ev);
 
@@ -2683,26 +2676,19 @@ async fn handle_tool_call(
                 );
                 ev.status = "denied".into();
                 ev.result_text = Some(text.clone());
-                {
-                    let db = state.db.lock().unwrap();
-                    let _ = store::update_tool_event(&db, &ev.id, "denied", Some(&text), Some("denied"));
-                }
+                let _ = state.with_session_db(session_id, |conn| store::update_tool_event(conn, &ev.id, "denied", Some(&text), Some("denied")));
                 emit_tool(app, session_id, &ev);
                 return ("denied".into(), text);
             }
             d => {
                 ev.approval_scope = Some(d.scope_str().into());
-                // 记忆放行规则：「本会话允许」把规则写入当前对话并落库，
-                // 仅对该对话生效、重启后仍保留
                 if let Decision::AllowSession = d {
                     let (kind, pattern) = approval::rule_for(&ctc.name, &ctc.params);
                     if !pattern.is_empty() {
-                        let rules = {
-                            let db = state.db.lock().unwrap();
-                            let _ = store::add_session_rule(&db, session_id, &kind, &pattern);
-                            store::list_session_rules(&db, session_id).unwrap_or_default()
-                        };
-                        // 通知前端刷新该对话的规则列表
+                        let rules = state.with_session_db(session_id, |conn| {
+                            let _ = store::add_session_rule(conn, session_id, &kind, &pattern);
+                            store::list_session_rules(conn, session_id)
+                        }).unwrap_or_default();
                         emit_session_rules(app, session_id, &rules);
                     }
                 }
@@ -2715,14 +2701,13 @@ async fn handle_tool_call(
     if ev.approval_scope.is_none() {
         ev.approval_scope = scope.map(|s| s.to_string());
     }
-    {
-        let db = state.db.lock().unwrap();
+    let _ = state.with_session_db(session_id, |conn| {
         if already_inserted {
-            let _ = store::update_tool_event(&db, &ev.id, "running", None, ev.approval_scope.as_deref());
+            store::update_tool_event(conn, &ev.id, "running", None, ev.approval_scope.as_deref())
         } else {
-            let _ = store::insert_tool_event(&db, &ev);
+            store::insert_tool_event(conn, &ev)
         }
-    }
+    });
     state.snapshot.start_tool_executing(session_id, &ctc.call_id, &ctc.name, &ev.id);
     emit_tool(app, session_id, &ev);
 
@@ -2915,17 +2900,18 @@ async fn handle_tool_call(
             ev.result_text = Some(text.clone());
             ev.approval_scope = None;
             {
-                let db = state.db.lock().unwrap();
                 let params_str = serde_json::to_string(&ev.params).ok();
-                let _ = store::update_tool_event_full(
-                    &db,
-                    &ev.id,
-                    "pending_approval",
-                    Some(&text),
-                    None,
-                    detected_sub_id.as_deref().or(ev.subprocess_id.as_deref()),
-                    params_str.as_deref(),
-                );
+                let _ = state.with_session_db(session_id, |conn| {
+                    store::update_tool_event_full(
+                        conn,
+                        &ev.id,
+                        "pending_approval",
+                        Some(&text),
+                        None,
+                        detected_sub_id.as_deref().or(ev.subprocess_id.as_deref()),
+                        params_str.as_deref(),
+                    )
+                });
             }
             emit_tool(app, session_id, &ev);
 
@@ -2993,26 +2979,25 @@ async fn handle_tool_call(
     ev.status = status.clone();
     ev.result_text = Some(text.clone());
     {
-        let db = state.db.lock().unwrap();
-        // todo 工具：保存会话任务清单快照
-        if ctc.name == "todo" && status == "success" {
-            let _ = store::set_kv(&db, session_id, "todos", &ctc.params.to_string());
-        }
         let params_str = serde_json::to_string(&ev.params).ok();
-        let _ = store::update_tool_event_full(
-            &db,
-            &ev.id,
-            &status,
-            Some(&text),
-            None,
-            detected_sub_id.as_deref().or(ev.subprocess_id.as_deref()),
-            params_str.as_deref(),
-        );
+        let _ = state.with_session_db(session_id, |conn| {
+            if ctc.name == "todo" && status == "success" {
+                let _ = store::set_kv(conn, session_id, "todos", &ctc.params.to_string());
+            }
+            store::update_tool_event_full(
+                conn,
+                &ev.id,
+                &status,
+                Some(&text),
+                None,
+                detected_sub_id.as_deref().or(ev.subprocess_id.as_deref()),
+                params_str.as_deref(),
+            )
+        });
     }
     emit_tool_with(app, session_id, &ev, json!({ "elapsedMs": elapsed }));
     if matches!(ctc.name.as_str(), "todo" | "create_plan" | "update_plan" | "switch_plan") && status == "success" {
-        let db = state.db.lock().unwrap();
-        crate::plan::emit_board_updated(app, &db, session_id);
+        crate::plan::emit_board_updated(app, &state, session_id);
     }
     (status, text)
 }
@@ -3020,20 +3005,17 @@ async fn handle_tool_call(
 /// 对话正常完成交付时调用：将任务清单（内存/KV todos 及最近的 todo 工具事件）中仍处于 in_progress 或 pending 的任务标记为 done 并持久化，同时广播更新。
 /// 注意：物理方案文档（.harness/plans/*.md）拥有独立完整的生命周期与分步执行管理，严禁在此自动批量标记完成。
 pub fn auto_finish_session_todos(state: &crate::AppState, app: &AppHandle, session_id: &str) {
-    let db = state.db.lock().unwrap();
-    let raw: Option<String> = store::get_kv(&db, session_id, "todos").ok().flatten();
+    let raw: Option<String> = state.with_session_db(session_id, |conn| store::get_kv(conn, session_id, "todos")).ok().flatten();
     let mut val: Option<Value> = raw.and_then(|r| serde_json::from_str(&r).ok());
 
-    // 若 session_kv 中未找到，尝试从最近的 todo tool event 中获取
     if val.is_none() {
-        let ev_params: Option<String> = db
-            .query_row(
+        let ev_params: Option<String> = state.with_session_db(session_id, |conn| {
+            conn.query_row(
                 "SELECT te.params_json FROM tool_events te JOIN messages m ON te.message_id = m.id WHERE m.session_id = ?1 AND te.tool_name = 'todo' ORDER BY te.created_at DESC LIMIT 1",
                 rusqlite::params![session_id],
                 |r| r.get(0),
-            )
-            .ok()
-            .flatten();
+            ).map_err(|e| e.to_string())
+        }).ok();
         if let Some(p) = ev_params {
             val = serde_json::from_str(&p).ok();
         }
@@ -3052,7 +3034,7 @@ pub fn auto_finish_session_todos(state: &crate::AppState, app: &AppHandle, sessi
     }
     if changed {
         let new_raw = val.to_string();
-        let _ = store::set_kv(&db, session_id, "todos", &new_raw);
+        let _ = state.with_session_db(session_id, |conn| store::set_kv(conn, session_id, "todos", &new_raw));
         if let Some(todos) = val.get("todos") {
             let _ = app.emit(
                 "session:todos",
@@ -3063,34 +3045,42 @@ pub fn auto_finish_session_todos(state: &crate::AppState, app: &AppHandle, sessi
             );
         }
 
-        // 同步更新最近的 todo 工具事件 params_json，并广播 tool:update，使前端卡片与历史记录保持一致
-        let last_todo_ev_id: Option<String> = db
-            .query_row(
+        let last_todo_ev_id: Option<String> = state.with_session_db(session_id, |conn| {
+            conn.query_row(
                 "SELECT te.id FROM tool_events te JOIN messages m ON te.message_id = m.id WHERE m.session_id = ?1 AND te.tool_name = 'todo' ORDER BY te.created_at DESC LIMIT 1",
                 rusqlite::params![session_id],
                 |r| r.get(0),
-            )
-            .ok();
+            ).map_err(|e| e.to_string())
+        }).ok();
         if let Some(ref ev_id) = last_todo_ev_id {
-            let _ = store::update_tool_event_full(
-                &db,
-                ev_id,
-                "success",
-                None,
-                None,
-                None,
-                Some(&new_raw),
-            );
-            if let Ok(Some((ev, _))) = store::get_tool_event_with_session(&db, ev_id) {
+            let ev_opt = state.with_session_db(session_id, |conn| {
+                let _ = store::update_tool_event_full(
+                    conn,
+                    ev_id,
+                    "success",
+                    None,
+                    None,
+                    None,
+                    Some(&new_raw),
+                );
+                store::get_tool_event_with_session(conn, ev_id)
+            }).ok().flatten();
+            if let Some((ev, _)) = ev_opt {
                 emit_tool(app, session_id, &ev);
             }
         }
     }
 
-    // 检查当前物理方案：若步骤已全部标记为 done，自动结案为 completed
-    if let Ok(Some(sess)) = store::get_session(&db, session_id) {
+    let sess_opt = {
+        let db = state.db.lock().unwrap();
+        store::get_session(&db, session_id).ok().flatten()
+    };
+    if let Some(sess) = sess_opt {
         let ws = std::path::Path::new(&sess.workspace_path);
-        if let Some((path, mut meta, body)) = crate::plan::find_plan_file(ws, session_id, None, Some(&db)) {
+        let find_res = state.with_session_db(session_id, |conn| {
+            Ok(crate::plan::find_plan_file(ws, session_id, None, Some(conn)))
+        }).unwrap_or(None);
+        if let Some((path, mut meta, body)) = find_res {
             if meta.status == "in_progress" {
                 let steps = crate::plan::parse_steps_from_markdown(&body);
                 if !steps.is_empty() && steps.iter().all(|s| s.status == "done") {
@@ -3103,13 +3093,12 @@ pub fn auto_finish_session_todos(state: &crate::AppState, app: &AppHandle, sessi
         }
     }
 
-    crate::plan::emit_board_updated(app, &db, session_id);
+    crate::plan::emit_board_updated(app, state, session_id);
 }
 
 /// 用户手动停止会话时调用：将仍处于 in_progress 的任务重置为 pending 并持久化，同时广播更新
 pub fn stop_session_todos(state: &crate::AppState, app: &AppHandle, session_id: &str) {
-    let db = state.db.lock().unwrap();
-    let raw: Option<String> = store::get_kv(&db, session_id, "todos").ok().flatten();
+    let raw: Option<String> = state.with_session_db(session_id, |conn| store::get_kv(conn, session_id, "todos")).ok().flatten();
     let Some(raw_str) = raw else { return };
     let Ok(mut val) = serde_json::from_str::<Value>(&raw_str) else { return };
     let Some(todos_arr) = val.get_mut("todos").and_then(|v| v.as_array_mut()) else { return };
@@ -3123,7 +3112,7 @@ pub fn stop_session_todos(state: &crate::AppState, app: &AppHandle, session_id: 
     }
     if changed {
         let new_raw = val.to_string();
-        let _ = store::set_kv(&db, session_id, "todos", &new_raw);
+        let _ = state.with_session_db(session_id, |conn| store::set_kv(conn, session_id, "todos", &new_raw));
         if let Some(todos) = val.get("todos") {
             let _ = app.emit(
                 "session:todos",
@@ -3134,31 +3123,33 @@ pub fn stop_session_todos(state: &crate::AppState, app: &AppHandle, session_id: 
             );
         }
 
-        // 同步更新最近的 todo 工具事件 params_json，并广播 tool:update
-        let last_todo_ev_id: Option<String> = db
-            .query_row(
+        let last_todo_ev_id: Option<String> = state.with_session_db(session_id, |conn| {
+            conn.query_row(
                 "SELECT te.id FROM tool_events te JOIN messages m ON te.message_id = m.id WHERE m.session_id = ?1 AND te.tool_name = 'todo' ORDER BY te.created_at DESC LIMIT 1",
                 rusqlite::params![session_id],
                 |r| r.get(0),
-            )
-            .ok();
+            ).map_err(|e| e.to_string())
+        }).ok();
         if let Some(ref ev_id) = last_todo_ev_id {
-            let _ = store::update_tool_event_full(
-                &db,
-                ev_id,
-                "success",
-                None,
-                None,
-                None,
-                Some(&new_raw),
-            );
-            if let Ok(Some((ev, _))) = store::get_tool_event_with_session(&db, ev_id) {
+            let ev_opt = state.with_session_db(session_id, |conn| {
+                let _ = store::update_tool_event_full(
+                    conn,
+                    ev_id,
+                    "success",
+                    None,
+                    None,
+                    None,
+                    Some(&new_raw),
+                );
+                store::get_tool_event_with_session(conn, ev_id)
+            }).ok().flatten();
+            if let Some((ev, _)) = ev_opt {
                 emit_tool(app, session_id, &ev);
             }
         }
     }
 
-    crate::plan::emit_board_updated(app, &db, session_id);
+    crate::plan::emit_board_updated(app, state, session_id);
 }
 
 
@@ -3246,24 +3237,21 @@ fn emit_tool_with(app: &AppHandle, session_id: &str, ev: &ToolEvent, extra: Valu
 }
 
 fn emit_error(app: &AppHandle, session_id: &str, kind: &str, message: String) {
-    // 1) 清理本次运行遗留的空 assistant 占位消息（避免留白）
-    {
-        let state = app.state::<crate::AppState>();
-        let db = state.db.lock().unwrap();
-          let _ = db.execute(
+    let state = app.state::<crate::AppState>();
+    let _ = state.with_session_db(session_id, |conn| {
+        let _ = conn.execute(
             "DELETE FROM messages WHERE session_id = ?1 AND role = 'assistant'
                  AND (content IS NULL OR content = '')
                  AND (reasoning IS NULL OR reasoning = '')
                  AND tool_calls_json IS NULL",
             rusqlite::params![session_id],
         );
-        // 2) 错误以 system 消息持久化进对话流（前端渲染为错误卡片）
-        if let Ok(m) = store::new_message(&db, session_id, "system", Some(format!("⚠️ {message}")), false) {
-            drop(db);
+        if let Ok(m) = store::new_message(conn, session_id, "system", Some(format!("⚠️ {message}")), false) {
+            state.cache_message_session(&m.id, session_id);
             let _ = app.emit("message:final", &m);
         }
-    }
-    // 3) 同时推送 toast 事件
+        Ok::<(), String>(())
+    });
     let _ = app.emit(
         "error",
         json!({"sessionId": session_id, "kind": kind, "message": message}),

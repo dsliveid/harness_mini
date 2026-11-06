@@ -951,6 +951,15 @@ export interface ReapplyResult {
   message: string;
 }
 
+/** 删除已撤回内容（物理删除，不可恢复）的结果统计 */
+export interface PurgeResult {
+  deletedMessages: number;
+  deletedToolEvents: number;
+  deletedSnapshots: number;
+  deletedRuns: number;
+  deletedBlobs: number;
+}
+
 export interface QueuedItem {
   id: string;
   content: string;

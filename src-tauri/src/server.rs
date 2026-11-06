@@ -312,7 +312,7 @@ pub async fn dispatch_rpc(
         }
         "delete_session" => {
             let id = params.get("id").and_then(|v| v.as_str()).ok_or("缺少 id")?.to_string();
-            commands::delete_session(st, app.clone(), id)?;
+            commands::delete_session(app.clone(), id).await?;
             Ok(Value::Null)
         }
         "archive_session" => {

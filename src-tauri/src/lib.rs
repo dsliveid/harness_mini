@@ -83,9 +83,145 @@ pub struct AppState {
     pub snapshot: snapshot::SnapshotStore,
     pub event_bus: tokio::sync::broadcast::Sender<(String, serde_json::Value)>,
     pub file_viewer_init_tab: Mutex<Option<serde_json::Value>>,
+    pub session_pool: crate::session_bundle::SessionPool,
+    pub message_session_cache: Mutex<HashMap<String, String>>,
 }
 
 impl AppState {
+    /// 执行会话专属库操作。统一调度会话连接池与物理库隔离
+    pub fn with_session_db<F, R>(&self, session_id: &str, f: F) -> Result<R, String>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<R, String>,
+    {
+        let data_dir_opt = self.data_dir.lock().unwrap().clone();
+        if let Some(ref data_dir) = data_dir_opt {
+            let bundle = crate::session_bundle::SessionBundle::new(session_id, data_dir);
+            if bundle.is_archived() {
+                if let Ok(conn) = bundle.open_db_readonly() {
+                    return f(&conn);
+                }
+            }
+            let conn_arc = self.session_pool.get_or_open(data_dir, session_id)?;
+            let conn = conn_arc.lock().unwrap();
+            return f(&conn);
+        }
+        let catalog_db = self.db.lock().unwrap();
+        f(&catalog_db)
+    }
+
+    pub fn cache_message_session(&self, message_id: &str, session_id: &str) {
+        if let Ok(mut cache) = self.message_session_cache.lock() {
+            cache.insert(message_id.to_string(), session_id.to_string());
+        }
+    }
+
+    /// 根据 message_id 定位其所属会话 ID（优先查缓存，再查活跃连接池，最后扫描物理分库）
+    pub fn find_session_by_message_id(&self, message_id: &str) -> Option<String> {
+        if let Ok(cache) = self.message_session_cache.lock() {
+            if let Some(sid) = cache.get(message_id) {
+                return Some(sid.clone());
+            }
+        }
+
+        // 检查活跃连接池中的各会话库
+        let active_sids = self.session_pool.active_session_ids();
+        for sid in &active_sids {
+            let res: Result<bool, _> = self.with_session_db(sid, |conn| {
+                conn.query_row("SELECT 1 FROM messages WHERE id = ?1", rusqlite::params![message_id], |_| Ok(true)).map_err(|e| e.to_string())
+            });
+            if res.unwrap_or(false) {
+                self.cache_message_session(message_id, sid);
+                return Some(sid.clone());
+            }
+        }
+
+        // 检查 catalog 主库（针对尚未迁移的旧数据或单表模式）
+        let cat_res: Option<String> = {
+            if let Ok(db) = self.db.lock() {
+                db.query_row("SELECT session_id FROM messages WHERE id = ?1", rusqlite::params![message_id], |r| r.get(0)).ok()
+            } else {
+                None
+            }
+        };
+        if let Some(ref sid) = cat_res {
+            self.cache_message_session(message_id, sid);
+            return cat_res;
+        }
+
+        // 扫描 sessions/ 目录
+        let data_dir_opt = self.data_dir.lock().unwrap().clone();
+        if let Some(ref data_dir) = data_dir_opt {
+            let sessions_dir = data_dir.join("sessions");
+            if let Ok(entries) = std::fs::read_dir(sessions_dir) {
+                for entry in entries.flatten() {
+                    let sid = entry.file_name().to_string_lossy().to_string();
+                    let res: Result<bool, _> = self.with_session_db(&sid, |conn| {
+                        conn.query_row("SELECT 1 FROM messages WHERE id = ?1", rusqlite::params![message_id], |_| Ok(true)).map_err(|e| e.to_string())
+                    });
+                    if res.unwrap_or(false) {
+                        self.cache_message_session(message_id, &sid);
+                        return Some(sid);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// 根据 tool_event_id 定位其所属会话 ID
+    pub fn find_session_by_tool_event_id(&self, tool_event_id: &str) -> Option<String> {
+        let active_sids = self.session_pool.active_session_ids();
+        for sid in &active_sids {
+            let res: Result<bool, _> = self.with_session_db(sid, |conn| {
+                conn.query_row(
+                    "SELECT 1 FROM tool_file_snapshots WHERE tool_event_id = ?1 UNION ALL SELECT 1 FROM tool_events WHERE id = ?1 LIMIT 1",
+                    rusqlite::params![tool_event_id],
+                    |_| Ok(true),
+                ).map_err(|e| e.to_string())
+            });
+            if res.unwrap_or(false) {
+                return Some(sid.clone());
+            }
+        }
+
+        let cat_res: Option<String> = {
+            if let Ok(db) = self.db.lock() {
+                db.query_row(
+                    "SELECT session_id FROM tool_file_snapshots WHERE tool_event_id = ?1 LIMIT 1",
+                    rusqlite::params![tool_event_id],
+                    |r| r.get(0),
+                ).ok()
+            } else {
+                None
+            }
+        };
+        if cat_res.is_some() {
+            return cat_res;
+        }
+
+        let data_dir_opt = self.data_dir.lock().unwrap().clone();
+        if let Some(ref data_dir) = data_dir_opt {
+            let sessions_dir = data_dir.join("sessions");
+            if let Ok(entries) = std::fs::read_dir(sessions_dir) {
+                for entry in entries.flatten() {
+                    let sid = entry.file_name().to_string_lossy().to_string();
+                    let res: Result<bool, _> = self.with_session_db(&sid, |conn| {
+                        conn.query_row(
+                            "SELECT 1 FROM tool_file_snapshots WHERE tool_event_id = ?1 UNION ALL SELECT 1 FROM tool_events WHERE id = ?1 LIMIT 1",
+                            rusqlite::params![tool_event_id],
+                            |_| Ok(true),
+                        ).map_err(|e| e.to_string())
+                    });
+                    if res.unwrap_or(false) {
+                        return Some(sid);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
     pub fn emit(&self, event: &str, payload: &impl serde::Serialize) {
         if let Ok(val) = serde_json::to_value(payload) {
             self.update_snapshot(event, &val);
@@ -309,10 +445,34 @@ pub fn run() {
                 snapshot: snapshot::SnapshotStore::new(),
                 event_bus,
                 file_viewer_init_tab: Mutex::new(None),
+                session_pool: crate::session_bundle::SessionPool::new(),
+                message_session_cache: Mutex::new(HashMap::new()),
             };
             app.manage(state);
             let handle = app.handle().clone();
             let _ = app.state::<AppState>().app.set(handle);
+
+            // 自动无损分库迁移：若 Catalog 库中仍残留存量消息表数据，自动在启动时迁移至 sessions/{id}/session.db
+            if let Some(ref d) = data_dir {
+                let db_path = d.join("harness_mini.db");
+                let state_ref = app.state::<AppState>();
+                let should_migrate = {
+                    let db = state_ref.db.lock().unwrap();
+                    let has_legacy_msgs: bool = db
+                        .query_row("SELECT 1 FROM messages LIMIT 1", [], |_| Ok(true))
+                        .unwrap_or(false);
+                    has_legacy_msgs
+                };
+                if should_migrate {
+                    let db = state_ref.db.lock().unwrap();
+                    if let Ok(report) = crate::session_bundle::migrate_all_sessions(&db, &db_path, d) {
+                        eprintln!(
+                            "[Startup Migration] 完成分库自动迁移: 总计 {} 会话，成功 {}，跳过 {}，错误数 {}",
+                            report.total_sessions, report.migrated_sessions, report.skipped_sessions, report.errors.len()
+                        );
+                    }
+                }
+            }
 
             // 初始化并加载启用的 MCP Servers
             let mcp_app_handle = app.handle().clone();
@@ -524,6 +684,7 @@ pub fn run() {
             commands::update_task_subtasks,
             commands::revert_to_message,
             commands::reapply_from_message,
+            commands::purge_withdrawn_messages,
             commands::revert_message_turn,
             commands::reapply_message_turn,
             commands::revert_tool_event,

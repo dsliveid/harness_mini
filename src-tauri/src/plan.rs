@@ -1470,12 +1470,22 @@ pub fn derive_current_board(
 /// 向前端广播最新的权威看板状态
 pub fn emit_board_updated(
     app: &tauri::AppHandle,
-    db: &rusqlite::Connection,
+    state: &crate::AppState,
     session_id: &str,
 ) {
-    if let Ok(Some(session)) = crate::store::get_session(db, session_id) {
-        let ws = Path::new(&session.workspace_path);
-        let board = derive_current_board(db, ws, session_id);
+    let ws_opt = {
+        let db = state.db.lock().unwrap();
+        crate::store::get_session(&db, session_id)
+            .ok()
+            .flatten()
+            .map(|s| PathBuf::from(s.workspace_path))
+    };
+    if let Some(ws) = ws_opt {
+        let board = state
+            .with_session_db(session_id, |conn| {
+                Ok(derive_current_board(conn, &ws, session_id))
+            })
+            .unwrap_or(None);
         let _ = app.emit(
             "board:updated",
             serde_json::json!({

@@ -54,13 +54,13 @@ pub fn migrate_single_session(
             id, session_id, run_id, seq, role, content, reasoning,
             tool_calls_json, tool_call_id, queued, usage_json, created_at,
             prompt_tokens, completion_tokens, total_tokens, cached_tokens,
-            is_estimated, duration_ms, turn_duration_ms, attachments_json, reverted_at
+            is_estimated, duration_ms, turn_duration_ms, attachments_json, reverted_at, runtime_anchor
         )
         SELECT
             id, session_id, run_id, seq, role, content, reasoning,
             tool_calls_json, tool_call_id, queued, usage_json, created_at,
             prompt_tokens, completion_tokens, total_tokens, cached_tokens,
-            is_estimated, duration_ms, turn_duration_ms, attachments_json, reverted_at
+            is_estimated, duration_ms, turn_duration_ms, attachments_json, reverted_at, runtime_anchor
         FROM catalog_source.messages
         WHERE session_id = ?1;",
         params![session_id],
@@ -168,6 +168,32 @@ pub fn migrate_single_session(
     )
     .map_err(|e| format!("迁移 runs 失败: {e}"))?;
 
+
+    // 检查源库是否存在 llm_requests 表
+    let has_llm_requests: bool = tx
+        .query_row(
+            "SELECT 1 FROM catalog_source.sqlite_master WHERE type='table' AND name='llm_requests';",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    if has_llm_requests {
+        // 实施选项 A：迁移 LLM 请求审计时保留模型、端点与时间戳元数据，丢弃重复膨胀的 payload_json
+        tx.execute(
+            "INSERT INTO llm_requests (
+                id, session_id, message_id, run_id, model, endpoint, payload_json, created_at
+            )
+            SELECT
+                id, session_id, message_id, run_id, model, endpoint,
+                '{\"migrated\":true,\"lean\":true}',
+                created_at
+            FROM catalog_source.llm_requests
+            WHERE session_id = ?1;",
+            params![session_id],
+        )
+        .map_err(|e| format!("迁移 llm_requests 失败: {e}"))?;
+    }
     // 3. 校验写入目标库的消息数量，不一致则绝对禁止清理源数据
     let dst_msg_count: i64 = tx
         .query_row(
@@ -235,6 +261,10 @@ pub fn migrate_single_session(
         "DELETE FROM runs WHERE session_id = ?1;",
         params![session_id],
     );
+    let _ = catalog_conn.execute(
+        "DELETE FROM llm_requests WHERE session_id = ?1;",
+        params![session_id],
+    );
 
     Ok(true)
 }
@@ -255,6 +285,18 @@ pub fn migrate_all_sessions(
         .filter_map(|r| r.ok())
         .collect();
 
+    // 先汇总历史 token 统计到 catalog 的 daily_token_stats 表中（确保分库后 token 统计报表毫秒级可用且完整保留历史）
+    let _ = catalog_conn.execute(
+        "INSERT OR REPLACE INTO daily_token_stats (date, session_id, project_id, prompt_tokens, completion_tokens, total_tokens, cached_tokens)
+         SELECT substr(m.created_at, 1, 10), m.session_id, s.project_id,
+                COALESCE(SUM(m.prompt_tokens), 0), COALESCE(SUM(m.completion_tokens), 0),
+                COALESCE(SUM(m.total_tokens), 0), COALESCE(SUM(m.cached_tokens), 0)
+         FROM messages m JOIN sessions s ON s.id = m.session_id
+         WHERE m.role = 'assistant'
+         GROUP BY substr(m.created_at, 1, 10), m.session_id;",
+        [],
+    );
+
     let total = session_ids.len();
     let mut migrated = 0;
     let mut skipped = 0;
@@ -270,6 +312,16 @@ pub fn migrate_all_sessions(
 
     // 全部迁移成功后，触发主库 VACUUM 回收空间，主库瞬间缩减为轻量 Catalog
     if migrated > 0 {
+        let _ = catalog_conn.execute("DELETE FROM llm_requests;", []);
+        let _ = catalog_conn.execute("DELETE FROM messages;", []);
+        let _ = catalog_conn.execute("DELETE FROM tool_events;", []);
+        let _ = catalog_conn.execute("DELETE FROM tool_file_snapshots;", []);
+        let _ = catalog_conn.execute("DELETE FROM runs;", []);
+        let _ = catalog_conn.execute("DELETE FROM session_kv;", []);
+        let _ = catalog_conn.execute("DELETE FROM session_rules_t;", []);
+        let _ = catalog_conn.execute("DELETE FROM session_compactions;", []);
+        let _ = catalog_conn.execute("DELETE FROM long_tasks;", []);
+        let _ = catalog_conn.execute("DELETE FROM task_checkpoints;", []);
         let _ = catalog_conn.execute("VACUUM;", []);
         let _ = catalog_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);", []);
     }
@@ -321,6 +373,71 @@ mod tests {
         // 验证主库记录已清理
         let cat_msg_count: i64 = catalog_conn.query_row("SELECT count(*) FROM messages WHERE session_id = ?1", params![s.id], |r| r.get(0)).unwrap();
         assert_eq!(cat_msg_count, 0);
+
+        drop(bundle_conn);
+        drop(catalog_conn);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_migrate_all_sessions_option_a_lean() {
+        let temp_dir = std::env::temp_dir().join(format!("hm_mig_all_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let catalog_path = temp_dir.join("harness_mini.db");
+        let catalog_conn = Connection::open(&catalog_path).unwrap();
+        crate::store::init_schema(&catalog_conn).unwrap();
+
+        let s = crate::store::create_session(&catalog_conn, "D:/ws", None, "全局瘦身迁移测试会话", "confirm").unwrap();
+
+        // 插入包含 token 的消息
+        catalog_conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, prompt_tokens, completion_tokens, total_tokens, cached_tokens, created_at, seq)
+             VALUES ('msg-1', ?1, 'assistant', '测试回复', 100, 200, 300, 50, datetime('now'), 1)",
+            params![s.id],
+        ).unwrap();
+
+        // 插入具有大 payload 的 llm_requests 追踪记录
+        let big_payload = "x".repeat(100_000);
+        catalog_conn.execute(
+            "INSERT INTO llm_requests (id, session_id, message_id, run_id, model, endpoint, payload_json, created_at)
+             VALUES ('req-1', ?1, 'msg-1', NULL, 'claude-3-5-sonnet', 'https://api.anthropic.com', ?2, datetime('now'))",
+            params![s.id, big_payload],
+        ).unwrap();
+
+        // 执行全库瘦身迁移
+        let report = migrate_all_sessions(&catalog_conn, &catalog_path, &temp_dir).unwrap();
+        assert_eq!(report.total_sessions, 1);
+        assert_eq!(report.migrated_sessions, 1);
+        assert!(report.errors.is_empty());
+
+        // 1. 验证 daily_token_stats 已汇总
+        let (p_tokens, c_tokens, t_tokens): (i64, i64, i64) = catalog_conn.query_row(
+            "SELECT prompt_tokens, completion_tokens, total_tokens FROM daily_token_stats WHERE session_id = ?1",
+            params![s.id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(p_tokens, 100);
+        assert_eq!(c_tokens, 200);
+        assert_eq!(t_tokens, 300);
+
+        // 2. 验证分库中 Option A 瘦身效果与元数据保留
+        let bundle = SessionBundle::new(&s.id, &temp_dir);
+        assert!(bundle.exists());
+        let bundle_conn = bundle.open_db().unwrap();
+        let (saved_model, payload): (String, String) = bundle_conn.query_row(
+            "SELECT model, payload_json FROM llm_requests WHERE session_id = ?1",
+            params![s.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(saved_model, "claude-3-5-sonnet");
+        assert_eq!(payload, r#"{"migrated":true,"lean":true}"#);
+
+        // 3. 验证主库中该会话的明细数据已被清理
+        let cat_msg_cnt: i64 = catalog_conn.query_row("SELECT count(*) FROM messages WHERE session_id = ?1", params![s.id], |r| r.get(0)).unwrap();
+        let cat_req_cnt: i64 = catalog_conn.query_row("SELECT count(*) FROM llm_requests WHERE session_id = ?1", params![s.id], |r| r.get(0)).unwrap();
+        assert_eq!(cat_msg_cnt, 0);
+        assert_eq!(cat_req_cnt, 0);
 
         drop(bundle_conn);
         drop(catalog_conn);

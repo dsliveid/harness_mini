@@ -1103,14 +1103,14 @@ pub async fn merge_space(
     let summary = apply_merge(&manifest, llm_cfg.as_ref()).await;
 
     {
-        let db = state.db.lock().unwrap();
-        let max_seq: i64 = db
-            .query_row(
+        let max_seq: i64 = state.with_session_db(session_id, |conn| {
+            conn.query_row(
                 "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE session_id = ?1",
                 [session_id],
                 |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
+            ).map_err(|e| e.to_string())
+        }).unwrap_or(0);
+        let db = state.db.lock().unwrap();
         store::set_session_merge_state(&db, session_id, Some(max_seq), true)?;
     }
     emit_session_update(state, app, session_id);
@@ -1413,14 +1413,14 @@ pub async fn merge_from_agent(
     let summary = apply_merge(&manifest, llm_cfg.as_ref()).await;
 
     {
-        let db = state.db.lock().unwrap();
-        let max_seq: i64 = db
-            .query_row(
+        let max_seq: i64 = state.with_session_db(session_id, |conn| {
+            conn.query_row(
                 "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE session_id = ?1",
                 [session_id],
                 |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
+            ).map_err(|e| e.to_string())
+        }).unwrap_or(0);
+        let db = state.db.lock().unwrap();
         store::set_session_merge_state(&db, session_id, Some(max_seq), true)?;
     }
     emit_session_update(state, app, session_id);

@@ -1,5 +1,6 @@
 use crate::models::*;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashSet;
 use std::path::Path;
 
 pub fn open_db(path: &Path) -> Result<Connection, String> {
@@ -252,6 +253,19 @@ fn init(conn: &Connection) -> Result<(), String> {
         );
         CREATE INDEX IF NOT EXISTS idx_llm_requests_msg ON llm_requests(message_id);
         CREATE INDEX IF NOT EXISTS idx_llm_requests_session ON llm_requests(session_id);
+
+        CREATE TABLE IF NOT EXISTS daily_token_stats (
+          date TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          project_id TEXT,
+          prompt_tokens INTEGER NOT NULL DEFAULT 0,
+          completion_tokens INTEGER NOT NULL DEFAULT 0,
+          total_tokens INTEGER NOT NULL DEFAULT 0,
+          cached_tokens INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (date, session_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_daily_tokens_date ON daily_token_stats(date);
+        CREATE INDEX IF NOT EXISTS idx_daily_tokens_project ON daily_token_stats(project_id);
         "#,
     )
     .map_err(|e| e.to_string())?;
@@ -519,6 +533,32 @@ pub fn increment_session_tokens(
         ],
     )
     .map_err(|e| e.to_string())?;
+
+    let now_s = now();
+    let today = if now_s.len() >= 10 { &now_s[0..10] } else { "" };
+    let proj_id: Option<String> = conn
+        .query_row("SELECT project_id FROM sessions WHERE id = ?1", params![session_id], |r| r.get(0))
+        .optional()
+        .unwrap_or(None)
+        .flatten();
+    let _ = conn.execute(
+        "INSERT INTO daily_token_stats (date, session_id, project_id, prompt_tokens, completion_tokens, total_tokens, cached_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(date, session_id) DO UPDATE SET
+           prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+           completion_tokens = completion_tokens + excluded.completion_tokens,
+           total_tokens = total_tokens + excluded.total_tokens,
+           cached_tokens = cached_tokens + excluded.cached_tokens",
+        params![
+            today,
+            session_id,
+            proj_id,
+            prompt_tokens as i64,
+            completion_tokens as i64,
+            total_tokens as i64,
+            cached_tokens as i64
+        ],
+    );
 
     let parent_id: Option<String> = conn
         .query_row(
@@ -2084,6 +2124,57 @@ mod tests {
         assert!(sanitized.contains("输出内容过长"));
         assert!(sanitized.len() < 2000);
     }
+
+    #[test]
+    fn test_queued_message_isolation_and_atomic_pop_resequence() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let s = create_session(&conn, "D:/ws", None, "测试排队时序", "confirm").unwrap();
+
+        // 1. 用户发送第 1 条指令
+        let m1 = new_message(&conn, &s.id, "user", Some("第一条任务".into()), false).unwrap();
+        assert_eq!(m1.seq, 1);
+        assert!(!m1.queued);
+
+        // 2. 模拟 Run 正在执行中，插入 Assistant 步骤 2
+        let m2 = new_message(&conn, &s.id, "assistant", Some("正在执行步骤1".into()), false).unwrap();
+        assert_eq!(m2.seq, 2);
+
+        // 3. 用户在 Run 执行期间发送一条排队消息（queued = true）
+        let q1 = new_message_with_attachments(&conn, &s.id, "user", Some("排队指令".into()), None, true, None).unwrap();
+        // 关键断言：排队消息初始 seq 必须为 0，不能占用 3！
+        assert_eq!(q1.seq, 0);
+        assert!(q1.queued);
+
+        // 4. Run 继续执行步骤 3，序号顺接 3
+        let m3 = new_message(&conn, &s.id, "assistant", Some("完成步骤1".into()), false).unwrap();
+        assert_eq!(m3.seq, 3);
+
+        // 5. 验证 get_messages 绝对不可见排队消息
+        let visible_msgs = get_messages(&conn, &s.id, None, 100).unwrap();
+        assert_eq!(visible_msgs.len(), 3);
+        assert_eq!(visible_msgs.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+
+        let queued_list = list_queued(&conn, &s.id).unwrap();
+        assert_eq!(queued_list.len(), 1);
+        assert_eq!(queued_list[0].id, q1.id);
+
+        // 6. Run 结案后，调度器调用 pop_queued 原子提取并转正
+        let popped = pop_queued(&conn, &s.id).unwrap().expect("should have queued msg");
+        assert_eq!(popped.id, q1.id);
+        assert!(!popped.queued);
+        // 关键断言：出队后原子获得最大合法序号 4！
+        assert_eq!(popped.seq, 4);
+
+        // 7. 转正后进入正式可见消息流
+        let updated_msgs = get_messages(&conn, &s.id, None, 100).unwrap();
+        assert_eq!(updated_msgs.len(), 4);
+        assert_eq!(updated_msgs.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        assert_eq!(updated_msgs.last().unwrap().id, q1.id);
+
+        // 8. 队列为空
+        assert!(pop_queued(&conn, &s.id).unwrap().is_none());
+    }
 }
 
 pub fn remove_project(conn: &Connection, id: &str) -> Result<(), String> {
@@ -3318,7 +3409,7 @@ pub fn set_message_tool_call_id(conn: &Connection, id: &str, tool_call_id: &str)
 
 pub fn next_seq(conn: &Connection, session_id: &str) -> Result<i64, String> {
     conn.query_row(
-        "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?1",
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?1 AND queued = 0",
         params![session_id],
         |r| r.get(0),
     )
@@ -3402,7 +3493,11 @@ pub fn new_message_with_attachments(
     queued: bool,
     run_id: Option<&str>,
 ) -> Result<Message, String> {
-    let seq = next_seq(conn, session_id)?;
+    let seq = if queued {
+        0
+    } else {
+        next_seq(conn, session_id)?
+    };
     let m = Message {
         id: uuid::Uuid::new_v4().to_string(),
         session_id: session_id.to_string(),
@@ -3592,7 +3687,7 @@ pub fn get_session_turns(
     // 寻找第 turns 轮 user 消息的下界 seq
     let min_user_seq: Option<i64> = conn
         .query_row(
-            "SELECT seq FROM messages              WHERE session_id = ?1 AND role = 'user' AND seq < ?2              ORDER BY seq DESC LIMIT 1 OFFSET ?3",
+            "SELECT seq FROM messages              WHERE session_id = ?1 AND role = 'user' AND seq < ?2 AND queued = 0              ORDER BY seq DESC LIMIT 1 OFFSET ?3",
             params![session_id, upper_seq, offset],
             |r| r.get(0),
         )
@@ -3602,7 +3697,7 @@ pub fn get_session_turns(
     let (lower_seq, has_more) = if let Some(seq) = min_user_seq {
         let more_exists: bool = conn
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM messages WHERE session_id = ?1 AND seq < ?2)",
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE session_id = ?1 AND seq < ?2 AND queued = 0)",
                 params![session_id, seq],
                 |r| r.get(0),
             )
@@ -3614,7 +3709,7 @@ pub fn get_session_turns(
 
     let mut stmt = conn
         .prepare(
-            "SELECT id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id,                     queued, usage_json, created_at, prompt_tokens, completion_tokens,                     total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens,                     is_estimated, reverted_at, runtime_anchor              FROM messages              WHERE session_id = ?1 AND seq >= ?2 AND seq < ?3              ORDER BY seq ASC",
+            "SELECT id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id,                     queued, usage_json, created_at, prompt_tokens, completion_tokens,                     total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens,                     is_estimated, reverted_at, runtime_anchor              FROM messages              WHERE session_id = ?1 AND seq >= ?2 AND seq < ?3 AND queued = 0              ORDER BY seq ASC",
         )
         .map_err(|e| e.to_string())?;
 
@@ -3683,7 +3778,7 @@ pub fn get_messages(
     let mut stmt = conn
         .prepare(
             "SELECT id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens, is_estimated, reverted_at, runtime_anchor
-             FROM messages WHERE session_id = ?1 AND seq < COALESCE(?2, 9223372036854775807)
+             FROM messages WHERE session_id = ?1 AND seq < COALESCE(?2, 9223372036854775807) AND queued = 0
              ORDER BY seq DESC LIMIT ?3",
         )
         .map_err(|e| e.to_string())?;
@@ -3924,7 +4019,7 @@ pub fn list_queued(conn: &Connection, session_id: &str) -> Result<Vec<Message>, 
     let mut stmt = conn
         .prepare(
             "SELECT id, session_id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id, queued, usage_json, created_at, prompt_tokens, completion_tokens, total_tokens, duration_ms, turn_duration_ms, attachments_json, cached_tokens, is_estimated, reverted_at, runtime_anchor
-             FROM messages WHERE session_id = ?1 AND queued = 1 ORDER BY seq ASC",
+             FROM messages WHERE session_id = ?1 AND queued = 1 ORDER BY created_at ASC, rowid ASC",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -3988,24 +4083,36 @@ pub fn update_message_runtime_anchor(
 pub fn pop_queued(conn: &Connection, session_id: &str) -> Result<Option<Message>, String> {
     let first: Option<String> = conn
         .query_row(
-            "SELECT id FROM messages WHERE session_id = ?1 AND queued = 1 ORDER BY seq ASC LIMIT 1",
+            "SELECT id FROM messages WHERE session_id = ?1 AND queued = 1 ORDER BY created_at ASC, rowid ASC LIMIT 1",
             params![session_id],
             |r| r.get(0),
         )
         .optional()
         .map_err(|e| e.to_string())?;
     let Some(id) = first else { return Ok(None) };
-    conn.execute("UPDATE messages SET queued = 0 WHERE id = ?1", params![id])
-        .map_err(|e| e.to_string())?;
-    get_message(conn, &id)
+    dequeue_message(conn, &id)
 }
 
 pub fn dequeue_message(conn: &Connection, message_id: &str) -> Result<Option<Message>, String> {
+    let session_id: Option<String> = conn
+        .query_row(
+            "SELECT session_id FROM messages WHERE id = ?1 AND queued = 1",
+            params![message_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    let Some(sid) = session_id else { return Ok(None) };
+    let new_seq = next_seq(conn, &sid)?;
+    let updated_at = now();
+
     conn.execute(
-        "UPDATE messages SET queued = 0 WHERE id = ?1 AND queued = 1",
-        params![message_id],
+        "UPDATE messages SET queued = 0, seq = ?2, created_at = ?3 WHERE id = ?1 AND queued = 1",
+        params![message_id, new_seq, updated_at],
     )
     .map_err(|e| e.to_string())?;
+
     get_message(conn, message_id)
 }
 
@@ -5769,6 +5876,142 @@ pub fn delete_reverted_tail_messages(
     Ok(())
 }
 
+/// 会话中已撤回内容的物理清除统计结果
+#[derive(Debug, Default, Clone)]
+pub struct PurgeWithdrawnStats {
+    /// 被删除的消息条数
+    pub messages: usize,
+    /// 被删除的工具事件条数
+    pub tool_events: usize,
+    /// 被删除的快照元数据条数
+    pub snapshots: usize,
+    /// 被删除的运行记录条数
+    pub runs: usize,
+    /// 候选快照 blob 哈希（去重后，需由调用方做跨库引用计数后决定是否物理删除）
+    pub candidate_blob_hashes: Vec<String>,
+    /// 被删除消息的 id 列表（供调用方清理 message_session_cache）
+    pub message_ids: Vec<String>,
+}
+
+/// 物理清除会话中所有已撤回（reverted_at 非空）的消息及其全部关联记录。
+///
+/// 语义：撤回点（最早一条 reverted_at 非空的消息 seq）及其之后的一切内容整体消失，
+/// 撤回点之前的历史绝不触碰。工作区文件在撤回阶段已被还原，这里不再改动文件内容。
+///
+/// 注意：本函数只处理会话专属分库内的表；sessions 元数据与 agent_growths 不在清除范围内。
+pub fn purge_withdrawn_messages(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<PurgeWithdrawnStats, String> {
+    let mut stats = PurgeWithdrawnStats::default();
+
+    // 1. 定位撤回边界：已撤回消息中最早的 seq
+    let boundary: Option<i64> = conn
+        .query_row(
+            "SELECT MIN(seq) FROM messages WHERE session_id = ?1 AND reverted_at IS NOT NULL",
+            params![session_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+
+    let boundary = match boundary {
+        Some(seq) => seq,
+        // 没有已撤回内容，幂等返回
+        None => return Ok(stats),
+    };
+
+    // 2. 收集待删除消息 id 与待评估的 blob 哈希（在删除前采集）
+    {
+        let mut stmt = conn
+            .prepare("SELECT id FROM messages WHERE session_id = ?1 AND seq >= ?2")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![session_id, boundary], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        for id in rows {
+            stats.message_ids.push(id.map_err(|e| e.to_string())?);
+        }
+    }
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT before_hash, after_hash FROM tool_file_snapshots
+                 WHERE session_id = ?1 AND message_id IN
+                   (SELECT id FROM messages WHERE session_id = ?1 AND seq >= ?2)",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![session_id, boundary], |r| {
+                Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut seen = HashSet::new();
+        for row in rows {
+            let (before, after) = row.map_err(|e| e.to_string())?;
+            if let Some(b) = before {
+                if seen.insert(b.clone()) {
+                    stats.candidate_blob_hashes.push(b);
+                }
+            }
+            if seen.insert(after.clone()) {
+                stats.candidate_blob_hashes.push(after);
+            }
+        }
+    }
+
+    // 3. 统计关联记录条数（供前端提示）
+    stats.messages = stats.message_ids.len();
+    stats.tool_events = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tool_events WHERE message_id IN
+               (SELECT id FROM messages WHERE session_id = ?1 AND seq >= ?2)",
+            params![session_id, boundary],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize;
+    stats.snapshots = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tool_file_snapshots WHERE session_id = ?1 AND message_id IN
+               (SELECT id FROM messages WHERE session_id = ?1 AND seq >= ?2)",
+            params![session_id, boundary],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize;
+    stats.runs = conn
+        .query_row(
+            "SELECT COUNT(*) FROM runs WHERE session_id = ?1 AND id NOT IN
+               (SELECT DISTINCT run_id FROM messages WHERE session_id = ?1 AND run_id IS NOT NULL AND seq < ?2)",
+            params![session_id, boundary],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize;
+
+    // 4. 执行物理删除（复用已有的级联删除逻辑，seq - 1 即删除 boundary 及其之后全部）
+    delete_messages_after(conn, session_id, boundary - 1)?;
+    conn.execute(
+        "DELETE FROM runs WHERE session_id = ?1 AND id NOT IN
+           (SELECT DISTINCT run_id FROM messages WHERE session_id = ?1 AND run_id IS NOT NULL)",
+        params![session_id],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(stats)
+}
+
+/// 统计指定 blob 哈希在全部分库快照中的引用数（用于 CAS blob 的安全物理删除）
+///
+/// 仅当引用数为 0 时才可删除 blob，否则会破坏未撤回历史的文件还原能力。
+pub fn count_snapshot_blob_references(conn: &Connection, hash: &str) -> Result<usize, String> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM tool_file_snapshots WHERE before_hash = ?1 OR after_hash = ?1",
+        params![hash],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n.max(0) as usize)
+    .map_err(|e| e.to_string())
+}
+
 /// 按照人机交互轮次（Turn，以 message_id 为原子单元）维护 50 轮滑动窗口。
 /// 当会话中快照所属的不同轮次数超过 max_turns 时，原子淘汰最老的多余轮次快照元数据。
 pub fn prune_session_snapshots_sliding_window(
@@ -5897,124 +6140,246 @@ pub fn query_tool_logs(conn: &Connection, filter: &ToolLogFilter) -> Result<Tool
             && !["用户消息", "AI 答复", "系统通知"].contains(&filter.tool_name.as_deref().unwrap_or("")));
     let is_conv_only = category == "conversation" || category == "message";
 
-    let source_sql = if is_tool_only {
-        r#"
-        SELECT
-            'tool' as log_type,
-            te.id as id,
-            te.message_id as message_id,
-            te.tool_name as tool_name,
-            te.tool_call_id as tool_call_id,
-            te.params_json as params_json,
-            te.result_text as result_text,
-            te.status as status,
-            te.approval_scope as approval_scope,
-            te.created_at as created_at,
-            te.subprocess_id as subprocess_id,
-            s.id as session_id,
-            s.title as session_title,
-            s.project_id as project_id,
-            p.name as project_name,
-            m.reasoning as reasoning,
-            m.role as role,
-            m.content as content
-        FROM tool_events te
-        JOIN messages m ON te.message_id = m.id
-        JOIN sessions s ON m.session_id = s.id
-        LEFT JOIN projects p ON s.project_id = p.id
-        "#.to_string()
-    } else if is_conv_only {
-        r#"
-        SELECT
-            m.role as log_type,
-            m.id as id,
-            m.id as message_id,
-            CASE m.role
-                WHEN 'user' THEN '用户消息'
-                WHEN 'assistant' THEN 'AI 答复'
-                WHEN 'system' THEN '系统通知'
-                ELSE m.role
-            END as tool_name,
-            m.tool_call_id as tool_call_id,
-            ('{"role":"' || m.role || '"}') as params_json,
-            m.content as result_text,
-            CASE
-                WHEN m.role = 'system' AND (m.content LIKE '%⚠️%' OR m.content LIKE '%error%' OR m.content LIKE '%fail%' OR m.content LIKE '%失败%') THEN 'failed'
-                ELSE 'success'
-            END as status,
-            NULL as approval_scope,
-            m.created_at as created_at,
-            NULL as subprocess_id,
-            s.id as session_id,
-            s.title as session_title,
-            s.project_id as project_id,
-            p.name as project_name,
-            m.reasoning as reasoning,
-            m.role as role,
-            m.content as content
-        FROM messages m
-        JOIN sessions s ON m.session_id = s.id
-        LEFT JOIN projects p ON s.project_id = p.id
-        WHERE (m.role IN ('user', 'system') OR (m.role = 'assistant' AND (COALESCE(TRIM(m.content), '') != '' OR COALESCE(TRIM(m.reasoning), '') != '')))
-        "#.to_string()
+    let has_sessions: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    let source_sql = if has_sessions {
+        if is_tool_only {
+            r#"
+            SELECT
+                'tool' as log_type,
+                te.id as id,
+                te.message_id as message_id,
+                te.tool_name as tool_name,
+                te.tool_call_id as tool_call_id,
+                te.params_json as params_json,
+                te.result_text as result_text,
+                te.status as status,
+                te.approval_scope as approval_scope,
+                te.created_at as created_at,
+                te.subprocess_id as subprocess_id,
+                s.id as session_id,
+                s.title as session_title,
+                s.project_id as project_id,
+                p.name as project_name,
+                m.reasoning as reasoning,
+                m.role as role,
+                m.content as content
+            FROM tool_events te
+            JOIN messages m ON te.message_id = m.id
+            JOIN sessions s ON m.session_id = s.id
+            LEFT JOIN projects p ON s.project_id = p.id
+            "#.to_string()
+        } else if is_conv_only {
+            r#"
+            SELECT
+                m.role as log_type,
+                m.id as id,
+                m.id as message_id,
+                CASE m.role
+                    WHEN 'user' THEN '用户消息'
+                    WHEN 'assistant' THEN 'AI 答复'
+                    WHEN 'system' THEN '系统通知'
+                    ELSE m.role
+                END as tool_name,
+                m.tool_call_id as tool_call_id,
+                ('{"role":"' || m.role || '"}') as params_json,
+                m.content as result_text,
+                CASE
+                    WHEN m.role = 'system' AND (m.content LIKE '%⚠️%' OR m.content LIKE '%error%' OR m.content LIKE '%fail%' OR m.content LIKE '%失败%') THEN 'failed'
+                    ELSE 'success'
+                END as status,
+                NULL as approval_scope,
+                m.created_at as created_at,
+                NULL as subprocess_id,
+                s.id as session_id,
+                s.title as session_title,
+                s.project_id as project_id,
+                p.name as project_name,
+                m.reasoning as reasoning,
+                m.role as role,
+                m.content as content
+            FROM messages m
+            JOIN sessions s ON m.session_id = s.id
+            LEFT JOIN projects p ON s.project_id = p.id
+            WHERE (m.role IN ('user', 'system') OR (m.role = 'assistant' AND (COALESCE(TRIM(m.content), '') != '' OR COALESCE(TRIM(m.reasoning), '') != '')))
+            "#.to_string()
+        } else {
+            r#"
+            SELECT
+                'tool' as log_type,
+                te.id as id,
+                te.message_id as message_id,
+                te.tool_name as tool_name,
+                te.tool_call_id as tool_call_id,
+                te.params_json as params_json,
+                te.result_text as result_text,
+                te.status as status,
+                te.approval_scope as approval_scope,
+                te.created_at as created_at,
+                te.subprocess_id as subprocess_id,
+                s.id as session_id,
+                s.title as session_title,
+                s.project_id as project_id,
+                p.name as project_name,
+                m.reasoning as reasoning,
+                m.role as role,
+                m.content as content
+            FROM tool_events te
+            JOIN messages m ON te.message_id = m.id
+            JOIN sessions s ON m.session_id = s.id
+            LEFT JOIN projects p ON s.project_id = p.id
+            UNION ALL
+            SELECT
+                m.role as log_type,
+                m.id as id,
+                m.id as message_id,
+                CASE m.role
+                    WHEN 'user' THEN '用户消息'
+                    WHEN 'assistant' THEN 'AI 答复'
+                    WHEN 'system' THEN '系统通知'
+                    ELSE m.role
+                END as tool_name,
+                m.tool_call_id as tool_call_id,
+                ('{"role":"' || m.role || '"}') as params_json,
+                m.content as result_text,
+                CASE
+                    WHEN m.role = 'system' AND (m.content LIKE '%⚠️%' OR m.content LIKE '%error%' OR m.content LIKE '%fail%' OR m.content LIKE '%失败%') THEN 'failed'
+                    ELSE 'success'
+                END as status,
+                NULL as approval_scope,
+                m.created_at as created_at,
+                NULL as subprocess_id,
+                s.id as session_id,
+                s.title as session_title,
+                s.project_id as project_id,
+                p.name as project_name,
+                m.reasoning as reasoning,
+                m.role as role,
+                m.content as content
+            FROM messages m
+            JOIN sessions s ON m.session_id = s.id
+            LEFT JOIN projects p ON s.project_id = p.id
+            WHERE (m.role IN ('user', 'system') OR (m.role = 'assistant' AND (COALESCE(TRIM(m.content), '') != '' OR COALESCE(TRIM(m.reasoning), '') != '')))
+            "#.to_string()
+        }
     } else {
-        r#"
-        SELECT
-            'tool' as log_type,
-            te.id as id,
-            te.message_id as message_id,
-            te.tool_name as tool_name,
-            te.tool_call_id as tool_call_id,
-            te.params_json as params_json,
-            te.result_text as result_text,
-            te.status as status,
-            te.approval_scope as approval_scope,
-            te.created_at as created_at,
-            te.subprocess_id as subprocess_id,
-            s.id as session_id,
-            s.title as session_title,
-            s.project_id as project_id,
-            p.name as project_name,
-            m.reasoning as reasoning,
-            m.role as role,
-            m.content as content
-        FROM tool_events te
-        JOIN messages m ON te.message_id = m.id
-        JOIN sessions s ON m.session_id = s.id
-        LEFT JOIN projects p ON s.project_id = p.id
-        UNION ALL
-        SELECT
-            m.role as log_type,
-            m.id as id,
-            m.id as message_id,
-            CASE m.role
-                WHEN 'user' THEN '用户消息'
-                WHEN 'assistant' THEN 'AI 答复'
-                WHEN 'system' THEN '系统通知'
-                ELSE m.role
-            END as tool_name,
-            m.tool_call_id as tool_call_id,
-            ('{"role":"' || m.role || '"}') as params_json,
-            m.content as result_text,
-            CASE
-                WHEN m.role = 'system' AND (m.content LIKE '%⚠️%' OR m.content LIKE '%error%' OR m.content LIKE '%fail%' OR m.content LIKE '%失败%') THEN 'failed'
-                ELSE 'success'
-            END as status,
-            NULL as approval_scope,
-            m.created_at as created_at,
-            NULL as subprocess_id,
-            s.id as session_id,
-            s.title as session_title,
-            s.project_id as project_id,
-            p.name as project_name,
-            m.reasoning as reasoning,
-            m.role as role,
-            m.content as content
-        FROM messages m
-        JOIN sessions s ON m.session_id = s.id
-        LEFT JOIN projects p ON s.project_id = p.id
-        WHERE (m.role IN ('user', 'system') OR (m.role = 'assistant' AND (COALESCE(TRIM(m.content), '') != '' OR COALESCE(TRIM(m.reasoning), '') != '')))
-        "#.to_string()
+        if is_tool_only {
+            r#"
+            SELECT
+                'tool' as log_type,
+                te.id as id,
+                te.message_id as message_id,
+                te.tool_name as tool_name,
+                te.tool_call_id as tool_call_id,
+                te.params_json as params_json,
+                te.result_text as result_text,
+                te.status as status,
+                te.approval_scope as approval_scope,
+                te.created_at as created_at,
+                te.subprocess_id as subprocess_id,
+                m.session_id as session_id,
+                '' as session_title,
+                NULL as project_id,
+                NULL as project_name,
+                m.reasoning as reasoning,
+                m.role as role,
+                m.content as content
+            FROM tool_events te
+            JOIN messages m ON te.message_id = m.id
+            "#.to_string()
+        } else if is_conv_only {
+            r#"
+            SELECT
+                m.role as log_type,
+                m.id as id,
+                m.id as message_id,
+                CASE m.role
+                    WHEN 'user' THEN '用户消息'
+                    WHEN 'assistant' THEN 'AI 答复'
+                    WHEN 'system' THEN '系统通知'
+                    ELSE m.role
+                END as tool_name,
+                m.tool_call_id as tool_call_id,
+                ('{"role":"' || m.role || '"}') as params_json,
+                m.content as result_text,
+                CASE
+                    WHEN m.role = 'system' AND (m.content LIKE '%⚠️%' OR m.content LIKE '%error%' OR m.content LIKE '%fail%' OR m.content LIKE '%失败%') THEN 'failed'
+                    ELSE 'success'
+                END as status,
+                NULL as approval_scope,
+                m.created_at as created_at,
+                NULL as subprocess_id,
+                m.session_id as session_id,
+                '' as session_title,
+                NULL as project_id,
+                NULL as project_name,
+                m.reasoning as reasoning,
+                m.role as role,
+                m.content as content
+            FROM messages m
+            WHERE (m.role IN ('user', 'system') OR (m.role = 'assistant' AND (COALESCE(TRIM(m.content), '') != '' OR COALESCE(TRIM(m.reasoning), '') != '')))
+            "#.to_string()
+        } else {
+            r#"
+            SELECT
+                'tool' as log_type,
+                te.id as id,
+                te.message_id as message_id,
+                te.tool_name as tool_name,
+                te.tool_call_id as tool_call_id,
+                te.params_json as params_json,
+                te.result_text as result_text,
+                te.status as status,
+                te.approval_scope as approval_scope,
+                te.created_at as created_at,
+                te.subprocess_id as subprocess_id,
+                m.session_id as session_id,
+                '' as session_title,
+                NULL as project_id,
+                NULL as project_name,
+                m.reasoning as reasoning,
+                m.role as role,
+                m.content as content
+            FROM tool_events te
+            JOIN messages m ON te.message_id = m.id
+            UNION ALL
+            SELECT
+                m.role as log_type,
+                m.id as id,
+                m.id as message_id,
+                CASE m.role
+                    WHEN 'user' THEN '用户消息'
+                    WHEN 'assistant' THEN 'AI 答复'
+                    WHEN 'system' THEN '系统通知'
+                    ELSE m.role
+                END as tool_name,
+                m.tool_call_id as tool_call_id,
+                ('{"role":"' || m.role || '"}') as params_json,
+                m.content as result_text,
+                CASE
+                    WHEN m.role = 'system' AND (m.content LIKE '%⚠️%' OR m.content LIKE '%error%' OR m.content LIKE '%fail%' OR m.content LIKE '%失败%') THEN 'failed'
+                    ELSE 'success'
+                END as status,
+                NULL as approval_scope,
+                m.created_at as created_at,
+                NULL as subprocess_id,
+                m.session_id as session_id,
+                '' as session_title,
+                NULL as project_id,
+                NULL as project_name,
+                m.reasoning as reasoning,
+                m.role as role,
+                m.content as content
+            FROM messages m
+            WHERE (m.role IN ('user', 'system') OR (m.role = 'assistant' AND (COALESCE(TRIM(m.content), '') != '' OR COALESCE(TRIM(m.reasoning), '') != '')))
+            "#.to_string()
+        }
     };
 
     let mut where_clauses: Vec<String> = Vec::new();
@@ -6409,10 +6774,38 @@ pub fn save_llm_request_trace(
 ) -> Result<(), String> {
     let id = uuid::Uuid::new_v4().to_string();
     let created_at = now();
+
+    // 选项 A：大型 Payload 精简，避免历史消息重复累加吞噬磁盘空间
+    let lean_payload = if payload_json.len() > 8192 {
+        if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(payload_json) {
+            if let Some(msgs) = val.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                if msgs.len() > 4 {
+                    let total = msgs.len();
+                    let kept: Vec<serde_json::Value> = vec![
+                        msgs[0].clone(),
+                        msgs[1].clone(),
+                        serde_json::json!({
+                            "role": "system",
+                            "content": format!("[...省略中间 {} 条历史消息以节省磁盘空间...]", total - 4)
+                        }),
+                        msgs[total - 2].clone(),
+                        msgs[total - 1].clone(),
+                    ];
+                    *msgs = kept;
+                }
+            }
+            serde_json::to_string(&val).unwrap_or_else(|_| payload_json[..8192].to_string())
+        } else {
+            payload_json[..8192].to_string()
+        }
+    } else {
+        payload_json.to_string()
+    };
+
     conn.execute(
         r#"INSERT INTO llm_requests (id, session_id, message_id, run_id, model, endpoint, payload_json, created_at)
            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
-        params![id, session_id, message_id, run_id, model, endpoint, payload_json, created_at],
+        params![id, session_id, message_id, run_id, model, endpoint, lean_payload, created_at],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -6449,4 +6842,343 @@ pub fn get_llm_request_trace(
         .map_err(|e| e.to_string())?;
 
     Ok(trace)
+}
+
+pub fn set_session_last_run_status(conn: &Connection, session_id: &str, status: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE sessions SET last_run_status = ?2 WHERE id = ?1",
+        params![session_id, status],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn collect_active_snapshot_hashes_from_all_sessions(
+    data_dir: &std::path::Path,
+    catalog_conn: &Connection,
+) -> Result<std::collections::HashSet<String>, String> {
+    let mut hashes = collect_active_snapshot_hashes(catalog_conn).unwrap_or_default();
+    let sessions_dir = data_dir.join("sessions");
+    if let Ok(entries) = std::fs::read_dir(sessions_dir) {
+        for entry in entries.flatten() {
+            let db_path = entry.path().join("session.db");
+            if db_path.exists() {
+                if let Ok(conn) = rusqlite::Connection::open_with_flags(
+                    &db_path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                ) {
+                    if let Ok(session_hashes) = collect_active_snapshot_hashes(&conn) {
+                        hashes.extend(session_hashes);
+                    }
+                }
+            }
+        }
+    }
+    Ok(hashes)
+}
+
+pub fn fork_session_sharded(
+    catalog_conn: &Connection,
+    src_conn: &Connection,
+    dst_conn: &Connection,
+    source_session_id: &str,
+    new_session_id: &str,
+    target_message_id: &str,
+    new_title: Option<&str>,
+    include_target: bool,
+) -> Result<Session, String> {
+    let source_session = get_session(catalog_conn, source_session_id)?
+        .ok_or_else(|| format!("未找到原会话: {}", source_session_id))?;
+
+    let (target_seq, target_role): (i64, String) = src_conn
+        .query_row(
+            "SELECT seq, role FROM messages WHERE id = ?1",
+            params![target_message_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| format!("未找到指定消息节点: {}", e))?;
+
+    let max_seq = if !include_target {
+        target_seq - 1
+    } else if target_role == "assistant" {
+        let mut check_seq = target_seq;
+        let mut stmt = src_conn
+            .prepare(
+                "SELECT seq, role FROM messages WHERE session_id = ?1 AND seq > ?2 ORDER BY seq ASC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![source_session_id, target_seq], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows.flatten() {
+            if row.1 == "tool" {
+                check_seq = row.0;
+            } else {
+                break;
+            }
+        }
+        check_seq
+    } else {
+        target_seq
+    };
+
+    let title = if let Some(t) = new_title.filter(|s| !s.trim().is_empty()) {
+        t.trim().to_string()
+    } else {
+        format!("[分支] {}", source_session.title)
+    };
+
+    let now_str = now();
+    let ws_path = if source_session.is_temp {
+        source_session
+            .source_workspace
+            .clone()
+            .unwrap_or_else(|| source_session.workspace_path.clone())
+    } else {
+        source_session.workspace_path.clone()
+    };
+
+    catalog_conn.execute(
+        "INSERT INTO sessions (
+            id, title, workspace_path, access_mode, project_id, status,
+            last_message_at, created_at, updated_at, is_temp,
+            temp_code, temp_root, source_workspace, merged_seq, merged_pending,
+            parent_session_id, session_type, subagent_role, subagent_task,
+            context_token_limit, last_reported_msg_id, auto_report,
+            trigger_tool_event_id, provider_id, model_id, dispatch_rule,
+            image_provider_id, image_model_id, vision_provider_id, vision_model_id,
+            decision_provider_id, decision_model_id,
+            forked_from_session_id, forked_from_message_id, reasoning_effort, max_steps
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, 'active',
+            ?6, ?6, ?6, 0,
+            NULL, NULL, NULL, NULL, 0,
+            NULL, 'main', NULL, NULL,
+            ?7, NULL, 1,
+            NULL, ?8, ?9, NULL,
+            ?10, ?11, ?12, ?13,
+            ?14, ?15,
+            ?16, ?17, ?18, ?19
+        )",
+        params![
+            new_session_id,
+            title,
+            ws_path,
+            source_session.access_mode,
+            source_session.project_id,
+            now_str,
+            source_session.context_token_limit.map(|v| v as i64),
+            source_session.provider_id,
+            source_session.model_id,
+            source_session.image_provider_id,
+            source_session.image_model_id,
+            source_session.vision_provider_id,
+            source_session.vision_model_id,
+            source_session.decision_provider_id,
+            source_session.decision_model_id,
+            source_session_id,
+            target_message_id,
+            source_session.reasoning_effort,
+            source_session.max_steps.map(|v| v as i64),
+        ],
+    )
+    .map_err(|e| format!("创建分支会话失败: {}", e))?;
+
+    let mut stmt = src_conn
+        .prepare(
+            "SELECT id, run_id, seq, role, content, reasoning, tool_calls_json, tool_call_id,
+                    queued, usage_json, created_at, prompt_tokens, completion_tokens,
+                    total_tokens, duration_ms, turn_duration_ms, attachments_json,
+                    cached_tokens, is_estimated, runtime_anchor
+             FROM messages
+             WHERE session_id = ?1 AND seq <= ?2 AND queued = 0
+             ORDER BY seq ASC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let old_msgs = stmt
+        .query_map(params![source_session_id, max_seq], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, i64>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, String>(10)?,
+                r.get::<_, Option<i64>>(11)?,
+                r.get::<_, Option<i64>>(12)?,
+                r.get::<_, Option<i64>>(13)?,
+                r.get::<_, Option<i64>>(14)?,
+                r.get::<_, Option<i64>>(15)?,
+                r.get::<_, Option<String>>(16)?,
+                r.get::<_, Option<i64>>(17)?,
+                r.get::<_, Option<i64>>(18)?,
+                r.get::<_, Option<String>>(19)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    let mut id_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut new_seq: i64 = 1;
+
+    for old in &old_msgs {
+        let old_id = &old.0;
+        let new_id = uuid::Uuid::new_v4().to_string();
+        id_map.insert(old_id.clone(), new_id.clone());
+
+        dst_conn.execute(
+            "INSERT INTO messages (
+                id, session_id, run_id, seq, role, content, reasoning,
+                tool_calls_json, tool_call_id, queued, usage_json, created_at,
+                prompt_tokens, completion_tokens, total_tokens, duration_ms,
+                turn_duration_ms, attachments_json, cached_tokens, is_estimated, runtime_anchor
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16,
+                ?17, ?18, ?19, ?20, ?21
+            )",
+            params![
+                new_id,
+                new_session_id,
+                old.1,
+                new_seq,
+                old.3,
+                old.4,
+                old.5,
+                old.6,
+                old.7,
+                old.8,
+                old.9,
+                old.10,
+                old.11,
+                old.12,
+                old.13,
+                old.14,
+                old.15,
+                old.16,
+                old.17.unwrap_or(0),
+                old.18.unwrap_or(0),
+                old.19,
+            ],
+        )
+        .map_err(|e| format!("复制消息失败: {}", e))?;
+
+        new_seq += 1;
+    }
+
+    for (old_id, new_id) in &id_map {
+        let mut ev_stmt = src_conn
+            .prepare(
+                "SELECT tool_name, tool_call_id, params_json, result_text, status,
+                        approval_scope, created_at, subprocess_id
+                 FROM tool_events WHERE message_id = ?1 ORDER BY rowid ASC",
+            )
+            .map_err(|e| e.to_string())?;
+
+        let ev_rows = ev_stmt
+            .query_map(params![old_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+
+        for ev in ev_rows {
+            let new_ev_id = uuid::Uuid::new_v4().to_string();
+            dst_conn.execute(
+                "INSERT INTO tool_events (
+                    id, message_id, tool_name, tool_call_id, params_json,
+                    result_text, status, approval_scope, created_at, subprocess_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    new_ev_id,
+                    new_id,
+                    ev.0,
+                    ev.1,
+                    ev.2,
+                    ev.3,
+                    ev.4,
+                    ev.5,
+                    ev.6,
+                    ev.7,
+                ],
+            )
+            .map_err(|e| format!("复制工具事件失败: {}", e))?;
+        }
+    }
+
+    let mut comp_stmt = src_conn
+        .prepare(
+            "SELECT start_seq, end_seq, summary_markdown, tokens_before, created_at
+             FROM session_compactions WHERE session_id = ?1 AND end_seq <= ?2 ORDER BY end_seq ASC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let comp_rows = comp_stmt
+        .query_map(params![source_session_id, max_seq], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    for c in comp_rows {
+        let new_comp_id = uuid::Uuid::new_v4().to_string();
+        dst_conn.execute(
+            "INSERT INTO session_compactions (
+                id, session_id, start_seq, end_seq, summary_markdown, tokens_before, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![new_comp_id, new_session_id, c.0, c.1, c.2, c.3, c.4],
+        )
+        .map_err(|e| format!("复制压缩备忘失败: {}", e))?;
+    }
+
+    let mut rules_stmt = src_conn
+        .prepare("SELECT kind, pattern, created_at FROM session_rules_t WHERE session_id = ?1")
+        .map_err(|e| e.to_string())?;
+
+    let rule_rows = rules_stmt
+        .query_map(params![source_session_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    for r in rule_rows {
+        let new_rule_id = uuid::Uuid::new_v4().to_string();
+        dst_conn.execute(
+            "INSERT INTO session_rules_t (id, session_id, kind, pattern, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![new_rule_id, new_session_id, r.0, r.1, r.2],
+        )
+        .map_err(|e| format!("复制审批规则失败: {}", e))?;
+    }
+
+    get_session(catalog_conn, new_session_id)?.ok_or_else(|| "无法获取新创建的分支会话".to_string())
 }
