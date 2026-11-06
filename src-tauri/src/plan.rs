@@ -1474,7 +1474,7 @@ pub fn emit_board_updated(
     session_id: &str,
 ) {
     let ws_opt = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         crate::store::get_session(&db, session_id)
             .ok()
             .flatten()

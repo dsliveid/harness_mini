@@ -39,6 +39,9 @@ sha2 = "0.10"
 image = { version = "0.25", default-features = false, features = ["png"] }
 async-trait = "0.1"
 tokio-tungstenite = "0.24"
+# 并发地基：parking_lot 的 MutexGuard 无 poisoned 语义，
+# 从类型层面根除「一次 panic 污染全局锁 → 后续连锁闪退」的崩溃放大链。
+parking_lot = "0.12"
 
 [profile.release]
 strip = true

@@ -92,7 +92,7 @@ pub async fn start_server(
 async fn health_handler(State(app): State<AppHandle>) -> Json<Value> {
     let state = app.state::<crate::AppState>();
     let pid = std::process::id();
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     let runs = crate::store::all_running_runs(&db).unwrap_or_default();
     Json(json!({
         "status": "ok",
@@ -378,7 +378,7 @@ pub async fn dispatch_rpc(
             let decision_provider_id = params.get("decisionProviderId").and_then(|v| v.as_str()).map(|s| s.to_string());
             let decision_model_id = params.get("decisionModelId").and_then(|v| v.as_str()).map(|s| s.to_string());
             let reasoning_effort = params.get("reasoningEffort").or_else(|| params.get("reasoning_effort")).and_then(|v| v.as_str()).map(|s| s.to_string());
-            let res = commands::send_message(st, app.clone(), session_id, text, workspace_path, project_id, temp, access_mode, context_token_limit, attachments, provider_id, model_id, image_provider_id, image_model_id, vision_provider_id, vision_model_id, decision_provider_id, decision_model_id, reasoning_effort)?;
+            let res = commands::send_message(st, app.clone(), session_id, text, workspace_path, project_id, temp, access_mode, context_token_limit, attachments, provider_id, model_id, image_provider_id, image_model_id, vision_provider_id, vision_model_id, decision_provider_id, decision_model_id, reasoning_effort).await?;
             Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
         }
         "list_queued" => {

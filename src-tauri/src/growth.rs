@@ -38,8 +38,8 @@ pub fn trigger_reflection_on_denial(
     tauri::async_runtime::spawn(async move {
         let state = app.state::<crate::AppState>();
         let (session, settings) = {
-            let db = state.db.lock().unwrap();
-            let master = state.master_key.lock().unwrap();
+            let db = state.db.lock();
+            let master = state.master_key.lock();
             (
                 store::get_session(&db, &session_id).ok().flatten(),
                 store::get_settings_with_secrets(&db, &master).unwrap_or_default(),
@@ -122,7 +122,7 @@ pub fn trigger_reflection_on_denial(
                     };
 
                     {
-                        let db = state.db.lock().unwrap();
+                        let db = state.db.lock();
                         let _ = store::insert_growth(&db, &growth);
                     }
 
@@ -169,8 +169,8 @@ pub fn trigger_manual_reflection(
     tauri::async_runtime::spawn(async move {
         let state = app.state::<crate::AppState>();
         let (session, settings) = {
-            let db = state.db.lock().unwrap();
-            let master = state.master_key.lock().unwrap();
+            let db = state.db.lock();
+            let master = state.master_key.lock();
             (
                 store::get_session(&db, &session_id).ok().flatten(),
                 store::get_settings_with_secrets(&db, &master).unwrap_or_default(),
@@ -199,7 +199,7 @@ pub fn trigger_manual_reflection(
         );
 
         let recent_msgs = {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             store::all_messages(&db, &session_id).unwrap_or_default()
         };
 
@@ -261,7 +261,7 @@ pub fn trigger_manual_reflection(
                 };
 
                 {
-                    let db = state.db.lock().unwrap();
+                    let db = state.db.lock();
                     let _ = store::insert_growth(&db, &growth);
                 }
 

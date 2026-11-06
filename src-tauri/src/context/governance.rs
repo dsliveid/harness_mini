@@ -356,7 +356,7 @@ pub async fn propose_and_execute_compaction(
 ) -> Result<bool, String> {
     // 1. 检查是否已有未决的压缩请求
     {
-        let compactions = state.compactions.lock().unwrap();
+        let compactions = state.compactions.lock();
         if compactions.values().any(|p| p.session_id == session_id) {
             return Err("当前会话已有正在处理中的上下文压缩确认请求，请先完成或等待其生效".into());
         }
@@ -364,7 +364,7 @@ pub async fn propose_and_execute_compaction(
 
     // 2. 评估候选消息
     let (candidate_msgs, candidate_tokens) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let settings = store::get_settings(&db).unwrap_or_default();
         let viewport = evaluate_context_viewport(&db, &settings, session_id)?;
 
@@ -512,7 +512,7 @@ pub async fn propose_and_execute_compaction(
         timeout_seconds: timeout_secs,
     };
 
-    state.compactions.lock().unwrap().insert(
+    state.compactions.lock().insert(
         event_id.clone(),
         crate::PendingCompaction {
             session_id: session_id.to_string(),
@@ -532,7 +532,7 @@ pub async fn propose_and_execute_compaction(
             d
         }
         _ => {
-            state.compactions.lock().unwrap().remove(&event_id);
+            state.compactions.lock().remove(&event_id);
             state.snapshot.set_pending_compaction(session_id, None);
             state.emit(
                 "compaction:timeout",
@@ -565,7 +565,7 @@ pub async fn propose_and_execute_compaction(
             created_at: chrono::Utc::now().to_rfc3339(),
         };
         {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             let _ = store::create_session_compaction(&db, &compaction);
         }
         let _ = app.emit("compaction:applied", &compaction);

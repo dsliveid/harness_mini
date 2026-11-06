@@ -1526,6 +1526,7 @@ dependencies = [
  "ignore",
  "image",
  "keyring",
+ "parking_lot",
  "rand",
  "regex",
  "reqwest 0.12.28",

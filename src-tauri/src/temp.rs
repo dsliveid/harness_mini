@@ -466,7 +466,6 @@ pub fn ensure_space(state: &crate::AppState, app: &tauri::AppHandle, session: &S
     let data_dir = state
         .data_dir
         .lock()
-        .unwrap()
         .clone()
         .ok_or("数据目录不可用")?;
     let raw_root = PathBuf::from(
@@ -481,7 +480,7 @@ pub fn ensure_space(state: &crate::AppState, app: &tauri::AppHandle, session: &S
         return Err("未检测到 Git（git 命令不可用），无法准备临时空间".into());
     }
     let mut manifest = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         load_manifest(&db, &session.id)?.ok_or("临时空间清单缺失")?
     };
     if !root.exists() {
@@ -506,7 +505,7 @@ pub fn ensure_space(state: &crate::AppState, app: &tauri::AppHandle, session: &S
         rebuilt = true;
     }
     if rebuilt {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         save_manifest(&db, &session.id, &manifest)?;
     }
     emit_temp_update(state, app, &session.id);
@@ -952,7 +951,7 @@ fn strip_fence(s: &str) -> String {
 /// 删除整个临时空间目录（含全部项目副本）。幂等：目录已不存在同样成功并解除禁止发送。
 pub fn clear_space(state: &crate::AppState, app: &tauri::AppHandle, session_id: &str) -> Result<(), String> {
     let session = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::get_session(&db, session_id)?.ok_or("会话不存在")?
     };
     if !session.is_temp {
@@ -961,7 +960,7 @@ pub fn clear_space(state: &crate::AppState, app: &tauri::AppHandle, session_id: 
     if crate::agent::is_run_active(state, session_id) {
         return Err("Agent 正在运行，请先停止后再清空临时空间".into());
     }
-    let data_dir = state.data_dir.lock().unwrap().clone().ok_or("数据目录不可用")?;
+    let data_dir = state.data_dir.lock().clone().ok_or("数据目录不可用")?;
     let raw_root = PathBuf::from(session.temp_root.clone().ok_or("临时空间缺失")?);
     let root = adapt_temp_path(&raw_root, &data_dir);
     validate_root(&root, &data_dir)?;
@@ -985,7 +984,7 @@ pub fn clear_space(state: &crate::AppState, app: &tauri::AppHandle, session_id: 
         std::fs::remove_dir_all(&root).map_err(|e| format!("删除临时空间失败: {e}"))?;
     }
     {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::set_session_merge_state(&db, session_id, session.merged_seq, false)?;
     }
     emit_session_update(state, app, session_id);
@@ -1034,7 +1033,7 @@ pub fn temp_info(db: &rusqlite::Connection, session: &Session) -> TempInfo {
 
 pub fn emit_temp_update(state: &crate::AppState, app: &tauri::AppHandle, session_id: &str) {
     let info = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::get_session(&db, session_id)
             .ok()
             .flatten()
@@ -1047,7 +1046,7 @@ pub fn emit_temp_update(state: &crate::AppState, app: &tauri::AppHandle, session
 
 fn emit_session_update(state: &crate::AppState, app: &tauri::AppHandle, session_id: &str) {
     let s = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::get_session(&db, session_id).ok().flatten()
     };
     if let Some(s) = s {
@@ -1062,8 +1061,8 @@ pub async fn merge_space(
     session_id: &str,
 ) -> Result<MergeSummary, String> {
     let (session, settings) = {
-        let db = state.db.lock().unwrap();
-        let master = state.master_key.lock().unwrap();
+        let db = state.db.lock();
+        let master = state.master_key.lock();
         (
             store::get_session(&db, session_id)?.ok_or("会话不存在")?,
             store::get_settings_with_secrets(&db, &master).unwrap_or_default(),
@@ -1078,7 +1077,7 @@ pub async fn merge_space(
     if session.merged_pending {
         return Err("本次变更已合并，请先清空临时空间后再发起新的修改".into());
     }
-    let data_dir = state.data_dir.lock().unwrap().clone().ok_or("数据目录不可用")?;
+    let data_dir = state.data_dir.lock().clone().ok_or("数据目录不可用")?;
     let raw_root = PathBuf::from(session.temp_root.clone().ok_or("临时空间缺失")?);
     let root = adapt_temp_path(&raw_root, &data_dir);
     validate_root(&root, &data_dir)?;
@@ -1086,7 +1085,7 @@ pub async fn merge_space(
         return Err("临时空间目录不存在，无法合并".into());
     }
     let manifest = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         load_manifest(&db, session_id)?.ok_or("临时空间清单缺失")?
     };
     // 无可用模型时仍可干净应用变更，冲突文件标记需人工处理
@@ -1110,7 +1109,7 @@ pub async fn merge_space(
                 |r| r.get(0),
             ).map_err(|e| e.to_string())
         }).unwrap_or(0);
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::set_session_merge_state(&db, session_id, Some(max_seq), true)?;
     }
     emit_session_update(state, app, session_id);
@@ -1376,7 +1375,7 @@ pub async fn merge_from_agent(
     session_id: &str,
 ) -> Result<MergeSummary, String> {
     let session = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::get_session(&db, session_id)?.ok_or("会话不存在")?
     };
     if !session.is_temp {
@@ -1385,7 +1384,7 @@ pub async fn merge_from_agent(
     if session.merged_pending {
         return Err("本次变更已合并，请等待用户清空临时空间后再发起新的修改".into());
     }
-    let data_dir = state.data_dir.lock().unwrap().clone().ok_or("数据目录不可用")?;
+    let data_dir = state.data_dir.lock().clone().ok_or("数据目录不可用")?;
     let raw_root = PathBuf::from(session.temp_root.clone().ok_or("临时空间缺失")?);
     let root = adapt_temp_path(&raw_root, &data_dir);
     validate_root(&root, &data_dir)?;
@@ -1393,8 +1392,8 @@ pub async fn merge_from_agent(
         return Err("临时空间目录不存在，无法合并".into());
     }
     let (manifest, settings) = {
-        let db = state.db.lock().unwrap();
-        let master = state.master_key.lock().unwrap();
+        let db = state.db.lock();
+        let master = state.master_key.lock();
         (
             load_manifest(&db, session_id)?.ok_or("临时空间清单缺失")?,
             store::get_settings_with_secrets(&db, &master).unwrap_or_default(),
@@ -1420,7 +1419,7 @@ pub async fn merge_from_agent(
                 |r| r.get(0),
             ).map_err(|e| e.to_string())
         }).unwrap_or(0);
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::set_session_merge_state(&db, session_id, Some(max_seq), true)?;
     }
     emit_session_update(state, app, session_id);

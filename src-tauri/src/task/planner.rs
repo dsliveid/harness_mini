@@ -14,8 +14,8 @@ pub async fn decompose_goal(
 ) -> (Vec<TaskSubItem>, String, crate::models::ParsedTokenUsage) {
     let state = app.state::<crate::AppState>();
     let (session, settings) = {
-        let db = state.db.lock().unwrap();
-        let master = state.master_key.lock().unwrap();
+        let db = state.db.lock();
+        let master = state.master_key.lock();
         (
             store::get_session(&db, session_id).ok().flatten(),
             store::get_settings_with_secrets(&db, &master).unwrap_or_default(),
@@ -75,7 +75,7 @@ pub async fn decompose_goal(
 
         let user_prompt = {
             let mut prompt_content = String::new();
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             let mut ctx_snippets = Vec::new();
 
             if let Some(ref s) = session {
@@ -125,9 +125,9 @@ pub async fn decompose_goal(
             json!({ "role": "user", "content": user_prompt }),
         ];
 
-        let reasoning_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let text_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let in_think_tag = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let reasoning_buf = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+        let text_buf = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+        let in_think_tag = std::sync::Arc::new(parking_lot::Mutex::new(false));
 
         let r_acc = reasoning_buf.clone();
         let app_r = app.clone();
@@ -135,7 +135,7 @@ pub async fn decompose_goal(
         let mid_r = plan_msg_id.to_string();
         let on_reasoning = move |delta: &str| {
             if !delta.is_empty() {
-                r_acc.lock().unwrap().push_str(delta);
+                r_acc.lock().push_str(delta);
                 let _ = app_r.emit(
                     "message:reasoning:delta",
                     json!({
@@ -154,15 +154,15 @@ pub async fn decompose_goal(
         let sid_t = session_id.to_string();
         let mid_t = plan_msg_id.to_string();
         let on_text = move |delta: &str| {
-            t_acc.lock().unwrap().push_str(delta);
-            let mut think_flag = in_think.lock().unwrap();
+            t_acc.lock().push_str(delta);
+            let mut think_flag = in_think.lock();
             if delta.contains("<think>") {
                 *think_flag = true;
             }
             if *think_flag {
                 let clean = delta.replace("<think>", "").replace("</think>", "");
                 if !clean.is_empty() {
-                    r_acc_text.lock().unwrap().push_str(&clean);
+                    r_acc_text.lock().push_str(&clean);
                     let _ = app_t.emit(
                         "message:reasoning:delta",
                         json!({
@@ -185,7 +185,7 @@ pub async fn decompose_goal(
 
             let state = app.state::<crate::AppState>();
             {
-                let db = state.db.lock().unwrap();
+                let db = state.db.lock();
                 let _ = store::increment_session_tokens(
                     &db,
                     session_id,
@@ -196,14 +196,14 @@ pub async fn decompose_goal(
                 );
             }
 
-            let captured_reasoning = reasoning_buf.lock().unwrap().clone();
+            let captured_reasoning = reasoning_buf.lock().clone();
             let final_r = if captured_reasoning.is_empty() {
                 res.reasoning.clone()
             } else {
                 captured_reasoning
             };
 
-            let full_text = text_buf.lock().unwrap().clone();
+            let full_text = text_buf.lock().clone();
             let content_str = if full_text.trim().is_empty() {
                 res.content.clone()
             } else {
@@ -279,8 +279,8 @@ pub async fn replan_subtasks(
 ) -> Result<bool, String> {
     let state = app.state::<crate::AppState>();
     let (mut task, pc, model, proxy_url) = {
-        let db = state.db.lock().unwrap();
-        let master = state.master_key.lock().unwrap();
+        let db = state.db.lock();
+        let master = state.master_key.lock();
         let task = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
         let settings = store::get_settings_with_secrets(&db, &master).unwrap_or_default();
         let s = store::get_session(&db, &task.session_id)?.ok_or("会话不存在")?;
@@ -307,7 +307,7 @@ pub async fn replan_subtasks(
     };
 
     let cps = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::list_task_checkpoints(&db, task_id).unwrap_or_default()
     };
     let memory_block = build_working_memory_block(&cps, &task.goal);
@@ -340,7 +340,7 @@ pub async fn replan_subtasks(
         let est_out = crate::models::estimate_tokens(&res.content);
         let parsed_usage = crate::models::parse_llm_usage(res.usage.as_ref(), est_in, est_out);
         {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             let _ = store::increment_session_tokens(
                 &db,
                 &task.session_id,
@@ -394,7 +394,7 @@ pub async fn replan_subtasks(
                 task.subtasks.extend(new_remains);
                 task.updated_at = store::now();
                 {
-                    let db = state.db.lock().unwrap();
+                    let db = state.db.lock();
                     store::update_long_task(&db, &task)?;
                 }
                 let _ = app.emit("task:update", &task);

@@ -6,7 +6,7 @@ use crate::tools::{self, ToolCtx, ToolSpec};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -115,9 +115,8 @@ pub fn is_run_active(state: &crate::AppState, session_id: &str) -> bool {
     state
         .handles
         .lock()
-        .unwrap()
         .get(session_id)
-        .map(|h| h.active_run.lock().unwrap().is_some())
+        .map(|h| h.active_run.lock().is_some())
         .unwrap_or(false)
 }
 
@@ -126,22 +125,21 @@ pub fn any_run_active(state: &crate::AppState) -> bool {
     state
         .handles
         .lock()
-        .unwrap()
         .values()
-        .any(|h| h.active_run.lock().unwrap().is_some())
+        .any(|h| h.active_run.lock().is_some())
 }
 
 /// 确保会话句柄存在，并启动/恢复运行任务（trigger=None 时从待执行队列取）
 pub fn spawn_session_task(app: AppHandle, session_id: String, trigger: Option<String>) {
     {
         let state = app.state::<crate::AppState>();
-        let mut handles = state.handles.lock().unwrap();
+        let mut handles = state.handles.lock();
         let h = handles.entry(session_id.clone()).or_insert_with(SessionHandle::new);
-        if h.active_run.lock().unwrap().is_some() {
+        if h.active_run.lock().is_some() {
             // 当前会话已有正在执行的 run，绝对不并发拉起第二个 run_loop，严禁覆盖现有 abort handle！
             return;
         }
-        *h.active_run.lock().unwrap() = Some("starting".into());
+        *h.active_run.lock() = Some("starting".into());
     }
     let app2 = app.clone();
     let sid2 = session_id.clone();
@@ -150,9 +148,9 @@ pub fn spawn_session_task(app: AppHandle, session_id: String, trigger: Option<St
         run_loop(app2, sid2, trigger).await;
     });
     let state = app.state::<crate::AppState>();
-    let handles = state.handles.lock().unwrap();
+    let handles = state.handles.lock();
     if let Some(h) = handles.get(&session_id) {
-        let mut g = h.abort.lock().unwrap();
+        let mut g = h.abort.lock();
         *g = Some(jh);
     }
 }
@@ -168,7 +166,7 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
     // 0. 级联停止属于该主会话的所有子 Agent 进程
     if cascade_subagents {
         let subs = {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             store::list_all_child_sessions(&db, session_id).unwrap_or_default()
         };
         for sub in subs {
@@ -193,7 +191,7 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
             }
 
             {
-                let db = state.db.lock().unwrap();
+                let db = state.db.lock();
                 let _ = store::set_session_status(&db, &sub.id, "cancelled");
             }
             stop_session_ext(app, &sub.id, true);
@@ -230,7 +228,7 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
 
     // 1. 优先强杀该会话下全部正在运行的控制台进程树（必须在 abort 协程前强杀，防止协程终止后子进程孤立遗留）
     {
-        let mut cmds = state.running_commands.lock().unwrap();
+        let mut cmds = state.running_commands.lock();
         let to_cancel: Vec<String> = cmds
             .iter()
             .filter(|(_, rc)| rc.session_id == session_id)
@@ -250,15 +248,14 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
     state
         .approvals
         .lock()
-        .unwrap()
         .retain(|_, p| p.session_id != session_id);
 
     // 3. 中止 Agent 循环任务
     let aborted_run = {
-        let handles = state.handles.lock().unwrap();
+        let handles = state.handles.lock();
         if let Some(h) = handles.get(session_id) {
-            let run = h.active_run.lock().unwrap().take();
-            if let Some(jh) = h.abort.lock().unwrap().take() {
+            let run = h.active_run.lock().take();
+            if let Some(jh) = h.abort.lock().take() {
                 jh.abort();
             }
             run
@@ -301,7 +298,7 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
     // 4. 若当前会话关联活跃长任务，协同中止长任务，将其运行中的子任务标记为 interrupted
     // （保护：若长任务已由 task 模块显式置为 paused 或 cancelled，绝不逆向篡改覆盖）
     {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         if let Ok(Some(mut lt)) = store::get_active_long_task(&db, session_id) {
             if lt.status != "paused" && lt.status != "cancelled" && lt.status != "completed" {
                 crate::task::set_control(&lt.id, true);
@@ -324,7 +321,7 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
 
     // 仅在主会话主动停止且存在排队时消费队列；子会话停止时不自发恢复
     let parent_id = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::get_session(&db, session_id)
             .ok()
             .flatten()
@@ -347,7 +344,7 @@ pub fn restart_subagent(app: &AppHandle, subagent_id: &str) -> Result<(), String
 
     let (parent_id, trigger_id) = {
         let s = {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             store::get_session(&db, subagent_id)?.ok_or("子 Agent 不存在")?
         };
         let delivered = state.with_session_db(subagent_id, |conn| {
@@ -357,7 +354,7 @@ pub fn restart_subagent(app: &AppHandle, subagent_id: &str) -> Result<(), String
             return Err("子 Agent 已完成交付结案，禁止重复唤醒".into());
         }
         {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             let _ = store::set_session_status(&db, subagent_id, "running");
         }
         let msgs = state.with_session_db(subagent_id, |conn| store::all_messages(conn, subagent_id))?;
@@ -429,12 +426,12 @@ pub fn reject_and_restart_subagent(app: &AppHandle, subagent_id: &str, feedback:
 
     let (parent_id, user_msg_id) = {
         let s = {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             store::get_session(&db, subagent_id)?.ok_or("子 Agent 不存在")?
         };
         let _ = state.with_session_db(subagent_id, |conn| store::set_kv(conn, subagent_id, "delivered_outcome", ""));
         {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             let _ = store::set_session_status(&db, subagent_id, "running");
         }
 
@@ -467,7 +464,7 @@ pub fn reject_and_restart_subagent(app: &AppHandle, subagent_id: &str, feedback:
 pub fn restart_all_subagents(app: &AppHandle, parent_session_id: &str) -> Result<usize, String> {
     let state = app.state::<crate::AppState>();
     let subs = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::list_subagents(&db, parent_session_id)?
     };
     let mut count = 0;
@@ -487,7 +484,7 @@ pub fn retry_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
 
     // 长任务防护：若当前会话绑定了活跃的长任务，阻止在主会话直接触发单轮 retry
     {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         if let Ok(Some(lt)) = store::get_latest_long_task(&db, session_id) {
             if lt.status != "completed" && lt.status != "cancelled" {
                 return Err("长任务推进中，请在长任务面板或顶栏中进行管理或回滚到检查点".into());
@@ -514,7 +511,7 @@ pub fn retry_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
         }).unwrap_or_default();
 
         let mut child_ids: Vec<String> = Vec::new();
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         if let Ok(mut stmt) = db.prepare(
             "SELECT id FROM sessions 
              WHERE (parent_session_id = ?1 AND session_type IN ('subprocess', 'subagent') AND created_at >= ?2)"
@@ -542,7 +539,7 @@ pub fn retry_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
     for child_id in &child_ids_to_clean {
         stop_session_ext(app, child_id, false);
         {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             let _ = store::delete_session(&db, child_id);
         }
         let _ = app.emit("sessions:changed", json!({"deleted": child_id}));
@@ -557,7 +554,7 @@ pub fn retry_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
     // 防止 LLM 看到末尾的 assistant 消息判定该轮已回答完毕而返回空回复
     {
         state.with_session_db(session_id, |conn| store::delete_messages_after(conn, session_id, user_seq))?;
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::touch_session(&db, session_id)?;
 
         // 3. 长任务子任务状态协同重置：若当前长任务子步骤处于失败或中断态，重置为 pending
@@ -581,7 +578,6 @@ pub fn retry_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
     state
         .approvals
         .lock()
-        .unwrap()
         .retain(|_, p| p.session_id != session_id);
 
     // 通知前端会话消息已回滚重置
@@ -601,7 +597,7 @@ pub fn continue_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
 
     // 0. 若当前会话关联处于挂起状态的长任务，通过 resume 恢复
     {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         if let Ok(Some(lt)) = store::get_latest_long_task(&db, session_id) {
             if lt.status == "interrupted" || lt.status == "failed" || lt.status == "paused" {
                 drop(db);
@@ -621,7 +617,7 @@ pub fn continue_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
 
     // 1. 普通模式：自动协同恢复关联的未完成子任务/子进程
     let subs_to_resume = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let subs = store::list_subagents(&db, session_id).unwrap_or_default();
         subs.into_iter()
             .filter(|s| s.status == "interrupted" || s.status == "failed" || s.status == "cancelled")
@@ -709,7 +705,7 @@ pub fn continue_turn_autonomous(app: &AppHandle, session_id: &str) -> Result<(),
 
     // 1. 自动恢复关联的未完成子任务（若有）
     let subs_to_resume = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let subs = store::list_subagents(&db, session_id).unwrap_or_default();
         subs.into_iter()
             .filter(|s| s.status == "interrupted" || s.status == "failed")
@@ -814,8 +810,8 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
             Ok(rid)
         }).ok().flatten();
         let Some(run_id) = run_id else { break };
-        if let Some(h) = state.handles.lock().unwrap().get(&session_id) {
-            *h.active_run.lock().unwrap() = Some(run_id.clone());
+        if let Some(h) = state.handles.lock().get(&session_id) {
+            *h.active_run.lock() = Some(run_id.clone());
         }
         let _ = state.emit(
             "run:status",
@@ -857,7 +853,7 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
                 Ok::<(), String>(())
             });
 
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             let _ = store::set_session_last_run_status(&db, &session_id, status);
             let _ = store::increment_session_tokens(
                 &db,
@@ -897,8 +893,8 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
             break;
         }
     }
-    if let Some(h) = state.handles.lock().unwrap().get(&session_id) {
-        *h.active_run.lock().unwrap() = None;
+    if let Some(h) = state.handles.lock().get(&session_id) {
+        *h.active_run.lock() = None;
     }
     state.snapshot.finish_run(&session_id);
     // 兜底：任务被中止（stop）时走不到 finish_run，把残留的 running run 标记为 interrupted，
@@ -918,7 +914,7 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
     // 若当前会话属于子进程或协作者，将其执行结论持久化并广播给主会话和前端界面
     let mut auto_report_task: Option<(String, bool)> = None;
     {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         if let Ok(Some(s)) = store::get_session(&db, &session_id) {
             if s.session_type == "collaborator" || s.session_type == "subprocess" || s.session_type == "subagent" || s.parent_session_id.is_some() {
                 // 若该会话已被显式取消、终止或中断，严禁反向冲刷为 completed！
@@ -1034,7 +1030,7 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
         let app_clone = app.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            let _ = crate::commands::do_report_collaborator_increment(&app_clone, &collab_id);
+            let _ = crate::commands::do_report_collaborator_increment(&app_clone, &collab_id).await;
         });
     }
 
@@ -1192,8 +1188,8 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
     let mut run_tokens = RunTokenMetrics::default();
     let state = app.state::<crate::AppState>();
     let (session, settings, parent_session) = {
-        let db = state.db.lock().unwrap();
-        let master = state.master_key.lock().unwrap();
+        let db = state.db.lock();
+        let master = state.master_key.lock();
         let s = store::get_session(&db, session_id).ok().flatten();
         let p = s
             .as_ref()
@@ -1207,7 +1203,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
     };
     let trigger_msg = state.with_session_db(session_id, |conn| store::get_message(conn, trigger_id)).ok().flatten();
     let Some(session) = session else { return (RunOutcome::Failed, None, run_tokens); };
-    let data_dir = state.data_dir.lock().unwrap().clone();
+    let data_dir = state.data_dir.lock().clone();
     let workspace = if session.is_temp {
         if let Some(d) = &data_dir {
             crate::temp::adapt_temp_path(Path::new(&session.workspace_path), d)
@@ -1325,7 +1321,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
 
     // 临时空间上下文：temp_* 工具依赖的清单（非临时会话为 None，对应工具不下发也不可用）
     let temp_ctx = if session.is_temp {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         match crate::temp::load_manifest(&db, session_id) {
             Ok(Some(m)) => Some(crate::temp::TempAgentCtx { manifest: m }),
             _ => None,
@@ -1363,7 +1359,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
     // 1. 若为主进程且名录中已配置【图像生成协作者】，主进程物理屏蔽直接生图工具 generate_image，强制走 dispatch_collaborator 委派；
     // 2. 只有当前会话本身绑定了生图模型、或属于生图协作者、或主进程未配置生图协作者但全局配有 image_gen 模型时，才下发生图工具。
     let has_collab_image_gen = if !is_subagent {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::list_collaborators(&db, session_id)
             .map(|list| list.iter().any(|c| c.subagent_role.as_deref() == Some("image_gen") || c.image_model_id.is_some()))
             .unwrap_or(false)
@@ -1384,7 +1380,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
     };
 
     let has_collab_vision = if !is_subagent {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::list_collaborators(&db, session_id)
             .map(|list| list.iter().any(|c| c.subagent_role.as_deref() == Some("vision") || c.vision_model_id.is_some()))
             .unwrap_or(false)
@@ -1431,7 +1427,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         })
         .collect();
     let is_long_task = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         if let Ok(Some(task)) = store::get_active_long_task(&db, session_id) {
             task.status == "running" || task.status == "planning"
         } else {
@@ -1451,7 +1447,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
     // 每次运行重建，修改约束 / 关联或知识沉淀后同对话下一条消息就地生效。
     // 临时空间会话改用临时空间说明段（含临时路径映射与优先级 临时空间 > 关联项目 > 项目约束）
     let (project_section, project_plan_mode, negative_code_intent) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let plan_mode = if let Some(ref pid) = session.project_id {
             store::get_project(&db, pid)
                 .ok()
@@ -1576,7 +1572,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
     let reached_max_steps;
     loop {
         let current_max_steps = {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             let sess = store::get_session(&db, session_id).ok().flatten();
             if let Some(ref s) = sess {
                 if let Some(ms) = s.max_steps {
@@ -1594,7 +1590,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         if _step >= current_max_steps {
             // 关键优化：若当前属于子任务，且工作区内已生成合格交付报告，视为正常达成结案，豁免 step_extension 审批阻断
             let has_valid_report = {
-                let db = state.db.lock().unwrap();
+                let db = state.db.lock();
                 if let Ok(Some(s)) = store::get_session(&db, session_id) {
                     if s.parent_session_id.is_some() || s.session_type == "subprocess" || s.session_type == "subagent" {
                         let ws = if !s.workspace_path.is_empty() {
@@ -1627,7 +1623,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             // 步数耗尽原地挂起：向前端推送 step_extension 审批申请，无限期等待用户决策
             let event_id = uuid::Uuid::new_v4().to_string();
             let (session_role, session_title) = {
-                let db = state.db.lock().unwrap();
+                let db = state.db.lock();
                 let sess = store::get_session(&db, session_id).ok().flatten();
                 (sess.as_ref().and_then(|s| s.subagent_role.clone()), sess.as_ref().map(|s| s.title.clone()))
             };
@@ -1669,7 +1665,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 crate::approval::Decision::AllowStepExtension(extra_steps) => {
                     let new_max = (current_max_steps as u32).saturating_add(extra_steps);
                     {
-                        let db = state.db.lock().unwrap();
+                        let db = state.db.lock();
                         let _ = store::set_session_max_steps(&db, session_id, Some(new_max));
                     }
                     let _ = app.emit("session:status_changed", serde_json::json!({
@@ -1810,16 +1806,16 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         let app2 = app.clone();
         let sid2 = session_id.to_string();
         let mid2 = assistant_id.clone();
-        let buf2: std::sync::Arc<Mutex<String>> = std::sync::Arc::new(Mutex::new(String::new()));
-        let rbuf2: std::sync::Arc<Mutex<String>> = std::sync::Arc::new(Mutex::new(String::new()));
+        let buf2: std::sync::Arc<parking_lot::Mutex<String>> = std::sync::Arc::new(Mutex::new(String::new()));
+        let rbuf2: std::sync::Arc<parking_lot::Mutex<String>> = std::sync::Arc::new(Mutex::new(String::new()));
 
         let mut retry_result: Option<llm::LlmResult> = None;
         let max_stream_retries = 3u32;
         for attempt in 1..=max_stream_retries {
             if attempt > 1 {
                 // 回滚上一次尝试中刷入数据库与界面的半截内容
-                buf2.lock().unwrap().clear();
-                rbuf2.lock().unwrap().clear();
+                buf2.lock().clear();
+                rbuf2.lock().clear();
                 let _ = state.with_session_db(session_id, |conn| {
                     let _ = store::update_message_content(conn, &assistant_id, "", None);
                     let _ = store::update_message_reasoning(conn, &assistant_id, "");
@@ -1881,7 +1877,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 {
                     let buf2 = buf2.clone();
                     move |delta| {
-                        let mut b = buf2.lock().unwrap();
+                        let mut b = buf2.lock();
                         b.push_str(delta);
                         app_text.state::<crate::AppState>().emit(
                             "message:delta",
@@ -1892,7 +1888,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 {
                     let rbuf2 = rbuf2.clone();
                     move |delta| {
-                        let mut b = rbuf2.lock().unwrap();
+                        let mut b = rbuf2.lock();
                         b.push_str(delta);
                         app_reason.state::<crate::AppState>().emit(
                             "message:reasoning:delta",
@@ -2022,7 +2018,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
 
         // 单步实时增量持久化 Token（自动递归累加至父会话）并即刻广播给前端
         {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             let _ = store::increment_session_tokens(
                 &db,
                 session_id,
@@ -2059,7 +2055,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             // ---- 步骤 4：纯文本回复，交付前检查 SOP 自检 ----
             if code_modified && !sop_verified && sop_retry_count < 2 {
                 let sop_opt = {
-                    let db = state.db.lock().unwrap();
+                    let db = state.db.lock();
                     let proj = match &session.project_id {
                         Some(pid) => store::get_project(&db, pid).ok().flatten(),
                         None => if !session.workspace_path.is_empty() {
@@ -2195,7 +2191,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 let _ = app.emit("message:final", &m);
             }
             {
-                let db = state.db.lock().unwrap();
+                let db = state.db.lock();
                 let _ = store::touch_session(&db, session_id);
                 if let Ok(Some(s)) = store::get_session(&db, session_id) {
                     let _ = app.emit("session:update", &s);
@@ -2240,7 +2236,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             let _ = app.emit("message:final", &m);
         }
         {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             let _ = store::touch_session(&db, session_id);
             if let Ok(Some(s)) = store::get_session(&db, session_id) {
                 let _ = app.emit("session:update", &s);
@@ -2443,7 +2439,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                     "path": format!("{}/.harness/plans", session.workspace_path)
                 }));
                 // 计划创建/更新/切换后，同步向前端广播最新任务清单
-                let db = state.db.lock().unwrap();
+                let db = state.db.lock();
                 if let Ok(Some(raw)) = store::get_kv(&db, session_id, "todos") {
                     if let Ok(val) = serde_json::from_str::<Value>(&raw) {
                         if let Some(todos) = val.get("todos") {
@@ -2511,7 +2507,7 @@ async fn handle_tool_call(
     };
     if (ctc.name == "write_file" || ctc.name == "edit_file" || ctc.name == "apply_diff") && !is_internal_harness_artifact {
         let (is_sub, is_sop_enabled, is_intent_satisfied) = {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             let sop_enabled = store::get_settings(&db)
                 .map(|s| !s.disabled_sops.iter().any(|sop| sop == "todo_first_gate"))
                 .unwrap_or(true);
@@ -2561,7 +2557,7 @@ async fn handle_tool_call(
     let eval_scope = spec.scope;
 
     let is_subagent_session = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::get_session(&db, session_id).ok().flatten().map(|s| {
             s.session_type == "subagent"
                 || s.session_type == "subprocess"
@@ -2588,7 +2584,7 @@ async fn handle_tool_call(
 
     // ---- 策略引擎安全评估（访问模式、安全域、规则判定） ----
     let access_mode = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::get_session(&db, session_id)
             .ok()
             .flatten()
@@ -3072,7 +3068,7 @@ pub fn auto_finish_session_todos(state: &crate::AppState, app: &AppHandle, sessi
     }
 
     let sess_opt = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::get_session(&db, session_id).ok().flatten()
     };
     if let Some(sess) = sess_opt {

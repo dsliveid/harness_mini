@@ -13,6 +13,7 @@ pub mod mcp;
 pub mod memory;
 mod models;
 mod paths;
+mod panic_guard;
 pub mod plan;
 pub mod policy;
 pub mod protocol;
@@ -37,7 +38,8 @@ use approval::Decision;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use parking_lot::Mutex;
 use tauri::Manager;
 use tokio::sync::oneshot;
 
@@ -93,7 +95,7 @@ impl AppState {
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, String>,
     {
-        let data_dir_opt = self.data_dir.lock().unwrap().clone();
+        let data_dir_opt = self.data_dir.lock().clone();
         if let Some(ref data_dir) = data_dir_opt {
             let bundle = crate::session_bundle::SessionBundle::new(session_id, data_dir);
             if bundle.is_archived() {
@@ -102,25 +104,23 @@ impl AppState {
                 }
             }
             let conn_arc = self.session_pool.get_or_open(data_dir, session_id)?;
-            let conn = conn_arc.lock().unwrap();
+            let conn = conn_arc.lock();
             return f(&conn);
         }
-        let catalog_db = self.db.lock().unwrap();
+        let catalog_db = self.db.lock();
         f(&catalog_db)
     }
 
     pub fn cache_message_session(&self, message_id: &str, session_id: &str) {
-        if let Ok(mut cache) = self.message_session_cache.lock() {
-            cache.insert(message_id.to_string(), session_id.to_string());
-        }
+        let mut cache = self.message_session_cache.lock();
+        cache.insert(message_id.to_string(), session_id.to_string());
     }
 
     /// 根据 message_id 定位其所属会话 ID（优先查缓存，再查活跃连接池，最后扫描物理分库）
     pub fn find_session_by_message_id(&self, message_id: &str) -> Option<String> {
-        if let Ok(cache) = self.message_session_cache.lock() {
-            if let Some(sid) = cache.get(message_id) {
-                return Some(sid.clone());
-            }
+        let cache = self.message_session_cache.lock();
+        if let Some(sid) = cache.get(message_id) {
+            return Some(sid.clone());
         }
 
         // 检查活跃连接池中的各会话库
@@ -137,11 +137,8 @@ impl AppState {
 
         // 检查 catalog 主库（针对尚未迁移的旧数据或单表模式）
         let cat_res: Option<String> = {
-            if let Ok(db) = self.db.lock() {
-                db.query_row("SELECT session_id FROM messages WHERE id = ?1", rusqlite::params![message_id], |r| r.get(0)).ok()
-            } else {
-                None
-            }
+            let db = self.db.lock();
+            db.query_row("SELECT session_id FROM messages WHERE id = ?1", rusqlite::params![message_id], |r| r.get(0)).ok()
         };
         if let Some(ref sid) = cat_res {
             self.cache_message_session(message_id, sid);
@@ -149,7 +146,7 @@ impl AppState {
         }
 
         // 扫描 sessions/ 目录
-        let data_dir_opt = self.data_dir.lock().unwrap().clone();
+        let data_dir_opt = self.data_dir.lock().clone();
         if let Some(ref data_dir) = data_dir_opt {
             let sessions_dir = data_dir.join("sessions");
             if let Ok(entries) = std::fs::read_dir(sessions_dir) {
@@ -185,21 +182,18 @@ impl AppState {
         }
 
         let cat_res: Option<String> = {
-            if let Ok(db) = self.db.lock() {
-                db.query_row(
-                    "SELECT session_id FROM tool_file_snapshots WHERE tool_event_id = ?1 LIMIT 1",
-                    rusqlite::params![tool_event_id],
-                    |r| r.get(0),
-                ).ok()
-            } else {
-                None
-            }
+            let db = self.db.lock();
+            db.query_row(
+                "SELECT session_id FROM tool_file_snapshots WHERE tool_event_id = ?1 LIMIT 1",
+                rusqlite::params![tool_event_id],
+                |r| r.get(0),
+            ).ok()
         };
         if cat_res.is_some() {
             return cat_res;
         }
 
-        let data_dir_opt = self.data_dir.lock().unwrap().clone();
+        let data_dir_opt = self.data_dir.lock().clone();
         if let Some(ref data_dir) = data_dir_opt {
             let sessions_dir = data_dir.join("sessions");
             if let Ok(entries) = std::fs::read_dir(sessions_dir) {
@@ -397,6 +391,12 @@ fn resolve_and_open(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 0. 最先安装全局 panic hook：release 构建 strip+lto 后崩溃无任何痕迹，
+    //    此处把 panic 位置/线程/消息落盘至数据目录 crash.log，将静默闪退转为可追溯事件。
+    //    注意必须在任何业务代码之前安装，才能覆盖启动阶段的早期 panic。
+    panic_guard::install();
+    eprintln!("[Panic Guard] 已安装全局 panic 捕获钩子");
+
     let dir_hash = single_instance::get_app_dir_hash();
     let pipe_name = format!(r"\\.\pipe\harness_mini_{}", dir_hash);
 
@@ -452,19 +452,28 @@ pub fn run() {
             let handle = app.handle().clone();
             let _ = app.state::<AppState>().app.set(handle);
 
+            // 绑定 panic 日志落盘目录：此时才解析出真正生效的数据目录
+            // （含自定义目录/不可写回退场景），据此把 crash.log 写到正确位置。
+            {
+                let st = app.state::<AppState>();
+                let log_dir = st.default_data_dir.clone();
+                let resolved = st.data_dir.lock().clone().unwrap_or(log_dir);
+                crate::panic_guard::set_log_dir(&resolved);
+            }
+
             // 自动无损分库迁移：若 Catalog 库中仍残留存量消息表数据，自动在启动时迁移至 sessions/{id}/session.db
             if let Some(ref d) = data_dir {
                 let db_path = d.join("harness_mini.db");
                 let state_ref = app.state::<AppState>();
                 let should_migrate = {
-                    let db = state_ref.db.lock().unwrap();
+                    let db = state_ref.db.lock();
                     let has_legacy_msgs: bool = db
                         .query_row("SELECT 1 FROM messages LIMIT 1", [], |_| Ok(true))
                         .unwrap_or(false);
                     has_legacy_msgs
                 };
                 if should_migrate {
-                    let db = state_ref.db.lock().unwrap();
+                    let db = state_ref.db.lock();
                     if let Ok(report) = crate::session_bundle::migrate_all_sessions(&db, &db_path, d) {
                         eprintln!(
                             "[Startup Migration] 完成分库自动迁移: 总计 {} 会话，成功 {}，跳过 {}，错误数 {}",
@@ -479,7 +488,7 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 let state = mcp_app_handle.state::<AppState>();
                 let servers = {
-                    let db = state.db.lock().unwrap();
+                    let db = state.db.lock();
                     store::list_mcp_servers(&db).unwrap_or_default()
                 };
                 mcp::global_mcp_manager().reload_from_db(servers).await;
@@ -515,7 +524,7 @@ pub fn run() {
                 if let Some(data_dir) = gc_data_dir {
                     let active_hashes = {
                         let state = app_handle_for_gc.state::<AppState>();
-                        let conn = state.db.lock().unwrap();
+                        let conn = state.db.lock();
                         store::collect_active_snapshot_hashes(&conn).unwrap_or_default()
                     };
                     let _ = snapshot_gc::gc_orphan_blobs(&data_dir, &active_hashes, std::time::Duration::from_secs(24 * 3600)).await;

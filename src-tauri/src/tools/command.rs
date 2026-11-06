@@ -224,7 +224,7 @@ pub(crate) async fn run_command(
     let event_id_opt = ctx.event_id.clone();
     if let (Some(host), Some(eid)) = (&ctx.host, &event_id_opt) {
         let state = host.app.state::<crate::AppState>();
-        state.running_commands.lock().unwrap().insert(
+        state.running_commands.lock().insert(
             eid.clone(),
             crate::RunningCommand {
                 session_id: host.session_id.clone(),
@@ -284,7 +284,7 @@ pub(crate) async fn run_command(
 
     if let (Some(host), Some(eid)) = (&ctx.host, &event_id_opt) {
         let state = host.app.state::<crate::AppState>();
-        state.running_commands.lock().unwrap().remove(eid);
+        state.running_commands.lock().remove(eid);
     }
 
     let wait_res = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;

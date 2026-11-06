@@ -305,7 +305,7 @@ pub async fn record_file_snapshot_raw(
 ) {
     let state = app.state::<crate::AppState>();
     let data_dir = {
-        let lock = state.data_dir.lock().unwrap();
+        let lock = state.data_dir.lock();
         lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
     };
 
@@ -341,7 +341,7 @@ pub async fn record_file_snapshot_raw(
         created_at: crate::store::now(),
     };
 
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     if let Err(e) = crate::store::insert_tool_file_snapshot(&db, &snap) {
         eprintln!("[Snapshot] 插入快照元数据失败: {e}");
     }

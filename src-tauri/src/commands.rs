@@ -12,7 +12,7 @@ fn is_run_active(state: &crate::AppState, session_id: &str) -> bool {
 }
 
 fn emit_session(state: &crate::AppState, app: &AppHandle, session_id: &str) {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     if let Ok(Some(s)) = store::get_session(&db, session_id) {
         let _ = app.emit("session:update", &s);
     }
@@ -35,8 +35,8 @@ fn emit_queue(state: &crate::AppState, app: &AppHandle, session_id: &str) {
 
 /// 广播设置变更（含审批规则），前端据此刷新缓存中的设置与规则列表
 pub fn emit_settings_changed(state: &crate::AppState) {
-    let db = state.db.lock().unwrap();
-    let master = state.master_key.lock().unwrap();
+    let db = state.db.lock();
+    let master = state.master_key.lock();
     if let Ok(settings) = store::get_settings_with_secrets(&db, &master) {
         state.emit("settings:changed", &settings);
     }
@@ -44,15 +44,15 @@ pub fn emit_settings_changed(state: &crate::AppState) {
 
 #[tauri::command]
 pub fn get_settings(state: State<'_, crate::AppState>) -> Result<SettingsData, String> {
-    let db = state.db.lock().unwrap();
-    let master = state.master_key.lock().unwrap();
+    let db = state.db.lock();
+    let master = state.master_key.lock();
     store::get_settings_with_secrets(&db, &master)
 }
 
 #[tauri::command]
 pub fn set_settings(state: State<'_, crate::AppState>, settings: SettingsData) -> Result<(), String> {
-    let db = state.db.lock().unwrap();
-    let master = state.master_key.lock().unwrap();
+    let db = state.db.lock();
+    let master = state.master_key.lock();
     let old = store::get_settings(&db)?;
     let mut clean = settings.clone();
     clean.normalize();
@@ -103,8 +103,8 @@ pub async fn test_provider(
     provider: ProviderCfg,
 ) -> Result<String, String> {
     let (key, proxy_url) = {
-        let db = state.db.lock().unwrap();
-        let master = state.master_key.lock().unwrap();
+        let db = state.db.lock();
+        let master = state.master_key.lock();
         let k = if provider.api_key.is_empty() {
             store::secret_get(&db, &master, &provider.id).ok().flatten().unwrap_or_default()
         } else {
@@ -141,8 +141,8 @@ pub async fn list_provider_models(
     provider: ProviderCfg,
 ) -> Result<Vec<String>, String> {
     let (key, proxy_url) = {
-        let db = state.db.lock().unwrap();
-        let master = state.master_key.lock().unwrap();
+        let db = state.db.lock();
+        let master = state.master_key.lock();
         let k = if provider.api_key.is_empty() {
             store::secret_get(&db, &master, &provider.id).ok().flatten().unwrap_or_default()
         } else {
@@ -160,8 +160,8 @@ pub async fn test_jev(
     jev_cfg: JevCfg,
 ) -> Result<String, String> {
     let (key, proxy_url) = {
-        let db = state.db.lock().unwrap();
-        let master = state.master_key.lock().unwrap();
+        let db = state.db.lock();
+        let master = state.master_key.lock();
         let k = if jev_cfg.api_key.trim().is_empty() {
             store::secret_get(&db, &master, crate::secrets::JEV_API_KEY_ID).ok().flatten().unwrap_or_default()
         } else {
@@ -211,8 +211,8 @@ pub async fn evaluate_plan(
 ) -> Result<crate::jev::PlanReviewReport, String> {
     let ws_path = Path::new(&workspace);
     let (settings, plan_content) = {
-        let db = state.db.lock().unwrap();
-        let m = *state.master_key.lock().unwrap();
+        let db = state.db.lock();
+        let m = *state.master_key.lock();
         let s = store::get_settings_with_secrets(&db, &m)?;
         let text = crate::plan::read_plan(ws_path, "", Some(&plan_id), Some(&db))?;
         (s, text)
@@ -271,13 +271,13 @@ pub async fn test_proxy_connection(proxy_url: String) -> Result<u64, String> {
 
 #[tauri::command]
 pub fn list_projects(state: State<'_, crate::AppState>) -> Result<Vec<Project>, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     store::list_projects(&db)
 }
 
 #[tauri::command]
 pub fn create_project(state: State<'_, crate::AppState>, app: AppHandle, name: String, path: Option<String>) -> Result<Project, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     let path = path.as_deref().map(str::trim).filter(|s| !s.is_empty());
     // 未指定名称时取目录名
     let name = if name.trim().is_empty() {
@@ -295,7 +295,7 @@ pub fn create_project(state: State<'_, crate::AppState>, app: AppHandle, name: S
 
 #[tauri::command]
 pub fn remove_project(state: State<'_, crate::AppState>, app: AppHandle, id: String) -> Result<(), String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     store::remove_project(&db, &id)?;
     drop(db);
     let _ = app.emit("projects:changed", &json!({"removed": id}));
@@ -310,7 +310,7 @@ pub fn set_project_pinned(
     pinned: bool,
 ) -> Result<(), String> {
     let project = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::set_project_pinned(&db, &id, pinned)?;
         store::get_project(&db, &id)?.ok_or("项目不存在")?
     };
@@ -328,7 +328,7 @@ pub fn set_project_constraints(
     constraints: String,
 ) -> Result<(), String> {
     let project = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::set_project_constraints(&db, &id, &constraints)?;
         store::get_project(&db, &id)?.ok_or("项目不存在")?
     };
@@ -344,7 +344,7 @@ pub fn set_project_plan_mode(
     mode: String,
 ) -> Result<(), String> {
     let project = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::set_project_plan_mode(&db, &id, &mode)?;
         store::get_project(&db, &id)?.ok_or("项目不存在")?
     };
@@ -357,7 +357,7 @@ pub fn list_project_links(
     state: State<'_, crate::AppState>,
     project_id: String,
 ) -> Result<Vec<ProjectLink>, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     store::list_project_links(&db, &project_id)
 }
 
@@ -368,7 +368,7 @@ pub fn add_project_link(
     path: String,
     description: String,
 ) -> Result<ProjectLink, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     store::add_project_link(&db, &project_id, &path, &description)
 }
 
@@ -379,13 +379,13 @@ pub fn update_project_link(
     path: String,
     description: String,
 ) -> Result<ProjectLink, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     store::update_project_link(&db, &id, &path, &description)
 }
 
 #[tauri::command]
 pub fn delete_project_link(state: State<'_, crate::AppState>, id: String) -> Result<(), String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     store::delete_project_link(&db, &id)
 }
 
@@ -393,25 +393,25 @@ pub fn delete_project_link(state: State<'_, crate::AppState>, id: String) -> Res
 
 #[tauri::command]
 pub fn list_sessions(state: State<'_, crate::AppState>) -> Result<Vec<Session>, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     store::list_sessions(&db, "active")
 }
 
 #[tauri::command]
 pub fn get_session(state: State<'_, crate::AppState>, session_id: String) -> Result<Option<Session>, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     store::get_session(&db, &session_id)
 }
 
 #[tauri::command]
 pub fn list_archived(state: State<'_, crate::AppState>) -> Result<Vec<Session>, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     store::list_sessions(&db, "archived")
 }
 
 #[tauri::command]
 pub fn rename_session(state: State<'_, crate::AppState>, app: AppHandle, id: String, title: String) -> Result<(), String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     store::rename_session(&db, &id, title.trim())?;
     drop(db);
     emit_session(&state, &app, &id);
@@ -435,10 +435,10 @@ pub async fn delete_session(app: AppHandle, id: String) -> Result<(), String> {
     state.session_pool.evict(&id);
     // 关键路径：仅锁内删元数据，不做任何全量回收/扫描
     let (parent_id, data_dir_opt) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let parent_id = store::get_session(&db, &id)?.and_then(|s| s.parent_session_id);
         store::delete_session(&db, &id)?;
-        let data_dir = state.data_dir.lock().unwrap().clone();
+        let data_dir = state.data_dir.lock().clone();
         (parent_id, data_dir)
     };
 
@@ -462,13 +462,13 @@ pub async fn delete_session(app: AppHandle, id: String) -> Result<(), String> {
 
             // 2. 收集活跃哈希（遍历全部 sessions/*/session.db，冷启动下最慢的一步）
             let active_hashes = {
-                let conn = bg_state.db.lock().unwrap();
+                let conn = bg_state.db.lock();
                 store::collect_active_snapshot_hashes_from_all_sessions(&dir, &conn).unwrap_or_default()
             };
 
             // 3. 回收 freelist：限定页数，避免长时间持有主库锁
             {
-                let conn = bg_state.db.lock().unwrap();
+                let conn = bg_state.db.lock();
                 let _ = store::reclaim_freelist_pages(&conn, Some(2000));
             }
 
@@ -495,9 +495,9 @@ pub fn archive_session(state: State<'_, crate::AppState>, app: AppHandle, id: St
         agent::stop_session(&app, &id);
     }
     let data_dir_opt = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::set_session_status(&db, &id, "archived")?;
-        state.data_dir.lock().unwrap().clone()
+        state.data_dir.lock().clone()
     };
     // 物理冷热隔离：将该会话 Bundle 移入 archives/ 冷存储目录，彻底释放热区
     if let Some(ref dir) = data_dir_opt {
@@ -510,11 +510,11 @@ pub fn archive_session(state: State<'_, crate::AppState>, app: AppHandle, id: St
 
 /// 生命周期守卫：临时空间对话在其临时空间目录仍存在时不允许删除/归档
 fn ensure_temp_cleared(state: &crate::AppState, id: &str) -> Result<(), String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     if let Some(s) = store::get_session(&db, id)? {
         if s.is_temp {
             if let Some(r) = s.temp_root.as_deref() {
-                let data_dir = state.data_dir.lock().unwrap().clone();
+                let data_dir = state.data_dir.lock().clone();
                 let p = if let Some(d) = data_dir.as_ref() {
                     crate::temp::adapt_temp_path(Path::new(r), d)
                 } else {
@@ -532,9 +532,9 @@ fn ensure_temp_cleared(state: &crate::AppState, id: &str) -> Result<(), String> 
 #[tauri::command]
 pub fn unarchive_session(state: State<'_, crate::AppState>, app: AppHandle, id: String) -> Result<(), String> {
     let data_dir_opt = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::set_session_status(&db, &id, "active")?;
-        state.data_dir.lock().unwrap().clone()
+        state.data_dir.lock().clone()
     };
     // 物理恢复：将该会话从 archives/ 冷存储恢复回 sessions/ 活跃区
     if let Some(ref dir) = data_dir_opt {
@@ -550,7 +550,7 @@ pub fn set_session_mode(state: State<'_, crate::AppState>, app: AppHandle, id: S
     // 访问模式为会话级：仅接受具体的 confirm / full_access（规范化后落库）
     let mode = crate::models::normalize_access_mode(&mode);
     {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::set_session_mode(&db, &id, &mode)?;
     }
     // 切到「完全访问」：立即放行该对话下已经弹出的审批条。
@@ -571,7 +571,7 @@ pub fn set_session_context_limit(
     limit: Option<usize>,
 ) -> Result<(), String> {
     {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::set_session_context_limit(&db, &id, limit)?;
     }
     emit_session(&state, &app, &id);
@@ -586,7 +586,7 @@ pub fn set_session_max_steps(
     max_steps: Option<u32>,
 ) -> Result<(), String> {
     {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::set_session_max_steps(&db, &id, max_steps)?;
     }
     emit_session(&state, &app, &id);
@@ -596,7 +596,7 @@ pub fn set_session_max_steps(
 /// 放行指定对话下所有挂起的审批请求（切换到「完全访问」时调用）
 fn resolve_pending_approvals(state: &crate::AppState, app: &AppHandle, session_id: &str) {
     let pending: Vec<(String, tokio::sync::oneshot::Sender<crate::approval::Decision>)> = {
-        let mut map = state.approvals.lock().unwrap();
+        let mut map = state.approvals.lock();
         let ids: Vec<String> = map
             .iter()
             .filter(|(_, p)| p.session_id == session_id)
@@ -647,7 +647,7 @@ pub fn delete_session_rule(
 pub fn set_session_workspace(state: State<'_, crate::AppState>, _app: AppHandle, id: String, path: String) -> Result<(), String> {
     // 工作区只读：会话在首次发送转正时固定工作区，已保存的对话不允许切换工作区
     let _ = path;
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     if store::get_session(&db, &id)?.is_none() {
         return Err("会话不存在".into());
     }
@@ -658,7 +658,7 @@ pub fn set_session_workspace(state: State<'_, crate::AppState>, _app: AppHandle,
 #[tauri::command]
 pub fn set_session_project(state: State<'_, crate::AppState>, app: AppHandle, id: String, project_id: Option<String>) -> Result<(), String> {
     {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         if let Some(pid) = project_id.as_deref() {
             store::get_project(&db, pid)?.ok_or("项目不存在")?;
         }
@@ -713,7 +713,7 @@ pub fn fork_session_at_message(
     let new_session_id = uuid::Uuid::new_v4().simple().to_string();
     let s = state.with_session_db(&session_id, |src_conn| {
         state.with_session_db(&new_session_id, |dst_conn| {
-            let cat_db = state.db.lock().unwrap();
+            let cat_db = state.db.lock();
             store::fork_session_sharded(
                 &cat_db,
                 src_conn,
@@ -757,14 +757,13 @@ pub fn create_session(
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| "主进程与统筹协调者".to_string());
 
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     if let Some(t) = temp {
         let proj_id = project_id.ok_or("临时空间对话缺少归属项目")?;
         store::get_project(&db, &proj_id)?.ok_or("归属项目不存在")?;
         let data_dir = state
             .data_dir
             .lock()
-            .unwrap()
             .clone()
             .ok_or("数据目录不可用")?;
         let root = PathBuf::from(&t.root);
@@ -854,8 +853,20 @@ pub fn create_session(
 
 // ---------- 消息发送 / 队列 / 重发 ----------
 
+/// 消息发送（热路径）。
+///
+/// 架构约束（务必遵守，否则会重演「发消息即卡死/闪退」）：
+/// 本函数是 `async` 而非同步 command。Tauri 的**同步** command 会在 UI 主线程执行，
+/// 一旦内部包含数据库 IO / 逐库扫描，主线程将被冻结直至完成，Windows 会判定
+/// Not Responding 并产生 AppHang。
+///
+/// 因此这里采取「异步外壳 + 阻塞内核」范式：
+/// - 外壳：`async fn`，在主线程只做零 IO 的参数规整；
+/// - 内核：全部落库逻辑整体下沉到 `spawn_blocking` 的阻塞线程池，绝不占用主线程。
+///
+/// 同时本函数不再收敛 `data_dir` 嵌套锁，避免 `db → data_dir` 交叉加锁。
 #[tauri::command]
-pub fn send_message(
+pub async fn send_message(
     state: State<'_, crate::AppState>,
     app: AppHandle,
     session_id: Option<String>,
@@ -881,10 +892,19 @@ pub fn send_message(
     if text.is_empty() && !has_attachments {
         return Err("消息内容与附件不能同时为空".into());
     }
+    // state 仅用于类型注入，实际逻辑在阻塞线程内重新获取，
+    // 避免把 State 的借用跨线程传递（其生命周期无法跨越 spawn_blocking）。
+    let _ = &state;
+
+    // 阻塞内核：全部落库/IO 逻辑下沉到阻塞线程池，主线程立即返回。
+    let app_for_task = app.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<SendResult, String> {
+    let state = app_for_task.state::<crate::AppState>();
+    let app = &app_for_task;
     // 访问模式为会话级：新对话落库时由前端传入（继承“上一条对话”或默认值）
     let access_mode = crate::models::normalize_access_mode(access_mode.as_deref().unwrap_or("confirm"));
     let sid = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         // 临时对话：首次发送时才真正落库
         match session_id {
             Some(id) => id,
@@ -897,7 +917,6 @@ pub fn send_message(
                 let data_dir = state
                     .data_dir
                     .lock()
-                    .unwrap()
                     .clone()
                     .ok_or("数据目录不可用")?;
                 let root = PathBuf::from(&t.root);
@@ -1001,7 +1020,7 @@ pub fn send_message(
     let msg_id = msg.id.clone();
 
     let session_row = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::touch_session(&db, &sid)?;
         // 记住最近工作区（未绑定工作区的纯对话不覆盖；临时空间路径不记住）
         let mut session_row: Option<Session> = None;
@@ -1034,6 +1053,9 @@ pub fn send_message(
         agent::spawn_session_task(app.clone(), result.session_id.clone(), Some(msg_id));
     }
     Ok(result)
+    })
+    .await
+    .map_err(|e| format!("消息发送任务执行失败: {e}"))?
 }
 
 #[tauri::command]
@@ -1050,7 +1072,6 @@ pub async fn save_attachment(
     let data_dir = state
         .data_dir
         .lock()
-        .unwrap()
         .clone()
         .unwrap_or_else(|| state.default_data_dir.clone());
     let sid = session_id.unwrap_or_else(|| "temp".to_string());
@@ -1145,7 +1166,7 @@ pub fn delete_queued_message(state: State<'_, crate::AppState>, app: AppHandle, 
 pub fn stop_run(app: AppHandle, session_id: String) -> Result<(), String> {
     let state = app.state::<crate::AppState>();
     let active_task = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::get_active_long_task(&db, &session_id).ok().flatten()
     };
     if let Some(task) = active_task {
@@ -1169,7 +1190,7 @@ pub fn continue_turn(app: AppHandle, session_id: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn list_subagents(state: State<'_, crate::AppState>, parent_session_id: String) -> Result<Vec<Session>, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     store::list_subagents(&db, &parent_session_id)
 }
 
@@ -1185,7 +1206,7 @@ pub fn spawn_subagent(
     _workspace_path: Option<String>,
 ) -> Result<Session, String> {
     let parent = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::get_session(&db, &parent_session_id)?.ok_or("父会话不存在")?
     };
     if parent.session_type == "subagent" || parent.parent_session_id.is_some() {
@@ -1196,7 +1217,7 @@ pub fn spawn_subagent(
     let sub_workspace = parent.workspace_path.clone();
 
     let (sub, user_msg) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let sub = store::create_subagent_session(
             &db,
             &parent_session_id,
@@ -1237,7 +1258,7 @@ pub fn spawn_subagent(
 pub fn stop_subagent(app: AppHandle, subagent_id: String) -> Result<(), String> {
     let state = app.state::<crate::AppState>();
     let parent_id = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let pid = store::get_session(&db, &subagent_id)?.and_then(|s| s.parent_session_id);
         let _ = store::set_session_status(&db, &subagent_id, "cancelled");
         pid
@@ -1275,7 +1296,7 @@ pub fn restart_all_subagents(app: AppHandle, parent_session_id: String) -> Resul
 pub fn delete_subagent(app: AppHandle, state: State<'_, crate::AppState>, subagent_id: String) -> Result<(), String> {
     agent::stop_session(&app, &subagent_id);
     let parent_id = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let parent_id = store::get_session(&db, &subagent_id)?.and_then(|s| s.parent_session_id);
         store::delete_session(&db, &subagent_id)?;
         parent_id
@@ -1291,13 +1312,13 @@ pub fn delete_subagent(app: AppHandle, state: State<'_, crate::AppState>, subage
 
 #[tauri::command]
 pub fn list_collaborators(state: State<'_, crate::AppState>, parent_session_id: String) -> Result<Vec<Session>, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     store::list_collaborators(&db, &parent_session_id)
 }
 
 #[tauri::command]
 pub fn list_subprocesses(state: State<'_, crate::AppState>, parent_session_id: String) -> Result<Vec<Session>, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     store::list_subprocesses(&db, &parent_session_id)
 }
 
@@ -1323,7 +1344,7 @@ pub fn create_collaborator(
     decision_model_id: Option<String>,
 ) -> Result<Session, String> {
     let parent = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         if parent_session_id.is_empty() || parent_session_id == "draft" {
             let ws = workspace_path.clone().unwrap_or_default();
             let project_id = if ws.is_empty() {
@@ -1365,7 +1386,7 @@ pub fn create_collaborator(
         task_prompt
     };
     let collab = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::create_collaborator_session(
             &db,
             &real_parent_id,
@@ -1428,7 +1449,7 @@ pub fn update_collaborator(
     decision_model_id: Option<String>,
 ) -> Result<Session, String> {
     let parent_id = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let s = store::get_session(&db, &collaborator_id)?.ok_or("协作者不存在")?;
         if s.session_type != "collaborator" {
             return Err("仅支持编辑协作者".into());
@@ -1437,7 +1458,7 @@ pub fn update_collaborator(
     };
 
     let parent_ws = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::get_session(&db, &parent_id)?
             .map(|p| p.workspace_path)
             .unwrap_or_default()
@@ -1466,7 +1487,7 @@ pub fn update_collaborator(
     };
 
     let collab = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::update_collaborator_session(
             &db,
             &collaborator_id,
@@ -1516,7 +1537,7 @@ pub fn set_session_models(
     decision_provider_id: Option<String>,
     decision_model_id: Option<String>,
 ) -> Result<Session, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     let updated = store::update_session_models(
         &db,
         &session_id,
@@ -1549,7 +1570,7 @@ pub fn set_session_reasoning_effort(
     session_id: String,
     reasoning_effort: Option<String>,
 ) -> Result<Session, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     let updated = store::set_session_reasoning_effort(
         &db,
         &session_id,
@@ -1576,7 +1597,7 @@ pub fn set_collaborator_auto_report(
     auto_report: bool,
 ) -> Result<(), String> {
     let parent_id = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::update_collaborator_auto_report(&db, &collaborator_id, auto_report)?;
         store::get_session(&db, &collaborator_id)?.and_then(|s| s.parent_session_id)
     };
@@ -1586,13 +1607,13 @@ pub fn set_collaborator_auto_report(
     Ok(())
 }
 
-pub fn do_report_collaborator_increment(
+pub async fn do_report_collaborator_increment(
     app: &AppHandle,
     collaborator_id: &str,
 ) -> Result<String, String> {
     let state = app.state::<crate::AppState>();
     let (parent_id, report_prompt, new_watermark_id) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let collab = store::get_session(&db, collaborator_id)?.ok_or("协作者不存在")?;
         let parent_id = collab.parent_session_id.ok_or("该会话没有关联的父会话")?;
         let msgs = store::get_messages(&db, collaborator_id, None, 100)?;
@@ -1666,11 +1687,12 @@ pub fn do_report_collaborator_increment(
         None,
         None,
         None,
-    )?;
+    )
+    .await?;
 
     {
         let state = app.state::<crate::AppState>();
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let _ = store::update_collaborator_watermark(&db, collaborator_id, &new_watermark_id);
     }
 
@@ -1687,19 +1709,19 @@ pub fn do_report_collaborator_increment(
 }
 
 #[tauri::command]
-pub fn report_collaborator_increment(
+pub async fn report_collaborator_increment(
     app: AppHandle,
     collaborator_id: String,
 ) -> Result<String, String> {
-    do_report_collaborator_increment(&app, &collaborator_id)
+    do_report_collaborator_increment(&app, &collaborator_id).await
 }
 
 #[tauri::command]
-pub fn report_subagent_to_parent(
+pub async fn report_subagent_to_parent(
     app: AppHandle,
     subagent_id: String,
 ) -> Result<String, String> {
-    do_report_collaborator_increment(&app, &subagent_id)
+    do_report_collaborator_increment(&app, &subagent_id).await
 }
 
 /// 手动关闭正在执行的控制台命令进程
@@ -1710,7 +1732,7 @@ pub fn kill_command(
     event_id: String,
 ) -> Result<(), String> {
     let rc_opt = {
-        let mut cmds = state.running_commands.lock().unwrap();
+        let mut cmds = state.running_commands.lock();
         cmds.remove(&event_id)
     };
     if let Some(rc) = rc_opt {
@@ -1721,7 +1743,7 @@ pub fn kill_command(
     } else {
         // 未在活跃进程表（如历史崩溃/重启遗留、已退出的孤立事件）：
         // 兜底将数据库中的状态由 running 修正为 failed，并广播 tool:update 给前端移除卡片
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         if let Ok(Some((mut ev, session_id))) = store::get_tool_event_with_session(&db, &event_id) {
             if ev.status == "running" || ev.status == "pending_approval" {
                 ev.status = "failed".to_string();
@@ -1764,11 +1786,11 @@ pub async fn edit_and_resend(
     //    两者必须分别用 state.db / with_session_db 访问，否则会查空导致静默失效。
     let (ws, data_dir, target_seq, snaps_to_revert) = {
         let (ws, dir, merged_seq) = {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             let session = store::get_session(&db, &session_id)?
                 .ok_or_else(|| format!("会话未找到: {session_id}"))?;
             let dir = {
-                let lock = state.data_dir.lock().unwrap();
+                let lock = state.data_dir.lock();
                 lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
             };
             (PathBuf::from(session.workspace_path), dir, session.merged_seq)
@@ -1803,7 +1825,7 @@ pub async fn edit_and_resend(
         Ok(())
     })?;
     {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::touch_session(&db, &session_id)?;
     }
     let _ = app.emit("messages:changed", json!({"sessionId": session_id}));
@@ -1820,7 +1842,7 @@ pub async fn edit_and_resend(
 pub fn list_running_sessions(
     state: State<'_, crate::AppState>,
 ) -> Result<Vec<RunningSession>, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     let rows = store::all_running_runs(&db)?;
     Ok(rows
         .into_iter()
@@ -1839,7 +1861,7 @@ pub fn respond_approval(
     reason: Option<String>,
 ) -> Result<(), String> {
     let d = crate::approval::Decision::from_str(&decision, reason).ok_or("无效的审批决定")?;
-    let tx = state.approvals.lock().unwrap().remove(&event_id).map(|p| p.tx);
+    let tx = state.approvals.lock().remove(&event_id).map(|p| p.tx);
     if let Some(tx) = tx {
         let _ = tx.send(d);
         Ok(())
@@ -1856,7 +1878,7 @@ pub fn respond_compaction(
     approved: bool,
     final_summary: String,
 ) -> Result<(), String> {
-    let pending = state.compactions.lock().unwrap().remove(&event_id);
+    let pending = state.compactions.lock().remove(&event_id);
     if let Some(p) = pending {
         state.snapshot.set_pending_compaction(&p.session_id, None);
         let _ = p.tx.send(crate::models::CompactionDecision {
@@ -1891,21 +1913,21 @@ pub async fn run_direct_decision(
     rubric: Option<Vec<String>>,
 ) -> Result<crate::jev::DecisionExecutionResult, String> {
     let session = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         crate::store::get_session(&db, &session_id)?
             .ok_or_else(|| format!("会话不存在: {session_id}"))?
     };
 
     let parent_session = if let Some(ref pid) = session.parent_session_id {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         crate::store::get_session(&db, pid).ok().flatten()
     } else {
         None
     };
 
     let settings = {
-        let db = state.db.lock().unwrap();
-        let master = state.master_key.lock().unwrap();
+        let db = state.db.lock();
+        let master = state.master_key.lock();
         crate::store::get_settings_with_secrets(&db, &master)?
     };
 
@@ -1933,7 +1955,7 @@ pub fn list_session_compactions(
     state: State<'_, crate::AppState>,
     session_id: String,
 ) -> Result<Vec<crate::models::SessionCompaction>, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     crate::store::list_session_compactions(&db, &session_id)
 }
 
@@ -1942,7 +1964,7 @@ pub fn get_context_viewport(
     state: State<'_, crate::AppState>,
     session_id: String,
 ) -> Result<crate::context::ContextViewport, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     let settings = crate::store::get_settings(&db).unwrap_or_default();
     crate::context::evaluate_context_viewport(&db, &settings, &session_id)
 }
@@ -1955,8 +1977,8 @@ pub async fn trigger_compaction(
     focus: Option<String>,
 ) -> Result<bool, String> {
     let cfg = {
-        let db = state.db.lock().unwrap();
-        let master = state.master_key.lock().unwrap();
+        let db = state.db.lock();
+        let master = state.master_key.lock();
         let settings = crate::store::get_settings_with_secrets(&db, &master)?;
         crate::context::resolve_session_llm_cfg(&db, &settings, &session_id)?
     };
@@ -1974,7 +1996,7 @@ pub async fn trigger_compaction(
 #[tauri::command]
 pub fn get_session_todos(state: State<'_, crate::AppState>, session_id: String) -> Result<Value, String> {
     let running = is_run_active(&state, &session_id);
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     let raw: Option<String> = db
         .query_row(
             "SELECT value FROM session_kv WHERE session_id = ?1 AND key = 'todos'",
@@ -2084,11 +2106,10 @@ pub fn alloc_temp_code(state: State<'_, crate::AppState>, project_id: String) ->
     let data_dir = state
         .data_dir
         .lock()
-        .unwrap()
         .clone()
         .ok_or("数据目录不可用")?;
     let (project, links) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         (
             store::get_project(&db, &project_id)?.ok_or("项目不存在")?,
             store::list_project_links(&db, &project_id)?,
@@ -2100,7 +2121,7 @@ pub fn alloc_temp_code(state: State<'_, crate::AppState>, project_id: String) ->
 /// 临时空间运行时状态：驱动临时目录 / 合并 / 清空按钮的禁用态
 #[tauri::command]
 pub fn get_temp_info(state: State<'_, crate::AppState>, session_id: String) -> Result<TempInfo, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     let s = store::get_session(&db, &session_id)?.ok_or("会话不存在")?;
     Ok(crate::temp::temp_info(&db, &s))
 }
@@ -2109,7 +2130,7 @@ pub fn get_temp_info(state: State<'_, crate::AppState>, session_id: String) -> R
 #[tauri::command]
 pub fn list_temp_changes(state: State<'_, crate::AppState>, session_id: String) -> Result<TempChanges, String> {
     let manifest = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let s = store::get_session(&db, &session_id)?.ok_or("会话不存在")?;
         if !s.is_temp {
             return Err("该对话不是临时空间对话".into());
@@ -2128,7 +2149,7 @@ pub fn get_temp_change_diff(
     path: String,
 ) -> Result<TempFileDiff, String> {
     let manifest = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let s = store::get_session(&db, &session_id)?.ok_or("会话不存在")?;
         if !s.is_temp {
             return Err("该对话不是临时空间对话".into());
@@ -2224,12 +2245,12 @@ pub fn inspect_path(
     } else if let Some(ref ws) = workspace_path {
         if !ws.trim().is_empty() {
             Path::new(ws.trim()).join(raw_path)
-        } else if let Some(d) = state.data_dir.lock().unwrap().as_ref() {
+        } else if let Some(d) = state.data_dir.lock().as_ref() {
             d.join(raw_path)
         } else {
             PathBuf::from(raw_trimmed)
         }
-    } else if let Some(d) = state.data_dir.lock().unwrap().as_ref() {
+    } else if let Some(d) = state.data_dir.lock().as_ref() {
         d.join(raw_path)
     } else {
         PathBuf::from(raw_trimmed)
@@ -2281,15 +2302,15 @@ pub fn open_dir(
     } else if let Some(ref ws) = workspace_path {
         if !ws.trim().is_empty() {
             Path::new(ws.trim()).join(raw_path)
-        } else if let Some(d) = state.data_dir.lock().unwrap().as_ref() {
+        } else if let Some(d) = state.data_dir.lock().as_ref() {
             d.join(raw_path)
         } else {
             PathBuf::from(raw_trimmed)
         }
-    } else if let Some(d) = state.data_dir.lock().unwrap().as_ref() {
+    } else if let Some(d) = state.data_dir.lock().as_ref() {
         d.join(raw_path)
     } else if !raw_path.exists() && crate::temp::rel_temp_path(raw_path).is_some() {
-        if let Some(d) = state.data_dir.lock().unwrap().as_ref() {
+        if let Some(d) = state.data_dir.lock().as_ref() {
             crate::temp::adapt_temp_path(raw_path, d)
         } else {
             PathBuf::from(raw_trimmed)
@@ -2394,7 +2415,6 @@ pub fn get_data_status(state: State<'_, crate::AppState>) -> DataStatus {
         data_dir: state
             .data_dir
             .lock()
-            .unwrap()
             .as_ref()
             .map(|p| p.display().to_string()),
         default_dir: state.default_data_dir.display().to_string(),
@@ -2412,20 +2432,20 @@ fn switch_data_dir(
     target: &std::path::Path,
     custom: bool,
 ) -> Result<(), String> {
-    if let Some(cur) = state.data_dir.lock().unwrap().clone() {
+    if let Some(cur) = state.data_dir.lock().clone() {
         if crate::paths::same_dir(&cur, target) {
             return Ok(()); // 与当前目录一致，无需迁移
         }
     }
-    let mut db = state.db.lock().unwrap();
-    let mut master = state.master_key.lock().unwrap();
+    let mut db = state.db.lock();
+    let mut master = state.master_key.lock();
     let target_db = target.join("harness_mini.db");
     let reuse_existing = target_db.exists();
     if !reuse_existing {
         // 把当前数据迁往目标：目标密钥必须与被迁移数据一致，
         // 清除目标残留密钥文件并随迁当前密钥（内存哨兵库无密钥文件，稍后生成新钥重加密）
         let _ = std::fs::remove_file(target.join("secret.key"));
-        if let Some(cur) = state.data_dir.lock().unwrap().clone() {
+        if let Some(cur) = state.data_dir.lock().clone() {
             let _ = crate::secrets::copy_key_file(&cur, target);
             let _ = crate::temp::copy_temp_projects_dir(&cur, target);
         }
@@ -2434,7 +2454,7 @@ fn switch_data_dir(
     let new_conn = if reuse_existing {
         // 目标已有库：视为复用该目录既有数据（其密文以目标自身密钥解密）
         store::open_db(&target_db)?
-    } else if state.data_dir.lock().unwrap().is_some() {
+    } else if state.data_dir.lock().is_some() {
         // 真实库：VACUUM INTO 一致性快照迁往新目录后打开
         let sql = format!("VACUUM INTO '{}'", target_db.to_string_lossy().replace('\'', "''"));
         db.execute(&sql, []).map_err(|e| format!("迁移数据失败: {e}"))?;
@@ -2450,7 +2470,7 @@ fn switch_data_dir(
     *master = new_master;
     drop(db);
     drop(master);
-    *state.data_dir.lock().unwrap() = Some(target.to_path_buf());
+    *state.data_dir.lock() = Some(target.to_path_buf());
     state.data_pending.store(false, Ordering::Relaxed);
     state.is_custom_dir.store(custom, Ordering::Relaxed);
     Ok(())
@@ -2506,9 +2526,9 @@ pub struct OptimizeResult {
 /// 手动/定时执行数据库压缩与物理空间回收（VACUUM + WAL 截断）
 #[tauri::command]
 pub fn optimize_database(state: State<'_, crate::AppState>) -> Result<OptimizeResult, String> {
-    let data_dir = state.data_dir.lock().unwrap().clone();
+    let data_dir = state.data_dir.lock().clone();
     let db_path = data_dir.as_ref().map(|d| d.join("harness_mini.db"));
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     let before_stats = store::get_db_stats(&db, db_path.as_deref())?;
     let before_total = before_stats.file_size_bytes + before_stats.wal_size_bytes;
 
@@ -2528,9 +2548,9 @@ pub fn optimize_database(state: State<'_, crate::AppState>) -> Result<OptimizeRe
 /// 获取当前数据库状态与空间统计信息
 #[tauri::command]
 pub fn get_database_stats(state: State<'_, crate::AppState>) -> Result<store::DbStats, String> {
-    let data_dir = state.data_dir.lock().unwrap().clone();
+    let data_dir = state.data_dir.lock().clone();
     let db_path = data_dir.as_ref().map(|d| d.join("harness_mini.db"));
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     store::get_db_stats(&db, db_path.as_deref())
 }
 
@@ -2543,7 +2563,7 @@ pub fn list_growths(
     project_id: Option<String>,
     status: Option<String>,
 ) -> Result<Vec<GrowthItem>, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     store::list_growths(&db, project_id.as_deref(), status.as_deref())
 }
 
@@ -2555,7 +2575,7 @@ pub fn update_growth_status(
     status: String,
 ) -> Result<(), String> {
     let item = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::update_growth_status(&db, &id, &status)?;
         store::get_growth(&db, &id)?
     };
@@ -2575,7 +2595,7 @@ pub fn update_growth_rule(
     category: String,
 ) -> Result<(), String> {
     let item = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::update_growth_rule(&db, &id, &title, &rule_content, &category)?;
         store::get_growth(&db, &id)?
     };
@@ -2592,7 +2612,7 @@ pub fn delete_growth(
     id: String,
 ) -> Result<(), String> {
     {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::delete_growth(&db, &id)?;
     }
     let _ = app.emit("growth:deleted", json!({ "id": id }));
@@ -2662,7 +2682,7 @@ pub fn get_project_sop(
     let ws = Path::new(&workspace_path);
     let (detected_stack, detected_default_cmd) = crate::sop::detect_project_stack(ws);
 
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     let project = if let Some(pid) = project_id.as_deref().filter(|s| !s.is_empty()) {
         store::get_project(&db, pid)?
     } else if !workspace_path.is_empty() {
@@ -2704,7 +2724,7 @@ pub fn set_project_sop(
     verify_cmd: Option<String>,
     enabled: bool,
 ) -> Result<(), String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     store::set_project_sop(&db, &project_id, verify_cmd.as_deref(), enabled)
 }
 
@@ -2733,7 +2753,7 @@ pub fn get_token_stats(
     start_date: Option<String>,
     end_date: Option<String>,
 ) -> Result<TokenStatsReport, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     store::get_token_stats(
         &db,
         project_id.as_deref(),
@@ -2804,7 +2824,7 @@ pub async fn read_file_base64_inner(state: Option<&crate::AppState>, path: &str)
     let resolved_path = if file_path.exists() {
         Some(file_path)
     } else if let Some(st) = state {
-        let db = st.db.lock().unwrap();
+        let db = st.db.lock();
         let mut candidate = None;
         // 1. 尝试使用 settings.last_workspace_path 拼接相对路径
         if let Ok(settings) = store::get_settings(&db) {
@@ -2831,7 +2851,7 @@ pub async fn read_file_base64_inner(state: Option<&crate::AppState>, path: &str)
         }
         // 3. 尝试从数据目录或 generated_images 目录查找
         if candidate.is_none() {
-            let data_dir = st.data_dir.lock().unwrap().clone().unwrap_or_else(|| st.default_data_dir.clone());
+            let data_dir = st.data_dir.lock().clone().unwrap_or_else(|| st.default_data_dir.clone());
             let cand1 = data_dir.join(&clean);
             if cand1.exists() {
                 candidate = Some(cand1);
@@ -2882,7 +2902,7 @@ pub fn get_active_plan(
     state: State<'_, crate::AppState>,
     session_id: String,
 ) -> Result<Option<Value>, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     let session = crate::store::get_session(&db, &session_id)?.ok_or("会话不存在")?;
     if session.workspace_path.is_empty() {
         return Ok(None);
@@ -2937,7 +2957,7 @@ pub fn get_current_board(
     session_id: String,
 ) -> Result<Option<crate::plan::CurrentBoard>, String> {
     let session = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let db = state.db.lock();
         crate::store::get_session(&db, &session_id)?.ok_or("会话不存在")?
     };
     let ws = std::path::Path::new(&session.workspace_path);
@@ -2956,7 +2976,7 @@ pub fn list_workspace_plans(
     if workspace_path.is_empty() {
         return Ok(Vec::new());
     }
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     let ws = std::path::Path::new(&workspace_path);
     crate::plan::list_plans(ws, session_id.as_deref(), include_archived.unwrap_or(false), Some(&db))
 }
@@ -2972,7 +2992,7 @@ pub fn backfill_plan_sources(
     if workspace_path.is_empty() {
         return Err("工作区路径不能为空".into());
     }
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     let ws = std::path::Path::new(&workspace_path);
     crate::plan::backfill_plan_sources(
         &db,
@@ -3056,7 +3076,7 @@ pub async fn open_file_viewer(
     payload: Option<serde_json::Value>,
 ) -> Result<(), String> {
     if let Some(ref p) = payload {
-        *state.file_viewer_init_tab.lock().unwrap() = Some(p.clone());
+        *state.file_viewer_init_tab.lock() = Some(p.clone());
     }
 
     if let Some(win) = app.get_webview_window("file_viewer") {
@@ -3093,7 +3113,7 @@ pub async fn open_file_viewer(
 pub fn get_file_viewer_init_tab(
     state: State<'_, crate::AppState>,
 ) -> Result<Option<serde_json::Value>, String> {
-    let val = state.file_viewer_init_tab.lock().unwrap().take();
+    let val = state.file_viewer_init_tab.lock().take();
     Ok(val)
 }
 
@@ -3188,7 +3208,7 @@ pub fn save_text_file(
     let norm_path = raw_trimmed.replace('\\', "/");
     if norm_path.contains("/.harness/plans/") || norm_path.starts_with(".harness/plans/") {
         let steps = crate::plan::parse_steps_from_markdown(&content);
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         if let Some(ref sid) = session_id {
             if !sid.is_empty() {
                 crate::plan::sync_steps_to_todos(Some(&db), sid, &steps);
@@ -3381,7 +3401,7 @@ pub fn get_plan_detail(
     if workspace_path.is_empty() {
         return Ok(None);
     }
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     let ws = Path::new(&workspace_path);
     let sid = session_id.unwrap_or_default();
     if let Some((path, meta, body)) = crate::plan::find_plan_file(ws, &sid, plan_id.as_deref(), Some(&db)) {
@@ -3490,7 +3510,7 @@ pub fn update_plan_step_status(
         }
         crate::plan::emit_board_updated(&app, &state, sid);
     } else {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         crate::plan::update_plan_step_status(
             ws,
             None,
@@ -3832,11 +3852,11 @@ pub async fn revert_to_message(
     }
     let (ws, data_dir, snapshots, target_seq) = {
         let (ws, dir) = {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             let session = store::get_session(&db, &session_id)?
                 .ok_or_else(|| format!("会话未找到: {session_id}"))?;
             let dir = {
-                let lock = state.data_dir.lock().unwrap();
+                let lock = state.data_dir.lock();
                 lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
             };
             (PathBuf::from(session.workspace_path), dir)
@@ -3908,11 +3928,11 @@ pub async fn reapply_from_message(
     }
     let (ws, data_dir, snapshots, target_seq) = {
         let (ws, dir) = {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             let session = store::get_session(&db, &session_id)?
                 .ok_or_else(|| format!("会话未找到: {session_id}"))?;
             let dir = {
-                let lock = state.data_dir.lock().unwrap();
+                let lock = state.data_dir.lock();
                 lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
             };
             (PathBuf::from(session.workspace_path), dir)
@@ -4000,11 +4020,11 @@ pub async fn purge_withdrawn_messages(
         return Err("Agent 正在运行中，无法删除已撤回内容".into());
     }
     let data_dir = {
-        let lock = state.data_dir.lock().unwrap();
+        let lock = state.data_dir.lock();
         lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
     };
     let ws = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::get_session(&db, &session_id)?
             .map(|s| PathBuf::from(s.workspace_path))
             .ok_or_else(|| format!("会话未找到: {session_id}"))?
@@ -4046,7 +4066,8 @@ pub async fn purge_withdrawn_messages(
     }
 
     // 3. 清理 message_id → session_id 缓存，避免已删消息残留陈旧映射
-    if let Ok(mut cache) = state.message_session_cache.lock() {
+    {
+        let mut cache = state.message_session_cache.lock();
         for mid in &stats.message_ids {
             cache.remove(mid);
         }
@@ -4091,11 +4112,11 @@ pub async fn revert_message_turn(
     let session_id = state.find_session_by_message_id(&message_id)
         .ok_or_else(|| format!("消息未找到: {message_id}"))?;
     let (ws, data_dir) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let session = store::get_session(&db, &session_id)?
             .ok_or_else(|| format!("会话未找到: {session_id}"))?;
         let dir = {
-            let lock = state.data_dir.lock().unwrap();
+            let lock = state.data_dir.lock();
             lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
         };
         (PathBuf::from(session.workspace_path), dir)
@@ -4158,11 +4179,11 @@ pub async fn reapply_message_turn(
     let session_id = state.find_session_by_message_id(&message_id)
         .ok_or_else(|| format!("消息未找到: {message_id}"))?;
     let (ws, data_dir) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let session = store::get_session(&db, &session_id)?
             .ok_or_else(|| format!("会话未找到: {session_id}"))?;
         let dir = {
-            let lock = state.data_dir.lock().unwrap();
+            let lock = state.data_dir.lock();
             lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
         };
         (PathBuf::from(session.workspace_path), dir)
@@ -4224,11 +4245,11 @@ pub async fn revert_tool_event(
     let session_id = state.find_session_by_tool_event_id(&tool_event_id)
         .ok_or_else(|| format!("工具事件未找到: {tool_event_id}"))?;
     let (ws, data_dir) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let session = store::get_session(&db, &session_id)?
             .ok_or_else(|| format!("会话未找到: {session_id}"))?;
         let dir = {
-            let lock = state.data_dir.lock().unwrap();
+            let lock = state.data_dir.lock();
             lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
         };
         (PathBuf::from(session.workspace_path), dir)
@@ -4273,11 +4294,11 @@ pub async fn reapply_tool_event(
     let session_id = state.find_session_by_tool_event_id(&tool_event_id)
         .ok_or_else(|| format!("工具事件未找到: {tool_event_id}"))?;
     let (ws, data_dir) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let session = store::get_session(&db, &session_id)?
             .ok_or_else(|| format!("会话未找到: {session_id}"))?;
         let dir = {
-            let lock = state.data_dir.lock().unwrap();
+            let lock = state.data_dir.lock();
             lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
         };
         (PathBuf::from(session.workspace_path), dir)
@@ -4322,11 +4343,11 @@ pub async fn revert_turn_file(
     let session_id = state.find_session_by_message_id(&message_id)
         .ok_or_else(|| format!("消息未找到: {message_id}"))?;
     let (ws, data_dir) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let session = store::get_session(&db, &session_id)?
             .ok_or_else(|| format!("会话未找到: {session_id}"))?;
         let dir = {
-            let lock = state.data_dir.lock().unwrap();
+            let lock = state.data_dir.lock();
             lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
         };
         (PathBuf::from(session.workspace_path), dir)
@@ -4375,11 +4396,11 @@ pub async fn reapply_turn_file(
     let session_id = state.find_session_by_message_id(&message_id)
         .ok_or_else(|| format!("消息未找到: {message_id}"))?;
     let (ws, data_dir) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let session = store::get_session(&db, &session_id)?
             .ok_or_else(|| format!("会话未找到: {session_id}"))?;
         let dir = {
-            let lock = state.data_dir.lock().unwrap();
+            let lock = state.data_dir.lock();
             lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
         };
         (PathBuf::from(session.workspace_path), dir)
@@ -4425,7 +4446,7 @@ pub async fn get_turn_diff(
     let session_id = state.find_session_by_message_id(&message_id)
         .ok_or_else(|| format!("消息未找到: {message_id}"))?;
     let data_dir = {
-        let lock = state.data_dir.lock().unwrap();
+        let lock = state.data_dir.lock();
         lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
     };
     let snapshots = state.with_session_db(&session_id, |conn| {
@@ -4447,16 +4468,16 @@ pub async fn query_tool_logs(
     }
 
     let has_cat_logs = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         db.query_row("SELECT 1 FROM tool_events LIMIT 1", [], |_| Ok(true)).unwrap_or(false)
     };
     if has_cat_logs {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         return store::query_tool_logs(&db, &filter);
     }
 
     let sessions = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::list_sessions(&db, "all").unwrap_or_default()
     };
     let page = filter.page.unwrap_or(1).max(1) as usize;
@@ -4516,14 +4537,14 @@ pub async fn get_llm_request_trace(
     if let Some(sid) = state.find_session_by_message_id(&message_id) {
         state.with_session_db(&sid, |conn| crate::store::get_llm_request_trace(conn, &message_id))
     } else {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let db = state.db.lock();
         crate::store::get_llm_request_trace(&db, &message_id)
     }
 }
 
 #[tauri::command]
 pub async fn list_mcp_servers(state: State<'_, crate::AppState>) -> Result<Vec<crate::mcp::McpServerConfig>, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = state.db.lock();
     crate::store::list_mcp_servers(&db)
 }
 
@@ -4533,7 +4554,7 @@ pub async fn save_mcp_server(
     state: State<'_, crate::AppState>,
 ) -> Result<Vec<crate::mcp::McpToolDefinition>, String> {
     {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let db = state.db.lock();
         crate::store::save_mcp_server(&db, &cfg)?;
     }
     crate::mcp::global_mcp_manager().start_server(&cfg).await
@@ -4545,7 +4566,7 @@ pub async fn delete_mcp_server(
     state: State<'_, crate::AppState>,
 ) -> Result<bool, String> {
     crate::mcp::global_mcp_manager().stop_server(&id).await;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = state.db.lock();
     crate::store::delete_mcp_server(&db, &id)
 }
 
@@ -4561,7 +4582,7 @@ pub async fn test_mcp_server(
 #[tauri::command]
 pub async fn reload_mcp_servers(state: State<'_, crate::AppState>) -> Result<(), String> {
     let servers = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let db = state.db.lock();
         crate::store::list_mcp_servers(&db)?
     };
     crate::mcp::global_mcp_manager().reload_from_db(servers).await;
@@ -4624,7 +4645,7 @@ pub async fn browser_navigate_url(
         return Err("URL 不能为空".to_string());
     }
     let ws_path = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::get_session(&db, &session_id)
             .ok()
             .flatten()
@@ -4646,7 +4667,7 @@ pub async fn save_browser_storage_state(
         .ok_or_else(|| "当前会话暂无活动的浏览器调试实例".to_string())?;
 
     let ws_path = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let raw_ws = store::get_session(&db, &session_id)?
             .map(|s| s.workspace_path)
             .unwrap_or_default();
@@ -4694,7 +4715,7 @@ pub async fn restore_browser_storage_state(
         .ok_or_else(|| "当前会话暂无活动的浏览器调试实例".to_string())?;
 
     let ws_path = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let raw_ws = store::get_session(&db, &session_id)?
             .map(|s| s.workspace_path)
             .unwrap_or_default();
@@ -4727,7 +4748,7 @@ pub async fn get_browser_storage_state_summary(
     let session = crate::browser::global_browser_manager().get(&session_id).await;
 
     let ws_path = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let raw_ws = store::get_session(&db, &session_id)?
             .map(|s| s.workspace_path)
             .unwrap_or_default();
@@ -4763,7 +4784,7 @@ pub async fn clear_browser_storage_state(
     let session = crate::browser::global_browser_manager().get(&session_id).await;
 
     let ws_path = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let raw_ws = store::get_session(&db, &session_id)?
             .map(|s| s.workspace_path)
             .unwrap_or_default();

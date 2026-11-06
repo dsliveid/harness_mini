@@ -115,7 +115,7 @@ pub(crate) async fn create_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<Stri
     let app = ctx.host.as_ref().map(|h| &h.app);
     let state = app.map(|a| a.state::<crate::AppState>());
     let effect = {
-        let db_guard = state.as_ref().map(|s| s.db.lock().unwrap());
+        let db_guard = state.as_ref().map(|s| s.db.lock());
         crate::plan::create_plan_with_effect(
             &ctx.workspace,
             session_id,
@@ -152,7 +152,7 @@ pub(crate) async fn update_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<Stri
     let app = ctx.host.as_ref().map(|h| &h.app);
     let state = app.map(|a| a.state::<crate::AppState>());
     let effect = {
-        let db_guard = state.as_ref().map(|s| s.db.lock().unwrap());
+        let db_guard = state.as_ref().map(|s| s.db.lock());
         crate::plan::update_plan_with_effect(
             &ctx.workspace,
             session_id,
@@ -179,7 +179,7 @@ pub(crate) async fn switch_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<Stri
     let session_id = ctx.host.as_ref().map(|h| h.session_id.as_str()).unwrap_or("");
     let app = ctx.host.as_ref().map(|h| &h.app);
     let state = app.map(|a| a.state::<crate::AppState>());
-    let db_guard = state.as_ref().map(|s| s.db.lock().unwrap());
+    let db_guard = state.as_ref().map(|s| s.db.lock());
     let db_ref = db_guard.as_deref();
 
     crate::plan::switch_plan(
@@ -197,7 +197,7 @@ pub(crate) async fn read_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<String
     let session_id = ctx.host.as_ref().map(|h| h.session_id.as_str()).unwrap_or("");
     let app = ctx.host.as_ref().map(|h| &h.app);
     let state = app.map(|a| a.state::<crate::AppState>());
-    let db_guard = state.as_ref().map(|s| s.db.lock().unwrap());
+    let db_guard = state.as_ref().map(|s| s.db.lock());
     let db_ref = db_guard.as_deref();
 
     crate::plan::read_plan(&ctx.workspace, session_id, plan_id, db_ref)
@@ -208,7 +208,7 @@ pub(crate) async fn list_plans_tool(args: &Value, ctx: &ToolCtx) -> Result<Strin
     let session_id = ctx.host.as_ref().map(|h| h.session_id.as_str());
     let app = ctx.host.as_ref().map(|h| &h.app);
     let state = app.map(|a| a.state::<crate::AppState>());
-    let db_guard = state.as_ref().map(|s| s.db.lock().unwrap());
+    let db_guard = state.as_ref().map(|s| s.db.lock());
     let db_ref = db_guard.as_deref();
 
     let list = crate::plan::list_plans(&ctx.workspace, session_id, include_archived, db_ref)?;
@@ -224,7 +224,7 @@ pub(crate) async fn generate_image_tool(args: &Value, ctx: &ToolCtx) -> Result<S
     let session_id = &host.session_id;
 
     let (session, parent_session) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let s = crate::store::get_session(&db, session_id)?
             .ok_or_else(|| format!("会话不存在: {session_id}"))?;
         let p = s.parent_session_id.as_deref()
@@ -233,8 +233,8 @@ pub(crate) async fn generate_image_tool(args: &Value, ctx: &ToolCtx) -> Result<S
     };
 
     let settings = {
-        let db = state.db.lock().unwrap();
-        let master = state.master_key.lock().unwrap();
+        let db = state.db.lock();
+        let master = state.master_key.lock();
         crate::store::get_settings_with_secrets(&db, &master)?
     };
 
@@ -314,11 +314,11 @@ pub(crate) async fn generate_image_tool(args: &Value, ctx: &ToolCtx) -> Result<S
                 ctx.workspace.join(p)
             }
         } else {
-            let data_dir = state.data_dir.lock().unwrap().clone().unwrap_or_else(|| state.default_data_dir.clone());
+            let data_dir = state.data_dir.lock().clone().unwrap_or_else(|| state.default_data_dir.clone());
             data_dir.join("generated_images").join(session_id).join(fname)
         }
     } else {
-        let data_dir = state.data_dir.lock().unwrap().clone().unwrap_or_else(|| state.default_data_dir.clone());
+        let data_dir = state.data_dir.lock().clone().unwrap_or_else(|| state.default_data_dir.clone());
         let folder = data_dir.join("generated_images").join(session_id);
         let ext = "png";
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
@@ -356,14 +356,14 @@ pub(crate) fn resolve_vision_model_for_tool(
     let session_id = &host.session_id;
 
     let session = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         crate::store::get_session(&db, session_id)?
             .ok_or_else(|| format!("会话不存在: {session_id}"))?
     };
 
     let settings = {
-        let db = state.db.lock().unwrap();
-        let master = state.master_key.lock().unwrap();
+        let db = state.db.lock();
+        let master = state.master_key.lock();
         crate::store::get_settings_with_secrets(&db, &master)?
     };
 
@@ -438,7 +438,7 @@ pub(crate) async fn recognize_image_tool(args: &Value, ctx: &ToolCtx) -> Result<
         if let Some(p) = in_workspace {
             p
         } else {
-            let data_dir = state.data_dir.lock().unwrap().clone().unwrap_or_else(|| state.default_data_dir.clone());
+            let data_dir = state.data_dir.lock().clone().unwrap_or_else(|| state.default_data_dir.clone());
             let in_session_artifacts = data_dir.join("sessions").join(session_id).join("artifacts").join(trimmed_path);
             let in_session_gen = data_dir.join("generated_images").join(session_id).join(trimmed_path);
             let in_gen_root = data_dir.join(trimmed_path);
@@ -508,13 +508,13 @@ pub(crate) async fn recognize_image_tool(args: &Value, ctx: &ToolCtx) -> Result<
     let requested_model = args.get("model").and_then(|v| v.as_str()).map(|s| s.trim()).filter(|s| !s.is_empty());
     let has_native_vision = if requested_model.is_none() {
         let session = {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             crate::store::get_session(&db, session_id)?
                 .ok_or_else(|| format!("会话不存在: {session_id}"))?
         };
         let settings = {
-            let db = state.db.lock().unwrap();
-            let master = state.master_key.lock().unwrap();
+            let db = state.db.lock();
+            let master = state.master_key.lock();
             crate::store::get_settings_with_secrets(&db, &master)?
         };
         let (pid, mid) = if let (Some(pid), Some(mid)) = (&session.provider_id, &session.model_id) {
@@ -594,21 +594,21 @@ pub(crate) fn resolve_decision_route_for_tool(
     let session_id = &host.session_id;
 
     let session = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         crate::store::get_session(&db, session_id)?
             .ok_or_else(|| format!("会话不存在: {session_id}"))?
     };
 
     let parent_session = if let Some(ref pid) = session.parent_session_id {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         crate::store::get_session(&db, pid).ok().flatten()
     } else {
         None
     };
 
     let settings = {
-        let db = state.db.lock().unwrap();
-        let master = state.master_key.lock().unwrap();
+        let db = state.db.lock();
+        let master = state.master_key.lock();
         crate::store::get_settings_with_secrets(&db, &master)?
     };
 
@@ -806,8 +806,8 @@ pub(crate) async fn compact_context_tool(args: &Value, ctx: &ToolCtx) -> Result<
     let state = app.state::<crate::AppState>();
 
     let cfg = {
-        let db = state.db.lock().unwrap();
-        let master = state.master_key.lock().unwrap();
+        let db = state.db.lock();
+        let master = state.master_key.lock();
         let settings = crate::store::get_settings_with_secrets(&db, &master)?;
         crate::context::resolve_session_llm_cfg(&db, &settings, session_id)?
     };

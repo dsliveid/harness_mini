@@ -20,7 +20,7 @@ pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiv
     task.status = "running".to_string();
     task.updated_at = store::now();
     {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let _ = store::update_long_task(&db, &task);
     }
     let _ = app.emit("task:update", &task);
@@ -33,7 +33,7 @@ pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiv
         match signal {
             crate::task::DaemonControlSignal::Pause { .. } => {
                 let db_status = {
-                    let db = state.db.lock().unwrap();
+                    let db = state.db.lock();
                     store::get_long_task(&db, &task_id).ok().flatten().map(|t| t.status)
                 };
                 // 终态保护：若已在数据库中宣告完成或取消，严禁反向写回 paused！
@@ -41,7 +41,7 @@ pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiv
                     task.status = "paused".to_string();
                     task.updated_at = store::now();
                     {
-                        let db = state.db.lock().unwrap();
+                        let db = state.db.lock();
                         let _ = store::update_long_task(&db, &task);
                     }
                     let _ = app.emit("task:update", &task);
@@ -62,7 +62,7 @@ pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiv
 
         // 2. 检查任务是否已在数据库中达成终态（如已被 complete_long_task 结案）
         let (db_task_status, total_tokens) = {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             let t_opt = store::get_long_task(&db, &task_id).ok().flatten();
             let status = t_opt.as_ref().map(|t| t.status.clone()).unwrap_or_else(|| "unknown".into());
             let sess_tokens: u64 = db.query_row(
@@ -84,7 +84,7 @@ pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiv
                 task.status = "paused".to_string();
                 task.updated_at = store::now();
                 {
-                    let db = state.db.lock().unwrap();
+                    let db = state.db.lock();
                     let _ = store::update_long_task(&db, &task);
                     let alert = format!(
                         "⚠️ **长任务已触发 Token 预算硬熔断保护！**\n已消耗 {} tokens，超过预设上限 {} tokens。任务已自动挂起，等待人工确认。",
@@ -125,7 +125,7 @@ pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiv
 
         // 7. 检查最后一轮助手消息内容，判断是否达成终态目标
         let last_message_info = {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             let msgs = store::all_messages(&db, &session_id).unwrap_or_default();
             msgs.last().map(|m| (m.role.clone(), m.content.clone().unwrap_or_default()))
         };
@@ -147,7 +147,7 @@ pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiv
                 task.status = "paused".to_string();
                 task.updated_at = store::now();
                 {
-                    let db = state.db.lock().unwrap();
+                    let db = state.db.lock();
                     let _ = store::update_long_task(&db, &task);
                 }
                 let _ = app.emit("task:update", &task);
@@ -159,7 +159,7 @@ pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiv
         task.current_step += 1;
         task.updated_at = store::now();
         {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             let _ = store::update_long_task(&db, &task);
         }
         let _ = app.emit("task:update", &task);

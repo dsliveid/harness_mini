@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
+use parking_lot::RwLock;
 
 #[derive(Clone, Debug)]
 pub struct LlmCfg {
@@ -105,13 +106,13 @@ pub fn get_client(proxy_url: Option<&str>) -> reqwest::Client {
     });
 
     {
-        let r = lock.read().unwrap();
+        let r = lock.read();
         if r.0 == normalized {
             return r.1.clone();
         }
     }
 
-    let mut w = lock.write().unwrap();
+    let mut w = lock.write();
     if w.0 == normalized {
         return w.1.clone();
     }

@@ -12,7 +12,7 @@ use crate::agent;
 use crate::models::{LongTask, TaskCheckpoint, TaskSubItem};
 use crate::store;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::watch;
 
@@ -27,7 +27,7 @@ pub enum DaemonControlSignal {
 static TASK_CONTROLS: Mutex<Option<HashMap<String, watch::Sender<DaemonControlSignal>>>> = Mutex::new(None);
 
 pub fn send_control_signal(task_id: &str, signal: DaemonControlSignal) {
-    let mut map = TASK_CONTROLS.lock().unwrap();
+    let mut map = TASK_CONTROLS.lock();
     let controls = map.get_or_insert_with(HashMap::new);
     if let Some(tx) = controls.get(task_id) {
         let _ = tx.send(signal);
@@ -53,7 +53,7 @@ pub fn get_next_subtask_index(task: &LongTask) -> Option<usize> {
 }
 
 pub(crate) fn register_control(task_id: &str) -> watch::Receiver<DaemonControlSignal> {
-    let mut map = TASK_CONTROLS.lock().unwrap();
+    let mut map = TASK_CONTROLS.lock();
     let controls = map.get_or_insert_with(HashMap::new);
     let (tx, rx) = watch::channel(DaemonControlSignal::Running);
     controls.insert(task_id.to_string(), tx);
@@ -61,7 +61,7 @@ pub(crate) fn register_control(task_id: &str) -> watch::Receiver<DaemonControlSi
 }
 
 pub(crate) fn remove_control(task_id: &str) {
-    let mut map = TASK_CONTROLS.lock().unwrap();
+    let mut map = TASK_CONTROLS.lock();
     if let Some(controls) = map.as_mut() {
         controls.remove(task_id);
     }
@@ -96,8 +96,8 @@ pub fn start_long_task(
     }
 
     let (workspace_path, task_id, long_task_max_steps) = {
-        let db = state.db.lock().unwrap();
-        let master = state.master_key.lock().unwrap();
+        let db = state.db.lock();
+        let master = state.master_key.lock();
         let s = store::get_session(&db, &session_id)?
             .ok_or_else(|| "会话不存在".to_string())?;
         let tid = format!("task-{}", uuid::Uuid::new_v4().simple());
@@ -128,7 +128,7 @@ pub fn start_long_task(
     };
 
     let user_msg_id = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::create_long_task(&db, &task)?;
         let prompt_text = format!(
             "🎯 **启动长任务自治推进模式**\n\n            **总目标**：{}\n\n            【长任务自主协同准则】：\n            1. 当前会话已进入后台守护进程驱动的长任务模式，主会话享有全量历史上下文与单轨决策权；\n            2. 请依据前文完整的工程全貌与盘点结论，直接思考并展开第一阶段工作；\n            3. 【严格防 Token 膨胀机制】：若涉及大范围文件探索、具体代码编写、测试调试等重度施工，**请务必调用 `spawn_subagent` 委派给独立子沙箱执行**，主会话只接收交付工件摘要；\n            4. 当全部目标已彻底完成并通过自检验收后，请在回复末尾明确输出 `🎯 **长任务全部目标达成**`，守护进程将自动结案。",
@@ -160,7 +160,7 @@ pub fn pause_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
     send_control_signal(task_id, DaemonControlSignal::Pause { reason: None });
     let state = app.state::<crate::AppState>();
     let session_id = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let mut task = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
         task.status = "paused".to_string();
         task.updated_at = store::now();
@@ -180,7 +180,7 @@ pub fn pause_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
         }),
     );
     if let Ok(Some(task)) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::get_long_task(&db, task_id)
     } {
         let _ = app.emit("task:update", &task);
@@ -192,7 +192,7 @@ pub fn pause_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
 pub fn resume_long_task(app: &AppHandle, task_id: &str) -> Result<LongTask, String> {
     let state = app.state::<crate::AppState>();
     let task = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let mut t = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
         t.status = "running".to_string();
         t.updated_at = store::now();
@@ -221,7 +221,7 @@ pub fn cancel_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
     send_control_signal(task_id, DaemonControlSignal::Cancel { reason: None });
     let state = app.state::<crate::AppState>();
     let session_id = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let mut task = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
         task.status = "cancelled".to_string();
         task.updated_at = store::now();
@@ -240,7 +240,7 @@ pub fn cancel_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
         }),
     );
     if let Ok(Some(task)) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         store::get_long_task(&db, task_id)
     } {
         let _ = app.emit("task:update", &task);
@@ -261,7 +261,7 @@ pub fn complete_long_task(
     });
     let state = app.state::<crate::AppState>();
     let (task, cp_opt) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let mut t = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
         t.status = "completed".to_string();
         t.updated_at = store::now();
@@ -357,14 +357,14 @@ pub fn cancel_long_task_by_session(
 /// 获取会话当前活跃长任务
 pub fn get_active_task(app: &AppHandle, session_id: &str) -> Result<Option<LongTask>, String> {
     let state = app.state::<crate::AppState>();
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     store::get_active_long_task(&db, session_id)
 }
 
 /// 列出任务的所有检查点
 pub fn list_task_checkpoints(app: &AppHandle, task_id: &str) -> Result<Vec<TaskCheckpoint>, String> {
     let state = app.state::<crate::AppState>();
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     store::list_task_checkpoints(&db, task_id)
 }
 
@@ -372,7 +372,7 @@ pub fn list_task_checkpoints(app: &AppHandle, task_id: &str) -> Result<Vec<TaskC
 pub fn rollback_to_checkpoint(app: &AppHandle, checkpoint_id: &str) -> Result<LongTask, String> {
     let state = app.state::<crate::AppState>();
     let (mut task, cp) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let mut stmt = db
             .prepare(
                 "SELECT id, task_id, step_number, subtask_id, status, summary, working_memory, git_commit_hash, created_at
@@ -415,7 +415,7 @@ pub fn rollback_to_checkpoint(app: &AppHandle, checkpoint_id: &str) -> Result<Lo
     }
 
     {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let _ = db.execute(
             "DELETE FROM task_checkpoints WHERE task_id = ?1 AND step_number > ?2",
             rusqlite::params![task.id, cp.step_number as i64],
@@ -435,7 +435,7 @@ pub fn update_task_subtasks(
 ) -> Result<LongTask, String> {
     let state = app.state::<crate::AppState>();
     let task = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let mut t = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
         t.subtasks = subtasks;
         t.updated_at = store::now();

@@ -54,7 +54,6 @@ pub async fn request_approval(
     state
         .approvals
         .lock()
-        .unwrap()
         .insert(req.event_id.clone(), crate::PendingApproval { session_id: req.session_id.clone(), tx });
     state.emit("approval:request", &req);
 
@@ -75,7 +74,6 @@ pub async fn request_step_approval(
     state
         .approvals
         .lock()
-        .unwrap()
         .insert(req.event_id.clone(), crate::PendingApproval { session_id: req.session_id.clone(), tx });
     state.emit("approval:request", &req);
 

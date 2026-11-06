@@ -219,7 +219,8 @@ pub fn init_session_bundle_schema(conn: &Connection) -> Result<(), String> {
 }
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 
 /// 活跃会话数据库连接池（线程安全且复用连接，避免高频创建销毁连接句柄）
 #[derive(Default)]
@@ -236,7 +237,7 @@ impl SessionPool {
 
     /// 获取或打开指定会话的数据库连接（线程安全，同一会话复用同一连接句柄）
     pub fn get_or_open(&self, data_dir: &Path, session_id: &str) -> Result<Arc<Mutex<Connection>>, String> {
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock();
         if let Some(conn) = pool.get(session_id) {
             return Ok(conn.clone());
         }
@@ -250,18 +251,18 @@ impl SessionPool {
 
     /// 会话删除或归档时，关闭并移出会话连接
     pub fn evict(&self, session_id: &str) {
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock();
         pool.remove(session_id);
     }
 
     /// 清空所有连接（例如热切换数据目录时）
     pub fn clear(&self) {
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock();
         pool.clear();
     }
 
     pub fn active_session_ids(&self) -> Vec<String> {
-        let pool = self.pool.lock().unwrap();
+        let pool = self.pool.lock();
         pool.keys().cloned().collect()
     }
 }
@@ -284,7 +285,7 @@ where
         if bundle.exists() {
             if let Some(pool) = session_pool {
                 let conn_arc = pool.get_or_open(data_dir, session_id)?;
-                let conn = conn_arc.lock().unwrap();
+                let conn = conn_arc.lock();
                 return f(&conn);
             } else {
                 let conn = bundle.open_db()?;
@@ -297,7 +298,7 @@ where
         } else {
             if let Some(pool) = session_pool {
                 let conn_arc = pool.get_or_open(data_dir, session_id)?;
-                let conn = conn_arc.lock().unwrap();
+                let conn = conn_arc.lock();
                 return f(&conn);
             } else {
                 let conn = bundle.open_db()?;

@@ -264,7 +264,6 @@ pub async fn browser_screenshot(args: &Value, ctx: &ToolCtx) -> Result<String, S
         let dd = state
             .data_dir
             .lock()
-            .unwrap()
             .clone()
             .unwrap_or_else(|| state.default_data_dir.clone());
         (dd, host.session_id.clone())

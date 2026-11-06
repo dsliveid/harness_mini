@@ -228,7 +228,7 @@ pub(crate) async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<S
     let parent_id = &host.session_id;
 
     let (parent_session, current_subs_count) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let p = crate::store::get_session(&db, parent_id)?.ok_or("父会话不存在")?;
         // 校验递归深度：子 Agent 会话禁止再次创建子 Agent
         if p.session_type == "subagent" || p.parent_session_id.is_some() {
@@ -246,7 +246,7 @@ pub(crate) async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<S
     let sub_workspace = parent_session.workspace_path.clone();
 
     let (sub, initial_prompt) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let sub = crate::store::create_subagent_session(
             &db,
             parent_id,
@@ -302,7 +302,7 @@ pub(crate) async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<S
         sub.id
     );
     let user_msg = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         crate::store::new_message(&db, &sub.id, "user", Some(trigger_prompt), false)?
     };
 
@@ -376,7 +376,7 @@ pub(crate) async fn get_subagent_status_tool(args: &Value, ctx: &ToolCtx) -> Res
     let parent_id = &host.session_id;
 
     let subs = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         crate::store::list_subagents(&db, parent_id)?
     };
 
@@ -395,7 +395,7 @@ pub(crate) async fn get_subagent_status_tool(args: &Value, ctx: &ToolCtx) -> Res
     }
 
     let mut out = format!("共查询到 {} 个子 Agent 状态：\n\n", filtered.len());
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     for s in filtered {
         let is_running = crate::agent::is_run_active(&state, &s.id);
         let msgs = crate::store::get_messages(&db, &s.id, None, 50).unwrap_or_default();
@@ -415,7 +415,6 @@ pub(crate) async fn get_subagent_status_tool(args: &Value, ctx: &ToolCtx) -> Res
         let has_pending_approval = state
             .approvals
             .lock()
-            .unwrap()
             .values()
             .any(|p| p.session_id == s.id);
 
@@ -467,7 +466,7 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
     let parent_id = &host.session_id;
 
     let target_ids: Vec<String> = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let subs = crate::store::list_subagents(&db, parent_id)?;
         if let Some(ids) = specified_ids {
             subs.into_iter().filter(|s| ids.contains(&s.id)).map(|s| s.id).collect()
@@ -489,7 +488,7 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
             break;
         }
         let has_user_steering = {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock();
             crate::store::list_queued(&db, parent_id).map(|l| !l.is_empty()).unwrap_or(false)
         };
         if has_user_steering {
@@ -505,7 +504,6 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
             let has_pending_approval = state
                 .approvals
                 .lock()
-                .unwrap()
                 .values()
                 .any(|p| p.session_id == *id);
             if has_pending_approval {
@@ -556,7 +554,7 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
     let is_timed_out = start_wait.elapsed() >= max_wait;
 
     let (sub_results, any_still_running, any_interrupted_or_failed, memory_effects) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let mut any_interrupted_or_failed = false;
         let mut any_still_running = false;
         let mut sub_results = Vec::new();
@@ -589,7 +587,6 @@ pub(crate) async fn wait_subagents_tool(args: &Value, ctx: &ToolCtx) -> Result<S
             let has_pending_approval = state
                 .approvals
                 .lock()
-                .unwrap()
                 .values()
                 .any(|p| p.session_id == *id);
 
@@ -774,7 +771,7 @@ pub(crate) async fn stop_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<St
     let subagent_id = args.get("subagent_id").and_then(|v| v.as_str()).ok_or("缺少 subagent_id 参数")?;
     {
         let state = host.app.state::<crate::AppState>();
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let _ = crate::store::set_session_status(&db, subagent_id, "cancelled");
     }
     crate::agent::stop_session(&host.app, subagent_id);
@@ -810,7 +807,7 @@ pub(crate) async fn resume_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<
 
     // 校验子 Agent 是否存在且属于当前主会话
     {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let s = crate::store::get_session(&db, subagent_id)?.ok_or("未找到指定的子 Agent")?;
         if s.parent_session_id.as_deref() != Some(parent_id) {
             return Err("指定的子 Agent 不属于当前主会话".into());
@@ -841,7 +838,7 @@ pub(crate) async fn reject_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<
 
     // 1. 校验子 Agent 是否存在且属于当前主会话
     {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let s = crate::store::get_session(&db, subagent_id)?.ok_or("未找到指定的子 Agent")?;
         if s.parent_session_id.as_deref() != Some(parent_id) {
             return Err("指定的子 Agent 不属于当前主会话".into());
@@ -873,7 +870,7 @@ pub(crate) async fn dispatch_collaborator_tool(args: &Value, ctx: &ToolCtx) -> R
     let parent_id = &host.session_id;
 
     let collab = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let s = crate::store::get_session(&db, collaborator_id)?.ok_or("未找到指定的协作者")?;
         if s.parent_session_id.as_deref() != Some(parent_id) {
             return Err("指定的协作者不属于当前主会话".into());
@@ -886,7 +883,7 @@ pub(crate) async fn dispatch_collaborator_tool(args: &Value, ctx: &ToolCtx) -> R
     }
 
     let user_prompt = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         build_briefing_packet(
             &db,
             &ctx.workspace,
@@ -898,7 +895,7 @@ pub(crate) async fn dispatch_collaborator_tool(args: &Value, ctx: &ToolCtx) -> R
         )
     };
     let (user_msg, user_prompt) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let _ = crate::store::set_kv(&db, collaborator_id, "dispatched_by_parent", "true");
         let msg = crate::store::new_message(&db, collaborator_id, "user", Some(user_prompt.clone()), false)?;
         (msg, user_prompt)
@@ -947,7 +944,7 @@ pub(crate) async fn wait_collaborators_tool(args: &Value, ctx: &ToolCtx) -> Resu
     let parent_id = &host.session_id;
 
     let target_ids: Vec<String> = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         let collabs = crate::store::list_collaborators(&db, parent_id)?;
         if let Some(ids) = specified_ids {
             collabs.into_iter().filter(|s| ids.contains(&s.id)).map(|s| s.id).collect()
@@ -979,7 +976,7 @@ pub(crate) async fn wait_collaborators_tool(args: &Value, ctx: &ToolCtx) -> Resu
         out.push_str("✅ 目标协作者本轮执行完毕！汇总增量成果如下：\n\n");
     }
 
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     for id in &target_ids {
         let is_running = crate::agent::is_run_active(&state, id);
         let s = match crate::store::get_session(&db, id)? {
@@ -1073,7 +1070,6 @@ pub(crate) async fn wait_collaborators_tool(args: &Value, ctx: &ToolCtx) -> Resu
         let has_pending_approval = state
             .approvals
             .lock()
-            .unwrap()
             .values()
             .any(|p| p.session_id == s.id);
 
@@ -1111,7 +1107,7 @@ pub(crate) async fn get_collaborators_tool(ctx: &ToolCtx) -> Result<String, Stri
     let parent_id = &host.session_id;
 
     let collabs = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock();
         crate::store::list_collaborators(&db, parent_id)?
     };
 
@@ -1120,7 +1116,7 @@ pub(crate) async fn get_collaborators_tool(ctx: &ToolCtx) -> Result<String, Stri
     }
 
     let mut out = format!("当前已配置 {} 位项目协作者：\n\n", collabs.len());
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock();
     for c in collabs {
         let is_running = crate::agent::is_run_active(&state, &c.id);
         let msgs = crate::store::get_messages(&db, &c.id, None, 10).unwrap_or_default();

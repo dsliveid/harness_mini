@@ -1,7 +1,7 @@
 use crate::models::{ApprovalRequest, CompactionRequest, ToolEvent};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -77,7 +77,7 @@ impl SnapshotStore {
     }
 
     pub fn get(&self, session_id: &str) -> SessionActiveState {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock();
         map.entry(session_id.to_string())
             .or_insert_with(|| SessionActiveState {
                 session_id: session_id.to_string(),
@@ -87,7 +87,7 @@ impl SnapshotStore {
     }
 
     pub fn start_run(&self, session_id: &str, run_id: &str) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock();
         let st = map.entry(session_id.to_string()).or_default();
         st.session_id = session_id.to_string();
         st.is_running = true;
@@ -103,7 +103,7 @@ impl SnapshotStore {
 
     /// 切换并开启新步骤：原子清空流式思考与正文缓冲区，彻底杜绝上一步思考跨步骤残留
     pub fn transition_to_step(&self, session_id: &str, run_id: &str, step_index: usize, message_id: &str) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock();
         let st = map.entry(session_id.to_string()).or_default();
         st.session_id = session_id.to_string();
         st.is_running = true;
@@ -122,7 +122,7 @@ impl SnapshotStore {
     }
 
     pub fn finish_run(&self, session_id: &str) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock();
         if let Some(st) = map.get_mut(session_id) {
             st.is_running = false;
             st.active_run_id = None;
@@ -137,7 +137,7 @@ impl SnapshotStore {
     }
 
     pub fn finish_step(&self, session_id: &str) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock();
         if let Some(st) = map.get_mut(session_id) {
             st.streaming_content.clear();
             st.streaming_reasoning.clear();
@@ -146,7 +146,7 @@ impl SnapshotStore {
     }
 
     pub fn append_content_delta(&self, session_id: &str, delta: &str, message_id: Option<&str>) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock();
         let st = map.entry(session_id.to_string()).or_default();
         if let Some(mid) = message_id {
             if st.current_message_id.as_deref() != Some(mid) {
@@ -165,7 +165,7 @@ impl SnapshotStore {
     }
 
     pub fn append_reasoning_delta(&self, session_id: &str, delta: &str, message_id: Option<&str>) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock();
         let st = map.entry(session_id.to_string()).or_default();
         if let Some(mid) = message_id {
             if st.current_message_id.as_deref() != Some(mid) {
@@ -184,7 +184,7 @@ impl SnapshotStore {
     }
 
     pub fn start_tool_preparing(&self, session_id: &str, call_id: &str, tool_name: &str) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock();
         let st = map.entry(session_id.to_string()).or_default();
         if let Some(ref mut step) = st.active_step {
             step.phase = StepPhase::ToolPreparing {
@@ -198,7 +198,7 @@ impl SnapshotStore {
     }
 
     pub fn append_tool_args_delta(&self, session_id: &str, _call_id: &str, delta: &str) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock();
         let st = map.entry(session_id.to_string()).or_default();
         if let Some(ref mut step) = st.active_step {
             if let StepPhase::ToolPreparing {
@@ -215,7 +215,7 @@ impl SnapshotStore {
     }
 
     pub fn start_tool_executing(&self, session_id: &str, call_id: &str, tool_name: &str, event_id: &str) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock();
         let st = map.entry(session_id.to_string()).or_default();
         if let Some(ref mut step) = st.active_step {
             step.phase = StepPhase::ToolExecuting {
@@ -228,7 +228,7 @@ impl SnapshotStore {
     }
 
     pub fn upsert_tool_event(&self, session_id: &str, ev: ToolEvent) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock();
         let st = map.entry(session_id.to_string()).or_default();
         if let Some(idx) = st.active_tool_events.iter().position(|e| e.id == ev.id) {
             st.active_tool_events[idx] = ev;
@@ -238,20 +238,20 @@ impl SnapshotStore {
     }
 
     pub fn remove_finished_tool_event(&self, session_id: &str, event_id: &str) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock();
         if let Some(st) = map.get_mut(session_id) {
             st.active_tool_events.retain(|e| e.id != event_id);
         }
     }
 
     pub fn set_pending_approval(&self, session_id: &str, req: Option<ApprovalRequest>) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock();
         let st = map.entry(session_id.to_string()).or_default();
         st.pending_approval = req;
     }
 
     pub fn set_pending_compaction(&self, session_id: &str, req: Option<CompactionRequest>) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock();
         let st = map.entry(session_id.to_string()).or_default();
         st.pending_compaction = req;
     }
