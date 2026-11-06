@@ -158,8 +158,13 @@ pub fn load_static_project_memory(workspace: &Path) -> Option<String> {
         // 排除仅有模板初始文字的情况
         if !trimmed.is_empty() && !trimmed.contains("（待提炼沉淀：") {
             let max_profile_chars = 8000;
-            let profile_content = if trimmed.len() > max_profile_chars {
-                let safe_slice = trimmed.char_indices().nth(max_profile_chars).map(|(i, _)| &trimmed[..i]).unwrap_or(&trimmed[..max_profile_chars]);
+            let profile_content = if trimmed.chars().count() > max_profile_chars {
+                // 按字符边界安全截断（禁止用字节索引，中文会落在字符中间导致 panic）
+                let safe_slice = trimmed
+                    .char_indices()
+                    .nth(max_profile_chars)
+                    .map(|(i, _)| &trimmed[..i])
+                    .unwrap_or(trimmed);
                 format!("{safe_slice}\n\n*(注：profile.md 超过 8,000 字符，已展示前部核心大盘，完整内容见 .harness/memory/profile.md)*")
             } else {
                 trimmed.to_string()
@@ -175,9 +180,22 @@ pub fn load_static_project_memory(workspace: &Path) -> Option<String> {
         let lines: Vec<_> = trimmed.lines().filter(|l| !l.trim().is_empty()).collect();
         if lines.len() > 2 {
             let max_chars = 3000;
-            let content_to_use = if trimmed.len() > max_chars {
+            let content_to_use = if trimmed.chars().count() > max_chars {
                 // 优先从末尾向前寻找最近的完整章节（\n### ），保留最新沉淀的工程约定
-                let slice = &trimmed[trimmed.len().saturating_sub(max_chars)..];
+                //
+                // ⚠️ 必须用 char_indices 定位字符边界：max_chars 语义是「字符数」，
+                // 而 trimmed.len() 是「字节数」。中文 UTF-8 每字约占 3 字节，
+                // 直接用字节索引切片会落在汉字中间，触发
+                // "start byte index ... is not a char boundary" panic（历史事故 2026-11-06，
+                // 表现为：发送消息后 run_loop 在 tokio worker 上 panic，界面永久无响应）。
+                let total_chars = trimmed.chars().count();
+                let start_char = total_chars.saturating_sub(max_chars);
+                let byte_start = trimmed
+                    .char_indices()
+                    .nth(start_char)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                let slice = &trimmed[byte_start..];
                 if let Some(pos) = slice.find("\n### ") {
                     format!("*(注：项目历史规约较多，此处精选最新关键沉淀，全量见 .harness/memory/conventions.md)*\n\n{}", &slice[pos + 1..].trim())
                 } else {
@@ -793,6 +811,45 @@ pub fn trigger_auto_distillation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_load_static_project_memory_chinese_truncation_no_panic() {
+        // 回归测试（2026-11-06 事故）：conventions.md 曾用字节索引切片
+        // `&trimmed[trimmed.len().saturating_sub(max_chars)..]`，
+        // 中文字符占 3 字节导致索引落在汉字中间，
+        // 触发 "start byte index ... is not a char boundary" panic，
+        // 表现为发送消息后 run_loop 在 tokio worker 上崩溃、界面永久无响应。
+        //
+        // 本测试用超长纯中文内容触发截断分支，确保不再 panic 且输出有效。
+        let temp_dir = std::env::temp_dir().join(format!("harness_test_mem_{}", uuid::Uuid::new_v4()));
+        let _ = fs::create_dir_all(&temp_dir);
+        ensure_memory_dir(&temp_dir).unwrap();
+
+        let mem = memory_dir(&temp_dir);
+
+        // profile.md：超过 8000 字符的中文，触发 profile 截断分支
+        let mut profile = String::new();
+        for i in 0..3000 {
+            profile.push_str(&format!("第{i}条技术大盘沉淀内容，用于验证中文字符边界安全。\n"));
+        }
+        fs::write(mem.join("profile.md"), &profile).unwrap();
+
+        // conventions.md：超过 3000 字符的中文，触发「从末尾逆序保留」截断分支
+        let mut conv = String::new();
+        for i in 0..1000 {
+            conv.push_str(&format!("\n### 规范条目{i}\n这是一段用于验证字符边界的中文工程规约内容。\n"));
+        }
+        fs::write(mem.join("conventions.md"), &conv).unwrap();
+
+        // 核心断言：不 panic，且正常返回内容
+        let out = load_static_project_memory(&temp_dir);
+        assert!(out.is_some(), "超长中文记忆应能正常加载而不是 panic");
+        let text = out.unwrap();
+        assert!(text.contains("profile.md"));
+        assert!(text.contains("conventions.md"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 
     #[test]
     fn test_ensure_memory_dir_creates_structure() {
