@@ -202,5 +202,9 @@ pub async fn chat_stream_full(
         }
     }
 
-    Ok(finish(result, &mut calls))
+    let partial_len = result.content.chars().count() + result.reasoning.chars().count();
+    Err(format!(
+        "流读取失败: 远程模型服务未收到 response.completed 即异常关闭连接 (Unexpected EOF, 已接收 {} 字符)",
+        partial_len
+    ))
 }

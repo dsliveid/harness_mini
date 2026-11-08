@@ -114,8 +114,23 @@ pub(crate) async fn create_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<Stri
     let session_id = ctx.host.as_ref().map(|h| h.session_id.as_str()).unwrap_or("");
     let app = ctx.host.as_ref().map(|h| &h.app);
     let state = app.map(|a| a.state::<crate::AppState>());
-    let effect = {
-        let db_guard = state.as_ref().map(|s| s.db.lock());
+    let effect = if let Some(state) = &state {
+        state.with_session_db(session_id, |conn| {
+            crate::plan::create_plan_with_effect(
+                &ctx.workspace,
+                session_id,
+                title,
+                goals,
+                architecture,
+                &files,
+                &steps,
+                verification,
+                ctx.message_id.as_deref(),
+                ctx.event_id.as_deref(),
+                Some(conn),
+            )
+        })?
+    } else {
         crate::plan::create_plan_with_effect(
             &ctx.workspace,
             session_id,
@@ -127,7 +142,7 @@ pub(crate) async fn create_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<Stri
             verification,
             ctx.message_id.as_deref(),
             ctx.event_id.as_deref(),
-            db_guard.as_deref(),
+            None,
         )?
     };
     drop(state);
@@ -151,8 +166,23 @@ pub(crate) async fn update_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<Stri
     let session_id = ctx.host.as_ref().map(|h| h.session_id.as_str()).unwrap_or("");
     let app = ctx.host.as_ref().map(|h| &h.app);
     let state = app.map(|a| a.state::<crate::AppState>());
-    let effect = {
-        let db_guard = state.as_ref().map(|s| s.db.lock());
+    let effect = if let Some(state) = &state {
+        state.with_session_db(session_id, |conn| {
+            crate::plan::update_plan_with_effect(
+                &ctx.workspace,
+                session_id,
+                plan_id,
+                reason,
+                status,
+                step_updates,
+                modified_sections,
+                revision_note,
+                ctx.message_id.as_deref(),
+                ctx.event_id.as_deref(),
+                Some(conn),
+            )
+        })?
+    } else {
         crate::plan::update_plan_with_effect(
             &ctx.workspace,
             session_id,
@@ -164,7 +194,7 @@ pub(crate) async fn update_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<Stri
             revision_note,
             ctx.message_id.as_deref(),
             ctx.event_id.as_deref(),
-            db_guard.as_deref(),
+            None,
         )?
     };
     drop(state);
@@ -179,17 +209,28 @@ pub(crate) async fn switch_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<Stri
     let session_id = ctx.host.as_ref().map(|h| h.session_id.as_str()).unwrap_or("");
     let app = ctx.host.as_ref().map(|h| &h.app);
     let state = app.map(|a| a.state::<crate::AppState>());
-    let db_guard = state.as_ref().map(|s| s.db.lock());
-    let db_ref = db_guard.as_deref();
 
-    crate::plan::switch_plan(
-        &ctx.workspace,
-        session_id,
-        plan_id,
-        ctx.message_id.as_deref(),
-        ctx.event_id.as_deref(),
-        db_ref,
-    )
+    if let Some(state) = &state {
+        state.with_session_db(session_id, |conn| {
+            crate::plan::switch_plan(
+                &ctx.workspace,
+                session_id,
+                plan_id,
+                ctx.message_id.as_deref(),
+                ctx.event_id.as_deref(),
+                Some(conn),
+            )
+        })
+    } else {
+        crate::plan::switch_plan(
+            &ctx.workspace,
+            session_id,
+            plan_id,
+            ctx.message_id.as_deref(),
+            ctx.event_id.as_deref(),
+            None,
+        )
+    }
 }
 
 pub(crate) async fn read_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
@@ -197,21 +238,30 @@ pub(crate) async fn read_plan_tool(args: &Value, ctx: &ToolCtx) -> Result<String
     let session_id = ctx.host.as_ref().map(|h| h.session_id.as_str()).unwrap_or("");
     let app = ctx.host.as_ref().map(|h| &h.app);
     let state = app.map(|a| a.state::<crate::AppState>());
-    let db_guard = state.as_ref().map(|s| s.db.lock());
-    let db_ref = db_guard.as_deref();
 
-    crate::plan::read_plan(&ctx.workspace, session_id, plan_id, db_ref)
+    if let Some(state) = &state {
+        state.with_session_db(session_id, |conn| {
+            crate::plan::read_plan(&ctx.workspace, session_id, plan_id, Some(conn))
+        })
+    } else {
+        crate::plan::read_plan(&ctx.workspace, session_id, plan_id, None)
+    }
 }
 
 pub(crate) async fn list_plans_tool(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let include_archived = get_bool_arg(args, "include_archived", false);
     let session_id = ctx.host.as_ref().map(|h| h.session_id.as_str());
+    let sid = session_id.unwrap_or("");
     let app = ctx.host.as_ref().map(|h| &h.app);
     let state = app.map(|a| a.state::<crate::AppState>());
-    let db_guard = state.as_ref().map(|s| s.db.lock());
-    let db_ref = db_guard.as_deref();
 
-    let list = crate::plan::list_plans(&ctx.workspace, session_id, include_archived, db_ref)?;
+    let list = if let Some(state) = &state {
+        state.with_session_db(sid, |conn| {
+            crate::plan::list_plans(&ctx.workspace, session_id, include_archived, Some(conn))
+        })?
+    } else {
+        crate::plan::list_plans(&ctx.workspace, session_id, include_archived, None)?
+    };
     serde_json::to_string_pretty(&list).map_err(|e| e.to_string())
 }
 

@@ -3,6 +3,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 use std::path::Path;
 
+pub mod blob;
+pub mod core;
+pub mod logs;
+
 pub fn open_db(path: &Path) -> Result<Connection, String> {
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
     conn.execute_batch(
@@ -12,6 +16,13 @@ pub fn open_db(path: &Path) -> Result<Connection, String> {
          PRAGMA auto_vacuum = INCREMENTAL;",
     )
     .map_err(|e| e.to_string())?;
+    // 老库修复（实测结论 5/6）：auto_vacuum=NONE 的老库必须 VACUUM 一次才能切换为
+    // INCREMENTAL。仅首次启动发生一次（之后模式已持久化），代价约 39MB/933ms。
+    match core::ensure_auto_vacuum_effective(&conn) {
+        Ok(true) => eprintln!("[Core] 老库 auto_vacuum 修复完成（VACUUM 一次，空间回收模式已生效）"),
+        Ok(false) => {}
+        Err(e) => eprintln!("[Core] auto_vacuum 修复失败（不影响启动）: {e}"),
+    }
     init_schema(&conn)?;
     // 仅在无活跃后台守护进程时才执行遗留状态清理，避免误杀正在运行的 Agent
     let is_daemon_alive = path.parent().and_then(|dir| {
@@ -129,17 +140,11 @@ fn init(conn: &Connection) -> Result<(), String> {
         );
 
         -- 权威单一事实源约束：runs 状态变更时自动对齐 sessions.last_run_status，消灭应用层漏改/误改
-        CREATE TRIGGER IF NOT EXISTS trg_runs_status_sync_insert
-        AFTER INSERT ON runs
-        BEGIN
-            UPDATE sessions SET last_run_status = NEW.status WHERE id = NEW.session_id;
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS trg_runs_status_sync_update
-        AFTER UPDATE OF status ON runs
-        BEGIN
-            UPDATE sessions SET last_run_status = NEW.status WHERE id = NEW.session_id;
-        END;
+        -- 三库分离（步骤12）：runs 表随会话迁入 session.db 后，跨库触发器已失效，
+        -- last_run_status 改由应用层在 run 状态变更的同一操作内回写（agent.rs / set_session_last_run_status）。
+        -- 老库中已存在的触发器在此一次性摘除，避免与 app 层双写。
+        DROP TRIGGER IF EXISTS trg_runs_status_sync_insert;
+        DROP TRIGGER IF EXISTS trg_runs_status_sync_update;
 
         CREATE TABLE IF NOT EXISTS session_kv (
           session_id TEXT NOT NULL,
@@ -366,6 +371,8 @@ fn init(conn: &Connection) -> Result<(), String> {
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id, started_at DESC, id DESC)", []);
     let _ = backfill_message_tokens(conn);
     let _ = backfill_session_tokens_and_last_runs(conn);
+    // 三库分离（阶段2）：sessions 分库元数据列 + 首屏覆盖索引（幂等）
+    core::ensure_core_evolution(conn)?;
     Ok(())
 }
 
@@ -2371,6 +2378,13 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         reasoning_effort: r.get(34)?,
         max_steps: r.get::<_, Option<i64>>(35).ok().flatten().map(|v| v as u32),
         last_run_status: r.get(40)?,
+        msg_count: r.get::<_, Option<i64>>(41)?.unwrap_or(0),
+        tool_event_count: r.get::<_, Option<i64>>(42)?.unwrap_or(0),
+        last_preview: r.get(43)?,
+        storage_state: r.get::<_, Option<String>>(44)?.unwrap_or_else(|| "hot".into()),
+        bundle_bytes: r.get::<_, Option<i64>>(45)?.unwrap_or(0),
+        schema_version: r.get::<_, Option<i64>>(46)?.unwrap_or(1),
+        logical_deleted_at: r.get(47)?,
     })
 }
 
@@ -2382,7 +2396,8 @@ const SESSION_COLS: &str =
      dispatch_rule, image_provider_id, image_model_id, vision_provider_id, vision_model_id, \
      decision_provider_id, decision_model_id, \
      forked_from_session_id, forked_from_message_id, reasoning_effort, max_steps, \
-     total_tokens, prompt_tokens, completion_tokens, cached_tokens, last_run_status";
+     total_tokens, prompt_tokens, completion_tokens, cached_tokens, last_run_status, \
+     msg_count, tool_event_count, last_preview, storage_state, bundle_bytes, schema_version, logical_deleted_at";
 
 pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>, String> {
     conn.query_row(
@@ -2395,9 +2410,12 @@ pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>, Strin
 }
 
 pub fn list_sessions(conn: &Connection, status: &str) -> Result<Vec<Session>, String> {
+    // 阶段2 首屏改造：只读 sessions 轻量元数据（msg_count/last_preview 为增量维护列），
+    // 排序走覆盖索引 idx_sessions_status_lastmsg(status, last_message_at DESC, id DESC)，
+    // 彻底移除对 messages 的跨表聚合（实测 10 万行场景 95.2ms → 0.1ms 级）。
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT {SESSION_COLS} FROM sessions WHERE status = ?1 AND (parent_session_id IS NULL OR parent_session_id = '') ORDER BY COALESCE(last_message_at, created_at) DESC"
+            "SELECT {SESSION_COLS} FROM sessions WHERE status = ?1 AND (parent_session_id IS NULL OR parent_session_id = '') ORDER BY last_message_at DESC, id DESC"
         ))
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -2568,6 +2586,13 @@ pub fn create_session_with_models(
         reasoning_effort: reasoning_effort.map(|s| s.to_string()),
         last_run_status: None,
         max_steps: None,
+        msg_count: 0,
+        tool_event_count: 0,
+        last_preview: None,
+        storage_state: "hot".into(),
+        bundle_bytes: 0,
+        schema_version: 1,
+        logical_deleted_at: None,
     };
     conn.execute(
         "INSERT INTO sessions(
@@ -2670,6 +2695,13 @@ pub fn create_collaborator_session(
         reasoning_effort: None,
         last_run_status: None,
         max_steps: None,
+        msg_count: 0,
+        tool_event_count: 0,
+        last_preview: None,
+        storage_state: "hot".into(),
+        bundle_bytes: 0,
+        schema_version: 1,
+        logical_deleted_at: None,
     };
     conn.execute(
         "INSERT INTO sessions(
@@ -2900,6 +2932,13 @@ pub fn create_subprocess_session(
         reasoning_effort,
         last_run_status: None,
         max_steps: Some(subtask_max_steps),
+        msg_count: 0,
+        tool_event_count: 0,
+        last_preview: None,
+        storage_state: "hot".into(),
+        bundle_bytes: 0,
+        schema_version: 1,
+        logical_deleted_at: None,
     };
     conn.execute(
         "INSERT INTO sessions(
@@ -6763,6 +6802,10 @@ pub fn delete_mcp_server(conn: &Connection, id: &str) -> Result<bool, String> {
 
 
 
+/// 旧路径：LLM 请求审计写入会话库/主库的 llm_requests 表（含 lean payload 瘦身）。
+/// 三库分离后写入已切换到 store::logs（日志库，大字段外置）；
+/// 此函数保留作为 storage.mode=single 回滚通路的写路径，日常不调用。
+#[allow(dead_code)]
 pub fn save_llm_request_trace(
     conn: &Connection,
     session_id: &str,
@@ -6853,11 +6896,15 @@ pub fn set_session_last_run_status(conn: &Connection, session_id: &str, status: 
     Ok(())
 }
 
-pub fn collect_active_snapshot_hashes_from_all_sessions(
+/// 扫描全部分库（sessions/*/session.db），收集其中仍在引用的快照哈希，并入传入的哈希集。
+///
+/// 性能约定（修复「重启后首次删除会话卡顿」）：
+/// 此函数是纯文件系统 IO，冷启动（无文件缓存 + Defender 首扫）时最慢可达数秒，
+/// 绝不能在持有主库锁（catalog）时调用——否则主线程上的同步命令会被整窗卡死。
+pub fn collect_snapshot_hashes_from_session_dbs(
     data_dir: &std::path::Path,
-    catalog_conn: &Connection,
-) -> Result<std::collections::HashSet<String>, String> {
-    let mut hashes = collect_active_snapshot_hashes(catalog_conn).unwrap_or_default();
+    mut hashes: std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
     let sessions_dir = data_dir.join("sessions");
     if let Ok(entries) = std::fs::read_dir(sessions_dir) {
         for entry in entries.flatten() {
@@ -6874,7 +6921,7 @@ pub fn collect_active_snapshot_hashes_from_all_sessions(
             }
         }
     }
-    Ok(hashes)
+    hashes
 }
 
 pub fn fork_session_sharded(
@@ -7178,6 +7225,27 @@ pub fn fork_session_sharded(
             params![new_rule_id, new_session_id, r.0, r.1, r.2],
         )
         .map_err(|e| format!("复制审批规则失败: {}", e))?;
+    }
+
+    let mut kv_stmt = src_conn
+        .prepare("SELECT key, value FROM session_kv WHERE session_id = ?1")
+        .map_err(|e| e.to_string())?;
+
+    let kv_rows = kv_stmt
+        .query_map(params![source_session_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    for (k, v) in kv_rows {
+        dst_conn.execute(
+            "INSERT INTO session_kv (session_id, key, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id, key) DO UPDATE SET value = excluded.value",
+            params![new_session_id, k, v],
+        )
+        .map_err(|e| format!("复制会话KV失败: {}", e))?;
     }
 
     get_session(catalog_conn, new_session_id)?.ok_or_else(|| "无法获取新创建的分支会话".to_string())

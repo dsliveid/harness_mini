@@ -377,3 +377,45 @@ console.log(`数据库优化完成，已释放物理空间: ${(result.freedBytes
 - **备份单个会话**：只需将 `data/sessions/{session_id}` 复制一份即可随处迁移；
 - **全量冷备**：只需备份 `catalog.db` 和 `secret.key` 即可保证项目结构与核心配置万无一失；
 - **清理归档**：若磁盘紧张，用户可直接在文件管理器中删除 `data/archives/` 目录下不需要的冷数据，下次启动系统自愈引擎会自动校准。
+
+---
+
+## 七、三库分离架构（2026-11 增补：core / session bundle / 月轮转日志库）
+
+> 权威表结构速查见 `docs/SQLITE_THREE_DB_SCHEMA_REFERENCE.md`，本节记录架构性契约与实测修订。
+
+### 7.1 三库划分与物理拓扑（对 §3.1 的增补）
+```
+data/
+├── harness_mini.db          # core.db（元数据库，恒定 MB 级：配置/项目/会话元数据/密钥/MCP/成长规则/日统计/schema_migrations）
+├── sessions/{id}/session.db # 会话库（消息/工具/任务/检查点 + blobs 外置索引）
+├── logs/logs-YYYYMM.db      # 按月轮转日志库（llm_requests 审计 + tool_call_logs 出入参明细），logs/blobs/ 为日志专属外置命名空间
+├── blobs/                   # 会话大字段外置（内容寻址 sha256 + zstd）
+└── archives/{id}.hmsession  # 冷归档
+```
+
+### 7.2 关键契约修订
+1. **首屏列表唯一数据源**：`sessions` 表新增 `msg_count / tool_event_count / last_preview / storage_state / bundle_bytes / schema_version / logical_deleted_at` 增量维护列；`list_sessions` 仅读该表并走覆盖索引 `idx_sessions_status_lastmsg(status, last_message_at DESC, id DESC)`，**彻底废除**对 messages 的跨库聚合（实测 10 万行场景 95.2ms → 0.1ms 级）。元数据在写消息的同一操作内增量维护（跨库无共享事务），偏差由启动对账任务（`core::reconcile_all_session_metadata`）以 session.db 为事实源修正。
+2. **跨库触发器摘除**：`runs` → `sessions.last_run_status` 的两个触发器已删除（分库后跨库失效），改为应用层在 run 状态变更（完成/取消/中断兜底）的同一操作内回写 catalog。
+3. **审计与业务解耦**：`tool_events`（会话库）只留业务态（result_text ≤64KB 内联）；`tool_call_logs`（日志库）留全量出入参（>8KB 外置 `logs/blobs/`）。删除日志不影响审批/回滚。
+4. **LLM 请求审计迁移**：写入路径从会话库切换到月轮转日志库（单写线程 + 200 条/200ms 批量事务，非阻塞有界队列）；新增 `ttft_ms / tokens_per_sec` 标量列记录生成性能（v2 设计：不建流式帧分片表）。旧 `save_llm_request_trace` 保留为 `storage.mode=single` 回滚写路径。
+5. **长任务路由**：`long_tasks / task_checkpoints` 读写统一经 `AppState.with_task_db`（按 task_id 定位会话 → session.db；未迁移回落 catalog），修复了「任务数据被迁移引擎搬入分库后任务模块失明」的潜在缺陷。
+
+### 7.3 VACUUM 策略修订（对 §2.1 / §4.x 的替代）
+基于实测（结论 5/6/7）**放弃** `incremental_vacuum` 循环回收方案：
+- **一级（主要手段）**：删文件——归档/删除会话直接删目录，回收率 100%、O(1)；日志按 TTL 删整月文件（含该月孤儿 blob GC）。
+- **二级**：`optimize_database` 改为分库统计聚合，仅对 >50MB 的会话库执行一次全量 VACUUM（实测 39MB 阻塞 933ms，用户手动触发即显式同意）。
+- **auto_vacuum 修复**：老库（auto_vacuum=NONE）必须「先设 PRAGMA → VACUUM 一次」模式才真正切换为 INCREMENTAL（实测仅设定无效），启动时一次性自动修复。
+
+### 7.4 storage.mode 回滚开关
+`settings.storage.mode = single | hybrid | split`（默认 hybrid；原子量缓存，`set_storage_mode` 命令显式确认后切换，有任务运行时拒绝）：
+- `single`：读写一律 catalog（旧单库模式，保证未迁移数据在回滚后仍可用）；
+- `hybrid`：有 bundle 走分库、无 bundle 回落 catalog；
+- `split`：同 hybrid 路由，日志库作为审计读的权威源。
+
+### 7.5 阶段1实测验收数据（scripts/sqlite_bench/bench5）
+| 指标 | 改造前 | 改造后 |
+|---|---|---|
+| 日志长事务期间核心写阻塞 | 113ms（同库实测样本） | **0ms**（分库） |
+| 日志写吞吐（窄行） | 0.15 万行/秒（逐条） | **33.3 万行/秒**（200 条/事务） |
+| 大字段模糊扫描（2000 行 × 48KB） | 472ms / 95.72MB | **<1ms / 0.01MB**（外置） |

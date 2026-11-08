@@ -94,6 +94,82 @@ export function DataDirSection() {
       <div className="text-inkdim text-[12px]">
         更改数据目录会自动迁移现有数据（含 API Key），切换后立即生效。
       </div>
+      <StorageModeSection />
+    </div>
+  );
+}
+
+/**
+ * 存储模式开关（三库分离回滚通路）：
+ * hybrid（默认）：消息/工具/任务按会话分库，无分库数据回落主库；
+ * single：读写一律走主库（旧单库模式，用于排查问题时一键回滚）；
+ * split：同 hybrid 路由，日志库（按月轮转）作为审计读取的权威源。
+ * 切换需显式确认；有任务运行时后端会拒绝。
+ */
+function StorageModeSection() {
+  const pushToast = useStore((s) => s.pushToast);
+  const [mode, setMode] = useState<string>("hybrid");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    ipc
+      .getStorageMode()
+      .then(setMode)
+      .catch(() => {});
+  }, []);
+
+  const change = async (next: string) => {
+    if (busy || next === mode) return;
+    const label: Record<string, string> = {
+      hybrid: "分库模式（默认）：会话数据独立分库、日志按月轮转",
+      single: "单库模式：读写全部走主库 harness_mini.db（回滚通路）",
+      split: "完全分库：同分库模式，且日志库作为审计读取权威源",
+    };
+    const ok = await ask(`确认切换存储模式为「${label[next] ?? next}」？\n\n切换立即生效，可随时切回。`, {
+      title: "切换存储模式",
+      kind: "info",
+      okLabel: "确认切换",
+      cancelLabel: "取消",
+    });
+    if (!ok) return;
+    setBusy(true);
+    try {
+      await ipc.setStorageMode(next);
+      setMode(next);
+      pushToast("存储模式已切换");
+    } catch (e) {
+      pushToast(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const options: { key: string; label: string }[] = [
+    { key: "single", label: "单库" },
+    { key: "hybrid", label: "分库（推荐）" },
+    { key: "split", label: "完全分库" },
+  ];
+
+  return (
+    <div className="flex items-center gap-2 mt-1 text-[12px]">
+      <span className="text-inkdim shrink-0">存储模式:</span>
+      <div className="flex gap-1.5">
+        {options.map((o) => (
+          <button
+            key={o.key}
+            disabled={busy}
+            onClick={() => void change(o.key)}
+            className={`px-2.5 py-1 rounded-lg border text-[12px] transition-colors disabled:opacity-50 ${
+              mode === o.key
+                ? "bg-panel3 border-edge text-ink"
+                : "bg-panel border-edge text-inkdim hover:text-ink"
+            }`}
+            title={`切换为${o.label}`}
+          >
+            {o.label}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

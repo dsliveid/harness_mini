@@ -20,8 +20,8 @@ pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiv
     task.status = "running".to_string();
     task.updated_at = store::now();
     {
-        let db = state.db.lock();
-        let _ = store::update_long_task(&db, &task);
+        // 步骤11：长任务数据路由到会话专属库
+        let _ = state.with_session_db(&session_id, |conn| store::update_long_task(conn, &task));
     }
     let _ = app.emit("task:update", &task);
 
@@ -32,18 +32,16 @@ pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiv
         let signal = rx.borrow().clone();
         match signal {
             crate::task::DaemonControlSignal::Pause { .. } => {
-                let db_status = {
-                    let db = state.db.lock();
-                    store::get_long_task(&db, &task_id).ok().flatten().map(|t| t.status)
-                };
+                let db_status = state
+                    .with_session_db(&session_id, |conn| store::get_long_task(conn, &task_id))
+                    .ok()
+                    .flatten()
+                    .map(|t| t.status);
                 // 终态保护：若已在数据库中宣告完成或取消，严禁反向写回 paused！
                 if db_status.as_deref() != Some("completed") && db_status.as_deref() != Some("cancelled") {
                     task.status = "paused".to_string();
                     task.updated_at = store::now();
-                    {
-                        let db = state.db.lock();
-                        let _ = store::update_long_task(&db, &task);
-                    }
+                    let _ = state.with_session_db(&session_id, |conn| store::update_long_task(conn, &task));
                     let _ = app.emit("task:update", &task);
                 }
                 crate::task::remove_control(&task_id);
@@ -61,16 +59,22 @@ pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiv
         }
 
         // 2. 检查任务是否已在数据库中达成终态（如已被 complete_long_task 结案）
-        let (db_task_status, total_tokens) = {
+        // 长任务状态走会话库；sessions.total_tokens 是 core.db 元数据，走 catalog
+        let db_task_status = state
+            .with_session_db(&session_id, |conn| store::get_long_task(conn, &task_id))
+            .ok()
+            .flatten()
+            .map(|t| t.status)
+            .unwrap_or_else(|| "unknown".into());
+        let total_tokens: u64 = {
             let db = state.db.lock();
-            let t_opt = store::get_long_task(&db, &task_id).ok().flatten();
-            let status = t_opt.as_ref().map(|t| t.status.clone()).unwrap_or_else(|| "unknown".into());
-            let sess_tokens: u64 = db.query_row(
+            db.query_row(
                 "SELECT COALESCE(total_tokens, 0) FROM sessions WHERE id = ?1",
                 rusqlite::params![&session_id],
-                |r| r.get(0),
-            ).unwrap_or(0);
-            (status, sess_tokens)
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v as u64)
+            .unwrap_or(0)
         };
 
         if db_task_status == "completed" || db_task_status == "cancelled" || db_task_status == "paused" {
@@ -83,15 +87,15 @@ pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiv
             if total_tokens >= budget {
                 task.status = "paused".to_string();
                 task.updated_at = store::now();
-                {
-                    let db = state.db.lock();
-                    let _ = store::update_long_task(&db, &task);
+                let _ = state.with_session_db(&session_id, |conn| {
+                    let _ = store::update_long_task(conn, &task);
                     let alert = format!(
                         "⚠️ **长任务已触发 Token 预算硬熔断保护！**\n已消耗 {} tokens，超过预设上限 {} tokens。任务已自动挂起，等待人工确认。",
                         total_tokens, budget
                     );
-                    let _ = store::new_message(&db, &session_id, "assistant", Some(alert), false);
-                }
+                    let _ = store::new_message(conn, &session_id, "assistant", Some(alert), false);
+                    Ok::<(), String>(())
+                });
                 let _ = app.emit("task:update", &task);
                 let _ = app.emit("task:budget_exceeded", json!({ "taskId": task_id, "tokensUsed": total_tokens, "budget": budget }));
                 return;
@@ -124,13 +128,21 @@ pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiv
         }
 
         // 7. 检查最后一轮助手消息内容，判断是否达成终态目标
-        let last_message_info = {
-            let db = state.db.lock();
-            let msgs = store::all_messages(&db, &session_id).unwrap_or_default();
-            msgs.last().map(|m| (m.role.clone(), m.content.clone().unwrap_or_default()))
-        };
+        let last_message_info = state
+            .with_session_db(&session_id, |conn| store::all_messages(conn, &session_id))
+            .map(|msgs| {
+                msgs.last()
+                    .map(|m| (m.role.clone(), m.content.clone().unwrap_or_default()))
+            })
+            .unwrap_or(None);
 
         if let Some((role, content)) = last_message_info {
+            // 若最后一轮消息是 user，说明上一轮指令仍在排队或等待模型初次响应，绝不可重复叠加自治推进脉冲！
+            if role == "user" {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                continue;
+            }
+
             // 终态结案识别
             if role == "assistant" && (
                 content.contains("🎯 **长任务全部目标达成**")
@@ -146,10 +158,7 @@ pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiv
             if role == "assistant" && is_waiting_for_user_confirmation(&content) {
                 task.status = "paused".to_string();
                 task.updated_at = store::now();
-                {
-                    let db = state.db.lock();
-                    let _ = store::update_long_task(&db, &task);
-                }
+                let _ = state.with_session_db(&session_id, |conn| store::update_long_task(conn, &task));
                 let _ = app.emit("task:update", &task);
                 return;
             }
@@ -159,8 +168,7 @@ pub async fn run_task_loop(app: AppHandle, mut task: LongTask, rx: watch::Receiv
         task.current_step += 1;
         task.updated_at = store::now();
         {
-            let db = state.db.lock();
-            let _ = store::update_long_task(&db, &task);
+            let _ = state.with_session_db(&session_id, |conn| store::update_long_task(conn, &task));
         }
         let _ = app.emit("task:update", &task);
 

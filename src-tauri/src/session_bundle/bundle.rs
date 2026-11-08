@@ -76,6 +76,21 @@ impl SessionBundle {
 pub fn init_session_bundle_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         r#"
+        -- 三库分离（步骤9）：外置大字段索引表（内容寻址 sha256，物理文件在 data/blobs/ab/cd/）
+        CREATE TABLE IF NOT EXISTS blobs (
+          sha256 TEXT PRIMARY KEY,
+          rel_path TEXT NOT NULL,
+          bytes INTEGER NOT NULL,
+          encoding TEXT NOT NULL DEFAULT 'identity',
+          ref_count INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .map_err(|e| format!("初始化会话专属数据库 Schema 失败: {e}"))?;
+
+    conn.execute_batch(
+        r#"
         CREATE TABLE IF NOT EXISTS messages (
           id TEXT PRIMARY KEY,
           session_id TEXT NOT NULL,
@@ -215,6 +230,50 @@ pub fn init_session_bundle_schema(conn: &Connection) -> Result<(), String> {
         "#,
     )
     .map_err(|e| format!("初始化会话专属数据库 Schema 失败: {e}"))?;
+
+    ensure_bundle_columns(conn)?;
+    Ok(())
+}
+
+/// 三库分离（步骤9）：messages / tool_events 的大字段外置引用列（幂等演进，老库自动补列）。
+/// 行内只留摘要与引用，>8KB 正文外置到 blobs 表引用的内容寻址文件。
+fn ensure_bundle_columns(conn: &Connection) -> Result<(), String> {
+    for (table, column, decl) in [
+        ("messages", "content_blob", "content_blob TEXT"),
+        ("messages", "content_bytes", "content_bytes INTEGER DEFAULT 0"),
+        ("messages", "content_sha256", "content_sha256 TEXT"),
+        ("messages", "is_truncated", "is_truncated INTEGER DEFAULT 0"),
+        ("tool_events", "result_blob", "result_blob TEXT"),
+        ("tool_events", "result_bytes", "result_bytes INTEGER DEFAULT 0"),
+        ("tool_events", "result_sha256", "result_sha256 TEXT"),
+        ("tool_events", "result_preview", "result_preview TEXT"),
+        ("tool_events", "truncated", "truncated INTEGER DEFAULT 0"),
+    ] {
+        ensure_column(conn, table, column, decl)?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);",
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 若表中不存在指定列则补齐（用于老库升级；与 store::ensure_column 同构）
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({})", table))
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let name: String = row.get(1).map_err(|e| e.to_string())?;
+        if name == column {
+            return Ok(());
+        }
+    }
+    drop(rows);
+    drop(stmt);
+    conn.execute(&format!("ALTER TABLE {} ADD COLUMN {}", table, decl), [])
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 

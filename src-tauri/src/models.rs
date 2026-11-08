@@ -958,6 +958,30 @@ pub struct Session {
     /// 会话专属单次运行最大步数上限（为空则跟随全局默认）
     #[serde(default)]
     pub max_steps: Option<u32>,
+    /// 三库分离·分库元数据：消息数（写消息路径增量维护，首屏列表直接读取，替代 COUNT(*)）
+    #[serde(default)]
+    pub msg_count: i64,
+    #[serde(default)]
+    pub tool_event_count: i64,
+    /// 最近一条消息前 200 字符预览（列表展示直读该列，避免回查 session.db）
+    #[serde(default)]
+    pub last_preview: Option<String>,
+    /// 存储状态：hot（活跃）| archived（已归档）| migrated（已迁移）
+    #[serde(default = "default_storage_state")]
+    pub storage_state: String,
+    /// 会话专属库（session.db + wal）占用字节
+    #[serde(default)]
+    pub bundle_bytes: i64,
+    /// 会话库 schema 版本（升级用）
+    #[serde(default)]
+    pub schema_version: i64,
+    /// 逻辑删除时间（物理清理由后台任务执行）
+    #[serde(default)]
+    pub logical_deleted_at: Option<String>,
+}
+
+fn default_storage_state() -> String {
+    "hot".into()
 }
 
 fn default_auto_report() -> Option<bool> {
@@ -1013,6 +1037,13 @@ impl Default for Session {
             reasoning_effort: None,
             last_run_status: None,
             max_steps: None,
+            msg_count: 0,
+            tool_event_count: 0,
+            last_preview: None,
+            storage_state: "hot".into(),
+            bundle_bytes: 0,
+            schema_version: 1,
+            logical_deleted_at: None,
         }
     }
 }

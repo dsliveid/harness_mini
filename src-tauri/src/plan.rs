@@ -948,10 +948,21 @@ fn replace_markdown_section(content: &str, header_prefix: &str, new_body: &str) 
     };
 
     let rest = &content[start_idx..];
-    let header_end = rest.find('\n').unwrap_or(0);
+    let header_end = rest.find('\n').unwrap_or(rest.len());
     let after_header = start_idx + header_end;
 
-    // 查找下一个以 ## 开头的标题
+    // 清理 new_body：如果模型在 new_body 中重复输出了标题本身（如 "## 二、架构设计..."），去除首行冗余标题
+    let mut cleaned_body = new_body.trim();
+    if cleaned_body.starts_with('#') {
+        if let Some(first_newline) = cleaned_body.find('\n') {
+            let first_line = cleaned_body[..first_newline].trim();
+            if first_line.starts_with("##") || first_line.starts_with('#') {
+                cleaned_body = cleaned_body[first_newline..].trim();
+            }
+        }
+    }
+
+    // 查找下一个以 "\n## " 开头的标题
     let next_header_idx = content[after_header..]
         .find("\n## ")
         .map(|idx| after_header + idx);
@@ -961,7 +972,20 @@ fn replace_markdown_section(content: &str, header_prefix: &str, new_body: &str) 
     let before = &content[..after_header];
     let after = &content[end_idx..];
 
-    format!("{}\n\n{}\n\n{}", before.trim_end(), new_body.trim(), after.trim_start())
+    // 检测 after 中是否残留同名重复标题（由于历史脏数据产生的重复块），若有则一并清理
+    let after_cleaned = if let Some(dup_idx) = after.find(header_prefix) {
+        let dup_rest = &after[dup_idx..];
+        let dup_after_header = dup_idx + dup_rest.find('\n').unwrap_or(dup_rest.len());
+        let dup_end = after[dup_after_header..]
+            .find("\n## ")
+            .map(|idx| dup_after_header + idx)
+            .unwrap_or(after.len());
+        format!("{}{}", &after[..dup_idx], &after[dup_end..])
+    } else {
+        after.to_string()
+    };
+
+    format!("{}\n\n{}\n\n{}", before.trim_end(), cleaned_body, after_cleaned.trim_start())
 }
 
 /// 切换当前活动的计划（多任务流转唤醒）

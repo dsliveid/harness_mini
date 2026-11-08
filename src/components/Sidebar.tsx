@@ -144,6 +144,11 @@ const SessionRow = memo(function SessionRow({
             </span>
           )}
         </div>
+        {s.lastPreview && (
+          <div className="truncate text-[10.5px] text-inkdim/60 leading-tight" title={s.lastPreview}>
+            {s.lastPreview}
+          </div>
+        )}
       </div>
       <button
         className={`opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-inkdim hover:text-ink transition-opacity ${

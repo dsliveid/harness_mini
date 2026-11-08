@@ -75,22 +75,25 @@ pub async fn decompose_goal(
 
         let user_prompt = {
             let mut prompt_content = String::new();
-            let db = state.db.lock();
             let mut ctx_snippets = Vec::new();
 
-            if let Some(ref s) = session {
-                if !s.workspace_path.is_empty() {
-                    let ws = std::path::Path::new(&s.workspace_path);
-                    if let Ok(plans) = crate::plan::list_plans(ws, Some(session_id), false, Some(&db)) {
-                        if !plans.is_empty() {
-                            let plan_titles: Vec<String> = plans.iter().take(3).map(|p| format!("- {} ({})", p.title, p.filename)).collect();
-                            ctx_snippets.push(format!("工作区已有方案文档：\n{}", plan_titles.join("\n")));
+            // 先在 catalog 锁内取方案文档清单，随即释放；消息读取路由会话库，避免嵌套锁
+            {
+                let db = state.db.lock();
+                if let Some(ref s) = session {
+                    if !s.workspace_path.is_empty() {
+                        let ws = std::path::Path::new(&s.workspace_path);
+                        if let Ok(plans) = crate::plan::list_plans(ws, Some(session_id), false, Some(&db)) {
+                            if !plans.is_empty() {
+                                let plan_titles: Vec<String> = plans.iter().take(3).map(|p| format!("- {} ({})", p.title, p.filename)).collect();
+                                ctx_snippets.push(format!("工作区已有方案文档：\n{}", plan_titles.join("\n")));
+                            }
                         }
                     }
                 }
             }
 
-            if let Ok(recent) = store::get_messages(&db, session_id, None, 8) {
+            if let Ok(recent) = state.with_session_db(session_id, |conn| store::get_messages(conn, session_id, None, 8)) {
                 let mut dialog_lines = Vec::new();
                 for m in recent {
                     if m.role == "user" || m.role == "assistant" {
@@ -279,11 +282,18 @@ pub async fn replan_subtasks(
 ) -> Result<bool, String> {
     let state = app.state::<crate::AppState>();
     let (mut task, pc, model, proxy_url) = {
-        let db = state.db.lock();
-        let master = state.master_key.lock();
-        let task = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
-        let settings = store::get_settings_with_secrets(&db, &master).unwrap_or_default();
-        let s = store::get_session(&db, &task.session_id)?.ok_or("会话不存在")?;
+        // 步骤11：任务本体路由到会话库；settings/session 元数据留在 catalog
+        let task = state.with_task_db(task_id, |conn| {
+            store::get_long_task(conn, task_id)?.ok_or_else(|| "长任务不存在".to_string())
+        })?;
+        let (settings, s) = {
+            let db = state.db.lock();
+            let master = state.master_key.lock();
+            (
+                store::get_settings_with_secrets(&db, &master).unwrap_or_default(),
+                store::get_session(&db, &task.session_id)?.ok_or("会话不存在")?,
+            )
+        };
         let resolved = if let (Some(pid), Some(mid)) = (&s.provider_id, &s.model_id) {
             settings.providers.iter().find(|p| &p.id == pid && p.models.contains(mid))
                 .map(|p| (p.clone(), mid.clone()))
@@ -306,10 +316,7 @@ pub async fn replan_subtasks(
         session_id: Some(task_id.to_string()),
     };
 
-    let cps = {
-        let db = state.db.lock();
-        store::list_task_checkpoints(&db, task_id).unwrap_or_default()
-    };
+    let cps = state.with_task_db(task_id, |conn| store::list_task_checkpoints(conn, task_id)).unwrap_or_default();
     let memory_block = build_working_memory_block(&cps, &task.goal);
 
     let cur_title = task.subtasks.get(cur_idx).map(|s| s.title.as_str()).unwrap_or("");

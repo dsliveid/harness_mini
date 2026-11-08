@@ -202,5 +202,9 @@ pub async fn chat_stream_full(
         }
     }
 
-    Ok(finish(result, &mut calls))
+    let partial_len = result.content.chars().count() + result.reasoning.chars().count();
+    Err(format!(
+        "流读取失败: 远程 Anthropic 模型服务连接提前断开（未收到 message_stop 结束标记，已接收 {} 字符）",
+        partial_len
+    ))
 }

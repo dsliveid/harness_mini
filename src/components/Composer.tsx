@@ -584,7 +584,14 @@ export function Composer() {
     const body = activeCfg ? trimmed : parsed.body;
     let messageToSend = t;
     if (cfg?.cmd === "/goal") {
-      const goalBody = (body || "").trim();
+      let goalBody = (body || "").trim();
+      const st = useStore.getState();
+      const activeBoard = targetId ? st.currentBoards[targetId] : null;
+      const activePlanTitle = activeBoard?.board_type === "plan" ? activeBoard.title : (activeBoard?.title || null);
+      const genericKeywords = ["确认", "开始", "执行", "开始执行", "执行计划", "推进", "继续", "好的", "ok"];
+      if ((!goalBody || genericKeywords.includes(goalBody.toLowerCase())) && activePlanTitle) {
+        goalBody = `执行任务方案【${activePlanTitle}】`;
+      }
       if (!goalBody) {
         setActiveCmd(null);
         setSessionDraft(targetId, "");
@@ -598,7 +605,6 @@ export function Composer() {
       requestAnimationFrame(resize);
 
       try {
-        const st = useStore.getState();
         const isDraftLike = !currentId || currentId === DRAFT_ID;
         const draft = st.draft;
         let targetSessionId = currentId;

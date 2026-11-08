@@ -76,6 +76,7 @@ pub async fn chat_stream_full(
     let mut calls: Vec<Option<ToolCallAcc>> = Vec::new();
 
     let mut has_received_token = false;
+    let mut has_completed = false;
     loop {
         let chunk_timeout = if !has_received_token {
             std::time::Duration::from_secs(120) // 首字/首Token预填充与推理深度推演允许最长 120s（避免长上下文或握手包提前击穿超时）
@@ -104,6 +105,7 @@ pub async fn chat_stream_full(
             let Some(data) = line.strip_prefix("data:") else { continue };
             let data = data.trim();
             if data == "[DONE]" {
+                has_completed = true;
                 return Ok(finish(result, &mut calls));
             }
             if data.is_empty() {
@@ -119,6 +121,13 @@ pub async fn chat_stream_full(
                 }
             }
             let Some(choices) = v.get("choices").and_then(|c| c.as_array()) else { continue };
+            if let Some(first_choice) = choices.get(0) {
+                if let Some(fr) = first_choice.get("finish_reason").and_then(|r| r.as_str()) {
+                    if fr == "stop" || fr == "tool_calls" || fr == "length" || fr == "end_turn" {
+                        has_completed = true;
+                    }
+                }
+            }
             let Some(delta) = choices.get(0).and_then(|c| c.get("delta")) else { continue };
             if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
                 if !text.is_empty() {
@@ -191,6 +200,13 @@ pub async fn chat_stream_full(
                 }
             }
         }
+    }
+    if !has_completed && result.usage.is_none() {
+        let partial_len = result.content.chars().count() + result.reasoning.chars().count();
+        return Err(format!(
+            "流读取失败: 远程模型服务未输出完成标记即异常关闭连接 (Unexpected EOF, 已接收 {} 字符)",
+            partial_len
+        ));
     }
     Ok(finish(result, &mut calls))
 }

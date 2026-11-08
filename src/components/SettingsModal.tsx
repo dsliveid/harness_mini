@@ -1,14 +1,13 @@
 import { useEffect, useState, useRef } from "react";
 import { ipc } from "../ipc";
 import { useStore } from "../store";
-import type { Provider, Settings, ToolInfo, AgentSopInfo, RequestProtocol, AgentSopDetail } from "../types";
-import { formatTokens, resolveModelContextLimit, resolveModelCapabilities, hasModelCapability, AGENT_SOPS, getModelProtocol, inferRequestProtocol } from "../types";
+import type { Provider, Settings, ToolInfo, AgentSopInfo, RequestProtocol } from "../types";
+import { formatTokens, resolveModelContextLimit, resolveModelCapabilities, hasModelCapability, getModelProtocol, inferRequestProtocol } from "../types";
 import { DataDirSection } from "./DataDirSection";
 import { ModalActions, ModalClose } from "./ModalActions";
 import { ModelContextModal } from "./ModelContextModal";
 import { ModelCapabilitySelect } from "./ModelCapabilitySelect";
 import { McpSection } from "./McpSection";
-import { Markdown } from "./Markdown";
 
 import {
   Cpu,
@@ -39,7 +38,6 @@ import {
   Server,
   ChevronDown,
   ChevronUp,
-  RotateCcw,
 } from "./Icons";
 
 const MODEL_CAP_OPTIONS = [
@@ -113,11 +111,11 @@ export function SettingsModal() {
   const [tab, setTab] = useState<Tab>("models");
   const [local, setLocal] = useState<Settings>(storeSettings);
   const [toolList, setToolList] = useState<ToolInfo[]>([]);
-  const [sopList, setSopList] = useState<AgentSopInfo[]>(AGENT_SOPS);
+  const [sopList, setSopList] = useState<AgentSopInfo[]>([]);
+  const [sopListLoading, setSopListLoading] = useState(false);
+  const [sopListError, setSopListError] = useState<string | null>(null);
   const [expandedSopIds, setExpandedSopIds] = useState<Record<string, boolean>>({});
-  const [sopDetails, setSopDetails] = useState<Record<string, AgentSopDetail>>({});
-  const [loadingSopDetails, setLoadingSopDetails] = useState<Record<string, boolean>>({});
-  const [sopDetailErrors, setSopDetailErrors] = useState<Record<string, string>>({});
+  const [expandedSopTexts, setExpandedSopTexts] = useState<Record<string, boolean>>({});
   const [testing, setTesting] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const [visibleKeys, setVisibleKeys] = useState<Record<string, boolean>>({});
@@ -139,6 +137,20 @@ export function SettingsModal() {
   const [proxyTesting, setProxyTesting] = useState(false);
   const [proxyTestResult, setProxyTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
 
+  const reloadSops = () => {
+    setSopListLoading(true);
+    setSopListError(null);
+    ipc
+      .listAgentSops()
+      .then((sops) => setSopList(Array.isArray(sops) ? sops : []))
+      .catch((e: unknown) => {
+        const msg = String((e as any)?.message || e || "加载 SOP 目录失败");
+        setSopListError(msg);
+        pushToast(msg);
+      })
+      .finally(() => setSopListLoading(false));
+  };
+
   useEffect(() => {
     if (show) {
       setTab("models");
@@ -154,6 +166,10 @@ export function SettingsModal() {
       setEditingContextModel(null);
       setProxyTesting(false);
       setProxyTestResult(null);
+      setSopList([]);
+      setSopListError(null);
+      setExpandedSopIds({});
+      setExpandedSopTexts({});
       // 打开时从后端拉取最新设置与工具列表，避免草稿基于启动时的旧缓存回写
       ipc
         .getSettings()
@@ -168,14 +184,8 @@ export function SettingsModal() {
         .then(setToolList)
         .catch((e) => pushToast(String(e)));
 
-      ipc
-        .listAgentSops()
-        .then((sops) => {
-          if (Array.isArray(sops) && sops.length > 0) {
-            setSopList(sops);
-          }
-        })
-        .catch((e) => pushToast(String(e)));
+      // SOP 目录：后端单一真源，一次拉取，失败明确报错（无前端影子数据兜底）
+      reloadSops();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [show]);
@@ -547,30 +557,12 @@ export function SettingsModal() {
     setLocal((cur) => ({ ...cur, disabledSops: next }));
   };
 
-  const toggleSopExpand = async (id: string) => {
-    const isExpanded = !!expandedSopIds[id];
-    const nextExpanded = !isExpanded;
-    setExpandedSopIds((prev) => ({ ...prev, [id]: nextExpanded }));
+  const toggleSopExpand = (id: string) => {
+    setExpandedSopIds((prev) => ({ ...prev, [id]: !prev[id] }));
+  };
 
-    if (nextExpanded && !sopDetails[id] && !loadingSopDetails[id]) {
-      setLoadingSopDetails((prev) => ({ ...prev, [id]: true }));
-      setSopDetailErrors((prev) => {
-        const next = { ...prev };
-        delete next[id];
-        return next;
-      });
-      try {
-        const detail = await ipc.getAgentSopDetail(id);
-        setSopDetails((prev) => ({ ...prev, [id]: detail }));
-      } catch (err: any) {
-        setSopDetailErrors((prev) => ({
-          ...prev,
-          [id]: String(err?.message || err || "加载规范详情失败"),
-        }));
-      } finally {
-        setLoadingSopDetails((prev) => ({ ...prev, [id]: false }));
-      }
-    }
+  const toggleSopText = (key: string) => {
+    setExpandedSopTexts((prev) => ({ ...prev, [key]: !prev[key] }));
   };
 
   const enableAllSops = () => {
@@ -632,9 +624,6 @@ export function SettingsModal() {
     const isHard = !!s.isHardRule;
     const enabled = isHard || isSopEnabled(s.id);
     const isExpanded = !!expandedSopIds[s.id];
-    const detail = sopDetails[s.id];
-    const isLoading = !!loadingSopDetails[s.id];
-    const error = sopDetailErrors[s.id];
 
     return (
       <div
@@ -722,54 +711,63 @@ export function SettingsModal() {
           </div>
         </div>
 
-        {/* 展开/收起规约详情触发器 */}
+        {/* 展开/收起提示词原文触发器 */}
         <div className="flex items-center justify-between pt-1 border-t border-edge/40">
           <button
             type="button"
             onClick={() => toggleSopExpand(s.id)}
             className="inline-flex items-center gap-1.5 text-[11px] text-inkdim/80 hover:text-ink px-2 py-1 rounded hover:bg-panel3/70 transition-colors cursor-pointer select-none"
           >
-            {isLoading ? (
-              <Loader2 className="w-3.5 h-3.5 animate-spin text-accent" />
-            ) : isExpanded ? (
+            {isExpanded ? (
               <ChevronUp className="w-3.5 h-3.5 text-accent" />
             ) : (
               <ChevronDown className="w-3.5 h-3.5" />
             )}
-            <span>{isExpanded ? "收起规约详情" : "展开规约详情"}</span>
+            <span>{isExpanded ? "收起提示词原文" : "展开提示词原文"}</span>
           </button>
-          {isExpanded && !isLoading && detail && (
+          {isExpanded && (
             <span className="text-[10px] text-inkdim/50 font-mono">
-              Prompt 标准执行细则
+              模型实际收到的 Prompt 原文 · {s.variants.length} 个变体
             </span>
           )}
         </div>
 
-        {/* 详情内容区域（懒加载/缓存） */}
+        {/* 提示词原文（与模型收到的内容同源，本地折叠渲染） */}
         {isExpanded && (
-          <div className="rounded-lg bg-panel3/60 border border-edge/60 p-3 mt-0.5 text-[12px] text-ink">
-            {isLoading ? (
-              <div className="flex items-center justify-center gap-2 py-4 text-inkdim text-[12px]">
-                <Loader2 className="w-4 h-4 animate-spin text-accent" />
-                <span>正在按需加载 SOP 规约详情...</span>
-              </div>
-            ) : error ? (
-              <div className="flex items-center justify-between py-2 px-1 text-red-400 text-[12px]">
-                <span>加载失败: {error}</span>
-                <button
-                  type="button"
-                  onClick={() => toggleSopExpand(s.id)}
-                  className="inline-flex items-center gap-1 text-[11px] text-accent hover:underline cursor-pointer"
+          <div className="rounded-lg bg-panel3/60 border border-edge/60 p-3 mt-0.5 flex flex-col gap-2.5 text-[12px] text-ink">
+            {s.variants.map((v, i) => {
+              const textKey = `${s.id}::${i}`;
+              const full = !!expandedSopTexts[textKey];
+              return (
+                <div
+                  key={textKey}
+                  className="rounded-md bg-panel/70 border border-edge/50 p-2.5 flex flex-col gap-1.5"
                 >
-                  <RotateCcw className="w-3 h-3" />
-                  <span>重试</span>
-                </button>
-              </div>
-            ) : detail ? (
-              <div className="prose prose-invert prose-sm max-w-none leading-relaxed overflow-x-auto text-[12px]">
-                <Markdown content={detail.content} enableAutolink={false} />
-              </div>
-            ) : null}
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-panel3 text-inkdim border border-edge/60 font-medium whitespace-nowrap shrink-0">
+                      {v.label}
+                    </span>
+                    <span className="text-[10px] text-inkdim/60 font-mono truncate">
+                      {v.title}
+                    </span>
+                  </div>
+                  <div
+                    className={`text-[11.5px] leading-relaxed font-mono whitespace-pre-wrap break-words text-ink/90 ${
+                      full ? "" : "line-clamp-3"
+                    }`}
+                  >
+                    {`【${v.title}】：${v.text}`}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => toggleSopText(textKey)}
+                    className="self-start inline-flex items-center gap-1 text-[11px] text-accent hover:underline cursor-pointer select-none"
+                  >
+                    {full ? "收起" : "展开全文"}
+                  </button>
+                </div>
+              );
+            })}
           </div>
         )}
       </div>
@@ -1755,6 +1753,27 @@ export function SettingsModal() {
                       </div>
                     </div>
                   </div>
+
+                  {/* 加载中 / 加载失败状态（后端单一真源，无前端影子数据兜底） */}
+                  {sopListLoading && (
+                    <div className="flex items-center justify-center gap-2 py-10 text-inkdim text-[13px]">
+                      <Loader2 className="w-4 h-4 animate-spin text-accent" />
+                      <span>正在加载 SOP 目录...</span>
+                    </div>
+                  )}
+                  {!sopListLoading && sopListError && (
+                    <div className="flex items-center justify-between gap-3 p-3 rounded-xl border border-red-500/30 bg-red-500/10 text-[12px] text-red-300">
+                      <span className="min-w-0 break-all">SOP 目录加载失败：{sopListError}</span>
+                      <button
+                        type="button"
+                        onClick={reloadSops}
+                        className="inline-flex items-center gap-1 text-[12px] text-accent hover:underline cursor-pointer shrink-0"
+                      >
+                        <RefreshCw className="w-3 h-3" />
+                        <span>重试</span>
+                      </button>
+                    </div>
+                  )}
 
                   <div className="flex flex-col gap-5 mt-4">
                     {/* 第一层级 */}

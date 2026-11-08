@@ -87,15 +87,26 @@ pub struct AppState {
     pub file_viewer_init_tab: Mutex<Option<serde_json::Value>>,
     pub session_pool: crate::session_bundle::SessionPool,
     pub message_session_cache: Mutex<HashMap<String, String>>,
+    /// 按月轮转日志库写线程句柄（审计态：llm_requests / tool_call_logs）。
+    /// 调用方仅入队，DB/文件 IO 全部在独立写线程内批量执行，不阻塞业务路径。
+    pub log_writer: Mutex<crate::store::logs::LogWriter>,
+    /// 存储模式开关（步骤14）：0=single（一律 catalog，回滚通路）| 1=hybrid（默认）| 2=split。
+    /// 用原子量缓存，避免热路径 with_session_db 每次回查 settings 表；由 set_storage_mode 命令同步更新。
+    pub storage_mode: std::sync::atomic::AtomicU8,
 }
 
 impl AppState {
-    /// 执行会话专属库操作。统一调度会话连接池与物理库隔离
+    /// 执行会话专属库操作。统一调度会话连接池与物理库隔离。
+    /// storage.mode = single 时强制走 catalog（步骤14 回滚通路：切换后应用仍能读写未迁移数据）。
     pub fn with_session_db<F, R>(&self, session_id: &str, f: F) -> Result<R, String>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, String>,
     {
         let data_dir_opt = self.data_dir.lock().clone();
+        if self.storage_mode.load(std::sync::atomic::Ordering::Relaxed) == crate::store::core::MODE_SINGLE {
+            let catalog_db = self.db.lock();
+            return f(&catalog_db);
+        }
         if let Some(ref data_dir) = data_dir_opt {
             let bundle = crate::session_bundle::SessionBundle::new(session_id, data_dir);
             if bundle.is_archived() {
@@ -114,6 +125,78 @@ impl AppState {
     pub fn cache_message_session(&self, message_id: &str, session_id: &str) {
         let mut cache = self.message_session_cache.lock();
         cache.insert(message_id.to_string(), session_id.to_string());
+    }
+
+    /// 根据 task_id 定位长任务所属会话 ID（缓存 → 活跃连接池 → catalog → 物理分库扫描）。
+    /// 缓存键复用 message_session_cache（"task:{id}" 前缀避免与消息 ID 冲突）。
+    pub fn find_session_by_task_id(&self, task_id: &str) -> Option<String> {
+        let cache_key = format!("task:{task_id}");
+        {
+            let cache = self.message_session_cache.lock();
+            if let Some(sid) = cache.get(&cache_key) {
+                return Some(sid.clone());
+            }
+        }
+
+        let probe = |conn: &rusqlite::Connection| -> bool {
+            conn.query_row(
+                "SELECT 1 FROM long_tasks WHERE id = ?1",
+                rusqlite::params![task_id],
+                |_| Ok(true),
+            )
+            .unwrap_or(false)
+        };
+
+        // 活跃连接池中的会话库
+        for sid in self.session_pool.active_session_ids() {
+            if self.with_session_db(&sid, |conn| Ok(probe(conn))).unwrap_or(false) {
+                self.cache_message_session(&cache_key, &sid);
+                return Some(sid);
+            }
+        }
+
+        // catalog 主库（未迁移的老数据）
+        let cat: Option<String> = {
+            let db = self.db.lock();
+            db.query_row(
+                "SELECT session_id FROM long_tasks WHERE id = ?1",
+                rusqlite::params![task_id],
+                |r| r.get(0),
+            )
+            .ok()
+        };
+        if let Some(ref sid) = cat {
+            self.cache_message_session(&cache_key, sid);
+            return cat;
+        }
+
+        // 扫描 sessions/ 物理分库
+        let data_dir_opt = self.data_dir.lock().clone();
+        if let Some(ref data_dir) = data_dir_opt {
+            if let Ok(entries) = std::fs::read_dir(data_dir.join("sessions")) {
+                for entry in entries.flatten() {
+                    let sid = entry.file_name().to_string_lossy().to_string();
+                    if self.with_session_db(&sid, |conn| Ok(probe(conn))).unwrap_or(false) {
+                        self.cache_message_session(&cache_key, &sid);
+                        return Some(sid);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// 执行长任务专属库操作（步骤11）：按 task_id 定位会话后路由到其 session.db；
+    /// 定位失败（未迁移/异常）回落 catalog 主库，保持 hybrid 兼容语义。
+    pub fn with_task_db<F, R>(&self, task_id: &str, f: F) -> Result<R, String>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<R, String>,
+    {
+        if let Some(sid) = self.find_session_by_task_id(task_id) {
+            return self.with_session_db(&sid, f);
+        }
+        let db = self.db.lock();
+        f(&db)
     }
 
     /// 根据 message_id 定位其所属会话 ID（优先查缓存，再查活跃连接池，最后扫描物理分库）
@@ -428,6 +511,8 @@ pub fn run() {
                 .unwrap_or_else(|| std::env::temp_dir().join("harness_mini_data"));
             let (data_dir, master_key, db, pending, unwritable_path) =
                 resolve_and_open(legacy_dir.as_deref(), custom_dir.as_deref(), &default_dir)?;
+            // 存储模式随库启动加载（默认 hybrid）
+            let storage_mode = store::core::get_storage_mode(&db);
             let (event_bus, _) = tokio::sync::broadcast::channel(2048);
             let state = AppState {
                 db: Mutex::new(db),
@@ -447,6 +532,11 @@ pub fn run() {
                 file_viewer_init_tab: Mutex::new(None),
                 session_pool: crate::session_bundle::SessionPool::new(),
                 message_session_cache: Mutex::new(HashMap::new()),
+                log_writer: Mutex::new(match data_dir.as_deref() {
+                    Some(d) => store::logs::LogWriter::new(store::logs::logs_root(d)),
+                    None => store::logs::LogWriter::disabled(),
+                }),
+                storage_mode: std::sync::atomic::AtomicU8::new(storage_mode),
             };
             app.manage(state);
             let handle = app.handle().clone();
@@ -528,6 +618,50 @@ pub fn run() {
                         store::collect_active_snapshot_hashes(&conn).unwrap_or_default()
                     };
                     let _ = snapshot_gc::gc_orphan_blobs(&data_dir, &active_hashes, std::time::Duration::from_secs(24 * 3600)).await;
+                }
+            });
+
+            // 日志库 TTL 清理：启动 30 秒后执行一次，此后每 24 小时一次。
+            // 清理在日志写线程内串行执行（避免与写线程在 Windows 上争抢文件句柄）；
+            // 保留月数可经 settings 表 `logs.retention_months` 覆盖，默认 6。
+            let ttl_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    let retention: u32 = {
+                        let st = ttl_handle.state::<AppState>();
+                        let db = st.db.lock();
+                        db.query_row(
+                            "SELECT value FROM settings WHERE key = 'logs.retention_months'",
+                            [],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(6)
+                    };
+                    {
+                        let st = ttl_handle.state::<AppState>();
+                        st.log_writer.lock().request_cleanup(retention);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
+                }
+            });
+
+            // 启动对账（步骤13）：以 session.db 为事实源修正 core.sessions 增量元数据
+            // （msg_count / last_preview / bundle_bytes 等）的偏差。延迟 10 秒执行避免拖慢首屏，
+            // 单会话失败不阻断其他会话；幂等可重复。
+            let rec_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                let st = rec_handle.state::<AppState>();
+                let data_dir_guard = st.data_dir.lock();
+                if let Some(ref d) = *data_dir_guard {
+                    let db = st.db.lock();
+                    match store::core::reconcile_all_session_metadata(&db, d) {
+                        Ok((ok, skip)) => eprintln!("[Core] 启动对账完成: {} 会话已核对, {} 跳过", ok, skip),
+                        Err(e) => eprintln!("[Core] 启动对账失败: {e}"),
+                    }
                 }
             });
 
@@ -618,7 +752,6 @@ pub fn run() {
             commands::set_session_reasoning_effort,
             commands::set_collaborator_auto_report,
             commands::list_agent_sops,
-            commands::get_agent_sop_detail,
             commands::report_collaborator_increment,
             commands::spawn_subagent,
             commands::stop_subagent,
@@ -650,6 +783,8 @@ pub fn run() {
             commands::get_data_status,
             commands::set_data_dir,
             commands::reset_data_dir,
+            commands::get_storage_mode,
+            commands::set_storage_mode,
             commands::optimize_database,
             commands::get_database_stats,
             commands::exit_app,

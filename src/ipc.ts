@@ -26,7 +26,6 @@ export const ipc = {
   setSettings: (settings: Settings) => invoke<void>("set_settings", { settings }),
   listTools: () => deduplicatedInvoke<ToolInfo[]>("list_tools"),
   listAgentSops: () => deduplicatedInvoke<import("./types").AgentSopInfo[]>("list_agent_sops"),
-  getAgentSopDetail: (id: string) => deduplicatedInvoke<import("./types").AgentSopDetail>("get_agent_sop_detail", { id }),
   testProvider: (provider: any) => invoke<string>("test_provider", { provider }),
   listProviderModels: (provider: any) => invoke<string[]>("list_provider_models", { provider }),
   testProxyConnection: (proxyUrl: string) => invoke<number>("test_proxy_connection", { proxyUrl }),
@@ -57,6 +56,10 @@ export const ipc = {
   optimizeDatabase: () => invoke<OptimizeResult>("optimize_database"),
   getDatabaseStats: () => deduplicatedInvoke<DbStats>("get_database_stats"),
   exitApp: () => invoke<void>("exit_app"),
+
+  // 存储模式开关（single | hybrid | split）
+  getStorageMode: () => invoke<string>("get_storage_mode"),
+  setStorageMode: (mode: string) => invoke<void>("set_storage_mode", { mode }),
 
   listProjects: () => deduplicatedInvoke<Project[]>("list_projects"),
   createProject: (name: string, path?: string) =>

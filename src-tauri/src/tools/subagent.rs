@@ -301,10 +301,9 @@ pub(crate) async fn spawn_subagent_tool(args: &Value, ctx: &ToolCtx) -> Result<S
         请立即围绕交接书目标展开分析与推进。完成任务或遇到阻碍时，唯一硬性交付标准是调用 `write_file` 工具将详尽报告写入 `.harness/subtasks/{report_filename}` 并做简短收敛宣告。",
         sub.id
     );
-    let user_msg = {
-        let db = state.db.lock();
-        crate::store::new_message(&db, &sub.id, "user", Some(trigger_prompt), false)?
-    };
+    let user_msg = state.with_session_db(&sub.id, |conn| {
+        crate::store::new_message(conn, &sub.id, "user", Some(trigger_prompt), false)
+    })?;
 
     // 启动子 Agent 异步运行循环
     crate::agent::spawn_session_task(host.app.clone(), sub.id.clone(), Some(user_msg.id));
@@ -895,9 +894,10 @@ pub(crate) async fn dispatch_collaborator_tool(args: &Value, ctx: &ToolCtx) -> R
         )
     };
     let (user_msg, user_prompt) = {
-        let db = state.db.lock();
-        let _ = crate::store::set_kv(&db, collaborator_id, "dispatched_by_parent", "true");
-        let msg = crate::store::new_message(&db, collaborator_id, "user", Some(user_prompt.clone()), false)?;
+        let msg = state.with_session_db(collaborator_id, |conn| {
+            let _ = crate::store::set_kv(conn, collaborator_id, "dispatched_by_parent", "true");
+            crate::store::new_message(conn, collaborator_id, "user", Some(user_prompt.clone()), false)
+        })?;
         (msg, user_prompt)
     };
 

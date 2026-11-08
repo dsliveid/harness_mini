@@ -69,8 +69,12 @@ impl IntentGateStatus {
     }
 }
 
-pub fn evaluate_intent_gate(db: &rusqlite::Connection, session_id: &str) -> IntentGateStatus {
-    let has_plan = store::get_kv(db, session_id, "active_plan_id")
+pub fn evaluate_intent_gate(
+    db: &rusqlite::Connection,
+    session_id: &str,
+    workspace: Option<&Path>,
+) -> IntentGateStatus {
+    let mut has_plan = store::get_kv(db, session_id, "active_plan_id")
         .ok()
         .flatten()
         .map(|id| !id.trim().is_empty())
@@ -80,6 +84,19 @@ pub fn evaluate_intent_gate(db: &rusqlite::Connection, session_id: &str) -> Inte
         .flatten()
         .map(|raw| raw.contains(r#""in_progress""#) || raw.contains(r#""pending""#))
         .unwrap_or(false);
+
+    // 意图门禁自愈保障：若会话专属库未绑定 active_plan_id，但工作区中存在当前会话的 in_progress 计划文件，自动修复并写回 session_kv
+    if !has_plan {
+        if let Some(ws) = workspace {
+            if let Some((_, meta, _)) = crate::plan::find_plan_file(ws, session_id, None, Some(db)) {
+                if meta.status == "in_progress" {
+                    has_plan = true;
+                    let _ = store::set_kv(db, session_id, "active_plan_id", &meta.id);
+                }
+            }
+        }
+    }
+
     IntentGateStatus { has_plan, has_todo }
 }
 
@@ -279,6 +296,11 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
                 }
             }
         }
+        // 步骤12：跨库触发器已移除，取消态同样由应用层回写 core.sessions.last_run_status
+        {
+            let db = state.db.lock();
+            let _ = store::set_session_last_run_status(&db, session_id, "cancelled");
+        }
         state.emit(
             "run:status",
             &json!({"sessionId": session_id, "runId": run_id, "status": "cancelled"}),
@@ -298,11 +320,10 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
     // 4. 若当前会话关联活跃长任务，协同中止长任务，将其运行中的子任务标记为 interrupted
     // （保护：若长任务已由 task 模块显式置为 paused 或 cancelled，绝不逆向篡改覆盖）
     {
-        let db = state.db.lock();
-        if let Ok(Some(mut lt)) = store::get_active_long_task(&db, session_id) {
+        // 步骤11：长任务路由到会话专属库
+        if let Ok(Some(mut lt)) = state.with_session_db(session_id, |conn| store::get_active_long_task(conn, session_id)) {
             if lt.status != "paused" && lt.status != "cancelled" && lt.status != "completed" {
                 crate::task::set_control(&lt.id, true);
-                let _ = store::update_long_task_status(&db, &lt.id, "interrupted");
                 if let Some(cur_idx) = crate::task::get_next_subtask_index(&lt) {
                     if lt.subtasks[cur_idx].status == "running"
                         || lt.subtasks[cur_idx].status == "verifying"
@@ -313,7 +334,10 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
                 }
                 lt.status = "interrupted".to_string();
                 lt.updated_at = store::now();
-                let _ = store::update_long_task(&db, &lt);
+                let _ = state.with_session_db(session_id, |conn| {
+                    let _ = store::update_long_task_status(conn, &lt.id, "interrupted");
+                    store::update_long_task(conn, &lt)
+                });
                 let _ = app.emit("task:update", &lt);
             }
         }
@@ -554,11 +578,14 @@ pub fn retry_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
     // 防止 LLM 看到末尾的 assistant 消息判定该轮已回答完毕而返回空回复
     {
         state.with_session_db(session_id, |conn| store::delete_messages_after(conn, session_id, user_seq))?;
-        let db = state.db.lock();
-        store::touch_session(&db, session_id)?;
+        {
+            let db = state.db.lock();
+            store::touch_session(&db, session_id)?;
+        }
 
         // 3. 长任务子任务状态协同重置：若当前长任务子步骤处于失败或中断态，重置为 pending
-        if let Ok(Some(mut lt)) = store::get_active_long_task(&db, session_id) {
+        // （步骤11：任务数据在会话库，catalog 锁已释放后再路由，避免嵌套锁）
+        if let Ok(Some(mut lt)) = state.with_session_db(session_id, |conn| store::get_active_long_task(conn, session_id)) {
             let mut changed = false;
             for st in &mut lt.subtasks {
                 if st.status == "interrupted" || st.status == "failed" || st.status == "running" {
@@ -568,7 +595,7 @@ pub fn retry_turn(app: &AppHandle, session_id: &str) -> Result<(), String> {
                 }
             }
             if changed {
-                let _ = store::update_long_task(&db, &lt);
+                let _ = state.with_session_db(session_id, |conn| store::update_long_task(conn, &lt));
                 let _ = app.emit("task:update", &lt);
             }
         }
@@ -907,6 +934,24 @@ async fn run_loop(app: AppHandle, session_id: String, mut trigger: Option<String
                     "tool:update",
                     &json!({"sessionId": session_id, "event": ev}),
                 );
+            }
+        }
+        // 步骤12：中断态由应用层回写 core.sessions.last_run_status（跨库触发器已移除）。
+        // 读取 session.db 中真实的最新 run 终态回写，避免兜底块在正常完成后覆盖 done。
+        {
+            let last_run_status = state
+                .with_session_db(&session_id, |conn| {
+                    conn.query_row(
+                        "SELECT status FROM runs WHERE session_id = ?1 ORDER BY started_at DESC, id DESC LIMIT 1",
+                        rusqlite::params![&session_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .ok();
+            if let Some(st) = last_run_status {
+                let db = state.db.lock();
+                let _ = store::set_session_last_run_status(&db, &session_id, &st);
             }
         }
     }
@@ -1426,14 +1471,13 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             })
         })
         .collect();
-    let is_long_task = {
-        let db = state.db.lock();
-        if let Ok(Some(task)) = store::get_active_long_task(&db, session_id) {
-            task.status == "running" || task.status == "planning"
-        } else {
-            false
-        }
-    };
+    // 长任务态走会话库（步骤11），catalog 锁不为此持有
+    let is_long_task = state
+        .with_session_db(session_id, |conn| store::get_active_long_task(conn, session_id))
+        .ok()
+        .flatten()
+        .map(|task| task.status == "running" || task.status == "planning")
+        .unwrap_or(false);
 
     // 确保工作区记忆目录存在，并执行轻量记忆衰减清理
     if !session.workspace_path.is_empty() {
@@ -1494,12 +1538,10 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             false
         };
 
-        // 识别长任务触发：包含显式指令前缀、/goal、或者数据库中有处于运行/推进中的长任务
-        let is_running_long_task = store::get_active_long_task(&db, session_id)
-            .ok()
-            .flatten()
-            .map(|t| t.status == "running" || t.status == "planning")
-            .unwrap_or(false);
+        // 识别长任务触发：包含显式指令前缀、/goal、或者存在处于运行/推进中的长任务。
+        // （步骤11：任务数据在会话库，运行态判定已在块外的 is_long_task 中以 with_session_db 完成，
+        //   此处不再在 catalog 锁内重复查询。）
+        let is_running_long_task = is_long_task;
 
         let is_goal_task = is_long_task || directly_triggered_goal || ongoing_goal_plan || is_running_long_task;
 
@@ -1728,7 +1770,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         let todo_first_enabled = !settings.disabled_sops.iter().any(|s| s == "todo_first_gate");
         if todo_first_enabled && _step == 8 {
             let intent_status = {
-                state.with_session_db(session_id, |conn| Ok(evaluate_intent_gate(conn, session_id))).unwrap_or_default()
+                state.with_session_db(session_id, |conn| Ok(evaluate_intent_gate(conn, session_id, Some(&workspace)))).unwrap_or_default()
             };
             if !intent_status.is_satisfied() {
                 let gate_msg = if is_subagent {
@@ -1784,6 +1826,12 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             match state.with_session_db(session_id, |conn| store::new_message_with_run(conn, session_id, "assistant", Some(String::new()), false, Some(run_id))) {
                 Ok(m) => {
                     state.cache_message_session(&m.id, session_id);
+                    // 占位消息只计数与推进时间，不写预览（避免空内容顶掉用户消息预览）；
+                    // catalog 锁在 session-db 连接释放后获取，保持「不嵌套锁」纪律
+                    {
+                        let db = state.db.lock();
+                        let _ = store::core::apply_message_metadata(&db, session_id, &m.created_at, "", false);
+                    }
                     m.id
                 }
                 Err(e) => {
@@ -1846,7 +1894,9 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             let sid_reason = sid2.clone();
             let mid_reason = mid2.clone();
 
-            if attempt == 1 {
+            // LLM 请求审计入队（日志库 logs-YYYYMM.db）：每次真实 API 尝试都留痕（含重试），
+            // payload 大字段由写线程外置，本线程零 DB/文件 IO，不阻塞流式请求。
+            let (llm_req_id, llm_req_month) = {
                 let trace_payload = serde_json::json!({
                     "model": &cfg.model,
                     "endpoint": &cfg.base_url,
@@ -1854,18 +1904,20 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                     "messages": &messages,
                     "tools": &schemas,
                 });
-                let _ = state.with_session_db(session_id, |conn| {
-                    store::save_llm_request_trace(
-                        conn,
-                        session_id,
-                        &assistant_id,
-                        Some(run_id),
-                        &cfg.model,
-                        &cfg.base_url,
-                        &trace_payload.to_string(),
-                    )
-                });
-            }
+                state.log_writer.lock().record_llm_request(store::logs::LlmRequestRecord {
+                    session_id: session_id.to_string(),
+                    message_id: assistant_id.clone(),
+                    run_id: Some(run_id.to_string()),
+                    model: cfg.model.clone(),
+                    endpoint: cfg.base_url.clone(),
+                    payload_json: trace_payload.to_string(),
+                    created_at: store::now(),
+                })
+            };
+
+            // TTFT 采集：首个可见增量（正文或思维链）到达的毫秒数；0 = 本次流式未收到任何增量
+            let ttft_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let stream_started = Instant::now();
 
             let app_tool = app2.clone();
             let sid_tool = sid2.clone();
@@ -1876,7 +1928,14 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 &schemas,
                 {
                     let buf2 = buf2.clone();
+                    let ttft_ms = ttft_ms.clone();
                     move |delta| {
+                        if ttft_ms.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                            ttft_ms.store(
+                                stream_started.elapsed().as_millis() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
                         let mut b = buf2.lock();
                         b.push_str(delta);
                         app_text.state::<crate::AppState>().emit(
@@ -1887,7 +1946,14 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 },
                 {
                     let rbuf2 = rbuf2.clone();
+                    let ttft_ms = ttft_ms.clone();
                     move |delta| {
+                        if ttft_ms.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                            ttft_ms.store(
+                                stream_started.elapsed().as_millis() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
                         let mut b = rbuf2.lock();
                         b.push_str(delta);
                         app_reason.state::<crate::AppState>().emit(
@@ -1936,6 +2002,27 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
 
             match call {
                 Ok(r) => {
+                    // 生成性能标量回填（llm_requests.ttft_ms / tokens_per_sec）：
+                    // 1 行即可记录整次请求的生成性能，替代流式帧级分片（v2 设计决策）。
+                    let ttft = ttft_ms.load(std::sync::atomic::Ordering::Relaxed);
+                    if ttft > 0 {
+                        let completion_tokens =
+                            crate::models::parse_llm_usage(r.usage.as_ref(), 0, 0).completion_tokens;
+                        let gen_ms = (stream_started.elapsed().as_millis() as u64).saturating_sub(ttft);
+                        let tokens_per_sec = if gen_ms > 0 && completion_tokens > 0 {
+                            completion_tokens as f64 / (gen_ms as f64 / 1000.0)
+                        } else {
+                            0.0
+                        };
+                        state.log_writer.lock().record_llm_perf(
+                            &llm_req_month,
+                            store::logs::LlmPerfUpdate {
+                                llm_request_id: llm_req_id.clone(),
+                                ttft_ms: ttft as i64,
+                                tokens_per_sec,
+                            },
+                        );
+                    }
                     retry_result = Some(r);
                     break;
                 }
@@ -2192,6 +2279,8 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             }
             {
                 let db = state.db.lock();
+                // 流式收尾：以最终正文刷新列表预览（不改计数），再推进会话时间
+                let _ = store::core::refresh_message_preview(&db, session_id, &store::now(), &result.content);
                 let _ = store::touch_session(&db, session_id);
                 if let Ok(Some(s)) = store::get_session(&db, session_id) {
                     let _ = app.emit("session:update", &s);
@@ -2395,6 +2484,17 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             });
             if let Ok(ref m) = tool_msg {
                 state.cache_message_session(&m.id, session_id);
+                // 工具消息计数与预览增量维护（catalog 锁在 session-db 连接释放后获取）
+                {
+                    let db = state.db.lock();
+                    let _ = store::core::apply_message_metadata(
+                        &db,
+                        session_id,
+                        &m.created_at,
+                        m.content.as_deref().unwrap_or(""),
+                        true,
+                    );
+                }
                 let _ = app.emit("message:final", m);
             }
             if (ctc.name == "write_file" || ctc.name == "edit_file" || ctc.name == "apply_diff") && status == "success" {
@@ -2518,7 +2618,24 @@ async fn handle_tool_call(
                     || s.session_type == "collaborator"
                     || s.parent_session_id.is_some()
             }).unwrap_or(false);
-            let intent_status = state.with_session_db(session_id, |conn| Ok(evaluate_intent_gate(conn, session_id))).unwrap_or_default();
+            let parent_id = s.as_ref().and_then(|sess| sess.parent_session_id.clone());
+
+            let mut intent_status = state.with_session_db(session_id, |conn| {
+                Ok(evaluate_intent_gate(conn, session_id, Some(&ctx.workspace)))
+            }).unwrap_or_default();
+
+            // 若子 Agent / 协作者本身未声明独立 plan，但父会话已持有生效的 plan，继承父会话的 plan 意图
+            if !intent_status.is_satisfied() {
+                if let Some(ref pid) = parent_id {
+                    let parent_has_plan = state.with_session_db(pid, |conn| {
+                        Ok(evaluate_intent_gate(conn, pid, Some(&ctx.workspace)).has_plan)
+                    }).unwrap_or(false);
+                    if parent_has_plan {
+                        intent_status.has_plan = true;
+                    }
+                }
+            }
+
             (sub, sop_enabled, intent_status.is_satisfied())
         };
         if is_sop_enabled && !is_intent_satisfied {
@@ -2989,6 +3106,21 @@ async fn handle_tool_call(
                 detected_sub_id.as_deref().or(ev.subprocess_id.as_deref()),
                 params_str.as_deref(),
             )
+        });
+    }
+    // 工具调用审计入队（日志库 tool_call_logs）：全量出入参留痕（>8KB 外置），
+    // 业务态 tool_events 只留 ≤64KB 摘要，两者解耦、删除日志不影响回滚。
+    {
+        state.log_writer.lock().record_tool_call(store::logs::ToolCallLogRecord {
+            session_id: session_id.to_string(),
+            message_id: assistant_msg_id.to_string(),
+            tool_event_id: ev.id.clone(),
+            tool_name: ctc.name.clone(),
+            params_json: serde_json::to_string(&ev.params).unwrap_or_else(|_| "{}".into()),
+            result_text: Some(text.clone()),
+            status: status.clone(),
+            duration_ms: elapsed as i64,
+            created_at: store::now(),
         });
     }
     emit_tool_with(app, session_id, &ev, json!({ "elapsedMs": elapsed }));

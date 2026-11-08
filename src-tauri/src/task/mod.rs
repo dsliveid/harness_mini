@@ -11,6 +11,7 @@ pub use verifier::{create_git_snapshot, execute_verify_command};
 use crate::agent;
 use crate::models::{LongTask, TaskCheckpoint, TaskSubItem};
 use crate::store;
+use rusqlite::OptionalExtension;
 use std::collections::HashMap;
 use parking_lot::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
@@ -106,12 +107,38 @@ pub fn start_long_task(
         (s.workspace_path, tid, limit)
     };
 
+    let trimmed_goal = goal.trim();
+    let is_generic = trimmed_goal.is_empty()
+        || trimmed_goal == "确认"
+        || trimmed_goal == "开始"
+        || trimmed_goal == "执行"
+        || trimmed_goal == "开始执行"
+        || trimmed_goal == "执行计划"
+        || trimmed_goal == "推进"
+        || trimmed_goal == "继续";
+
+    let effective_goal = if is_generic {
+        let ws = std::path::Path::new(&workspace_path);
+        let plan_title = state.with_session_db(&session_id, |conn| {
+            Ok(crate::plan::find_plan_file(ws, &session_id, None, Some(conn)).map(|(_, m, _)| m.title))
+        }).unwrap_or(None);
+        if let Some(t) = plan_title {
+            format!("执行任务方案【{}】", t)
+        } else if trimmed_goal.is_empty() {
+            "自主推进当前任务目标".to_string()
+        } else {
+            trimmed_goal.to_string()
+        }
+    } else {
+        trimmed_goal.to_string()
+    };
+
     let now = store::now();
     let task = LongTask {
         id: task_id.clone(),
         session_id: session_id.clone(),
         workspace_path,
-        goal: goal.clone(),
+        goal: effective_goal.clone(),
         status: "running".to_string(),
         current_subtask_index: 0,
         subtasks: vec![],
@@ -127,14 +154,16 @@ pub fn start_long_task(
         updated_at: now,
     };
 
-    let user_msg_id = {
-        let db = state.db.lock();
-        store::create_long_task(&db, &task)?;
+    let user_msg = state.with_session_db(&session_id, |conn| {
+        // 步骤11：长任务与消息路由到会话专属库（无 bundle 时回落 catalog）
+        store::create_long_task(conn, &task)?;
         let prompt_text = format!(
             "🎯 **启动长任务自治推进模式**\n\n            **总目标**：{}\n\n            【长任务自主协同准则】：\n            1. 当前会话已进入后台守护进程驱动的长任务模式，主会话享有全量历史上下文与单轨决策权；\n            2. 请依据前文完整的工程全貌与盘点结论，直接思考并展开第一阶段工作；\n            3. 【严格防 Token 膨胀机制】：若涉及大范围文件探索、具体代码编写、测试调试等重度施工，**请务必调用 `spawn_subagent` 委派给独立子沙箱执行**，主会话只接收交付工件摘要；\n            4. 当全部目标已彻底完成并通过自检验收后，请在回复末尾明确输出 `🎯 **长任务全部目标达成**`，守护进程将自动结案。",
-            goal
+            effective_goal
         );
-        let user_msg = store::new_message(&db, &session_id, "user", Some(prompt_text), false)?;
+        store::new_message(conn, &session_id, "user", Some(prompt_text), false)
+    })?;
+    let user_msg_id = {
         let _ = app.emit("message:final", &user_msg);
         user_msg.id
     };
@@ -160,12 +189,13 @@ pub fn pause_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
     send_control_signal(task_id, DaemonControlSignal::Pause { reason: None });
     let state = app.state::<crate::AppState>();
     let session_id = {
-        let db = state.db.lock();
-        let mut task = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
-        task.status = "paused".to_string();
-        task.updated_at = store::now();
-        store::update_long_task(&db, &task)?;
-        task.session_id
+        state.with_task_db(task_id, |conn| {
+            let mut task = store::get_long_task(conn, task_id)?.ok_or("长任务不存在")?;
+            task.status = "paused".to_string();
+            task.updated_at = store::now();
+            store::update_long_task(conn, &task)?;
+            Ok(task.session_id)
+        })?
     };
 
     // 级联非阻塞停止主会话及其实时运行的子任务
@@ -179,10 +209,7 @@ pub fn pause_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
             "status": "idle"
         }),
     );
-    if let Ok(Some(task)) = {
-        let db = state.db.lock();
-        store::get_long_task(&db, task_id)
-    } {
+    if let Ok(Some(task)) = state.with_task_db(task_id, |conn| store::get_long_task(conn, task_id)) {
         let _ = app.emit("task:update", &task);
     }
     Ok(())
@@ -191,14 +218,13 @@ pub fn pause_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
 /// 恢复长任务执行
 pub fn resume_long_task(app: &AppHandle, task_id: &str) -> Result<LongTask, String> {
     let state = app.state::<crate::AppState>();
-    let task = {
-        let db = state.db.lock();
-        let mut t = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
+    let task = state.with_task_db(task_id, |conn| {
+        let mut t = store::get_long_task(conn, task_id)?.ok_or("长任务不存在")?;
         t.status = "running".to_string();
         t.updated_at = store::now();
-        store::update_long_task(&db, &t)?;
-        t
-    };
+        store::update_long_task(conn, &t)?;
+        Ok(t)
+    })?;
 
     let _ = app.emit("task:update", &task);
     let rx = register_control(task_id);
@@ -221,12 +247,13 @@ pub fn cancel_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
     send_control_signal(task_id, DaemonControlSignal::Cancel { reason: None });
     let state = app.state::<crate::AppState>();
     let session_id = {
-        let db = state.db.lock();
-        let mut task = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
-        task.status = "cancelled".to_string();
-        task.updated_at = store::now();
-        store::update_long_task(&db, &task)?;
-        task.session_id
+        state.with_task_db(task_id, |conn| {
+            let mut task = store::get_long_task(conn, task_id)?.ok_or("长任务不存在")?;
+            task.status = "cancelled".to_string();
+            task.updated_at = store::now();
+            store::update_long_task(conn, &task)?;
+            Ok(task.session_id)
+        })?
     };
 
     agent::stop_session_ext(app, &session_id, true);
@@ -239,10 +266,7 @@ pub fn cancel_long_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
             "status": "idle"
         }),
     );
-    if let Ok(Some(task)) = {
-        let db = state.db.lock();
-        store::get_long_task(&db, task_id)
-    } {
+    if let Ok(Some(task)) = state.with_task_db(task_id, |conn| store::get_long_task(conn, task_id)) {
         let _ = app.emit("task:update", &task);
     }
     Ok(())
@@ -260,9 +284,8 @@ pub fn complete_long_task(
         evidence: evidence.map(|e| e.to_string()),
     });
     let state = app.state::<crate::AppState>();
-    let (task, cp_opt) = {
-        let db = state.db.lock();
-        let mut t = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
+    let (task, cp_opt) = state.with_task_db(task_id, |conn| {
+        let mut t = store::get_long_task(conn, task_id)?.ok_or("长任务不存在")?;
         t.status = "completed".to_string();
         t.updated_at = store::now();
 
@@ -275,7 +298,7 @@ pub fn complete_long_task(
                 sub.error = None;
             }
         }
-        store::update_long_task(&db, &t)?;
+        store::update_long_task(conn, &t)?;
 
         let summary_text = summary.unwrap_or("长任务全部目标达成并由智能体通过实测验收");
         let evidence_text = evidence.unwrap_or("已在现场通过测试与自检验证");
@@ -290,10 +313,10 @@ pub fn complete_long_task(
             git_commit_hash: None,
             created_at: store::now(),
         };
-        let _ = store::save_task_checkpoint(&db, &cp);
+        let _ = store::save_task_checkpoint(conn, &cp);
 
         let ws = std::path::PathBuf::from(&t.workspace_path);
-        if let Some((_, meta, _)) = crate::plan::find_plan_file(&ws, &t.session_id, None, Some(&db)) {
+        if let Some((_, meta, _)) = crate::plan::find_plan_file(&ws, &t.session_id, None, Some(conn)) {
             let _ = crate::plan::update_plan(
                 &ws,
                 &t.session_id,
@@ -305,12 +328,12 @@ pub fn complete_long_task(
                 None,
                 None,
                 None,
-                Some(&db),
+                Some(conn),
             );
         }
 
-        (t, Some(cp))
-    };
+        Ok((t, Some(cp)))
+    })?;
 
     if let Some(cp) = cp_opt {
         let _ = app.emit("task:checkpoint", &cp);
@@ -357,48 +380,26 @@ pub fn cancel_long_task_by_session(
 /// 获取会话当前活跃长任务
 pub fn get_active_task(app: &AppHandle, session_id: &str) -> Result<Option<LongTask>, String> {
     let state = app.state::<crate::AppState>();
-    let db = state.db.lock();
-    store::get_active_long_task(&db, session_id)
+    state.with_session_db(session_id, |conn| store::get_active_long_task(conn, session_id))
 }
 
 /// 列出任务的所有检查点
 pub fn list_task_checkpoints(app: &AppHandle, task_id: &str) -> Result<Vec<TaskCheckpoint>, String> {
     let state = app.state::<crate::AppState>();
-    let db = state.db.lock();
-    store::list_task_checkpoints(&db, task_id)
+    state.with_task_db(task_id, |conn| store::list_task_checkpoints(conn, task_id))
 }
 
 /// 回退到指定检查点
 pub fn rollback_to_checkpoint(app: &AppHandle, checkpoint_id: &str) -> Result<LongTask, String> {
     let state = app.state::<crate::AppState>();
+    // 检查点表按 task_id 归属会话库：先由 checkpoint 反查 task（catalog 优先，迁移后扫描分库）
     let (mut task, cp) = {
-        let db = state.db.lock();
-        let mut stmt = db
-            .prepare(
-                "SELECT id, task_id, step_number, subtask_id, status, summary, working_memory, git_commit_hash, created_at
-                 FROM task_checkpoints WHERE id = ?1",
-            )
-            .map_err(|e| e.to_string())?;
-
-        let cp = stmt
-            .query_row(rusqlite::params![checkpoint_id], |r| {
-                let step_num: i64 = r.get(2)?;
-                Ok(TaskCheckpoint {
-                    id: r.get(0)?,
-                    task_id: r.get(1)?,
-                    step_number: step_num as usize,
-                    subtask_id: r.get(3)?,
-                    status: r.get(4)?,
-                    summary: r.get(5)?,
-                    working_memory: r.get(6)?,
-                    git_commit_hash: r.get(7)?,
-                    created_at: r.get(8)?,
-                })
-            })
-            .map_err(|e| format!("未找到指定的检查点: {e}"))?;
-
-        let task = store::get_long_task(&db, &cp.task_id)?.ok_or("关联的长任务不存在")?;
-        (task, cp)
+        let found = find_checkpoint_anywhere(&state, checkpoint_id)?
+            .ok_or_else(|| "未找到指定的检查点".to_string())?;
+        let task = state.with_task_db(&found.task_id, |conn| {
+            store::get_long_task(conn, &found.task_id)?.ok_or_else(|| "关联的长任务不存在".to_string())
+        })?;
+        (task, found)
     };
 
     let _ = pause_long_task(app, &task.id);
@@ -414,17 +415,80 @@ pub fn rollback_to_checkpoint(app: &AppHandle, checkpoint_id: &str) -> Result<Lo
         task.subtasks[i].verify_output = None;
     }
 
-    {
-        let db = state.db.lock();
-        let _ = db.execute(
+    state.with_task_db(&task.id, |conn| {
+        let _ = conn.execute(
             "DELETE FROM task_checkpoints WHERE task_id = ?1 AND step_number > ?2",
             rusqlite::params![task.id, cp.step_number as i64],
         );
-        store::update_long_task(&db, &task)?;
-    }
+        store::update_long_task(conn, &task)?;
+        Ok(())
+    })?;
 
     let _ = app.emit("task:update", &task);
     Ok(task)
+}
+
+/// 在 catalog 与物理分库中查找指定检查点（rollback 入口的跨库定位）
+fn find_checkpoint_anywhere(
+    state: &crate::AppState,
+    checkpoint_id: &str,
+) -> Result<Option<TaskCheckpoint>, String> {
+    // 1) catalog（未迁移数据）
+    {
+        let db = state.db.lock();
+        if let Ok(Some(cp)) = query_checkpoint(&db, checkpoint_id) {
+            return Ok(Some(cp));
+        }
+    }
+    // 2) 活跃连接池
+    for sid in state.session_pool.active_session_ids() {
+        if let Ok(Some(cp)) = state.with_session_db(&sid, |conn| query_checkpoint(conn, checkpoint_id)) {
+            return Ok(Some(cp));
+        }
+    }
+    // 3) sessions/ 物理分库扫描
+    let data_dir_opt = state.data_dir.lock().clone();
+    if let Some(ref data_dir) = data_dir_opt {
+        if let Ok(entries) = std::fs::read_dir(data_dir.join("sessions")) {
+            for entry in entries.flatten() {
+                let sid = entry.file_name().to_string_lossy().to_string();
+                if let Ok(Some(cp)) = state.with_session_db(&sid, |conn| query_checkpoint(conn, checkpoint_id)) {
+                    return Ok(Some(cp));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn query_checkpoint(
+    conn: &rusqlite::Connection,
+    checkpoint_id: &str,
+) -> Result<Option<TaskCheckpoint>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, task_id, step_number, subtask_id, status, summary, working_memory, git_commit_hash, created_at
+             FROM task_checkpoints WHERE id = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let cp = stmt
+        .query_row(rusqlite::params![checkpoint_id], |r| {
+            let step_num: i64 = r.get(2)?;
+            Ok(TaskCheckpoint {
+                id: r.get(0)?,
+                task_id: r.get(1)?,
+                step_number: step_num as usize,
+                subtask_id: r.get(3)?,
+                status: r.get(4)?,
+                summary: r.get(5)?,
+                working_memory: r.get(6)?,
+                git_commit_hash: r.get(7)?,
+                created_at: r.get(8)?,
+            })
+        })
+        .optional()
+        .map_err(|e| format!("查询检查点失败: {e}"))?;
+    Ok(cp)
 }
 
 /// 更新待执行的子任务清单
@@ -434,14 +498,13 @@ pub fn update_task_subtasks(
     subtasks: Vec<TaskSubItem>,
 ) -> Result<LongTask, String> {
     let state = app.state::<crate::AppState>();
-    let task = {
-        let db = state.db.lock();
-        let mut t = store::get_long_task(&db, task_id)?.ok_or("长任务不存在")?;
+    let task = state.with_task_db(task_id, |conn| {
+        let mut t = store::get_long_task(conn, task_id)?.ok_or("长任务不存在")?;
         t.subtasks = subtasks;
         t.updated_at = store::now();
-        store::update_long_task(&db, &t)?;
-        t
-    };
+        store::update_long_task(conn, &t)?;
+        Ok(t)
+    })?;
     let _ = app.emit("task:update", &task);
     Ok(task)
 }

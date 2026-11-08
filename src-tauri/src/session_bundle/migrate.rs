@@ -44,6 +44,16 @@ pub fn migrate_single_session(
         )
         .unwrap_or(0);
 
+    // tool_events 源计数（步骤10 双向对账）
+    let src_te_count: i64 = session_conn
+        .query_row(
+            "SELECT count(*) FROM catalog_source.tool_events WHERE message_id IN
+               (SELECT id FROM catalog_source.messages WHERE session_id = ?1);",
+            params![session_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
     // 2. 开启事务并在显式指定所有列名的情况下迁移，杜绝因列物理顺序变动引发类型错配
     let tx = session_conn
         .transaction()
@@ -204,12 +214,27 @@ pub fn migrate_single_session(
         .unwrap_or(0);
 
     if dst_msg_count != src_msg_count {
+        // 对账失败：tx 在此 drop 即自动 ROLLBACK，目标库不留半截数据，源库绝不删除
         return Err(format!(
             "会话 {session_id} 迁移校验失败: 源消息数 {src_msg_count}，目标写入数 {dst_msg_count}，中止源库清理"
         ));
     }
 
+    // 双向行数对账（步骤10）：tool_events 一并对账，杜绝部分写入
+    let dst_te_count: i64 = tx
+        .query_row("SELECT count(*) FROM tool_events;", [], |r| r.get(0))
+        .unwrap_or(0);
+    if dst_te_count != src_te_count {
+        return Err(format!(
+            "会话 {session_id} tool_events 迁移校验失败: 源 {src_te_count} 条，目标 {dst_te_count} 条，中止源库清理"
+        ));
+    }
+
     tx.commit().map_err(|e| format!("提交会话迁移事务失败: {e}"))?;
+
+    // 断点续迁（步骤10）：每会话迁移完成即在 core.db.schema_migrations 记录，
+    // name = 'split:<session_id>'；可中断续跑（重复迁移被 bundle.exists() 幂等跳过）。
+    record_split_migration(catalog_conn, session_id);
 
     let _ = session_conn.execute("DETACH DATABASE catalog_source;", []);
     drop(session_conn);
@@ -267,6 +292,24 @@ pub fn migrate_single_session(
     );
 
     Ok(true)
+}
+
+/// 断点续迁记录（步骤10）：在 core.db.schema_migrations 写入 `split:<session_id>` 行。
+/// version 主键取毫秒时间戳，撞键时 +1 重试（同毫秒多会话迁移的极小概率冲突）。
+/// 记录失败不阻断迁移主流程（幂等性由 bundle.exists() 保证，记录仅用于审计与续迁查询）。
+fn record_split_migration(catalog_conn: &Connection, session_id: &str) {
+    let name = format!("split:{session_id}");
+    let mut version = chrono::Utc::now().timestamp_millis();
+    for _ in 0..5 {
+        let res = catalog_conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+            params![version, name, chrono::Utc::now().to_rfc3339()],
+        );
+        match res {
+            Ok(_) => return,
+            Err(_) => version += 1,
+        }
+    }
 }
 
 /// 扫描并迁移主库中所有存量会话至各自分离的 SessionBundle

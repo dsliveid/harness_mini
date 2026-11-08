@@ -1,6 +1,6 @@
 node_modules/
 dist/
-src-tauri/target/
+target/
 .harness
 
 # 开发模式本地数据（SQLite + 主密钥，位于项目根目录，避开 tauri dev 文件监视）
@@ -8,3 +8,7 @@ src-tauri/target/
 scratch/
 
 *.tsbuildinfo
+
+# 仅保留核心生产/启动脚本（tauri-dev.mjs），忽略临时诊断与基准测试脚本
+scripts/diag/
+scripts/sqlite_bench/

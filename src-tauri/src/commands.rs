@@ -269,7 +269,7 @@ pub async fn test_proxy_connection(proxy_url: String) -> Result<u64, String> {
 
 // ---------- projects ----------
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_projects(state: State<'_, crate::AppState>) -> Result<Vec<Project>, String> {
     let db = state.db.lock();
     store::list_projects(&db)
@@ -391,19 +391,21 @@ pub fn delete_project_link(state: State<'_, crate::AppState>, id: String) -> Res
 
 // ---------- sessions ----------
 
-#[tauri::command]
+// async 标记：Tauri v2 同步命令默认跑在主线程，一旦后台任务持主库锁做慢 IO，
+// 这些高频读命令会把整窗 UI 卡死。标记 async 后改跑在 tokio 线程池，只慢自己不冻结界面。
+#[tauri::command(async)]
 pub fn list_sessions(state: State<'_, crate::AppState>) -> Result<Vec<Session>, String> {
     let db = state.db.lock();
     store::list_sessions(&db, "active")
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_session(state: State<'_, crate::AppState>, session_id: String) -> Result<Option<Session>, String> {
     let db = state.db.lock();
     store::get_session(&db, &session_id)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_archived(state: State<'_, crate::AppState>) -> Result<Vec<Session>, String> {
     let db = state.db.lock();
     store::list_sessions(&db, "archived")
@@ -460,11 +462,15 @@ pub async fn delete_session(app: AppHandle, id: String) -> Result<(), String> {
             let res = crate::session_bundle::SessionResource::new(&id, &dir);
             let _ = res.cleanup_all_external_resources();
 
-            // 2. 收集活跃哈希（遍历全部 sessions/*/session.db，冷启动下最慢的一步）
-            let active_hashes = {
+            // 2. 收集活跃哈希：锁内只查 catalog，随即释放锁；
+            //    全分库文件扫描（冷启动下最慢的一步）绝不持主库锁——
+            //    否则前端删除后立即触发的 list_sessions（同步命令，跑在主线程）
+            //    会被卡在锁上，造成「首次删除会话」整窗冻结。
+            let catalog_hashes = {
                 let conn = bg_state.db.lock();
-                store::collect_active_snapshot_hashes_from_all_sessions(&dir, &conn).unwrap_or_default()
+                store::collect_active_snapshot_hashes(&conn).unwrap_or_default()
             };
+            let active_hashes = store::collect_snapshot_hashes_from_session_dbs(&dir, catalog_hashes);
 
             // 3. 回收 freelist：限定页数，避免长时间持有主库锁
             {
@@ -473,12 +479,15 @@ pub async fn delete_session(app: AppHandle, id: String) -> Result<(), String> {
             }
 
             // 4. 孤儿 Blob GC（async，需回到 async 运行时）
+            //    宽限期 0s → 300s：哈希收集改为不持主库锁后，收集与 GC 之间存在窗口，
+            //    正在运行的其他会话可能刚写入新 blob（哈希尚未被收集到）；
+            //    mtime 宽限可避免误删，真孤儿会在后续删除或下次启动（24h 宽限 GC）时回收。
             let gc_dir = dir.clone();
             tauri::async_runtime::spawn(async move {
                 let _ = crate::snapshot_gc::gc_orphan_blobs(
                     &gc_dir,
                     &active_hashes,
-                    std::time::Duration::from_secs(0),
+                    std::time::Duration::from_secs(300),
                 )
                 .await;
             });
@@ -497,6 +506,9 @@ pub fn archive_session(state: State<'_, crate::AppState>, app: AppHandle, id: St
     let data_dir_opt = {
         let db = state.db.lock();
         store::set_session_status(&db, &id, "archived")?;
+        // 步骤16：归档闭环——storage_state 置 archived，列表读取走 core 元数据，
+        // 点开归档会话走 open_db_readonly 零拷贝只读挂载
+        let _ = store::core::set_storage_state(&db, &id, "archived");
         state.data_dir.lock().clone()
     };
     // 物理冷热隔离：将该会话 Bundle 移入 archives/ 冷存储目录，彻底释放热区
@@ -534,6 +546,8 @@ pub fn unarchive_session(state: State<'_, crate::AppState>, app: AppHandle, id: 
     let data_dir_opt = {
         let db = state.db.lock();
         store::set_session_status(&db, &id, "active")?;
+        // 步骤16：恢复热区状态
+        let _ = store::core::set_storage_state(&db, &id, "hot");
         state.data_dir.lock().clone()
     };
     // 物理恢复：将该会话从 archives/ 冷存储恢复回 sessions/ 活跃区
@@ -1021,7 +1035,14 @@ pub async fn send_message(
 
     let session_row = {
         let db = state.db.lock();
-        store::touch_session(&db, &sid)?;
+        // 用户消息计数与预览增量维护（含 touch_session 的 last_message_at/updated_at 语义）
+        store::core::apply_message_metadata(
+            &db,
+            &sid,
+            &msg.created_at,
+            msg.content.as_deref().unwrap_or(""),
+            true,
+        )?;
         // 记住最近工作区（未绑定工作区的纯对话不覆盖；临时空间路径不记住）
         let mut session_row: Option<Session> = None;
         if let Ok(Some(s)) = store::get_session(&db, &sid) {
@@ -1165,10 +1186,11 @@ pub fn delete_queued_message(state: State<'_, crate::AppState>, app: AppHandle, 
 #[tauri::command]
 pub fn stop_run(app: AppHandle, session_id: String) -> Result<(), String> {
     let state = app.state::<crate::AppState>();
-    let active_task = {
-        let db = state.db.lock();
-        store::get_active_long_task(&db, &session_id).ok().flatten()
-    };
+    // 步骤11：长任务路由会话库
+    let active_task = state
+        .with_session_db(&session_id, |conn| store::get_active_long_task(conn, &session_id))
+        .ok()
+        .flatten();
     if let Some(task) = active_task {
         if task.status == "running" || task.status == "planning" {
             let _ = crate::task::pause_long_task(&app, &task.id);
@@ -1216,7 +1238,7 @@ pub fn spawn_subagent(
     // 子 Agent 工作区严格继承父会话工作区根目录
     let sub_workspace = parent.workspace_path.clone();
 
-    let (sub, user_msg) = {
+    let (sub, initial_prompt) = {
         let db = state.db.lock();
         let sub = store::create_subagent_session(
             &db,
@@ -1232,9 +1254,11 @@ pub fn spawn_subagent(
         let initial_prompt = format!(
             "【子 Agent 协作任务】\n角色定位：{role}\n任务标题：{title}\n工作区根目录：{sub_workspace}\n\n详细需求描述：\n{task}"
         );
-        let user_msg = store::new_message(&db, &sub.id, "user", Some(initial_prompt), false)?;
-        (sub, user_msg)
+        (sub, initial_prompt)
     };
+    let user_msg = state.with_session_db(&sub.id, |conn| {
+        store::new_message(conn, &sub.id, "user", Some(initial_prompt), false)
+    })?;
 
     agent::spawn_session_task(app.clone(), sub.id.clone(), Some(user_msg.id));
     let _ = app.emit("subagent:created", json!({
@@ -2466,6 +2490,8 @@ fn switch_data_dir(
         new_db
     };
     let _ = crate::temp::rebase_temp_storage(&new_conn, target);
+    // 存储模式随新目录的库重新加载（在连接被移入 state 前读取）
+    let new_storage_mode = crate::store::core::get_storage_mode(&new_conn);
     *db = new_conn; // 旧连接随之关闭，旧目录数据保留为备份
     *master = new_master;
     drop(db);
@@ -2473,6 +2499,10 @@ fn switch_data_dir(
     *state.data_dir.lock() = Some(target.to_path_buf());
     state.data_pending.store(false, Ordering::Relaxed);
     state.is_custom_dir.store(custom, Ordering::Relaxed);
+    // 日志写线程随数据目录热切换（旧写线程把队列存量刷完即退出，不丢已入队数据）
+    *state.log_writer.lock() = crate::store::logs::LogWriter::new(crate::store::logs::logs_root(target));
+    // 存储模式随新目录的库重新加载
+    state.storage_mode.store(new_storage_mode, Ordering::Relaxed);
     Ok(())
 }
 
@@ -2515,6 +2545,39 @@ pub fn exit_app(app: AppHandle) {
     app.exit(0);
 }
 
+/// 读取当前存储模式（single | hybrid | split）
+#[tauri::command]
+pub fn get_storage_mode(state: State<'_, crate::AppState>) -> Result<String, String> {
+    let db = state.db.lock();
+    Ok(match crate::store::core::get_storage_mode(&db) {
+        crate::store::core::MODE_SINGLE => "single".into(),
+        crate::store::core::MODE_SPLIT => "split".into(),
+        _ => "hybrid".into(),
+    })
+}
+
+/// 切换存储模式（步骤14 回滚开关）：需前端显式确认后调用。
+/// single：读写一律 catalog（旧单库模式，未迁移数据保持可用）；
+/// hybrid：有 bundle 走分库、无 bundle 回落 catalog（默认）；
+/// split：同 hybrid 路由，日志库作为审计读的权威源。
+#[tauri::command]
+pub fn set_storage_mode(state: State<'_, crate::AppState>, mode: String) -> Result<(), String> {
+    if crate::agent::any_run_active(&state) {
+        return Err("有会话任务正在运行，请先停止后再切换存储模式".into());
+    }
+    {
+        let db = state.db.lock();
+        crate::store::core::set_storage_mode(&db, &mode)?;
+    }
+    let v = match mode.as_str() {
+        "single" => crate::store::core::MODE_SINGLE,
+        "split" => crate::store::core::MODE_SPLIT,
+        _ => crate::store::core::MODE_HYBRID,
+    };
+    state.storage_mode.store(v, Ordering::Relaxed);
+    Ok(())
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OptimizeResult {
@@ -2523,21 +2586,88 @@ pub struct OptimizeResult {
     pub freed_bytes: u64,
 }
 
-/// 手动/定时执行数据库压缩与物理空间回收（VACUUM + WAL 截断）
+/// 统计单个库文件（含 -wal/-shm）的磁盘占用
+fn db_disk_bytes(db_path: &Path) -> u64 {
+    let mut total = 0u64;
+    for suffix in ["", "-wal", "-shm"] {
+        let mut p = db_path.to_path_buf().into_os_string();
+        p.push(suffix);
+        if let Ok(m) = std::fs::metadata(std::path::PathBuf::from(p)) {
+            total += m.len();
+        }
+    }
+    total
+}
+
+/// 手动执行数据库压缩与物理空间回收（步骤15 分库化改造）：
+/// 1) core.db（catalog）始终 VACUUM；
+/// 2) 会话分库仅对 >50MB 的大库执行 VACUUM（实测 39MB 阻塞 933ms，用户手动触发即显式同意），
+///    日志库按 TTL 整月删除，不参与 VACUUM。
 #[tauri::command]
 pub fn optimize_database(state: State<'_, crate::AppState>) -> Result<OptimizeResult, String> {
     let data_dir = state.data_dir.lock().clone();
-    let db_path = data_dir.as_ref().map(|d| d.join("harness_mini.db"));
-    let db = state.db.lock();
-    let before_stats = store::get_db_stats(&db, db_path.as_deref())?;
-    let before_total = before_stats.file_size_bytes + before_stats.wal_size_bytes;
+    let mut before_total: u64 = 0;
+    let mut after_total: u64 = 0;
 
-    store::vacuum_database(&db)?;
+    // 1) core.db（catalog，恒定 MB 级）
+    {
+        let db_path = data_dir.as_ref().map(|d| d.join("harness_mini.db"));
+        let db = state.db.lock();
+        let before_stats = store::get_db_stats(&db, db_path.as_deref())?;
+        let before = before_stats.file_size_bytes + before_stats.wal_size_bytes;
+        store::vacuum_database(&db)?;
+        let after_stats = store::get_db_stats(&db, db_path.as_deref())?;
+        let after = after_stats.file_size_bytes + after_stats.wal_size_bytes;
+        before_total += before;
+        after_total += after;
+    }
 
-    let after_stats = store::get_db_stats(&db, db_path.as_deref())?;
-    let after_total = after_stats.file_size_bytes + after_stats.wal_size_bytes;
+    // 2) 会话分库（sessions/{id}/session.db）
+    if let Some(ref d) = data_dir {
+        const SESSION_VACUUM_THRESHOLD: u64 = 50 * 1024 * 1024;
+        if let Ok(entries) = std::fs::read_dir(d.join("sessions")) {
+            for entry in entries.flatten() {
+                if !entry.path().is_dir() {
+                    continue;
+                }
+                let db_path = entry.path().join("session.db");
+                if !db_path.exists() {
+                    continue;
+                }
+                let before = db_disk_bytes(&db_path);
+                before_total += before;
+                if before > SESSION_VACUUM_THRESHOLD {
+                    let sid = entry.file_name().to_string_lossy().to_string();
+                    // 优先复用连接池中的活跃连接，避免跨连接 VACUUM 的锁冲突
+                    let vacuumed = match state.session_pool.get_or_open(d, &sid) {
+                        Ok(conn_arc) => {
+                            let conn = conn_arc.lock();
+                            store::vacuum_database(&conn).is_ok()
+                        }
+                        Err(_) => match rusqlite::Connection::open(&db_path) {
+                            Ok(conn) => {
+                                let _ = conn.execute_batch(
+                                    "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
+                                );
+                                store::vacuum_database(&conn).is_ok()
+                            }
+                            Err(_) => false,
+                        },
+                    };
+                    if vacuumed {
+                        eprintln!(
+                            "[Optimize] 会话库 {} 已 VACUUM（{} MB）",
+                            &sid[..sid.len().min(8)],
+                            before / 1024 / 1024
+                        );
+                    }
+                }
+                after_total += db_disk_bytes(&db_path);
+            }
+        }
+    }
+
     let freed = before_total.saturating_sub(after_total);
-
     Ok(OptimizeResult {
         before_bytes: before_total,
         after_bytes: after_total,
@@ -2908,7 +3038,10 @@ pub fn get_active_plan(
         return Ok(None);
     }
     let ws = std::path::Path::new(&session.workspace_path);
-    if let Some((path, meta, body)) = crate::plan::find_plan_file(ws, &session_id, None, Some(&db)) {
+    let plan_opt = state.with_session_db(&session_id, |conn| {
+        Ok(crate::plan::find_plan_file(ws, &session_id, None, Some(conn)))
+    }).unwrap_or(None);
+    if let Some((path, meta, body)) = plan_opt {
         let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
         let steps = crate::plan::parse_steps_from_markdown(&body);
         Ok(Some(serde_json::json!({
@@ -3401,10 +3534,17 @@ pub fn get_plan_detail(
     if workspace_path.is_empty() {
         return Ok(None);
     }
-    let db = state.db.lock();
     let ws = Path::new(&workspace_path);
     let sid = session_id.unwrap_or_default();
-    if let Some((path, meta, body)) = crate::plan::find_plan_file(ws, &sid, plan_id.as_deref(), Some(&db)) {
+    let plan_opt = if !sid.is_empty() {
+        state.with_session_db(&sid, |conn| {
+            Ok(crate::plan::find_plan_file(ws, &sid, plan_id.as_deref(), Some(conn)))
+        }).unwrap_or(None)
+    } else {
+        let db = state.db.lock();
+        crate::plan::find_plan_file(ws, &sid, plan_id.as_deref(), Some(&db))
+    };
+    if let Some((path, meta, body)) = plan_opt {
         let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
         let steps = crate::plan::parse_steps_from_markdown(&body);
         Ok(Some(serde_json::json!({
@@ -4534,6 +4674,17 @@ pub async fn get_llm_request_trace(
     state: State<'_, crate::AppState>,
     message_id: String,
 ) -> Result<Option<crate::models::LlmRequestTrace>, String> {
+    // 优先读日志库（三库分离后新写入落 logs-YYYYMM.db，payload 大字段懒加载回读）
+    {
+        let dir = state.data_dir.lock().clone();
+        if let Some(ref d) = dir {
+            let trace = crate::store::logs::load_llm_trace(&crate::store::logs::logs_root(d), &message_id)?;
+            if trace.is_some() {
+                return Ok(trace);
+            }
+        }
+    }
+    // 回退：历史数据仍在会话库 / 主库（hybrid 兼容读路径）
     if let Some(sid) = state.find_session_by_message_id(&message_id) {
         state.with_session_db(&sid, |conn| crate::store::get_llm_request_trace(conn, &message_id))
     } else {
@@ -4901,12 +5052,6 @@ pub async fn browser_open_devtools_window(
 #[tauri::command]
 pub fn list_agent_sops() -> Result<Vec<crate::sop_catalog::SopItem>, String> {
     Ok(crate::sop_catalog::get_sop_catalog())
-}
-
-#[tauri::command]
-pub fn get_agent_sop_detail(id: String) -> Result<crate::sop_catalog::AgentSopDetail, String> {
-    crate::sop_catalog::get_sop_detail(&id)
-        .ok_or_else(|| format!("SOP '{}' not found", id))
 }
 
 #[cfg(test)]

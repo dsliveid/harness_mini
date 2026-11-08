@@ -317,8 +317,16 @@ export interface DirectDecisionResult {
   model: string;
 }
 
+/** 提示词真实原文的一个变体（text 即模型实际收到的正文，不含序号） */
+export interface AgentSopVariant {
+  label: string;
+  title: string;
+  text: string;
+}
+
 export interface AgentSopInfo {
   id: string;
+  /** 界面卡片标题 = variants[0].title（与模型实际收到的提示词标题同源） */
   name: string;
   phase: number;
   phaseLabel: string;
@@ -329,168 +337,8 @@ export interface AgentSopInfo {
   isHardRule?: boolean;
   description: string;
   disableEffect: string;
+  variants: AgentSopVariant[];
 }
-
-export interface AgentSopDetail {
-  id: string;
-  name: string;
-  phase: number;
-  phaseLabel: string;
-  category: "thinking" | "memory" | "orchestration" | "quality" | "workflow" | "safety" | string;
-  categoryLabel: string;
-  scope: "universal" | "main_only" | "sub_only" | string;
-  scopeLabel: string;
-  isHardRule?: boolean;
-  description: string;
-  disableEffect: string;
-  content: string;
-}
-
-export const AGENT_SOPS: AgentSopInfo[] = [
-  {
-    id: "todo_first_gate",
-    name: "Todo 先行与阶梯门禁公理",
-    phase: 1,
-    phaseLabel: "第一层级 · 前置意图与写入门禁",
-    category: "thinking",
-    categoryLabel: "思考范式",
-    scope: "universal",
-    scopeLabel: "主/子对话可用",
-    isHardRule: false,
-    description: "动代码前必须先声明施工意图（小型任务调用 todo，复杂工程调用 create_plan，二选一即可）；只读勘察严格限制在 ≤8 步以内，查清直接答复；若达 8 步仍无法梳理意图必须立即停下向用户/父进程汇报事实并对齐阻碍；落盘计划与子进程施工统一遵守此项门禁。",
-    disableEffect: "禁用后：Agent 免除动代码前的强制 todo 立项约束，且不触发 8 步勘察上限熔断，可自由读写探索。",
-  },
-  {
-    id: "plan_first",
-    name: "方案先行与计划中枢规范",
-    phase: 2,
-    phaseLabel: "第二层级 · 工程规划与落地执行",
-    category: "thinking",
-    categoryLabel: "思考范式",
-    scope: "universal",
-    scopeLabel: "主/子对话可用",
-    isHardRule: false,
-    description: "面对大改动任务（3个以上文件）或多轮需求，在 .harness/plans/ 自动建立结构化计划 MD 文档；需求变更时优先更新计划，后续严格根据计划分步执行，防止多轮需求失真与遗忘；若已有落盘计划，天然满足代码写入门禁。",
-    disableEffect: "禁用后：Agent 接到任务后可直接编写代码，不强制在 .harness/plans/ 建立结构化方案文档。",
-  },
-  {
-    id: "todo_lifecycle",
-    name: "任务清单全生命周期规范",
-    phase: 2,
-    phaseLabel: "第二层级 · 工程规划与落地执行",
-    category: "workflow",
-    categoryLabel: "任务规划",
-    scope: "universal",
-    scopeLabel: "主/子对话可用",
-    isHardRule: false,
-    description: "针对小的调整和探索，可以调用 todo 工具列出任务列表，并随进展更新各项任务状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done，切勿遗留 in_progress 状态。",
-    disableEffect: "禁用后：允许 Agent 自由多步推进，不强制调用 todo 工具维护状态清单。",
-  },
-  {
-    id: "subagent_orchestration",
-    name: "子进程协作与架构编排规范",
-    phase: 2,
-    phaseLabel: "第二层级 · 工程规划与落地执行",
-    category: "orchestration",
-    categoryLabel: "协同体系",
-    scope: "main_only",
-    scopeLabel: "仅主对话",
-    isHardRule: false,
-    description: "面对复杂需求、多模块并发开发（如前后端分离、多独立模块并行）时，可按职责派生专职子 Agent 协同推进。",
-    disableEffect: "禁用后：停用多子进程协作编排指引，Agent 倾向于在单主进程内直接就地处理全部任务。",
-  },
-  {
-    id: "subagent_deliver",
-    name: "子任务交付与状态汇报规范",
-    phase: 2,
-    phaseLabel: "第二层级 · 工程规划与落地执行",
-    category: "orchestration",
-    categoryLabel: "协同体系",
-    scope: "sub_only",
-    scopeLabel: "子对话可用",
-    isHardRule: false,
-    description: "专职子任务在完成施工、纯调研结案或遇到重大阻碍时，必须调用 write_file 工具向黑板文件 .harness/subtasks/{id}_report.md 正式交付结构化成果。落盘后子会话立即优雅结案。",
-    disableEffect: "子对话专属交付规范，主对话天然跳过。",
-  },
-  {
-    id: "subagent_worker_blueprint",
-    name: "施工工人准则与蓝图遵从规范",
-    phase: 2,
-    phaseLabel: "第二层级 · 工程规划与落地执行",
-    category: "orchestration",
-    categoryLabel: "协同体系",
-    scope: "sub_only",
-    scopeLabel: "子对话可用",
-    isHardRule: false,
-    description: "子任务作为实施工人，严格遵从主进程蓝图进行精确修改与自检，严禁擅自改动方法签名、接口名或推翻既定全局设计。",
-    disableEffect: "子对话专属准则，主对话天然跳过。",
-  },
-  {
-    id: "surgical_code_reading",
-    name: "精益代码研读规范",
-    phase: 2,
-    phaseLabel: "第二层级 · 工程规划与落地执行",
-    category: "quality",
-    categoryLabel: "工程质量",
-    scope: "universal",
-    scopeLabel: "主/子对话可用",
-    isHardRule: false,
-    description: "探索业务与代码时遵循漏斗式渐进探索（目录/清单 ➔ file_outline 骨架 ➔ grep 线索 ➔ 局部靶向精读）；严禁对大型文件进行多轮无休止的分页切片（offset_line）式逐行通读；修改前只精读最小必要上下文，严禁凭空盲猜。",
-    disableEffect: "禁用后：允许 Agent 自由阅读大段源码，解除对连续分页通读与精益读取的强约束。",
-  },
-  {
-    id: "safe_code_edit",
-    name: "代码克制与精确修改规范",
-    phase: 2,
-    phaseLabel: "第二层级 · 工程规划与落地执行",
-    category: "quality",
-    categoryLabel: "工程质量",
-    scope: "universal",
-    scopeLabel: "主/子对话可用",
-    isHardRule: false,
-    description: "修改文件前必须先用 read_file 读取相关内容，用 edit_file 做基于精确原文的最小化修改；新文件才用 write_file；动手前探索代码结构，修改后尽量用 run_command 运行构建或测试验证。",
-    disableEffect: "禁用后：移除代码最小化精确修改与构建验证的强指引约束。",
-  },
-  {
-    id: "memory_distill",
-    name: "边读边记与认知沉淀规范",
-    phase: 2,
-    phaseLabel: "第二层级 · 工程规划与落地执行",
-    category: "memory",
-    categoryLabel: "知识资产",
-    scope: "universal",
-    scopeLabel: "主/子对话可用",
-    isHardRule: false,
-    description: "内置工作区长期认知记忆（.harness/memory/）；常见技术栈提问优先秒级召回；深入探索或阅读多个文件后强制调用 record_memory 沉淀技术大盘与主题碎记；对话完成后台自动萃取 digests。",
-    disableEffect: "禁用后：移除强制调用 record_memory 沉淀约束，且会话结束后不触发后台自动提炼。",
-  },
-  {
-    id: "visual_artifact",
-    name: "双轨视觉感知与图表生成规范",
-    phase: 3,
-    phaseLabel: "第三层级 · 系统交互与安全红线",
-    category: "quality",
-    categoryLabel: "工程质量",
-    scope: "universal",
-    scopeLabel: "主/子对话可用",
-    isHardRule: true,
-    description: "图像与海报必须调用 generate_image 工具；架构/流程图必须直接输出 Markdown Mermaid 代码块，严禁写 Python 脚本绘制静态图。",
-    disableEffect: "系统级质量规范，常驻生效。",
-  },
-  {
-    id: "process_safety_boundary",
-    name: "进程生命周期安全红线",
-    phase: 3,
-    phaseLabel: "第三层级 · 系统交互与安全红线",
-    category: "safety",
-    categoryLabel: "安全底线",
-    scope: "universal",
-    scopeLabel: "主/子对话可用",
-    isHardRule: true,
-    description: "严禁按进程名称全局通配强杀（如 killall/taskkill /IM），进程管理必须精确到具体 PID，严禁误杀宿主与外部系统进程。",
-    disableEffect: "核心安全红线，常驻生效，不可关闭。",
-  },
-];
 
 export type PlanMode = "standard" | "always_plan" | "always_proceed";
 
@@ -605,6 +453,15 @@ export interface Session {
   reasoning_effort?: string | null;
   /** 会话专属最大工具步数上限（为空则跟随全局默认） */
   maxSteps?: number | null;
+  /** 三库分离·分库元数据：消息数（后端增量维护，列表直读，替代消息表聚合） */
+  msgCount?: number | null;
+  toolEventCount?: number | null;
+  /** 最近一条消息前 200 字符预览（列表展示，点开会话前即可识别内容） */
+  lastPreview?: string | null;
+  /** 存储状态：hot（活跃）| archived（已归档）| migrated（已迁移） */
+  storageState?: string | null;
+  /** 会话专属库（session.db + wal）占用字节 */
+  bundleBytes?: number | null;
 }
 
 /** 判断会话是否处于未完结的活跃执行/待执行态 */
