@@ -151,7 +151,7 @@ export const MermaidBlock = memo(function MermaidBlock({ code }: MermaidBlockPro
               type="button"
               onClick={handleOpenLightbox}
               className="p-1 rounded hover:bg-panel hover:text-ink text-inkdim transition-colors cursor-pointer"
-              title="打开全屏弹窗大图 (默认放大 145%，支持滚轮缩放与平移)"
+              title="打开全屏弹窗大图 (支持滚轮缩放与平移)"
             >
               <Maximize2 size={13} />
             </button>
@@ -186,7 +186,7 @@ export const MermaidBlock = memo(function MermaidBlock({ code }: MermaidBlockPro
           onClick={handleOpenLightbox}
           className="p-4 overflow-x-auto flex justify-center items-center bg-panel/20 cursor-zoom-in group hover:bg-panel/30 transition-colors [&_svg]:max-w-full [&_svg]:h-auto min-h-[120px]"
           dangerouslySetInnerHTML={{ __html: activeSvg }}
-          title="点击打开全屏弹窗大图 (默认以 145% 放大状态呈现，支持滚轮缩放与平移)"
+          title="点击打开全屏弹窗大图 (支持滚轮缩放与平移)"
         />
       ) : (
         /* 首步尚未生成合法 SVG 时：以紧凑代码块静默占位，高度恒定，绝不突变报错卡片 */

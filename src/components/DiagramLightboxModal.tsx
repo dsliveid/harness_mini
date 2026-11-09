@@ -3,14 +3,15 @@ import { createPortal } from "react-dom";
 import { X, ZoomIn, ZoomOut, RotateCcw, Copy, Check, Download, Maximize2 } from "./Icons";
 import { useStore } from "../store";
 
-const DEFAULT_ENLARGED_SCALE = 1.45; // 默认以 145% 舒适大图比例打开，无需手动滚轮放大
+const DEFAULT_SCALE = 1.0; // 默认以 100% 原始尺寸打开
+const ENLARGED_SCALE = 1.45; // 快捷放大挡位 (145%)
 
 export function DiagramLightboxModal() {
   const lightboxDiagram = useStore((s) => s.lightboxDiagram);
   const setLightboxDiagram = useStore((s) => s.setLightboxDiagram);
   const pushToast = useStore((s) => s.pushToast);
 
-  const [scale, setScale] = useState(DEFAULT_ENLARGED_SCALE);
+  const [scale, setScale] = useState(DEFAULT_SCALE);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
@@ -83,10 +84,10 @@ export function DiagramLightboxModal() {
     };
   }, [lightboxDiagram?.svgHtml]);
 
-  // 2. 每次打开新图表时，重置为默认放大状态 (145%) 并居中
+  // 2. 每次打开新图表时，重置为默认 100% 原始尺寸并居中
   useEffect(() => {
     if (lightboxDiagram) {
-      setScale(DEFAULT_ENLARGED_SCALE);
+      setScale(DEFAULT_SCALE);
       setPan({ x: 0, y: 0 });
       setCopiedCode(false);
       hasDraggedRef.current = false;
@@ -149,14 +150,14 @@ export function DiagramLightboxModal() {
     setLightboxDiagram(null);
   };
 
-  // 6. 双击快捷切换：在【145% 默认放大】与【整屏适应 (fitScale) 或 100%】间无缝切换
+  // 6. 双击快捷切换：在【100% 原始大小】与【145% 放大】间无缝切换
   const handleDoubleClick = (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (Math.abs(scale - DEFAULT_ENLARGED_SCALE) < 0.1) {
-      setScale(fitScale || 1.0);
+    if (Math.abs(scale - DEFAULT_SCALE) < 0.05) {
+      setScale(ENLARGED_SCALE);
       setPan({ x: 0, y: 0 });
     } else {
-      setScale(DEFAULT_ENLARGED_SCALE);
+      setScale(DEFAULT_SCALE);
       setPan({ x: 0, y: 0 });
     }
   };
@@ -265,18 +266,18 @@ export function DiagramLightboxModal() {
           适应
         </button>
 
-        {/* 挡位 3：145% 默认放大状态 */}
+        {/* 挡位 3：145% 放大状态 */}
         <button
           onClick={() => {
-            setScale(DEFAULT_ENLARGED_SCALE);
+            setScale(ENLARGED_SCALE);
             setPan({ x: 0, y: 0 });
           }}
           className={`px-2 py-1 rounded-lg text-[11px] font-mono transition-colors cursor-pointer ${
-            Math.abs(scale - DEFAULT_ENLARGED_SCALE) < 0.05
+            Math.abs(scale - ENLARGED_SCALE) < 0.05
               ? "bg-cyan-500/20 text-cyan-400 font-semibold"
               : "hover:bg-panel2 text-inkdim hover:text-ink"
           }`}
-          title="切换至 145% 默认清晰放大状态"
+          title="切换至 145% 清晰放大状态"
         >
           放大
         </button>
@@ -284,11 +285,11 @@ export function DiagramLightboxModal() {
         {/* 重置 */}
         <button
           onClick={() => {
-            setScale(DEFAULT_ENLARGED_SCALE);
+            setScale(DEFAULT_SCALE);
             setPan({ x: 0, y: 0 });
           }}
           className="p-1.5 rounded-lg hover:bg-panel2 text-inkdim hover:text-ink transition-colors cursor-pointer"
-          title="重置视图居中"
+          title="重置视图为 100% 居中"
         >
           <RotateCcw size={15} />
         </button>

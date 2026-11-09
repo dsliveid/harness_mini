@@ -439,43 +439,54 @@ export const MermaidBlock = memo(function MermaidBlock({ code }: { code: string 
 在 [`src/store.ts`](file:///f:/WorkSpace/Other/harness_mini/src/store.ts) 中增加 `lightboxDiagram` 状态与动作，在 [`src/App.tsx`](file:///f:/WorkSpace/Other/harness_mini/src/App.tsx) 根节点挂载 `<DiagramLightboxModal />`，并通过 `createPortal(..., document.body)` 彻底脱离聊天气泡的 CSS Containing Block 束缚。
 
 重构后的 [`src/components/DiagramLightboxModal.tsx`](file:///f:/WorkSpace/Other/harness_mini/src/components/DiagramLightboxModal.tsx) 具备以下关键特性：
-1. **默认放大阅读（145% Scale）**：打开即清晰，无需每次手动滚轮放大；
-2. **解除 Mermaid 内联样式限制**：自动剥离 `<svg>` 标签内 Mermaid 原生注入的 `max-width` 限制，结合 `[&_svg]:!max-w-none [&_svg]:!w-auto [&_svg]:!h-auto` 还原 100% 原始矢量尺寸；
-3. **平滑滚轮缩放与平移**：支持 20% ~ 600% 无级平滑缩放与鼠标左键拖拽平移；
-4. **双击快速切换**：双击画布在 145% 放大态与 100% 原始态之间快速平滑切换；
-5. **快捷预设与导出**：提供 100% 原始大小、放大阅读、导出 SVG、复制图表代码及 ESC 一键退出。
+1. **默认 100% 原始尺寸打开**：以 1:1 标准矢量比例初始打开，并提供“适应”与“放大(145%)”快捷挡位；
+2. **物理尺寸推导与消除 0x0 塌陷**：解析 viewBox 与 max-width，设置确定像素容器并配合 `bg-panel2/95 border border-edge/80 shadow-2xl` 独立承载卡片；
+3. **平滑滚轮缩放与平移**：支持 15% ~ 600% 无级平滑缩放与鼠标左键拖拽平移；
+4. **双击快速切换**：双击画布在 100% 原始态与 145% 放大态之间快速平滑切换；
+5. **快捷预设与导出**：提供 100%、适应、放大、重置、导出 SVG、复制图表代码及 ESC 一键退出。
 
 ```tsx
-import { useState, useRef, useEffect, useMemo } from "react";
+import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { createPortal } from "react-dom";
-import { X, ZoomIn, ZoomOut, RotateCcw, Copy, Check, Download, Eye } from "./Icons";
+import { X, ZoomIn, ZoomOut, RotateCcw, Copy, Check, Download, Maximize2 } from "./Icons";
 import { useStore } from "../store";
 
-const DEFAULT_ENLARGED_SCALE = 1.45; // 默认以 145% 舒适大图比例打开，无需手动滚轮放大
+const DEFAULT_SCALE = 1.0; // 默认以 100% 原始尺寸打开
+const ENLARGED_SCALE = 1.45; // 快捷放大挡位 (145%)
 
 export function DiagramLightboxModal() {
   const lightboxDiagram = useStore((s) => s.lightboxDiagram);
   const setLightboxDiagram = useStore((s) => s.setLightboxDiagram);
   const pushToast = useStore((s) => s.pushToast);
 
-  const [scale, setScale] = useState(DEFAULT_ENLARGED_SCALE);
+  const [scale, setScale] = useState(DEFAULT_SCALE);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
 
-  const dragStartRef = useRef({ x: 0, y: 0 });
+  const dragStartRef = useRef({ x: 0, y: 0, startClientX: 0, startClientY: 0 });
+  const hasDraggedRef = useRef(false);
 
-  // 每次打开新图表时，重置为默认放大状态 (145%) 并居中
+  // 每次打开新图表时，重置为默认 100% 原始尺寸并居中
   useEffect(() => {
     if (lightboxDiagram) {
-      setScale(DEFAULT_ENLARGED_SCALE);
+      setScale(DEFAULT_SCALE);
       setPan({ x: 0, y: 0 });
       setCopiedCode(false);
+      hasDraggedRef.current = false;
     }
   }, [lightboxDiagram]);
 
+  // ESC 键盘快捷键退出
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && lightboxDiagram) {
+        setLightboxDiagram(null);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
+  }, [lightboxDiagram, setLightboxDiagram]);
 
   // 2. 鼠标滚轮平滑缩放 (20% ~ 500%)
   const handleWheel = (e: React.WheelEvent) => {
