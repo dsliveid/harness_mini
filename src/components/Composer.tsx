@@ -267,7 +267,6 @@ export function Composer() {
 
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const backupDraftRef = useRef<{ text: string; attachments: Attachment[] } | null>(null);
   const prevEditingIdRef = useRef<string | null>(null);
 
   // 切换会话时重置标签态指令
@@ -275,16 +274,12 @@ export function Composer() {
     setActiveCmd(null);
   }, [activeId]);
 
-  // 同步编辑目标到输入框与附件
+  // 同步编辑目标到输入框与附件（退出编辑模式时保留输入框已有内容，不进行强制清空/还原）
   useEffect(() => {
     const curEditingId = editingMessage?.messageId ?? null;
     if (curEditingId !== prevEditingIdRef.current) {
       if (editingMessage) {
-        // 进入编辑模式：备份进入编辑前的草稿与临时附件
-        backupDraftRef.current = {
-          text: useStore.getState().sessionDrafts[activeId] ?? "",
-          attachments: pendingAttachments,
-        };
+        // 进入编辑模式：将被撤回/编辑的消息文本与附件带入输入框
         setSessionDraft(activeId, editingMessage.text);
         setPendingAttachments(editingMessage.attachments ?? []);
         requestAnimationFrame(() => {
@@ -295,14 +290,6 @@ export function Composer() {
             taRef.current.setSelectionRange(len, len);
           }
         });
-      } else {
-        // 退出编辑模式且存在草稿备份时恢复
-        if (backupDraftRef.current) {
-          setSessionDraft(activeId, backupDraftRef.current.text);
-          setPendingAttachments(backupDraftRef.current.attachments);
-          backupDraftRef.current = null;
-          requestAnimationFrame(resize);
-        }
       }
       prevEditingIdRef.current = curEditingId;
     }
@@ -310,13 +297,7 @@ export function Composer() {
 
   const cancelEdit = () => {
     if (!editingMessage) return;
-    const backup = backupDraftRef.current;
-    backupDraftRef.current = null;
     setEditingMessage(null);
-    if (backup) {
-      setSessionDraft(activeId, backup.text);
-      setPendingAttachments(backup.attachments);
-    }
     requestAnimationFrame(resize);
   };
 
@@ -560,13 +541,7 @@ export function Composer() {
           t,
           sendingAttachments.length > 0 ? sendingAttachments : undefined
         );
-        const backup = backupDraftRef.current;
-        backupDraftRef.current = null;
         setEditingMessage(null);
-        if (backup && (backup.text.trim() || backup.attachments.length > 0)) {
-          setSessionDraft(targetId, backup.text);
-          setPendingAttachments(backup.attachments);
-        }
       } catch (e) {
         pushToast(String(e));
         setSessionDraft(targetId, t);

@@ -125,6 +125,224 @@ export const Markdown = memo(function Markdown({
     return autolinkPlainPaths(body);
   }, [body, enableAutolink]);
 
+  // 稳定 Markdown 自定义节点组件字典引用，消除流式吐字期间子组件高频 Unmount/Remount 与闪烁
+  const components = useMemo(() => {
+    return {
+      a: ({ href, children, ...props }: any) => {
+        const trimmedHref = (href || "").trim();
+        const isAutoPath = trimmedHref.startsWith("x-path://");
+        const rawActualPath = isAutoPath ? trimmedHref.slice(9) : trimmedHref;
+        let actualPath = rawActualPath;
+        try {
+          actualPath = decodeURIComponent(rawActualPath);
+        } catch {}
+
+        // 若是由 autolinkPlainPaths 自动识别的路径候选
+        if (isAutoPath) {
+          if (isPotentialPath(actualPath)) {
+            return (
+              <PathLink
+                rawPath={actualPath}
+                workspacePath={effectiveWorkspace}
+                currentDocPath={currentDocPath}
+                isAutoLinked={true}
+                isExplicitLink={false}
+              >
+                {children}
+              </PathLink>
+            );
+          }
+          // 如果不是潜在合法路径，直接降级为纯文本，绝不能变成外链
+          return <span>{children}</span>;
+        }
+
+        // 作者显式书写的链接 [text](url)
+        const isExternalWeb =
+          actualPath.startsWith("http://") ||
+          actualPath.startsWith("https://") ||
+          actualPath.startsWith("mailto:");
+
+        if (isExternalWeb) {
+          return (
+            <a
+              href={href}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-0.5 text-sky-400 hover:text-sky-300 underline underline-offset-2 decoration-sky-400/40 hover:decoration-sky-300 transition-colors select-text group/ext"
+              {...props}
+            >
+              <span>{children}</span>
+              <ExternalLink size={11} className="inline ml-0.5 opacity-65 group-hover/ext:opacity-100 transition-opacity shrink-0 align-baseline" />
+            </a>
+          );
+        }
+
+        // 页内锚点跳转（如 #heading-1）
+        if (trimmedHref.startsWith("#")) {
+          return (
+            <a
+              href={trimmedHref}
+              className="text-sky-400 hover:text-sky-300 underline underline-offset-2 transition-colors select-text"
+              {...props}
+            >
+              {children}
+            </a>
+          );
+        }
+
+        // 本地文件、目录或文档相对引用（如 [指南](./guide.md) 或 [源码](src/App.tsx)）
+        if (actualPath.startsWith("file://") || isPotentialPath(actualPath)) {
+          return (
+            <PathLink
+              rawPath={actualPath}
+              workspacePath={effectiveWorkspace}
+              currentDocPath={currentDocPath}
+              isAutoLinked={false}
+              isExplicitLink={true}
+            >
+              {children}
+            </PathLink>
+          );
+        }
+
+        // 链接地址：纯外部超链接，独立的天空蓝配色与外部跳转 SVG 小图标
+        return (
+          <a
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-0.5 text-sky-400 hover:text-sky-300 underline underline-offset-2 decoration-sky-400/40 hover:decoration-sky-300 transition-colors select-text group/ext"
+            {...props}
+          >
+            <span>{children}</span>
+            <ExternalLink size={11} className="inline ml-0.5 opacity-65 group-hover/ext:opacity-100 transition-opacity shrink-0 align-baseline" />
+          </a>
+        );
+      },
+      pre: ({ children, ...props }: any) => {
+        const child = Array.isArray(children) ? children[0] : children;
+        if (child && typeof child === "object" && "props" in child) {
+          const className = (child as any).props?.className || "";
+          if (/language-mermaid\b/i.test(className)) {
+            return <>{children}</>;
+          }
+        }
+        return <pre {...props}>{children}</pre>;
+      },
+      code: ({ className, children, ...props }: any) => {
+        const match = /language-(\w+)/.exec(className || "");
+        const text = String(children).replace(/\n$/, "");
+        const isMultiLine = text.includes("\n");
+
+        if (match && match[1].toLowerCase() === "mermaid") {
+          return <MermaidBlock code={text} />;
+        }
+
+        // 单行行内代码：若符合文件或目录路径特征，转换为交互式 PathLink
+        if (!match && !isMultiLine && isPotentialPath(text)) {
+          return (
+            <PathLink
+              rawPath={text}
+              workspacePath={effectiveWorkspace}
+              currentDocPath={currentDocPath}
+              isInlineCode={true}
+            >
+              {text}
+            </PathLink>
+          );
+        }
+
+        // 文字标签：中性深灰底色 + 浅白灰字，无链接交互，无下划线，作为纯代码/配置/术语标签
+        return (
+          <code
+            className={`bg-panel3/90 text-zinc-300 border border-zinc-700/60 rounded-md px-1.5 py-0.5 font-mono text-[12px] inline-block my-0.5 select-text ${className || ""}`}
+            {...props}
+          >
+            {children}
+          </code>
+        );
+      },
+      h1: ({ node, children, ...props }: any) => {
+        const line = node?.position?.start?.line;
+        return (
+          <h1 id={line ? `md-line-${line}` : undefined} {...props}>
+            {children}
+          </h1>
+        );
+      },
+      h2: ({ node, children, ...props }: any) => {
+        const line = node?.position?.start?.line;
+        return (
+          <h2 id={line ? `md-line-${line}` : undefined} {...props}>
+            {children}
+          </h2>
+        );
+      },
+      h3: ({ node, children, ...props }: any) => {
+        const line = node?.position?.start?.line;
+        return (
+          <h3 id={line ? `md-line-${line}` : undefined} {...props}>
+            {children}
+          </h3>
+        );
+      },
+      h4: ({ node, children, ...props }: any) => {
+        const line = node?.position?.start?.line;
+        return (
+          <h4 id={line ? `md-line-${line}` : undefined} {...props}>
+            {children}
+          </h4>
+        );
+      },
+      h5: ({ node, children, ...props }: any) => {
+        const line = node?.position?.start?.line;
+        return (
+          <h5 id={line ? `md-line-${line}` : undefined} {...props}>
+            {children}
+          </h5>
+        );
+      },
+      h6: ({ node, children, ...props }: any) => {
+        const line = node?.position?.start?.line;
+        return (
+          <h6 id={line ? `md-line-${line}` : undefined} {...props}>
+            {children}
+          </h6>
+        );
+      },
+      table: ({ children, ...props }: any) => (
+        <div className="overflow-x-auto my-3 max-w-full">
+          <table {...props}>{children}</table>
+        </div>
+      ),
+      img: ({ src, alt, ...props }: any) => {
+        const finalSrc = resolveMarkdownImagePath(src || "", effectiveWorkspace);
+        return (
+          <SafeImage
+            src={finalSrc}
+            alt={alt || "图片"}
+            onClick={() => {
+              if (typeof window !== "undefined" && window.location.search.includes("window=file_viewer")) {
+                ipc.openFileViewer({
+                  id: `image:${finalSrc}`,
+                  type: "image",
+                  title: alt || finalSrc.split("/").pop() || "图片",
+                  path: finalSrc,
+                  workspacePath: effectiveWorkspace,
+                });
+              } else {
+                setLightboxImage({ src: finalSrc, title: alt });
+              }
+            }}
+            className="max-h-80 rounded-xl my-2 border border-edge object-contain cursor-zoom-in hover:opacity-95 transition-opacity shadow-sm"
+            loading="lazy"
+            {...props}
+          />
+        );
+      },
+    };
+  }, [effectiveWorkspace, currentDocPath, setLightboxImage]);
+
   return (
     <div className="md-content">
       {hasFrontmatter && showFrontmatter && (
@@ -142,222 +360,9 @@ export const Markdown = memo(function Markdown({
           urlTransform={safeUrlTransform}
           remarkPlugins={REMARK_PLUGINS}
           rehypePlugins={REHYPE_PLUGINS}
-        components={{
-          a: ({ href, children, ...props }) => {
-            const trimmedHref = (href || "").trim();
-            const isAutoPath = trimmedHref.startsWith("x-path://");
-            const rawActualPath = isAutoPath ? trimmedHref.slice(9) : trimmedHref;
-            let actualPath = rawActualPath;
-            try {
-              actualPath = decodeURIComponent(rawActualPath);
-            } catch {}
-
-            // 若是由 autolinkPlainPaths 自动识别的路径候选
-            if (isAutoPath) {
-              if (isPotentialPath(actualPath)) {
-                return (
-                  <PathLink
-                    rawPath={actualPath}
-                    workspacePath={effectiveWorkspace}
-                    currentDocPath={currentDocPath}
-                    isAutoLinked={true}
-                    isExplicitLink={false}
-                  >
-                    {children}
-                  </PathLink>
-                );
-              }
-              // 如果不是潜在合法路径，直接降级为纯文本，绝不能变成外链
-              return <span>{children}</span>;
-            }
-
-            // 作者显式书写的链接 [text](url)
-            const isExternalWeb =
-              actualPath.startsWith("http://") ||
-              actualPath.startsWith("https://") ||
-              actualPath.startsWith("mailto:");
-
-            if (isExternalWeb) {
-              return (
-                <a
-                  href={href}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex items-center gap-0.5 text-sky-400 hover:text-sky-300 underline underline-offset-2 decoration-sky-400/40 hover:decoration-sky-300 transition-colors select-text group/ext"
-                  {...props}
-                >
-                  <span>{children}</span>
-                  <ExternalLink size={11} className="inline ml-0.5 opacity-65 group-hover/ext:opacity-100 transition-opacity shrink-0 align-baseline" />
-                </a>
-              );
-            }
-
-            // 页内锚点跳转（如 #heading-1）
-            if (trimmedHref.startsWith("#")) {
-              return (
-                <a
-                  href={trimmedHref}
-                  className="text-sky-400 hover:text-sky-300 underline underline-offset-2 transition-colors select-text"
-                  {...props}
-                >
-                  {children}
-                </a>
-              );
-            }
-
-            // 本地文件、目录或文档相对引用（如 [指南](./guide.md) 或 [源码](src/App.tsx)）
-            if (actualPath.startsWith("file://") || isPotentialPath(actualPath)) {
-              return (
-                <PathLink
-                  rawPath={actualPath}
-                  workspacePath={effectiveWorkspace}
-                  currentDocPath={currentDocPath}
-                  isAutoLinked={false}
-                  isExplicitLink={true}
-                >
-                  {children}
-                </PathLink>
-              );
-            }
-
-            // 链接地址：纯外部超链接，独立的天空蓝配色与外部跳转 SVG 小图标
-            return (
-              <a
-                href={href}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-0.5 text-sky-400 hover:text-sky-300 underline underline-offset-2 decoration-sky-400/40 hover:decoration-sky-300 transition-colors select-text group/ext"
-                {...props}
-              >
-                <span>{children}</span>
-                <ExternalLink size={11} className="inline ml-0.5 opacity-65 group-hover/ext:opacity-100 transition-opacity shrink-0 align-baseline" />
-              </a>
-            );
-          },
-          pre: ({ children, ...props }) => {
-            const child = Array.isArray(children) ? children[0] : children;
-            if (child && typeof child === "object" && "props" in child) {
-              const className = (child as any).props?.className || "";
-              if (/language-mermaid\b/i.test(className)) {
-                return <>{children}</>;
-              }
-            }
-            return <pre {...props}>{children}</pre>;
-          },
-          code: ({ className, children, ...props }) => {
-            const match = /language-(\w+)/.exec(className || "");
-            const text = String(children).replace(/\n$/, "");
-            const isMultiLine = text.includes("\n");
-
-            if (match && match[1].toLowerCase() === "mermaid") {
-              return <MermaidBlock code={text} />;
-            }
-
-            // 单行行内代码：若符合文件或目录路径特征，转换为交互式 PathLink
-            if (!match && !isMultiLine && isPotentialPath(text)) {
-              return (
-                <PathLink
-                  rawPath={text}
-                  workspacePath={effectiveWorkspace}
-                  currentDocPath={currentDocPath}
-                  isInlineCode={true}
-                >
-                  {text}
-                </PathLink>
-              );
-            }
-
-            // 文字标签：中性深灰底色 + 浅白灰字，无链接交互，无下划线，作为纯代码/配置/术语标签
-            return (
-              <code
-                className={`bg-panel3/90 text-zinc-300 border border-zinc-700/60 rounded-md px-1.5 py-0.5 font-mono text-[12px] inline-block my-0.5 select-text ${className || ""}`}
-                {...props}
-              >
-                {children}
-              </code>
-            );
-          },
-          h1: ({ node, children, ...props }) => {
-            const line = node?.position?.start?.line;
-            return (
-              <h1 id={line ? `md-line-${line}` : undefined} {...props}>
-                {children}
-              </h1>
-            );
-          },
-          h2: ({ node, children, ...props }) => {
-            const line = node?.position?.start?.line;
-            return (
-              <h2 id={line ? `md-line-${line}` : undefined} {...props}>
-                {children}
-              </h2>
-            );
-          },
-          h3: ({ node, children, ...props }) => {
-            const line = node?.position?.start?.line;
-            return (
-              <h3 id={line ? `md-line-${line}` : undefined} {...props}>
-                {children}
-              </h3>
-            );
-          },
-          h4: ({ node, children, ...props }) => {
-            const line = node?.position?.start?.line;
-            return (
-              <h4 id={line ? `md-line-${line}` : undefined} {...props}>
-                {children}
-              </h4>
-            );
-          },
-          h5: ({ node, children, ...props }) => {
-            const line = node?.position?.start?.line;
-            return (
-              <h5 id={line ? `md-line-${line}` : undefined} {...props}>
-                {children}
-              </h5>
-            );
-          },
-          h6: ({ node, children, ...props }) => {
-            const line = node?.position?.start?.line;
-            return (
-              <h6 id={line ? `md-line-${line}` : undefined} {...props}>
-                {children}
-              </h6>
-            );
-          },
-          table: ({ children, ...props }) => (
-            <div className="overflow-x-auto my-3 max-w-full">
-              <table {...props}>{children}</table>
-            </div>
-          ),
-          img: ({ src, alt, ...props }) => {
-            const finalSrc = resolveMarkdownImagePath(src || "", effectiveWorkspace);
-            return (
-              <SafeImage
-                src={finalSrc}
-                alt={alt || "图片"}
-                onClick={() => {
-                  if (typeof window !== "undefined" && window.location.search.includes("window=file_viewer")) {
-                    ipc.openFileViewer({
-                      id: `image:${finalSrc}`,
-                      type: "image",
-                      title: alt || finalSrc.split("/").pop() || "图片",
-                      path: finalSrc,
-                      workspacePath: effectiveWorkspace,
-                    });
-                  } else {
-                    setLightboxImage({ src: finalSrc, title: alt });
-                  }
-                }}
-                className="max-h-80 rounded-xl my-2 border border-edge object-contain cursor-zoom-in hover:opacity-95 transition-opacity shadow-sm"
-                loading="lazy"
-                {...props}
-              />
-            );
-          },
-        }}
-      >
-        {processedContent}
+          components={components}
+        >
+          {processedContent}
         </ReactMarkdown>
       </MarkdownErrorBoundary>
     </div>

@@ -62,6 +62,7 @@ export {
   Edit3,
   Pencil,
   Save,
+  Download,
   ExternalLink,
   Link,
   Link2,
