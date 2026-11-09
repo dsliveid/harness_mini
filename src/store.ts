@@ -231,6 +231,8 @@ interface Store {
   showCreateSubagentModal: boolean;
   view: "list" | "project";
   lightboxImage: { src: string; alt?: string; title?: string } | null;
+  lightboxDiagram: { svgHtml: string; title?: string; code?: string } | null;
+  setLightboxDiagram: (d: { svgHtml: string; title?: string; code?: string } | null) => void;
   setLightboxImage: (img: { src: string; alt?: string; title?: string } | null) => void;
   /** 外部（如对话卡片）请求聚焦右侧浮窗的特定任务或方案标识 */
   focusFloatingTaskId: string | FocusFloatingTarget | null;
@@ -762,6 +764,8 @@ export const useStore = create<Store>((set, get) => ({
   // 启动默认进入项目视图
   view: "project",
   lightboxImage: null,
+  lightboxDiagram: null,
+  setLightboxDiagram: (d) => set({ lightboxDiagram: d }),
   setLightboxImage: (img) => set({ lightboxImage: img }),
   focusFloatingTaskId: null,
   setFocusFloatingTaskId: (target) => set({ focusFloatingTaskId: target }),

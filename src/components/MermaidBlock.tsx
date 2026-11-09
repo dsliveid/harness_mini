@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useId, memo } from "react";
 import mermaid from "mermaid";
 import { Copy, Check, Code, Eye, Maximize2, Loader2 } from "./Icons";
-import { DiagramLightboxModal } from "./DiagramLightboxModal";
+import { useStore } from "../store";
 
 let initialized = false;
 function ensureMermaidInitialized() {
@@ -47,6 +47,8 @@ export const MermaidBlock = memo(function MermaidBlock({ code }: MermaidBlockPro
   const rawId = useId();
   const safeId = `mermaid_${rawId.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
 
+  const setLightboxDiagram = useStore((s) => s.setLightboxDiagram);
+
   const cleanCode = code.trim();
   const initialCache = cleanCode ? MERMAID_RENDER_CACHE.get(cleanCode) || "" : "";
 
@@ -55,7 +57,6 @@ export const MermaidBlock = memo(function MermaidBlock({ code }: MermaidBlockPro
   const [isCompiling, setIsCompiling] = useState<boolean>(!initialCache && !!cleanCode);
   const [showCode, setShowCode] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [showLightbox, setShowLightbox] = useState(false);
 
   // 记录最近一次编译成功的合法 SVG，作为双缓冲防护底板
   const lastValidSvgRef = useRef<string>(initialCache);
@@ -120,6 +121,16 @@ export const MermaidBlock = memo(function MermaidBlock({ code }: MermaidBlockPro
   const hasSvg = Boolean(svgHtml || lastValidSvgRef.current);
   const activeSvg = svgHtml || lastValidSvgRef.current;
 
+  const handleOpenLightbox = () => {
+    if (hasSvg && activeSvg) {
+      setLightboxDiagram({
+        svgHtml: activeSvg,
+        title: "Mermaid 架构流程图",
+        code: cleanCode,
+      });
+    }
+  };
+
   return (
     <div className="my-3 rounded-xl border border-edge/80 bg-panel2/60 overflow-hidden shadow-sm transition-all">
       {/* 顶栏操作条 */}
@@ -138,9 +149,9 @@ export const MermaidBlock = memo(function MermaidBlock({ code }: MermaidBlockPro
           {hasSvg && (
             <button
               type="button"
-              onClick={() => setShowLightbox(true)}
+              onClick={handleOpenLightbox}
               className="p-1 rounded hover:bg-panel hover:text-ink text-inkdim transition-colors cursor-pointer"
-              title="全屏放大查看图表 (支持滚轮缩放与拖拽平移)"
+              title="打开全屏弹窗大图 (默认放大 145%，支持滚轮缩放与平移)"
             >
               <Maximize2 size={13} />
             </button>
@@ -172,10 +183,10 @@ export const MermaidBlock = memo(function MermaidBlock({ code }: MermaidBlockPro
       ) : hasSvg ? (
         <div
           ref={containerRef}
-          onClick={() => setShowLightbox(true)}
+          onClick={handleOpenLightbox}
           className="p-4 overflow-x-auto flex justify-center items-center bg-panel/20 cursor-zoom-in group hover:bg-panel/30 transition-colors [&_svg]:max-w-full [&_svg]:h-auto min-h-[120px]"
           dangerouslySetInnerHTML={{ __html: activeSvg }}
-          title="点击放大查看高清图表 (支持滚轮缩放与平移)"
+          title="点击打开全屏弹窗大图 (默认以 145% 放大状态呈现，支持滚轮缩放与平移)"
         />
       ) : (
         /* 首步尚未生成合法 SVG 时：以紧凑代码块静默占位，高度恒定，绝不突变报错卡片 */
@@ -188,16 +199,6 @@ export const MermaidBlock = memo(function MermaidBlock({ code }: MermaidBlockPro
             <code>{cleanCode || "正在准备图表定义..."}</code>
           </pre>
         </div>
-      )}
-
-      {/* 独立全屏矢量灯箱 */}
-      {showLightbox && hasSvg && (
-        <DiagramLightboxModal
-          svgHtml={activeSvg}
-          title="Mermaid 架构流程图"
-          code={cleanCode}
-          onClose={() => setShowLightbox(false)}
-        />
       )}
     </div>
   );

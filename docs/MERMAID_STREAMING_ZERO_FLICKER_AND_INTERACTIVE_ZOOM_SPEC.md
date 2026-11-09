@@ -429,55 +429,51 @@ export const MermaidBlock = memo(function MermaidBlock({ code }: { code: string 
         </div>
       )}
 
-      {/* 独立全屏矢量灯箱 */}
-      {showLightbox && hasSvg && (
-        <DiagramLightboxModal
-          svgHtml={activeSvg}
-          title="Mermaid 架构流程图"
-          code={cleanCode}
-          onClose={() => setShowLightbox(false)}
-        />
-      )}
+      {/* 全局全屏矢量灯箱已提升至 App 根节点与 Zustand Store 管理，彻底脱离聊天气泡与包含块约束 */}
     </div>
   );
 });
 ```
 
-### 4.3 重构 Layer 3: DiagramLightboxModal 全屏交互灯箱子系统
-新建 [`src/components/DiagramLightboxModal.tsx`](file:///f:/WorkSpace/Other/harness_mini/src/components/DiagramLightboxModal.tsx)，提供专业的矢量缩放、平移画布与工具条：
+### 4.3 重构 Layer 3: DiagramLightboxModal 全局交互灯箱子系统
+在 [`src/store.ts`](file:///f:/WorkSpace/Other/harness_mini/src/store.ts) 中增加 `lightboxDiagram` 状态与动作，在 [`src/App.tsx`](file:///f:/WorkSpace/Other/harness_mini/src/App.tsx) 根节点挂载 `<DiagramLightboxModal />`，并通过 `createPortal(..., document.body)` 彻底脱离聊天气泡的 CSS Containing Block 束缚。
+
+重构后的 [`src/components/DiagramLightboxModal.tsx`](file:///f:/WorkSpace/Other/harness_mini/src/components/DiagramLightboxModal.tsx) 具备以下关键特性：
+1. **默认放大阅读（145% Scale）**：打开即清晰，无需每次手动滚轮放大；
+2. **解除 Mermaid 内联样式限制**：自动剥离 `<svg>` 标签内 Mermaid 原生注入的 `max-width` 限制，结合 `[&_svg]:!max-w-none [&_svg]:!w-auto [&_svg]:!h-auto` 还原 100% 原始矢量尺寸；
+3. **平滑滚轮缩放与平移**：支持 20% ~ 600% 无级平滑缩放与鼠标左键拖拽平移；
+4. **双击快速切换**：双击画布在 145% 放大态与 100% 原始态之间快速平滑切换；
+5. **快捷预设与导出**：提供 100% 原始大小、放大阅读、导出 SVG、复制图表代码及 ESC 一键退出。
 
 ```tsx
-import { useState, useRef, useEffect, useCallback } from "react";
-import { X, ZoomIn, ZoomOut, RotateCcw, Copy, Check, Download, Move } from "./Icons";
+import { useState, useRef, useEffect, useMemo } from "react";
+import { createPortal } from "react-dom";
+import { X, ZoomIn, ZoomOut, RotateCcw, Copy, Check, Download, Eye } from "./Icons";
 import { useStore } from "../store";
 
-interface DiagramLightboxModalProps {
-  svgHtml: string;
-  title?: string;
-  code?: string;
-  onClose: () => void;
-}
+const DEFAULT_ENLARGED_SCALE = 1.45; // 默认以 145% 舒适大图比例打开，无需手动滚轮放大
 
-export function DiagramLightboxModal({
-  svgHtml,
-  title = "图表查看器",
-  code,
-  onClose,
-}: DiagramLightboxModalProps) {
+export function DiagramLightboxModal() {
+  const lightboxDiagram = useStore((s) => s.lightboxDiagram);
+  const setLightboxDiagram = useStore((s) => s.setLightboxDiagram);
   const pushToast = useStore((s) => s.pushToast);
-  const [scale, setScale] = useState(1);
+
+  const [scale, setScale] = useState(DEFAULT_ENLARGED_SCALE);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
 
   const dragStartRef = useRef({ x: 0, y: 0 });
 
-  // 1. ESC 键盘快捷键退出
+  // 每次打开新图表时，重置为默认放大状态 (145%) 并居中
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", handleKeyDown);
+    if (lightboxDiagram) {
+      setScale(DEFAULT_ENLARGED_SCALE);
+      setPan({ x: 0, y: 0 });
+      setCopiedCode(false);
+    }
+  }, [lightboxDiagram]);
+
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [onClose]);
 
