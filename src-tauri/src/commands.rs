@@ -4589,9 +4589,25 @@ pub async fn get_turn_diff(
         let lock = state.data_dir.lock();
         lock.clone().unwrap_or_else(|| state.default_data_dir.clone())
     };
-    let snapshots = state.with_session_db(&session_id, |conn| {
+    let mut snapshots = state.with_session_db(&session_id, |conn| {
         store::list_snapshots_for_turn(conn, &message_id)
     })?;
+
+    if snapshots.is_empty() {
+        let db = state.db.lock();
+        if let Ok(snaps) = store::list_snapshots_for_turn(&db, &message_id) {
+            if !snaps.is_empty() {
+                snapshots = snaps;
+            }
+        }
+        if snapshots.is_empty() {
+            if let Ok(snaps) = store::list_snapshots_for_message(&db, &message_id) {
+                if !snaps.is_empty() {
+                    snapshots = snaps;
+                }
+            }
+        }
+    }
 
     crate::snapshot_revert::get_snapshots_diff_details(&data_dir, &snapshots).await
 }
@@ -4602,42 +4618,84 @@ pub async fn query_tool_logs(
     filter: crate::models::ToolLogFilter,
 ) -> Result<crate::models::ToolLogQueryResult, String> {
     if let Some(ref sid) = filter.session_id {
+        let mut session_filter = filter.clone();
+        session_filter.project_id = None;
         return state.with_session_db(sid, |conn| {
-            store::query_tool_logs(conn, &filter)
+            store::query_tool_logs(conn, &session_filter)
         });
     }
 
-    let has_cat_logs = {
-        let db = state.db.lock();
-        db.query_row("SELECT 1 FROM tool_events LIMIT 1", [], |_| Ok(true)).unwrap_or(false)
-    };
-    if has_cat_logs {
+    let storage_mode = state.storage_mode.load(std::sync::atomic::Ordering::Relaxed);
+    if storage_mode == crate::store::core::MODE_SINGLE {
         let db = state.db.lock();
         return store::query_tool_logs(&db, &filter);
     }
 
-    let sessions = {
+    struct SessionTarget {
+        id: String,
+        title: String,
+        project_id: Option<String>,
+    }
+
+    let target_sessions: Vec<SessionTarget> = {
         let db = state.db.lock();
-        store::list_sessions(&db, "all").unwrap_or_default()
+        let mut sql = "SELECT id, title, project_id FROM sessions WHERE 1=1".to_string();
+        if let Some(ref pid) = filter.project_id {
+            let trimmed = pid.trim();
+            if !trimmed.is_empty() && trimmed != "all" {
+                if trimmed == "unassigned" {
+                    sql.push_str(" AND (project_id IS NULL OR project_id = '')");
+                } else {
+                    sql.push_str(&format!(" AND project_id = '{trimmed}'"));
+                }
+            }
+        }
+        let category = filter.category.as_deref().unwrap_or("all");
+        if category == "tool" {
+            sql.push_str(" AND tool_event_count > 0");
+        } else if category == "conversation" || category == "message" {
+            sql.push_str(" AND msg_count > 0");
+        } else {
+            sql.push_str(" AND (tool_event_count > 0 OR msg_count > 0)");
+        }
+        if let Some(ref sd) = filter.start_date {
+            let trimmed = sd.trim();
+            if !trimmed.is_empty() {
+                let d = if trimmed.len() >= 10 { &trimmed[..10] } else { trimmed };
+                sql.push_str(&format!(" AND substr(COALESCE(last_message_at, created_at), 1, 10) >= '{d}'"));
+            }
+        }
+        sql.push_str(" ORDER BY last_message_at DESC, id DESC");
+        let mut stmt = db.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SessionTarget {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                project_id: r.get(2)?,
+            })
+        }).map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
     };
+
     let page = filter.page.unwrap_or(1).max(1) as usize;
     let page_size = filter.page_size.unwrap_or(30).clamp(1, 200) as usize;
 
     let mut all_items = Vec::new();
-    for s in sessions {
-        if let Some(ref pid) = filter.project_id {
-            if s.project_id.as_deref() != Some(pid) {
-                continue;
-            }
-        }
+    let mut total_count: u32 = 0;
+    let mut error_count: u32 = 0;
+
+    for s in target_sessions {
         let mut session_filter = filter.clone();
         session_filter.session_id = Some(s.id.clone());
+        session_filter.project_id = None;
         session_filter.page = Some(1);
         session_filter.page_size = Some((page * page_size) as u32);
         let res = state.with_session_db(&s.id, |conn| {
             store::query_tool_logs(conn, &session_filter)
         });
         if let Ok(r) = res {
+            total_count += r.total_count;
+            error_count += r.error_count;
             for mut item in r.items {
                 if item.session_title.is_empty() {
                     item.session_title = s.title.clone();
@@ -4651,9 +4709,11 @@ pub async fn query_tool_logs(
     }
 
     all_items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    let total_count = all_items.len() as u32;
-    let error_count = all_items.iter().filter(|i| i.status == "failed" || i.status == "denied").count() as u32;
-    let total_pages = if page_size == 0 { 1 } else { ((total_count as f64) / (page_size as f64)).ceil() as u32 };
+    let total_pages = if total_count == 0 {
+        1
+    } else {
+        ((total_count as f64) / (page_size as f64)).ceil() as u32
+    };
     let start = ((page - 1) * page_size).min(all_items.len());
     let end = (start + page_size).min(all_items.len());
     let paged_items = all_items[start..end].to_vec();

@@ -137,7 +137,7 @@ pub fn reconcile_session_metadata(
     session_id: &str,
 ) -> Result<(), String> {
     let db_path = data_dir.join("sessions").join(session_id).join("session.db");
-    let (msg_count, tool_event_count, last_created_at, last_content) = if db_path.exists() {
+    let (msg_count, tool_event_count, last_created_at, last_content, token_stats_opt) = if db_path.exists() {
         let sdb = Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| format!("只读打开会话库失败: {e}"))?;
         let msg_count: i64 = sdb
@@ -160,9 +160,61 @@ pub fn reconcile_session_metadata(
             )
             .optional()
             .map_err(|e| e.to_string())?;
+
+        let (sess_pt, sess_ct, sess_tt, sess_cached): (i64, i64, i64, i64) = sdb
+            .query_row(
+                "SELECT COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cached_tokens), 0)
+                 FROM messages WHERE role = 'assistant'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap_or((0, 0, 0, 0));
+
+        let s_proj_id: Option<String> = catalog
+            .query_row("SELECT project_id FROM sessions WHERE id = ?1", params![session_id], |r| r.get(0))
+            .ok()
+            .flatten();
+        if let Ok(mut stmt) = sdb.prepare(
+            "SELECT substr(created_at, 1, 10) as day,
+                    COALESCE(SUM(prompt_tokens), 0),
+                    COALESCE(SUM(completion_tokens), 0),
+                    COALESCE(SUM(total_tokens), 0),
+                    COALESCE(SUM(cached_tokens), 0),
+                    COUNT(*)
+             FROM messages
+             WHERE role = 'assistant' AND (total_tokens > 0 OR prompt_tokens > 0 OR completion_tokens > 0)
+             GROUP BY day",
+        ) {
+            if let Ok(rows) = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            }) {
+                for r in rows.flatten() {
+                    let _ = catalog.execute(
+                        "INSERT INTO daily_token_stats (date, session_id, project_id, prompt_tokens, completion_tokens, total_tokens, cached_tokens, message_count)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                         ON CONFLICT(date, session_id) DO UPDATE SET
+                           project_id = excluded.project_id,
+                           prompt_tokens = excluded.prompt_tokens,
+                           completion_tokens = excluded.completion_tokens,
+                           total_tokens = excluded.total_tokens,
+                           cached_tokens = excluded.cached_tokens,
+                           message_count = excluded.message_count",
+                        params![r.0, session_id, s_proj_id, r.1, r.2, r.3, r.4, r.5],
+                    );
+                }
+            }
+        }
+
         match last {
-            Some((created_at, content)) => (msg_count, tool_event_count, Some(created_at), content),
-            None => (0, tool_event_count, None, String::new()),
+            Some((created_at, content)) => (msg_count, tool_event_count, Some(created_at), content, Some((sess_pt, sess_ct, sess_tt, sess_cached))),
+            None => (0, tool_event_count, None, String::new(), Some((sess_pt, sess_ct, sess_tt, sess_cached))),
         }
     } else {
         // 未迁移老会话：catalog 自身统计（messages 表仍在本库）
@@ -194,8 +246,8 @@ pub fn reconcile_session_metadata(
             .optional()
             .map_err(|e| e.to_string())?;
         match last {
-            Some((created_at, content)) => (msg_count, 0, Some(created_at), content),
-            None => (0, 0, None, String::new()),
+            Some((created_at, content)) => (msg_count, 0, Some(created_at), content, None),
+            None => (0, 0, None, String::new(), None),
         }
     };
 
@@ -210,21 +262,75 @@ pub fn reconcile_session_metadata(
     }
 
     let preview = make_preview(&last_content);
-    catalog
-        .execute(
-            "UPDATE sessions SET
-               msg_count = ?2, tool_event_count = ?3,
-               last_preview = ?4, last_message_at = COALESCE(?5, last_message_at),
-               bundle_bytes = ?6
-             WHERE id = ?1",
-            params![session_id, msg_count, tool_event_count, preview, last_created_at, bundle_bytes],
-        )
-        .map_err(|e| format!("回填会话元数据失败: {e}"))?;
+    if let Some((pt, ct, tt, cached)) = token_stats_opt {
+        catalog
+            .execute(
+                "UPDATE sessions SET
+                   msg_count = ?2, tool_event_count = ?3,
+                   last_preview = ?4, last_message_at = COALESCE(?5, last_message_at),
+                   bundle_bytes = ?6,
+                   prompt_tokens = ?7, completion_tokens = ?8, total_tokens = ?9, cached_tokens = ?10
+                 WHERE id = ?1",
+                params![session_id, msg_count, tool_event_count, preview, last_created_at, bundle_bytes, pt, ct, tt, cached],
+            )
+            .map_err(|e| format!("回填会话元数据失败: {e}"))?;
+    } else {
+        catalog
+            .execute(
+                "UPDATE sessions SET
+                   msg_count = ?2, tool_event_count = ?3,
+                   last_preview = ?4, last_message_at = COALESCE(?5, last_message_at),
+                   bundle_bytes = ?6
+                 WHERE id = ?1",
+                params![session_id, msg_count, tool_event_count, preview, last_created_at, bundle_bytes],
+            )
+            .map_err(|e| format!("回填会话元数据失败: {e}"))?;
+    }
     Ok(())
 }
 
 /// 全量对账（启动后台任务）：遍历 catalog 中全部会话逐一修正。返回 (成功, 跳过)。
 pub fn reconcile_all_session_metadata(catalog: &Connection, data_dir: &Path) -> Result<(usize, usize), String> {
+    // 迁移 catalog 中遗留的快照元数据到对应分库
+    let has_cat_snaps: bool = catalog
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tool_file_snapshots'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if has_cat_snaps {
+        if let Ok(mut stmt) = catalog.prepare(
+            "SELECT id, session_id, message_id, tool_event_id, file_path, before_hash, after_hash, is_new_file, reverted_at, created_at FROM tool_file_snapshots"
+        ) {
+            if let Ok(rows) = stmt.query_map([], |r| {
+                Ok(crate::models::ToolFileSnapshot {
+                    id: r.get(0)?,
+                    session_id: r.get(1)?,
+                    message_id: r.get(2)?,
+                    tool_event_id: r.get(3)?,
+                    file_path: r.get(4)?,
+                    before_hash: r.get(5)?,
+                    after_hash: r.get(6)?,
+                    is_new_file: r.get::<_, i64>(7)? != 0,
+                    reverted_at: r.get(8)?,
+                    created_at: r.get(9)?,
+                })
+            }) {
+                let snaps: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+                for snap in snaps {
+                    let s_path = data_dir.join("sessions").join(&snap.session_id).join("session.db");
+                    if s_path.exists() {
+                        if let Ok(sdb) = Connection::open(&s_path) {
+                            let _ = crate::store::insert_tool_file_snapshot(&sdb, &snap);
+                        }
+                    }
+                }
+                let _ = catalog.execute("DELETE FROM tool_file_snapshots", []);
+            }
+        }
+    }
+
     let ids: Vec<String> = {
         let mut stmt = catalog
             .prepare("SELECT id FROM sessions")

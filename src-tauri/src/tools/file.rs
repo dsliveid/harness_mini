@@ -341,9 +341,15 @@ pub async fn record_file_snapshot_raw(
         created_at: crate::store::now(),
     };
 
-    let db = state.db.lock();
-    if let Err(e) = crate::store::insert_tool_file_snapshot(&db, &snap) {
-        eprintln!("[Snapshot] 插入快照元数据失败: {e}");
+    let res = state.with_session_db(session_id, |conn| {
+        crate::store::insert_tool_file_snapshot(conn, &snap)
+    });
+    if let Err(e) = res {
+        eprintln!("[Snapshot] 插入会话专属库快照元数据失败，回落主库: {e}");
+        let db = state.db.lock();
+        if let Err(e2) = crate::store::insert_tool_file_snapshot(&db, &snap) {
+            eprintln!("[Snapshot] 插入快照元数据失败: {e2}");
+        }
     }
 }
 

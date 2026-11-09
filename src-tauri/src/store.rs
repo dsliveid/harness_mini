@@ -267,6 +267,7 @@ fn init(conn: &Connection) -> Result<(), String> {
           completion_tokens INTEGER NOT NULL DEFAULT 0,
           total_tokens INTEGER NOT NULL DEFAULT 0,
           cached_tokens INTEGER NOT NULL DEFAULT 0,
+          message_count INTEGER NOT NULL DEFAULT 0,
           PRIMARY KEY (date, session_id)
         );
         CREATE INDEX IF NOT EXISTS idx_daily_tokens_date ON daily_token_stats(date);
@@ -362,6 +363,7 @@ fn init(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "sessions", "completion_tokens", "completion_tokens INTEGER DEFAULT 0")?;
     ensure_column(conn, "sessions", "cached_tokens", "cached_tokens INTEGER DEFAULT 0")?;
     ensure_column(conn, "sessions", "last_run_status", "last_run_status TEXT")?;
+    ensure_column(conn, "daily_token_stats", "message_count", "message_count INTEGER NOT NULL DEFAULT 0")?;
 
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_trigger_tool ON sessions(trigger_tool_event_id)", []);
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_forked_from ON sessions(forked_from_session_id)", []);
@@ -549,13 +551,14 @@ pub fn increment_session_tokens(
         .unwrap_or(None)
         .flatten();
     let _ = conn.execute(
-        "INSERT INTO daily_token_stats (date, session_id, project_id, prompt_tokens, completion_tokens, total_tokens, cached_tokens)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO daily_token_stats (date, session_id, project_id, prompt_tokens, completion_tokens, total_tokens, cached_tokens, message_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)
          ON CONFLICT(date, session_id) DO UPDATE SET
            prompt_tokens = prompt_tokens + excluded.prompt_tokens,
            completion_tokens = completion_tokens + excluded.completion_tokens,
            total_tokens = total_tokens + excluded.total_tokens,
-           cached_tokens = cached_tokens + excluded.cached_tokens",
+           cached_tokens = cached_tokens + excluded.cached_tokens,
+           message_count = message_count + 1",
         params![
             today,
             session_id,
@@ -2413,6 +2416,17 @@ pub fn list_sessions(conn: &Connection, status: &str) -> Result<Vec<Session>, St
     // 阶段2 首屏改造：只读 sessions 轻量元数据（msg_count/last_preview 为增量维护列），
     // 排序走覆盖索引 idx_sessions_status_lastmsg(status, last_message_at DESC, id DESC)，
     // 彻底移除对 messages 的跨表聚合（实测 10 万行场景 95.2ms → 0.1ms 级）。
+    if status == "all" {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {SESSION_COLS} FROM sessions WHERE (parent_session_id IS NULL OR parent_session_id = '') ORDER BY last_message_at DESC, id DESC"
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], row_to_session)
+            .map_err(|e| e.to_string())?;
+        return rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string());
+    }
     let mut stmt = conn
         .prepare(&format!(
             "SELECT {SESSION_COLS} FROM sessions WHERE status = ?1 AND (parent_session_id IS NULL OR parent_session_id = '') ORDER BY last_message_at DESC, id DESC"
@@ -4828,6 +4842,377 @@ pub fn get_token_stats(
     start_date: Option<&str>,
     end_date: Option<&str>,
 ) -> Result<TokenStatsReport, String> {
+    let has_daily: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_token_stats'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false)
+        && conn
+            .query_row("SELECT 1 FROM daily_token_stats LIMIT 1", [], |_| Ok(true))
+            .unwrap_or(false);
+
+    let has_messages: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false)
+        && conn
+            .query_row(
+                "SELECT 1 FROM messages WHERE role='assistant' AND total_tokens > 0 LIMIT 1",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+    if !has_daily && has_messages {
+        return get_token_stats_from_messages(conn, project_id, days, start_date, end_date);
+    }
+
+    get_token_stats_from_daily(conn, project_id, days, start_date, end_date)
+}
+
+fn get_token_stats_from_daily(
+    conn: &Connection,
+    project_id: Option<&str>,
+    days: Option<u32>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+) -> Result<TokenStatsReport, String> {
+    let now_str = now();
+    let today_prefix = if now_str.len() >= 10 {
+        &now_str[0..10]
+    } else {
+        ""
+    };
+
+    let mut date_conditions = Vec::new();
+    if let Some(sd) = start_date {
+        let trimmed = sd.trim();
+        if !trimmed.is_empty() {
+            let d = if trimmed.len() >= 10 { &trimmed[..10] } else { trimmed };
+            date_conditions.push(format!("d.date >= '{d}'"));
+        }
+    }
+    if let Some(ed) = end_date {
+        let trimmed = ed.trim();
+        if !trimmed.is_empty() {
+            let d = if trimmed.len() >= 10 { &trimmed[..10] } else { trimmed };
+            date_conditions.push(format!("d.date <= '{d}'"));
+        }
+    }
+
+    let date_filter_sql = if !date_conditions.is_empty() {
+        format!("AND {}", date_conditions.join(" AND "))
+    } else if let Some(d) = days {
+        if d > 0 {
+            let cutoff = (chrono::Utc::now() - chrono::Duration::days(d as i64)).format("%Y-%m-%d").to_string();
+            format!("AND d.date >= '{cutoff}'")
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let proj_filter_sql = if let Some(pid) = project_id {
+        if !pid.is_empty() {
+            if pid == "unassigned" {
+                "AND (d.project_id IS NULL OR d.project_id = '' OR s.project_id IS NULL OR s.project_id = '')".to_string()
+            } else {
+                format!("AND (d.project_id = '{pid}' OR s.project_id = '{pid}')")
+            }
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    // 1. 全局概览汇总
+    let summary_sql = format!(
+        "SELECT 
+            COALESCE(SUM(d.prompt_tokens), 0),
+            COALESCE(SUM(d.completion_tokens), 0),
+            COALESCE(SUM(d.total_tokens), 0),
+            COALESCE(SUM(d.cached_tokens), 0),
+            COALESCE(SUM(CASE WHEN d.message_count > 0 THEN d.message_count ELSE 1 END), 0),
+            COUNT(DISTINCT d.session_id)
+         FROM daily_token_stats d
+         LEFT JOIN sessions s ON s.id = d.session_id
+         WHERE (d.total_tokens > 0 OR d.prompt_tokens > 0 OR d.completion_tokens > 0) {date_filter_sql} {proj_filter_sql}"
+    );
+
+    let (tot_pt, tot_ct, tot_tt, tot_cached, tot_msgs, tot_sessions): (i64, i64, i64, i64, i64, i64) = conn
+        .query_row(
+            &summary_sql,
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .unwrap_or((0, 0, 0, 0, 0, 0));
+
+    let today_sql = format!(
+        "SELECT 
+            COALESCE(SUM(d.prompt_tokens), 0),
+            COALESCE(SUM(d.completion_tokens), 0),
+            COALESCE(SUM(d.total_tokens), 0),
+            COALESCE(SUM(d.cached_tokens), 0)
+         FROM daily_token_stats d
+         LEFT JOIN sessions s ON s.id = d.session_id
+         WHERE d.date = ?1 {proj_filter_sql}"
+    );
+
+    let (today_pt, today_ct, today_tt, today_cached): (i64, i64, i64, i64) = conn
+        .query_row(
+            &today_sql,
+            params![today_prefix],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap_or((0, 0, 0, 0));
+
+    let summary = TokenStatsSummary {
+        total_prompt_tokens: tot_pt as u64,
+        total_completion_tokens: tot_ct as u64,
+        total_tokens: tot_tt as u64,
+        total_cached_tokens: tot_cached as u64,
+        overall_cache_hit_rate: if tot_pt > 0 {
+            (((tot_cached as f64 / tot_pt as f64) * 1000.0).round() / 10.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        },
+        today_prompt_tokens: today_pt as u64,
+        today_completion_tokens: today_ct as u64,
+        today_tokens: today_tt as u64,
+        today_cached_tokens: today_cached as u64,
+        today_cache_hit_rate: if today_pt > 0 {
+            (((today_cached as f64 / today_pt as f64) * 1000.0).round() / 10.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        },
+        total_sessions: tot_sessions as u64,
+        total_messages: tot_msgs as u64,
+    };
+
+    // 2. 按项目聚合
+    let all_projects = list_projects(conn)?;
+    let mut by_project: Vec<ProjectTokenStats> = Vec::new();
+
+    let proj_sql = format!(
+        "SELECT 
+            COALESCE(s.project_id, d.project_id) as pid,
+            COALESCE(SUM(d.prompt_tokens), 0),
+            COALESCE(SUM(d.completion_tokens), 0),
+            COALESCE(SUM(d.total_tokens), 0),
+            COALESCE(SUM(d.cached_tokens), 0),
+            COUNT(DISTINCT d.session_id),
+            COALESCE(SUM(CASE WHEN d.message_count > 0 THEN d.message_count ELSE 1 END), 0),
+            MAX(d.date)
+         FROM daily_token_stats d
+         LEFT JOIN sessions s ON s.id = d.session_id
+         WHERE (d.total_tokens > 0 OR d.prompt_tokens > 0 OR d.completion_tokens > 0) {date_filter_sql}
+         GROUP BY pid"
+    );
+
+    let mut proj_stmt = conn.prepare(&proj_sql).map_err(|e| e.to_string())?;
+
+    let proj_rows = proj_stmt
+        .query_map([], |r| {
+            let pid: Option<String> = r.get(0)?;
+            let pt: i64 = r.get(1)?;
+            let ct: i64 = r.get(2)?;
+            let tt: i64 = r.get(3)?;
+            let cached: i64 = r.get(4)?;
+            let sc: i64 = r.get(5)?;
+            let mc: i64 = r.get(6)?;
+            let last_at: Option<String> = r.get(7)?;
+            Ok((pid, pt as u64, ct as u64, tt as u64, cached as u64, sc as u64, mc as u64, last_at))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut mapped_stats: std::collections::HashMap<
+        Option<String>,
+        (u64, u64, u64, u64, u64, u64, Option<String>),
+    > = std::collections::HashMap::new();
+
+    for row in proj_rows.filter_map(|r| r.ok()) {
+        mapped_stats.insert(row.0, (row.1, row.2, row.3, row.4, row.5, row.6, row.7));
+    }
+
+    for p in &all_projects {
+        let stats = mapped_stats
+            .remove(&Some(p.id.clone()))
+            .unwrap_or((0, 0, 0, 0, 0, 0, None));
+        let pt = stats.0;
+        let cached = stats.3;
+        let rate = if pt > 0 {
+            (((cached as f64 / pt as f64) * 1000.0).round() / 10.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        by_project.push(ProjectTokenStats {
+            project_id: Some(p.id.clone()),
+            project_name: p.name.clone(),
+            project_path: p.path.clone(),
+            prompt_tokens: stats.0,
+            completion_tokens: stats.1,
+            total_tokens: stats.2,
+            cached_tokens: cached,
+            cache_hit_rate: rate,
+            session_count: stats.4,
+            message_count: stats.5,
+            last_used_at: stats.6.or_else(|| p.last_activity_at.clone()),
+        });
+    }
+
+    if let Some(stats) = mapped_stats.remove(&None) {
+        if stats.2 > 0 || stats.5 > 0 {
+            let pt = stats.0;
+            let cached = stats.3;
+            let rate = if pt > 0 {
+                (((cached as f64 / pt as f64) * 1000.0).round() / 10.0).clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
+            by_project.push(ProjectTokenStats {
+                project_id: None,
+                project_name: "未归类 / 纯对话".to_string(),
+                project_path: None,
+                prompt_tokens: stats.0,
+                completion_tokens: stats.1,
+                total_tokens: stats.2,
+                cached_tokens: cached,
+                cache_hit_rate: rate,
+                session_count: stats.4,
+                message_count: stats.5,
+                last_used_at: stats.6,
+            });
+        }
+    }
+
+    by_project.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+
+    // 3. 按时间聚合（每日趋势）
+    let time_query = format!(
+        "SELECT 
+            d.date as day,
+            COALESCE(SUM(d.prompt_tokens), 0),
+            COALESCE(SUM(d.completion_tokens), 0),
+            COALESCE(SUM(d.total_tokens), 0),
+            COALESCE(SUM(d.cached_tokens), 0),
+            COALESCE(SUM(CASE WHEN d.message_count > 0 THEN d.message_count ELSE 1 END), 0)
+         FROM daily_token_stats d
+         LEFT JOIN sessions s ON s.id = d.session_id
+         WHERE (d.total_tokens > 0 OR d.prompt_tokens > 0 OR d.completion_tokens > 0) {date_filter_sql} {proj_filter_sql}
+         GROUP BY day
+         ORDER BY day ASC"
+    );
+
+    let mut time_stmt = conn.prepare(&time_query).map_err(|e| e.to_string())?;
+    let by_time: Vec<DailyTokenStats> = time_stmt
+        .query_map([], |r| {
+            let day: String = r.get(0)?;
+            let pt: i64 = r.get(1)?;
+            let ct: i64 = r.get(2)?;
+            let tt: i64 = r.get(3)?;
+            let cached: i64 = r.get(4)?;
+            let mc: i64 = r.get(5)?;
+            let rate = if pt > 0 {
+                (((cached as f64 / pt as f64) * 1000.0).round() / 10.0).clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
+            Ok(DailyTokenStats {
+                date: day,
+                prompt_tokens: pt as u64,
+                completion_tokens: ct as u64,
+                total_tokens: tt as u64,
+                cached_tokens: cached as u64,
+                cache_hit_rate: rate,
+                message_count: mc as u64,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // 4. 会话排行 (Top 50)
+    let session_query = format!(
+        "SELECT 
+            s.id,
+            s.title,
+            s.project_id,
+            p.name,
+            COALESCE(SUM(d.prompt_tokens), 0) as pt,
+            COALESCE(SUM(d.completion_tokens), 0) as ct,
+            COALESCE(SUM(d.total_tokens), 0) as tt,
+            COALESCE(SUM(d.cached_tokens), 0) as cached,
+            COALESCE(SUM(CASE WHEN d.message_count > 0 THEN d.message_count ELSE 1 END), 0) as mc,
+            MAX(d.date) as last_msg
+         FROM daily_token_stats d
+         JOIN sessions s ON (s.id = d.session_id OR d.session_id IN (SELECT child.id FROM sessions child WHERE child.parent_session_id = s.id))
+         LEFT JOIN projects p ON p.id = s.project_id
+         WHERE (s.parent_session_id IS NULL OR s.parent_session_id = '')
+           {date_filter_sql} {proj_filter_sql}
+         GROUP BY s.id
+         HAVING tt > 0
+         ORDER BY tt DESC
+         LIMIT 50"
+    );
+
+    let mut sess_stmt = conn.prepare(&session_query).map_err(|e| e.to_string())?;
+    let by_session: Vec<SessionTokenStats> = sess_stmt
+        .query_map([], |r| {
+            let sid: String = r.get(0)?;
+            let title: String = r.get(1)?;
+            let pid: Option<String> = r.get(2)?;
+            let pname: Option<String> = r.get(3)?;
+            let pt: i64 = r.get(4)?;
+            let ct: i64 = r.get(5)?;
+            let tt: i64 = r.get(6)?;
+            let cached: i64 = r.get(7)?;
+            let mc: i64 = r.get(8)?;
+            let last_at: Option<String> = r.get(9)?;
+            let rate = if pt > 0 {
+                (((cached as f64 / pt as f64) * 1000.0).round() / 10.0).clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
+            Ok(SessionTokenStats {
+                session_id: sid,
+                title,
+                project_id: pid,
+                project_name: pname,
+                prompt_tokens: pt as u64,
+                completion_tokens: ct as u64,
+                total_tokens: tt as u64,
+                cached_tokens: cached as u64,
+                cache_hit_rate: rate,
+                message_count: mc as u64,
+                last_message_at: last_at,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(TokenStatsReport {
+        summary,
+        by_project,
+        by_time,
+        by_session,
+    })
+}
+
+fn get_token_stats_from_messages(
+    conn: &Connection,
+    project_id: Option<&str>,
+    days: Option<u32>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+) -> Result<TokenStatsReport, String> {
     let now_str = now();
     let today_prefix = if now_str.len() >= 10 {
         &now_str[0..10]
@@ -6424,14 +6809,16 @@ pub fn query_tool_logs(conn: &Connection, filter: &ToolLogFilter) -> Result<Tool
     let mut where_clauses: Vec<String> = Vec::new();
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
 
-    if let Some(ref pid) = filter.project_id {
-        let trimmed = pid.trim();
-        if !trimmed.is_empty() && trimmed != "all" {
-            if trimmed == "unassigned" {
-                where_clauses.push("(u.project_id IS NULL OR u.project_id = '')".to_string());
-            } else {
-                params.push(rusqlite::types::Value::Text(trimmed.to_string()));
-                where_clauses.push(format!("u.project_id = ?{}", params.len()));
+    if has_sessions {
+        if let Some(ref pid) = filter.project_id {
+            let trimmed = pid.trim();
+            if !trimmed.is_empty() && trimmed != "all" {
+                if trimmed == "unassigned" {
+                    where_clauses.push("(u.project_id IS NULL OR u.project_id = '')".to_string());
+                } else {
+                    params.push(rusqlite::types::Value::Text(trimmed.to_string()));
+                    where_clauses.push(format!("u.project_id = ?{}", params.len()));
+                }
             }
         }
     }
@@ -6578,14 +6965,16 @@ pub fn query_tool_logs(conn: &Connection, filter: &ToolLogFilter) -> Result<Tool
     // 3. 高频同款错误聚类统计（针对当前选定的项目/会话作用域及日期范围）
     let mut top_where: Vec<String> = vec!["te.status IN ('failed', 'denied', 'timeout')".to_string()];
     let mut top_params: Vec<rusqlite::types::Value> = Vec::new();
-    if let Some(ref pid) = filter.project_id {
-        let trimmed = pid.trim();
-        if !trimmed.is_empty() && trimmed != "all" {
-            if trimmed == "unassigned" {
-                top_where.push("(s.project_id IS NULL OR s.project_id = '')".to_string());
-            } else {
-                top_params.push(rusqlite::types::Value::Text(trimmed.to_string()));
-                top_where.push(format!("s.project_id = ?{}", top_params.len()));
+    if has_sessions {
+        if let Some(ref pid) = filter.project_id {
+            let trimmed = pid.trim();
+            if !trimmed.is_empty() && trimmed != "all" {
+                if trimmed == "unassigned" {
+                    top_where.push("(s.project_id IS NULL OR s.project_id = '')".to_string());
+                } else {
+                    top_params.push(rusqlite::types::Value::Text(trimmed.to_string()));
+                    top_where.push(format!("s.project_id = ?{}", top_params.len()));
+                }
             }
         }
     }
@@ -6613,20 +7002,36 @@ pub fn query_tool_logs(conn: &Connection, filter: &ToolLogFilter) -> Result<Tool
         }
     }
     let top_where_sql = format!("WHERE {}", top_where.join(" AND "));
-    let top_sql = format!(
-        "SELECT te.tool_name,
-                substr(COALESCE(te.result_text, ''), 1, 140) as err_summary,
-                COUNT(*) as cnt,
-                COUNT(DISTINCT s.id) as s_cnt,
-                MAX(te.created_at) as latest_at
-         FROM tool_events te
-         JOIN messages m ON te.message_id = m.id
-         JOIN sessions s ON m.session_id = s.id
-         {top_where_sql}
-         GROUP BY te.tool_name, substr(COALESCE(te.result_text, ''), 1, 140)
-         ORDER BY cnt DESC
-         LIMIT 10"
-    );
+    let top_sql = if has_sessions {
+        format!(
+            "SELECT te.tool_name,
+                    substr(COALESCE(te.result_text, ''), 1, 140) as err_summary,
+                    COUNT(*) as cnt,
+                    COUNT(DISTINCT s.id) as s_cnt,
+                    MAX(te.created_at) as latest_at
+             FROM tool_events te
+             JOIN messages m ON te.message_id = m.id
+             JOIN sessions s ON m.session_id = s.id
+             {top_where_sql}
+             GROUP BY te.tool_name, substr(COALESCE(te.result_text, ''), 1, 140)
+             ORDER BY cnt DESC
+             LIMIT 10"
+        )
+    } else {
+        format!(
+            "SELECT te.tool_name,
+                    substr(COALESCE(te.result_text, ''), 1, 140) as err_summary,
+                    COUNT(*) as cnt,
+                    COUNT(DISTINCT m.session_id) as s_cnt,
+                    MAX(te.created_at) as latest_at
+             FROM tool_events te
+             JOIN messages m ON te.message_id = m.id
+             {top_where_sql}
+             GROUP BY te.tool_name, substr(COALESCE(te.result_text, ''), 1, 140)
+             ORDER BY cnt DESC
+             LIMIT 10"
+        )
+    };
 
     let mut top_stmt = conn.prepare(&top_sql).map_err(|e| e.to_string())?;
     let top_errors: Vec<TopErrorSummary> = top_stmt
