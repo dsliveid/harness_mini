@@ -225,14 +225,14 @@ pub fn partition_compaction_candidates<'a, T: std::borrow::Borrow<crate::models:
 }
 
 pub fn evaluate_context_viewport(
-    conn: &rusqlite::Connection,
-    settings: &crate::models::SettingsData,
+    session_conn: &rusqlite::Connection,
+    limit: usize,
     session_id: &str,
+    is_running_hint: Option<bool>,
 ) -> Result<ContextViewport, String> {
-    let limit = resolve_session_context_limit(conn, settings, session_id);
-    let msgs = store::all_messages(conn, session_id).map_err(|e| e.to_string())?;
+    let msgs = store::all_messages(session_conn, session_id).map_err(|e| e.to_string())?;
     let compactions =
-        store::list_session_compactions(conn, session_id).map_err(|e| e.to_string())?;
+        store::list_session_compactions(session_conn, session_id).map_err(|e| e.to_string())?;
     let max_compacted_seq = compactions.iter().map(|c| c.end_seq).max().unwrap_or(0);
     let compaction_count = compactions.len();
 
@@ -300,14 +300,17 @@ pub fn evaluate_context_viewport(
     };
 
     // 寻找候选压缩历史消息（当前活跃轮次起点之前的已完成交互，或空闲态下的已完结大历史）
-    let is_running = conn
-        .query_row(
-            "SELECT count(*) FROM runs WHERE session_id = ?1 AND status = 'running'",
-            rusqlite::params![session_id],
-            |r| r.get::<_, i64>(0),
-        )
-        .map(|c| c > 0)
-        .unwrap_or(false);
+    // 运行态判定：优先使用调用方传入的内存实时状态，未传时回退到会话专属库 runs 表
+    let is_running = is_running_hint.unwrap_or_else(|| {
+        session_conn
+            .query_row(
+                "SELECT count(*) FROM runs WHERE session_id = ?1 AND status = 'running'",
+                rusqlite::params![session_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false)
+    });
     let candidate_msgs = partition_compaction_candidates(&uncompacted, is_running);
 
     let candidate_messages_count = candidate_msgs.len();
@@ -364,45 +367,53 @@ pub async fn propose_and_execute_compaction(
 
     // 2. 评估候选消息
     let (candidate_msgs, candidate_tokens) = {
-        let db = state.db.lock();
-        let settings = store::get_settings(&db).unwrap_or_default();
-        let viewport = evaluate_context_viewport(&db, &settings, session_id)?;
-
-        if !force && !viewport.is_compaction_recommended {
-            return Ok(false);
-        }
-        if !viewport.can_compact {
-            if force {
-                return Err("当前会话暂无可供压缩的早期历史消息（至少需要 1 轮已完成对话）".into());
-            } else {
-                return Ok(false);
-            }
-        }
-
-        let compactions = store::list_session_compactions(&db, session_id).unwrap_or_default();
-        let max_compacted_seq = compactions.iter().map(|c| c.end_seq).max().unwrap_or(0);
-        let msgs = store::all_messages(&db, session_id).unwrap_or_default();
-        let uncompacted: Vec<_> = msgs
-            .into_iter()
-            .filter(|m| !m.queued && m.seq > max_compacted_seq && m.reverted_at.is_none())
-            .collect();
-
+        // 先在 Catalog 主库读取 settings 并解析生效 limit，锁立即释放（杜绝锁嵌套与自死锁）
+        let limit = {
+            let db = state.db.lock();
+            let settings = store::get_settings(&db).unwrap_or_default();
+            resolve_session_context_limit(&db, &settings, session_id)
+        };
         let is_running = crate::agent::is_run_active(state, session_id);
-        let candidates: Vec<crate::models::Message> =
-            partition_compaction_candidates(&uncompacted, is_running)
+
+        // 统一在会话专属分库执行消息与历史评估
+        state.with_session_db(session_id, |conn| {
+            let viewport = evaluate_context_viewport(conn, limit, session_id, Some(is_running))?;
+
+            if !force && !viewport.is_compaction_recommended {
+                return Ok((Vec::new(), 0));
+            }
+            if !viewport.can_compact {
+                if force {
+                    return Err("当前会话暂无可供压缩的早期历史消息（至少需要 1 轮已完成对话）".into());
+                } else {
+                    return Ok((Vec::new(), 0));
+                }
+            }
+
+            let compactions = store::list_session_compactions(conn, session_id).unwrap_or_default();
+            let max_compacted_seq = compactions.iter().map(|c| c.end_seq).max().unwrap_or(0);
+            let msgs = store::all_messages(conn, session_id).unwrap_or_default();
+            let uncompacted: Vec<_> = msgs
                 .into_iter()
-                .cloned()
+                .filter(|m| !m.queued && m.seq > max_compacted_seq && m.reverted_at.is_none())
                 .collect();
 
-        let tokens: usize = candidates
-            .iter()
-            .map(|m| {
-                estimate_tokens(m.content.as_deref().unwrap_or(""))
-                    + m.tool_calls.as_ref().map(estimate_value_tokens).unwrap_or(0)
-            })
-            .sum();
+            let candidates: Vec<crate::models::Message> =
+                partition_compaction_candidates(&uncompacted, is_running)
+                    .into_iter()
+                    .cloned()
+                    .collect();
 
-        (candidates, tokens)
+            let tokens: usize = candidates
+                .iter()
+                .map(|m| {
+                    estimate_tokens(m.content.as_deref().unwrap_or(""))
+                        + m.tool_calls.as_ref().map(estimate_value_tokens).unwrap_or(0)
+                })
+                .sum();
+
+            Ok((candidates, tokens))
+        })?
     };
 
     if candidate_msgs.is_empty() {
@@ -564,6 +575,11 @@ pub async fn propose_and_execute_compaction(
             tokens_before: candidate_tokens,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
+        // 核心：写入会话专属分库（保证装配上下文 assemble_execution_context 与前端查询可读出）
+        state.with_session_db(session_id, |conn| {
+            store::create_session_compaction(conn, &compaction)
+        })?;
+        // 主库双写兜底（保证单库/跨库归档兼容）
         {
             let db = state.db.lock();
             let _ = store::create_session_compaction(&db, &compaction);
@@ -593,7 +609,8 @@ mod tests {
         let _ = crate::store::new_message(&conn, &s.id, "user", Some("问题2".into()), false).unwrap();
 
         let settings = crate::models::SettingsData::default();
-        let vp = evaluate_context_viewport(&conn, &settings, &s.id).unwrap();
+        let limit = resolve_session_context_limit(&conn, &settings, &s.id);
+        let vp = evaluate_context_viewport(&conn, limit, &s.id, None).unwrap();
 
         assert_eq!(vp.candidate_messages_count, 2);
         assert!(vp.can_compact);
@@ -626,5 +643,52 @@ mod tests {
         let msgs2 = crate::store::all_messages(&conn, &s.id).unwrap();
         let candidates_with_pending = partition_compaction_candidates(&msgs2, false);
         assert_eq!(candidates_with_pending.len(), 4);
+    }
+
+    #[test]
+    fn test_evaluate_context_viewport_session_bundle_isolation() {
+        // catalog 库：只有 session 与 settings，没有真实消息
+        let catalog_conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::init_schema(&catalog_conn).unwrap();
+        let s = crate::store::create_session(&catalog_conn, ".", None, "test", "confirm").unwrap();
+
+        // session 专属分库：采用会话专属 Schema，存有真实会话历史
+        let session_conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::session_bundle::bundle::init_session_bundle_schema(&session_conn).unwrap();
+
+        let _ = crate::store::new_message(&session_conn, &s.id, "user", Some("历史问题".into()), false).unwrap();
+        let _ = crate::store::new_message(&session_conn, &s.id, "assistant", Some("历史回答".into()), false).unwrap();
+        let _ = crate::store::new_message(&session_conn, &s.id, "user", Some("当前问题".into()), false).unwrap();
+
+        // 验证旧缺陷：若错误地在 catalog_conn 上评估，消息数为 0，can_compact 为 false（误报无可压缩历史）
+        let settings = crate::models::SettingsData::default();
+        let limit = resolve_session_context_limit(&catalog_conn, &settings, &s.id);
+        let bug_vp = evaluate_context_viewport(&catalog_conn, limit, &s.id, None).unwrap();
+        assert_eq!(bug_vp.candidate_messages_count, 0);
+        assert!(!bug_vp.can_compact);
+
+        // 验证新重构的正确性：在 session_conn 上评估，从分库读取到消息，can_compact 为 true！
+        let fixed_vp = evaluate_context_viewport(&session_conn, limit, &s.id, None).unwrap();
+        assert_eq!(fixed_vp.candidate_messages_count, 2);
+        assert!(fixed_vp.can_compact);
+
+        // 验证持久化写分库后，assemble_execution_context 能够成功从分库提取并挂载备忘录
+        let compaction = SessionCompaction {
+            id: "comp-1".to_string(),
+            session_id: s.id.clone(),
+            start_seq: 1,
+            end_seq: 2,
+            summary_markdown: "历史备忘录内容".to_string(),
+            tokens_before: 500,
+            created_at: "2026-11-10T00:00:00Z".to_string(),
+        };
+        crate::store::create_session_compaction(&session_conn, &compaction).unwrap();
+
+        let (exec_msgs, _, _) = crate::context::assemble_execution_context(&session_conn, &s.id, "系统提示", 32000);
+        let msgs_val = exec_msgs.unwrap();
+        let has_memo = msgs_val.iter().any(|v| {
+            v.get("content").and_then(|c| c.as_str()).map(|t| t.contains("历史备忘录内容")).unwrap_or(false)
+        });
+        assert!(has_memo);
     }
 }

@@ -1979,8 +1979,9 @@ pub fn list_session_compactions(
     state: State<'_, crate::AppState>,
     session_id: String,
 ) -> Result<Vec<crate::models::SessionCompaction>, String> {
-    let db = state.db.lock();
-    crate::store::list_session_compactions(&db, &session_id)
+    state.with_session_db(&session_id, |conn| {
+        crate::store::list_session_compactions(conn, &session_id)
+    })
 }
 
 #[tauri::command]
@@ -1988,9 +1989,15 @@ pub fn get_context_viewport(
     state: State<'_, crate::AppState>,
     session_id: String,
 ) -> Result<crate::context::ContextViewport, String> {
-    let db = state.db.lock();
-    let settings = crate::store::get_settings(&db).unwrap_or_default();
-    crate::context::evaluate_context_viewport(&db, &settings, &session_id)
+    let limit = {
+        let db = state.db.lock();
+        let settings = crate::store::get_settings(&db).unwrap_or_default();
+        crate::context::resolve_session_context_limit(&db, &settings, &session_id)
+    };
+    let is_running = is_run_active(&state, &session_id);
+    state.with_session_db(&session_id, |conn| {
+        crate::context::evaluate_context_viewport(conn, limit, &session_id, Some(is_running))
+    })
 }
 
 #[tauri::command]
