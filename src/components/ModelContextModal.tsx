@@ -38,7 +38,7 @@ export function ModelContextModal({
   if (!open) return null;
 
   const inferred = inferModelContextLimit(modelName);
-  const compactionThreshold = Math.round(val * 0.75);
+  const compactionThreshold = Math.round(val * 0.8);
   const isDefaultInferred = val === inferred;
 
   const categories = Array.from(new Set(MODEL_CONTEXT_PRESETS.map((p) => p.category)));
@@ -193,7 +193,7 @@ export function ModelContextModal({
             <div className="flex items-center justify-between">
               <span>自动智能压缩阈值：</span>
               <span className="font-mono text-ink font-medium">
-                约 {(compactionThreshold || 0).toLocaleString()} tokens (~75%)
+                约 {(compactionThreshold || 0).toLocaleString()} tokens (~80%)
               </span>
             </div>
             <div className="flex items-center justify-between">
@@ -210,7 +210,7 @@ export function ModelContextModal({
               )}
             </div>
             <div className="text-[10px] text-inkdim/70 leading-relaxed mt-0.5 border-t border-edge/30 pt-1.5">
-              未压缩历史消息达到 75% 阈值时系统将自动提炼 Markdown 备忘录并触发确认压缩；超出上限将触发原子成对淘汰兜底。
+              未压缩历史消息达到 80% 阈值时，系统将在新一轮对话开始时自动提炼 Markdown 备忘录并弹窗请求确认；超出上限将触发原子轮次截断兜底。
             </div>
           </div>
         </div>

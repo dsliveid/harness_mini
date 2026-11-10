@@ -6,12 +6,13 @@ pub mod tail_anchor;
 
 pub use governance::{
     evaluate_context_viewport, propose_and_execute_compaction, resolve_session_context_limit,
-    resolve_session_llm_cfg, ContextViewport,
+    resolve_session_llm_cfg, CompactionConfirmPolicy, ContextViewport,
 };
 pub use ingress_normalizer::normalize_tool_output_for_ingress;
 pub use message_stream::{assemble_execution_context, ExecutionContext};
 pub use static_system::{
     build_static_collaborator_section, build_static_project_section, build_static_system_prompt,
+    resolve_or_freeze_system_prompt,
 };
 pub use tail_anchor::build_runtime_anchor;
 

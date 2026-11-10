@@ -855,11 +855,22 @@ pub(crate) async fn compact_context_tool(args: &Value, ctx: &ToolCtx) -> Result<
     let session_id = &host.session_id;
     let state = app.state::<crate::AppState>();
 
-    let cfg = {
+    let (cfg, confirm_policy) = {
         let db = state.db.lock();
         let master = state.master_key.lock();
         let settings = crate::store::get_settings_with_secrets(&db, &master)?;
-        crate::context::resolve_session_llm_cfg(&db, &settings, session_id)?
+        let cfg = crate::context::resolve_session_llm_cfg(&db, &settings, session_id)?;
+        let is_background = crate::store::get_session(&db, session_id)
+            .ok()
+            .flatten()
+            .map(|s| s.session_type == "subagent" || s.session_type == "subprocess" || s.parent_session_id.is_some())
+            .unwrap_or(false);
+        let policy = if is_background {
+            crate::context::CompactionConfirmPolicy::AutoApplySilent
+        } else {
+            crate::context::CompactionConfirmPolicy::PromptUserWithTimeout
+        };
+        (cfg, policy)
     };
 
     let compacted = crate::context::propose_and_execute_compaction(
@@ -869,6 +880,7 @@ pub(crate) async fn compact_context_tool(args: &Value, ctx: &ToolCtx) -> Result<
         &cfg,
         focus,
         true,
+        confirm_policy,
     )
     .await?;
 

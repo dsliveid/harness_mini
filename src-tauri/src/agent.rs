@@ -261,11 +261,29 @@ pub fn stop_session_ext(app: &AppHandle, session_id: &str, cascade_subagents: bo
         }
     }
 
-    // 2. 清理该会话挂起的审批
+    // 2. 清理该会话挂起的审批与上下文压缩确认请求
     state
         .approvals
         .lock()
         .retain(|_, p| p.session_id != session_id);
+    let cleared_compaction_ids: Vec<String> = {
+        let mut compactions = state.compactions.lock();
+        let ids: Vec<String> = compactions
+            .iter()
+            .filter(|(_, p)| p.session_id == session_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for id in &ids {
+            compactions.remove(id);
+        }
+        ids
+    };
+    if !cleared_compaction_ids.is_empty() {
+        state.snapshot.set_pending_compaction(session_id, None);
+        for eid in cleared_compaction_ids {
+            state.emit("compaction:resolved", &json!({ "eventId": eid, "approved": false, "sessionId": session_id }));
+        }
+    }
 
     // 3. 中止 Agent 循环任务
     let aborted_run = {
@@ -1471,13 +1489,18 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             })
         })
         .collect();
-    // 长任务态走会话库（步骤11），catalog 锁不为此持有
-    let is_long_task = state
-        .with_session_db(session_id, |conn| store::get_active_long_task(conn, session_id))
-        .ok()
-        .flatten()
-        .map(|task| task.status == "running" || task.status == "planning")
-        .unwrap_or(false);
+    // 长任务态与会话消息基线统一从会话专属分库读取（严格遵守不交叉持有 catalog 锁与 session_db 锁）
+    let (is_long_task, session_msgs) = state
+        .with_session_db(session_id, |conn| {
+            let active_lt = store::get_active_long_task(conn, session_id)
+                .ok()
+                .flatten()
+                .map(|task| task.status == "running" || task.status == "planning")
+                .unwrap_or(false);
+            let msgs = store::all_messages(conn, session_id).unwrap_or_default();
+            Ok((active_lt, msgs))
+        })
+        .unwrap_or((false, Vec::new()));
 
     // 确保工作区记忆目录存在，并执行轻量记忆衰减清理
     if !session.workspace_path.is_empty() {
@@ -1486,11 +1509,8 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         let _ = crate::memory::prune_memory(ws_path, 30, 20);
     }
 
-    // 项目约束 + 关联项目说明 + 工作区知识记忆：按会话所属项目动态组装进 system prompt。
-    // system 位于上下文第 0 位且永不截断 → 新对话注入一次、同对话多条消息不重复；
-    // 每次运行重建，修改约束 / 关联或知识沉淀后同对话下一条消息就地生效。
-    // 临时空间会话改用临时空间说明段（含临时路径映射与优先级 临时空间 > 关联项目 > 项目约束）
-    let (project_section, project_plan_mode, negative_code_intent) = {
+    // 1. 短效持锁 Catalog 主库：解析显式项目配置、计划模式、协作者与本轮尾部动态锚点（不进磁盘读 memory）
+    let (db_sec, static_collabs_sec, project_plan_mode, negative_code_intent, pending_anchor) = {
         let db = state.db.lock();
         let plan_mode = if let Some(ref pid) = session.project_id {
             store::get_project(&db, pid)
@@ -1508,8 +1528,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             "standard".into()
         };
 
-        let msgs = store::all_messages(&db, session_id).unwrap_or_default();
-        let last_user_content = msgs
+        let last_user_content = session_msgs
             .iter()
             .filter(|m| m.role == "user")
             .last()
@@ -1517,18 +1536,16 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
 
         let neg_intent = last_user_content.map(contains_negative_code_intent).unwrap_or(false);
 
-        // 识别长任务触发：包含显式指令前缀或 /goal
         let directly_triggered_goal = last_user_content
             .map(|c| c.contains("【长任务目标模式】") || c.starts_with("/goal"))
             .unwrap_or(false);
 
-        // 或者当前会话曾触发过长任务且仍有处于进行中 (in_progress) 的方案正在推进
         let ongoing_goal_plan = if !session.workspace_path.is_empty() {
             let ws = std::path::Path::new(&session.workspace_path);
             crate::plan::find_plan_file(ws, session_id, None, Some(&db))
                 .map(|(_, meta, _)| meta.status == "in_progress")
                 .unwrap_or(false)
-                && msgs.iter().any(|m| {
+                && session_msgs.iter().any(|m| {
                     m.content
                         .as_deref()
                         .map(|c| c.contains("【长任务目标模式】") || c.starts_with("/goal"))
@@ -1538,15 +1555,8 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             false
         };
 
-        // 识别长任务触发：包含显式指令前缀、/goal、或者存在处于运行/推进中的长任务。
-        // （步骤11：任务数据在会话库，运行态判定已在块外的 is_long_task 中以 with_session_db 完成，
-        //   此处不再在 catalog 锁内重复查询。）
-        let is_running_long_task = is_long_task;
+        let is_goal_task = is_long_task || directly_triggered_goal || ongoing_goal_plan;
 
-        let is_goal_task = is_long_task || directly_triggered_goal || ongoing_goal_plan || is_running_long_task;
-
-        // 子任务（工人沙箱）与长任务（后台自治）均自动强制走 always_proceed 模式（自治推进，落盘即开工，严禁停顿审批）；
-        // 普通对话则严格按用户/项目设置的 plan_mode 运行（支持 standard / always_plan / always_proceed）。
         let effective_plan_mode = if is_subagent || is_goal_task {
             "always_proceed".to_string()
         } else {
@@ -1564,42 +1574,59 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 None => None,
             }
         };
-        let static_mem_sec = if !session.workspace_path.is_empty() {
-            crate::memory::load_static_project_memory(std::path::Path::new(&session.workspace_path))
-        } else {
-            None
-        };
         let static_collabs_sec = if !is_subagent {
             crate::context::build_static_collaborator_section(&db, session_id)
         } else {
             None
         };
 
-        // 提取并冻结当前轮次 User 消息的运行时环境附注 (Layer 4)
-        // 确保动态任务计划、最新知识索引与中断标记只挂载在尾部，且写入后终生不可变以保护前缀缓存
         let trigger_user_msg = trigger_msg.as_ref().cloned().or_else(|| {
-            msgs.iter().rev().find(|m| m.role == "user").cloned()
+            session_msgs.iter().rev().find(|m| m.role == "user").cloned()
         });
-        if let Some(ref um) = trigger_user_msg {
+        let pending_anchor = trigger_user_msg.and_then(|um| {
             if um.runtime_anchor.is_none() {
-                if let Some(anchor) = crate::context::build_runtime_anchor(&db, &session, um.content.as_deref()) {
-                    let _ = state.with_session_db(session_id, |conn| store::update_message_runtime_anchor(conn, &um.id, &anchor));
-                }
+                crate::context::build_runtime_anchor(&db, &session, um.content.as_deref())
+                    .map(|anchor| (um.id, anchor))
+            } else {
+                None
             }
-        }
+        });
 
-        let sys = crate::context::build_static_system_prompt(
-            &session,
-            &settings.disabled_sops,
-            &effective_plan_mode,
-            db_sec.as_deref(),
-            static_mem_sec.as_deref(),
-            static_collabs_sec.as_deref(),
-        );
-
-        (Some(sys), effective_plan_mode, neg_intent)
+        (db_sec, static_collabs_sec, effective_plan_mode, neg_intent, pending_anchor)
     };
-    let sys = project_section.unwrap_or_default();
+
+    // 2. 在会话专属分库落盘冻结尾部锚点，并解析/锁定会话级静态 System Prompt (Layer 1 & 2)
+    let sys = state
+        .with_session_db(session_id, |conn| {
+            if let Some((ref um_id, ref anchor)) = pending_anchor {
+                let _ = store::update_message_runtime_anchor(conn, um_id, anchor);
+            }
+            Ok(crate::context::resolve_or_freeze_system_prompt(
+                conn,
+                &session,
+                &settings.disabled_sops,
+                &project_plan_mode,
+                db_sec.as_deref(),
+                static_collabs_sec.as_deref(),
+                || {
+                    if !session.workspace_path.is_empty() {
+                        crate::memory::load_static_project_memory(std::path::Path::new(&session.workspace_path))
+                    } else {
+                        None
+                    }
+                },
+            ))
+        })
+        .unwrap_or_else(|_| {
+            crate::context::build_static_system_prompt(
+                &session,
+                &settings.disabled_sops,
+                &project_plan_mode,
+                db_sec.as_deref(),
+                None,
+                static_collabs_sec.as_deref(),
+            )
+        });
 
     let verified_intent_prefix: Option<String> = None;
     let mut sop_verified = false;
@@ -1731,20 +1758,22 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         }
         let current_sys = &sys;
 
-        // ---- 步骤 0：在首步或每 5 步检测是否触发阶段性自动压缩（实用安全水位检测） ----
-        if _step == 0 || _step % 5 == 0 {
-            let compacted = check_and_trigger_compaction(
+        // ---- 步骤 0：仅在新一轮对话开始时（_step == 0）检测是否达到 80% 压缩线 ----
+        // 单轮工具循环期间（_step >= 1）绝不中断压缩，确保连续推理与 Prefix Cache 全程高命中。
+        if _step == 0 {
+            let confirm_policy = if is_subagent || session.session_type == "subprocess" {
+                crate::context::CompactionConfirmPolicy::AutoApplySilent
+            } else {
+                crate::context::CompactionConfirmPolicy::PromptUserWithTimeout
+            };
+            let _ = check_and_trigger_compaction(
                 app,
                 &state,
                 session_id,
                 &cfg,
-                current_sys,
-                effective_ctx_limit,
+                confirm_policy,
             )
             .await;
-            if compacted {
-                let _ = app.emit("session:compacted", json!({ "sessionId": session_id }));
-            }
         }
 
         // ---- 步骤 1/2：组装上下文（含运行中被"引导"注入的新消息） ----
@@ -1756,7 +1785,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         if let Some(ref notice) = truncation_notice {
             let _ = app.emit("context:truncated", notice);
         }
-        let mut messages = match messages {
+        let messages = match messages {
             Ok(m) => m,
             Err(e) => {
                 emit_error(app, session_id, "context", e);
@@ -1764,40 +1793,12 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             }
         };
 
-        // 第 8 步阶梯门禁拦截：当只读勘察达 8 步且尚未声明施工意图时，注入强制对齐/意图声明提示
-        let todo_first_enabled = !settings.disabled_sops.iter().any(|s| s == "todo_first_gate");
-        if todo_first_enabled && _step == 8 {
-            let intent_status = {
-                state.with_session_db(session_id, |conn| Ok(evaluate_intent_gate(conn, session_id, Some(&workspace)))).unwrap_or_default()
-            };
-            if !intent_status.is_satisfied() {
-                let gate_msg = if is_subagent {
-                    let report_filename = format!("{}_report.md", session_id);
-                    format!(
-                        "【🛑 第 8 步门禁拦截（子任务施工/探索门禁）】：只读勘察已达 8 步上限且当前未声明施工意图！\n\
-                        1. 若本任务需要修改代码且施工目标明确，必须在下一步声明意图（小型任务调用 todo 工具声明步骤清单，复杂架构任务调用 create_plan 工具生成方案，二选一即可），方可开始调用 write_file / edit_file 施工；\n\
-                        2. 若为纯探索/调研类任务且事实已查明，严禁盲目漫游，直接调用 write_file 将详尽报告写入 `.harness/subtasks/{report_filename}` 并结案交付；\n\
-                        3. 若在 8 步内探索受阻、无法梳理出可行方案或缺少前置条件，严禁继续漫游或盲目重试，必须立即调用 write_file 写入 `.harness/subtasks/{report_filename}` 汇报遇到的具体阻碍并交回主会话！"
-                    )
-                } else {
-                    "【🛑 第 8 步门禁拦截】：只读勘察已达 8 步上限且当前未声明施工意图！\n\
-                    1. 若已查明事实且无需修改代码（如咨询答疑），必须立即在正式回复（Content）中输出完整答复并直接结案；\n\
-                    2. 若需要修改代码且方向明确，必须在下一步声明意图（小型调整/探索调用 todo 工具声明任务列表，复杂跨模块工程调用 create_plan 工具生成实施方案，二选一即可，严禁重复创建），方可进行代码修改；\n\
-                    3. 若依然方向模糊、无法梳理出清晰的执行路线，严禁盲目漫游或脑补计划，必须立即停止调用工具，在正式回复中向用户汇报当前事实并对齐目标！".to_string()
-                };
-                messages.push(json!({
-                    "role": "user",
-                    "content": gate_msg,
-                }));
-            }
-        }
-
-        // 注：步数预算感知与临界预警已统一挂载至 Tool 结果并落库持久化，
-        // 彻底根除内存临时注入导致的「下一轮凭空消失」与 Prefix Cache 击穿。
+        // 注：步数预算感知、临界预警与第 8 步意图门禁已全部收敛至 build_step_feedback_suffix，
+        // 并统一挂载至前置步骤最后一条 Tool 结果落库持久化，彻底消除内存临时注入导致的 Prefix Cache 击穿。
 
         // ---- 步骤 3：流式调用 LLM（先预占 assistant 消息位，供增量事件引用） ----
         let step_start = Instant::now();
-        let assistant_id = {
+        let (assistant_id, assistant_seq) = {
             match state.with_session_db(session_id, |conn| store::new_message_with_run(conn, session_id, "assistant", Some(String::new()), false, Some(run_id))) {
                 Ok(m) => {
                     state.cache_message_session(&m.id, session_id);
@@ -2451,25 +2452,24 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                 None
             };
             let mut normalized_result = crate::context::normalize_tool_output_for_ingress(&ctc.name, &result_text);
-
-            // 步数预算感知与临界预警：仅挂载至本轮最后一个工具执行结果，保证落库持久化且前缀严格不可变
-            if tc_idx + 1 == total_tcs {
-                let next_step = _step + 1;
-                let remaining_steps = current_max_steps.saturating_sub(next_step);
-                if remaining_steps <= 2 && current_max_steps > 2 {
-                    let limit_label = format!("最大步数上限（{current_max_steps}）");
-                    normalized_result.push_str(&format!(
-                        "\n\n【⚠️ 临界步数紧急预警：当前仅剩最后 {remaining_steps} 步，即将达到{limit_label}！严禁继续调用任何探索、排查或读取类工具！必须立即根据目前已掌握的所有信息，按规定结构化格式输出最终总结与交付回复！】"
-                    ));
-                } else if next_step > 0 && next_step % 10 == 0 && remaining_steps > 2 {
-                    let role_label = if is_subagent { "专职子任务" } else { "主对话任务" };
-                    normalized_result.push_str(&format!(
-                        "\n\n【⏱️ 步数预算感知】：当前{}已执行 {}/{} 步（剩余 {} 步预算）。请严格收敛工作，优先完成核心交付目标，避免非必要发散；若阶段目标已达成，请尽快输出交付成果。",
-                        role_label, next_step, current_max_steps, remaining_steps
-                    ));
-                }
-            }
+            let todo_first_enabled = !settings.disabled_sops.iter().any(|s| s == "todo_first_gate");
+            let is_last_tool_in_step = tc_idx + 1 == total_tcs;
             let tool_msg = state.with_session_db(session_id, |conn| {
+                // 在本步最后一个工具结果写入前，统一附加步数感知与第 8 步门禁提示并持久化入库，确保全前缀不可变
+                if is_last_tool_in_step {
+                    if let Some(feedback) = build_step_feedback_suffix(
+                        conn,
+                        session_id,
+                        &workspace,
+                        is_subagent,
+                        todo_first_enabled,
+                        _step + 1,
+                        current_max_steps,
+                    ) {
+                        normalized_result.push_str("\n\n");
+                        normalized_result.push_str(&feedback);
+                    }
+                }
                 let r = store::new_message_with_attachments(conn, session_id, "tool", Some(normalized_result), tool_attachments, false, None);
                 if let Ok(ref m) = r {
                     let _ = store::set_message_tool_call_id(conn, &m.id, &ctc.call_id);
@@ -3286,6 +3286,63 @@ fn truncate_preview(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// 统一生成挂载到本步最后一条工具结果尾部的步数感知、临界预警与第 8 步意图门禁提示
+/// （直接随 tool 消息落库持久化，彻底消除内存临时注入导致的 Prefix Cache 击穿）
+fn build_step_feedback_suffix(
+    session_conn: &rusqlite::Connection,
+    session_id: &str,
+    workspace: &Path,
+    is_subagent: bool,
+    todo_first_enabled: bool,
+    next_step: usize,
+    current_max_steps: usize,
+) -> Option<String> {
+    let remaining_steps = current_max_steps.saturating_sub(next_step);
+    let mut sections: Vec<String> = Vec::new();
+
+    if remaining_steps <= 2 && current_max_steps > 2 {
+        let limit_label = format!("最大步数上限（{current_max_steps}）");
+        sections.push(format!(
+            "【⚠️ 临界步数紧急预警：当前仅剩最后 {remaining_steps} 步，即将达到{limit_label}！严禁继续调用任何探索、排查或读取类工具！必须立即根据目前已掌握的所有信息，按规定结构化格式输出最终总结与交付回复！】"
+        ));
+    } else {
+        if todo_first_enabled && next_step == 8 {
+            let intent_status = evaluate_intent_gate(session_conn, session_id, Some(workspace));
+            if !intent_status.is_satisfied() {
+                let gate_msg = if is_subagent {
+                    let report_filename = format!("{}_report.md", session_id);
+                    format!(
+                        "【🛑 第 8 步门禁拦截（子任务施工/探索门禁）】：只读勘察已达 8 步上限且当前未声明施工意图！\n\
+                        1. 若本任务需要修改代码且施工目标明确，必须在下一步声明意图（小型任务调用 todo 工具声明步骤清单，复杂架构任务调用 create_plan 工具生成方案，二选一即可），方可开始调用 write_file / edit_file 施工；\n\
+                        2. 若为纯探索/调研类任务且事实已查明，严禁盲目漫游，直接调用 write_file 将详尽报告写入 `.harness/subtasks/{report_filename}` 并结案交付；\n\
+                        3. 若在 8 步内探索受阻、无法梳理出可行方案或缺少前置条件，严禁继续漫游或盲目重试，必须立即调用 write_file 写入 `.harness/subtasks/{report_filename}` 汇报遇到的具体阻碍并交回主会话！"
+                    )
+                } else {
+                    "【🛑 第 8 步门禁拦截】：只读勘察已达 8 步上限且当前未声明施工意图！\n\
+                    1. 若已查明事实且无需修改代码（如咨询答疑），必须立即在正式回复（Content）中输出完整答复并直接结案；\n\
+                    2. 若需要修改代码且方向明确，必须在下一步声明意图（小型调整/探索调用 todo 工具声明任务列表，复杂跨模块工程调用 create_plan 工具生成实施方案，二选一即可，严禁重复创建），方可进行代码修改；\n\
+                    3. 若依然方向模糊、无法梳理出清晰的执行路线，严禁盲目漫游或脑补计划，必须立即停止调用工具，在正式回复中向用户汇报当前事实并对齐目标！".to_string()
+                };
+                sections.push(gate_msg);
+            }
+        }
+
+        if next_step > 0 && next_step % 10 == 0 {
+            let role_label = if is_subagent { "专职子任务" } else { "主对话任务" };
+            sections.push(format!(
+                "【⏱️ 步数预算感知】：当前{}已执行 {}/{} 步（剩余 {} 步预算）。请严格收敛工作，优先完成核心交付目标，避免非必要发散；若阶段目标已达成，请尽快输出交付成果。",
+                role_label, next_step, current_max_steps, remaining_steps
+            ));
+        }
+    }
+
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n\n"))
+    }
+}
+
 /// 检测用户 Prompt 中是否包含“先不改动代码”的明确否定语义
 fn contains_negative_code_intent(s: &str) -> bool {
     let text = s.to_lowercase();
@@ -3303,12 +3360,19 @@ async fn check_and_trigger_compaction(
     state: &crate::AppState,
     session_id: &str,
     cfg: &crate::llm::LlmCfg,
-    _sys: &str,
-    _token_limit: usize,
+    confirm_policy: crate::context::CompactionConfirmPolicy,
 ) -> bool {
-    crate::context::propose_and_execute_compaction(app, state, session_id, cfg, None, false)
-        .await
-        .unwrap_or(false)
+    crate::context::propose_and_execute_compaction(
+        app,
+        state,
+        session_id,
+        cfg,
+        None,
+        false,
+        confirm_policy,
+    )
+    .await
+    .unwrap_or(false)
 }
 
 pub fn build_context(
@@ -4244,5 +4308,47 @@ mod tests {
         assert!(!formatted.contains("用户: A1"));
     }
 
-    
+    #[test]
+    fn test_build_step_feedback_suffix_gate_budget_and_critical_priority() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        store::init_schema(&conn).unwrap();
+        let s = store::create_session(&conn, ".", None, "gate-test", "confirm").unwrap();
+        let ws = std::path::Path::new(".");
+
+        // 1. 第 7 步完成即将进入第 8 步且无 todo/plan 时：挂载第 8 步门禁
+        let fb8 = build_step_feedback_suffix(&conn, &s.id, ws, false, true, 8, 50).unwrap();
+        assert!(fb8.contains("第 8 步门禁拦截"));
+
+        // 2. 若步数已进入最后 2 步（临界优先于第 8 步与每 10 步），禁止再鼓励调工具
+        let fb_crit = build_step_feedback_suffix(&conn, &s.id, ws, false, true, 8, 10).unwrap();
+        assert!(fb_crit.contains("临界步数紧急预警"));
+        assert!(!fb_crit.contains("第 8 步门禁拦截"));
+
+        // 3. 第 9 步完成即将进入第 10 步时：挂载每 10 步预算感知
+        let fb10 = build_step_feedback_suffix(&conn, &s.id, ws, false, true, 10, 50).unwrap();
+        assert!(fb10.contains("步数预算感知"));
+
+        // 4. 关闭 todo_first_gate 后第 8 步不触发门禁
+        assert!(build_step_feedback_suffix(&conn, &s.id, ws, false, false, 8, 50).is_none());
+
+        // 5. 若已有活跃 todo，第 8 步放行不注入门禁
+        let _ = store::new_message(&conn, &s.id, "user", Some("请重构".into()), false).unwrap();
+        let msg_todo = store::new_message(&conn, &s.id, "assistant", Some("".into()), false).unwrap();
+        let ev_todo = ToolEvent {
+            id: "ev-todo".into(),
+            message_id: msg_todo.id,
+            tool_name: "todo".into(),
+            tool_call_id: Some("call_todo".into()),
+            params: json!({"todos": [{"content": "step1", "status": "in_progress"}]}),
+            result_text: None,
+            status: "success".into(),
+            approval_scope: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            reverted_at: None,
+            subprocess_id: None,
+        };
+        store::insert_tool_event(&conn, &ev_todo).unwrap();
+        let _ = store::set_kv(&conn, &s.id, "todos", &ev_todo.params.to_string());
+        assert!(build_step_feedback_suffix(&conn, &s.id, ws, false, true, 8, 50).is_none());
+    }
 }

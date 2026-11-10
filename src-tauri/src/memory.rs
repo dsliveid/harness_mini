@@ -307,7 +307,7 @@ pub fn record_memory_with_effect(
                 rel_path: ".harness/memory/profile.md".into(),
                 old_bytes,
                 new_bytes,
-                message: "已成功将最新技术栈与架构档案持久化至 `.harness/memory/profile.md`，后续所有新会话均会自动秒级召回。".into(),
+                message: "已成功将最新技术栈与架构档案持久化至 `.harness/memory/profile.md`，后续所有新会话均会自动全量载入；当前会话顶部基线已缓存锁定不再改写，最新内容已在当前对话流记录并立即生效。".into(),
             })
         }
         "convention" | "notes" => {
@@ -326,7 +326,7 @@ pub fn record_memory_with_effect(
                 rel_path: ".harness/memory/conventions.md".into(),
                 old_bytes,
                 new_bytes,
-                message: format!("已成功将规范约定【{}】追加至 `.harness/memory/conventions.md`。", title),
+                message: format!("已成功将规范约定【{}】追加至 `.harness/memory/conventions.md`，后续新会话将自动全量载入；当前会话内已在上下文中生效，不改写顶部基线以保护缓存。", title),
             })
         }
         _ => {

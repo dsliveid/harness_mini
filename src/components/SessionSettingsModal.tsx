@@ -294,7 +294,7 @@ export function SessionSettingsModal() {
                 <div>
                   <div className="font-medium text-[14px]">本次对话上下文上限</div>
                   <div className="text-[12px] text-inkdim mt-0.5 leading-relaxed">
-                    可针对当前对话单独调整 Token 上限。超出 75% 时触发智能压缩，超出上限触发原子轮次截断。
+                    可针对当前对话单独调整 Token 上限。新一轮开始时达到 80% 触发智能压缩提示，超出上限触发原子轮次截断。
                   </div>
                 </div>
 

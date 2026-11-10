@@ -67,7 +67,7 @@ export function computeContextUsage(
     : settings.contextTokenLimit || 64_000;
 
   const limit = session?.contextTokenLimit ?? draftLimit ?? defaultLimit;
-  const compactionThreshold = Math.round(limit * 0.75);
+  const compactionThreshold = Math.round(limit * 0.8);
 
   const maxCompactedSeq = compactions.reduce((max, c) => Math.max(max, c.endSeq), 0);
   const compactionCount = compactions.length;
@@ -141,7 +141,7 @@ export function computeContextUsage(
   const tokensToCompaction = Math.max(0, compactionThreshold - activeTokens);
 
   let status: "safe" | "moderate" | "critical" = "safe";
-  if (percentage >= 75) {
+  if (percentage >= 80) {
     status = "critical";
   } else if (percentage >= 60) {
     status = "moderate";
@@ -374,7 +374,7 @@ export function ContextUsageGauge({ session, className = "" }: ContextUsageGauge
             </div>
           </div>
 
-          {/* 线性水平进度条，附带 75% 压缩触发线 */}
+          {/* 线性水平进度条，附带 80% 压缩触发线 */}
           <div className="w-full bg-panel3 h-2 rounded-full overflow-hidden relative mt-1.5 border border-edge/40">
             <div
               className={`h-full rounded-full transition-all duration-300 ${
@@ -386,11 +386,11 @@ export function ContextUsageGauge({ session, className = "" }: ContextUsageGauge
               }`}
               style={{ width: `${Math.min(info.percentage, 100)}%` }}
             />
-            {/* 75% 压缩警戒标记 */}
+            {/* 80% 压缩警戒标记 */}
             <div
               className="absolute top-0 bottom-0 w-[1.5px] bg-rose-400/90 z-10"
-              style={{ left: "75%" }}
-              title="75% 智能语义压缩触发线"
+              style={{ left: "80%" }}
+              title="80% 智能语义压缩触发线"
             />
           </div>
 
@@ -401,7 +401,7 @@ export function ContextUsageGauge({ session, className = "" }: ContextUsageGauge
               <span className="text-ink font-medium">{info.remainingTokens.toLocaleString()} tokens</span>
             </div>
             <div className="flex items-center justify-between">
-              <span>智能压缩阈值 (75%):</span>
+              <span>智能压缩阈值 (80%):</span>
               <span className="text-inkdim">{formatTokens(info.compactionThreshold)}</span>
             </div>
             <div className="flex items-center justify-between">

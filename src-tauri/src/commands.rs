@@ -2020,6 +2020,7 @@ pub async fn trigger_compaction(
         &cfg,
         focus.as_deref(),
         true,
+        crate::context::CompactionConfirmPolicy::PromptUserWithTimeout,
     )
     .await
 }

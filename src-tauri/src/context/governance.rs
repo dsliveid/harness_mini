@@ -9,6 +9,18 @@ use serde_json::json;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
+/// 自动触发上下文压缩的水位阈值百分比（80%）
+pub const COMPACTION_THRESHOLD_PERCENT: usize = 80;
+
+/// 上下文压缩确认策略（由调用入口显式声明，避免通过运行状态隐式猜测）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionConfirmPolicy {
+    /// 向前端弹出 CompactionBanner 请求确认（30 秒无操作超时默认自动应用并继续）
+    PromptUserWithTimeout,
+    /// 静默自动应用（用于无界面的后台子代理或子进程任务）
+    AutoApplySilent,
+}
+
 fn truncate_preview(s: &str, max_chars: usize) -> String {
     let s = s.trim();
     if s.chars().count() <= max_chars {
@@ -17,6 +29,145 @@ fn truncate_preview(s: &str, max_chars: usize) -> String {
         let truncated: String = s.chars().take(max_chars).collect();
         format!("{}...", truncated)
     }
+}
+
+/// 安全按字符数截断文本，可选保留首尾两端（适合工具输出与终端日志）
+fn truncate_text_block(s: &str, max_chars: usize, head_tail: bool) -> String {
+    let total_chars = s.chars().count();
+    if total_chars <= max_chars {
+        return s.to_string();
+    }
+    if !head_tail || max_chars < 40 {
+        let head: String = s.chars().take(max_chars).collect();
+        return format!("{head}...[已截断]");
+    }
+    let head_len = max_chars / 2;
+    let tail_len = max_chars.saturating_sub(head_len);
+    let head: String = s.chars().take(head_len).collect();
+    let tail: String = s.chars().skip(total_chars.saturating_sub(tail_len)).collect();
+    format!("{head}\n...[已折叠中间输出，共 {total_chars} 字符]...\n{tail}")
+}
+
+/// 精炼提取 assistant 消息中的工具调用清单，避免纯工具步在摘要中被忽略
+fn format_tool_calls_brief(tcs: &serde_json::Value) -> String {
+    let Some(arr) = tcs.as_array() else {
+        return String::new();
+    };
+    let mut parts = Vec::with_capacity(arr.len());
+    for tc in arr {
+        let func = tc.get("function");
+        let name = func
+            .and_then(|f| f.get("name"))
+            .or_else(|| tc.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let args = func
+            .and_then(|f| f.get("arguments"))
+            .or_else(|| tc.get("arguments"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let compact_args = args.trim().replace(['\r', '\n'], " ");
+        let args_preview = truncate_preview(&compact_args, 100);
+        if args_preview.is_empty() {
+            parts.push(name.to_string());
+        } else {
+            parts.push(format!("{name}({args_preview})"));
+        }
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("[调用工具: {}]", parts.join("; "))
+    }
+}
+
+/// 格式化待压缩历史消息，保障单条不膨胀、工具轨迹不缺失且总字符数有硬上限保护
+pub(crate) fn format_compaction_history(
+    msgs: &[crate::models::Message],
+    max_total_chars: usize,
+) -> String {
+    let mut blocks: Vec<String> = Vec::with_capacity(msgs.len());
+    for m in msgs {
+        let role_name = match m.role.as_str() {
+            "user" => "【用户】",
+            "assistant" => "【助手】",
+            "tool" => "【工具返回】",
+            _ => "【系统】",
+        };
+        let raw_content = m.content.as_deref().unwrap_or("").trim();
+        let body = match m.role.as_str() {
+            "tool" => truncate_text_block(raw_content, 600, true),
+            _ => truncate_text_block(raw_content, 1200, false),
+        };
+        let tools_brief = if m.role == "assistant" {
+            m.tool_calls
+                .as_ref()
+                .map(format_tool_calls_brief)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let mut lines = Vec::new();
+        if !body.is_empty() {
+            lines.push(body);
+        }
+        if !tools_brief.is_empty() {
+            lines.push(tools_brief);
+        }
+        if !lines.is_empty() {
+            blocks.push(format!("{role_name}: {}\n\n", lines.join("\n")));
+        }
+    }
+
+    let total_chars: usize = blocks.iter().map(|b| b.chars().count()).sum();
+    if total_chars <= max_total_chars || blocks.len() <= 2 {
+        return blocks.concat();
+    }
+
+    // 超长历史保护：保留最开头 20% 预算（原始需求目标）+ 最近 80% 预算（最新进展与代码变更）
+    let head_budget = max_total_chars / 5;
+    let tail_budget = max_total_chars.saturating_sub(head_budget);
+
+    let mut head_blocks = Vec::new();
+    let mut head_used = 0usize;
+    let mut head_end = 0usize;
+    for (idx, b) in blocks.iter().enumerate() {
+        let len = b.chars().count();
+        if idx == 0 || head_used + len <= head_budget {
+            head_blocks.push(b.as_str());
+            head_used += len;
+            head_end = idx + 1;
+        } else {
+            break;
+        }
+    }
+
+    let mut tail_blocks = Vec::new();
+    let mut tail_used = 0usize;
+    let mut tail_start = blocks.len();
+    for idx in (head_end..blocks.len()).rev() {
+        let b = &blocks[idx];
+        let len = b.chars().count();
+        if tail_blocks.is_empty() || tail_used + len <= tail_budget {
+            tail_blocks.push(b.as_str());
+            tail_used += len;
+            tail_start = idx;
+        } else {
+            break;
+        }
+    }
+    tail_blocks.reverse();
+
+    let omitted = tail_start.saturating_sub(head_end);
+    let mut out = head_blocks.concat();
+    if omitted > 0 {
+        out.push_str(&format!(
+            "...[为防止摘要超出上限，已省略中间 {omitted} 条较早执行明细]...\n\n"
+        ));
+    }
+    out.push_str(&tail_blocks.concat());
+    out
 }
 
 fn extract_msg_tokens(m: &crate::models::Message) -> (usize, usize) {
@@ -57,7 +208,7 @@ pub struct ContextViewport {
     pub percentage: f32,
     /// 剩余可用空间
     pub remaining_tokens: usize,
-    /// 智能语义压缩触发阈值 (75%)
+    /// 智能语义压缩触发阈值 (80%)
     pub compaction_threshold: usize,
     /// 距触发压缩剩余 Token (0 表示已达到或超出)
     pub tokens_to_compaction: usize,
@@ -85,28 +236,26 @@ pub fn resolve_session_context_limit(
     if let Some(limit) = session.as_ref().and_then(|s| s.context_token_limit) {
         return limit;
     }
-    let resolved_model = if let Some(s) = &session {
-        if let (Some(pid), Some(mid)) = (s.provider_id.as_deref(), s.model_id.as_deref()) {
-            Some((pid.to_string(), mid.to_string()))
-        } else {
+    let resolved_model = session
+        .as_ref()
+        .and_then(|s| {
+            s.model_id
+                .as_deref()
+                .filter(|m| !m.is_empty())
+                .map(|mid| (s.provider_id.clone(), mid.to_string()))
+        })
+        .or_else(|| {
             crate::models::resolve_active_model(settings)
-                .map(|(p, m)| (p.id.clone(), m.to_string()))
-        }
-    } else {
-        crate::models::resolve_active_model(settings).map(|(p, m)| (p.id.clone(), m.to_string()))
-    };
+                .map(|(p, m)| (Some(p.id.clone()), m.to_string()))
+        });
 
-    let model_limit = if let Some((pid, model)) = resolved_model {
-        settings.resolve_context_limit(Some(&pid), &model)
+    if let Some((pid, model)) = resolved_model {
+        settings.resolve_context_limit(pid.as_deref(), &model)
     } else if settings.context_token_limit > 0 {
         settings.context_token_limit
     } else {
         64_000
-    };
-
-    // 实用安全水位封顶：在未显式为特定会话设置 context_token_limit 时，
-    // 治理引擎将有效上限封顶在 64,000 Tokens（75% 触发线为 48,000），杜绝 800k 超大上限导致自动压缩机制彻底哑火
-    model_limit.min(64_000)
+    }
 }
 
 /// 解析会话关联的大模型调用配置
@@ -326,14 +475,14 @@ pub fn evaluate_context_viewport(
         })
         .sum();
 
-    let compaction_threshold = (limit * 75) / 100;
+    let compaction_threshold = (limit * COMPACTION_THRESHOLD_PERCENT) / 100;
     let tokens_to_compaction = compaction_threshold.saturating_sub(baseline_tokens);
     let remaining_tokens = limit.saturating_sub(baseline_tokens);
     let watermark_ratio = (baseline_tokens as f32 / limit.max(1) as f32).min(1.0);
     let percentage = (watermark_ratio * 1000.0).round() / 10.0;
     let can_compact = candidate_messages_count > 0;
     let is_compaction_recommended =
-        baseline_tokens >= compaction_threshold || (limit > 0 && candidate_tokens >= limit / 2);
+        can_compact && baseline_tokens >= compaction_threshold;
 
     Ok(ContextViewport {
         baseline_tokens,
@@ -360,6 +509,7 @@ pub async fn propose_and_execute_compaction(
     cfg: &LlmCfg,
     manual_focus: Option<&str>,
     force: bool,
+    confirm_policy: CompactionConfirmPolicy,
 ) -> Result<bool, String> {
     // 1. 检查是否已有未决的压缩请求
     {
@@ -370,7 +520,7 @@ pub async fn propose_and_execute_compaction(
     }
 
     // 2. 评估候选消息
-    let (candidate_msgs, candidate_tokens) = {
+    let (candidate_msgs, candidate_tokens, effective_limit) = {
         // 先在 Catalog 主库读取 settings 并解析生效 limit，锁立即释放（杜绝锁嵌套与自死锁）
         let limit = {
             let db = state.db.lock();
@@ -384,13 +534,13 @@ pub async fn propose_and_execute_compaction(
             let viewport = evaluate_context_viewport(conn, limit, session_id, Some(is_running))?;
 
             if !force && !viewport.is_compaction_recommended {
-                return Ok((Vec::new(), 0));
+                return Ok((Vec::new(), 0, limit));
             }
             if !viewport.can_compact {
                 if force {
                     return Err("当前会话暂无可供压缩的早期历史消息（至少需要 1 轮已完成对话）".into());
                 } else {
-                    return Ok((Vec::new(), 0));
+                    return Ok((Vec::new(), 0, limit));
                 }
             }
 
@@ -416,7 +566,7 @@ pub async fn propose_and_execute_compaction(
                 })
                 .sum();
 
-            Ok((candidates, tokens))
+            Ok((candidates, tokens, limit))
         })?
     };
 
@@ -428,26 +578,9 @@ pub async fn propose_and_execute_compaction(
         };
     }
 
-    // 3. 格式化待压缩的历史对话文本
-    let mut history_str = String::new();
-    for m in &candidate_msgs {
-        let role_name = match m.role.as_str() {
-            "user" => "【用户】",
-            "assistant" => "【助手】",
-            "tool" => "【工具返回】",
-            _ => "【系统】",
-        };
-        let c = m.content.as_deref().unwrap_or("");
-        if !c.is_empty() {
-            let truncated = if c.len() > 800 {
-                let safe_len = c.char_indices().nth(800).map(|(i, _)| i).unwrap_or(c.len());
-                format!("{}...[已截断]", &c[..safe_len])
-            } else {
-                c.to_string()
-            };
-            history_str.push_str(&format!("{role_name}: {truncated}\n\n"));
-        }
-    }
+    // 3. 格式化待压缩的历史对话文本（保留工具调用轨迹，安全截断防摘要超限）
+    let max_history_chars = effective_limit.saturating_mul(2).clamp(40_000, 240_000);
+    let history_str = format_compaction_history(&candidate_msgs, max_history_chars);
 
     let focus_clause = if let Some(focus) = manual_focus.filter(|f| !f.trim().is_empty()) {
         format!(
@@ -527,55 +660,57 @@ pub async fn propose_and_execute_compaction(
         timeout_seconds: timeout_secs,
     };
 
-    let is_running = crate::agent::is_run_active(state, session_id);
-    let decision = if is_running {
-        // 自治执行态自动压缩：直接应用生成的结构化摘要，零等待零阻塞继续运行
-        state.emit(
-            "compaction:auto_applied",
-            &json!({
-                "eventId": event_id,
-                "sessionId": session_id,
-                "summary": initial_summary,
-            }),
-        );
-        CompactionDecision {
-            approved: true,
-            final_summary: initial_summary.clone(),
-        }
-    } else {
-        state.compactions.lock().insert(
-            event_id.clone(),
-            crate::PendingCompaction {
-                session_id: session_id.to_string(),
-                tx,
-            },
-        );
-
-        state
-            .snapshot
-            .set_pending_compaction(session_id, Some(req.clone()));
-        state.emit("compaction:request", &req);
-
-        // 等待用户确认（默认阻塞等待 30 秒；超时自动应用）
-        match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
-            Ok(Ok(d)) => {
-                state.snapshot.set_pending_compaction(session_id, None);
-                d
+    let decision = match confirm_policy {
+        CompactionConfirmPolicy::AutoApplySilent => {
+            // 后台无界面场景：直接应用生成的结构化摘要，零等待继续运行
+            state.emit(
+                "compaction:auto_applied",
+                &json!({
+                    "eventId": event_id,
+                    "sessionId": session_id,
+                    "summary": initial_summary,
+                }),
+            );
+            CompactionDecision {
+                approved: true,
+                final_summary: initial_summary.clone(),
             }
-            _ => {
-                state.compactions.lock().remove(&event_id);
-                state.snapshot.set_pending_compaction(session_id, None);
-                state.emit(
-                    "compaction:timeout",
-                    &json!({
-                        "eventId": event_id,
-                        "sessionId": session_id,
-                        "autoApplied": true,
-                    }),
-                );
-                CompactionDecision {
-                    approved: true,
-                    final_summary: initial_summary.clone(),
+        }
+        CompactionConfirmPolicy::PromptUserWithTimeout => {
+            state.compactions.lock().insert(
+                event_id.clone(),
+                crate::PendingCompaction {
+                    session_id: session_id.to_string(),
+                    tx,
+                },
+            );
+
+            state
+                .snapshot
+                .set_pending_compaction(session_id, Some(req.clone()));
+            state.emit("compaction:request", &req);
+
+            // 等待用户确认（默认阻塞等待 30 秒；超时默认应用压缩并继续）
+            match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+                Ok(Ok(d)) => {
+                    state.snapshot.set_pending_compaction(session_id, None);
+                    d
+                }
+                _ => {
+                    state.compactions.lock().remove(&event_id);
+                    state.snapshot.set_pending_compaction(session_id, None);
+                    state.emit(
+                        "compaction:timeout",
+                        &json!({
+                            "eventId": event_id,
+                            "sessionId": session_id,
+                            "autoApplied": true,
+                        }),
+                    );
+                    CompactionDecision {
+                        approved: true,
+                        final_summary: initial_summary.clone(),
+                    }
                 }
             }
         }
@@ -711,5 +846,67 @@ mod tests {
             v.get("content").and_then(|c| c.as_str()).map(|t| t.contains("历史备忘录内容")).unwrap_or(false)
         });
         assert!(has_memo);
+    }
+
+    #[test]
+    fn test_compaction_threshold_strict_80_percent_and_no_64k_cap() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        let s = crate::store::create_session(&conn, ".", None, "test-80", "confirm").unwrap();
+        conn.execute(
+            "UPDATE sessions SET provider_id = ?2, model_id = ?3 WHERE id = ?1",
+            rusqlite::params![&s.id, "p1", "deepseek-v4.1-flash"],
+        )
+        .unwrap();
+
+        let settings = crate::models::SettingsData::default();
+        let limit = resolve_session_context_limit(&conn, &settings, &s.id);
+        assert_eq!(limit, 800_000, "不应再被 64k 硬顶封杀");
+
+        // 构造真实 Usage = 600,000（占 800k 的 75%），以及大体积历史候选消息（超过 50%），均不应提前触发 80% 压缩
+        let _ = crate::store::new_message(&conn, &s.id, "user", Some("第一轮问题".into()), false).unwrap();
+        let asst = crate::store::new_message(&conn, &s.id, "assistant", Some("回答".into()), false).unwrap();
+        conn.execute(
+            "UPDATE messages SET prompt_tokens = 600000, completion_tokens = 1000 WHERE id = ?1",
+            rusqlite::params![&asst.id],
+        )
+        .unwrap();
+        let _ = crate::store::new_message(&conn, &s.id, "user", Some("第二轮问题".into()), false).unwrap();
+
+        let vp_75 = evaluate_context_viewport(&conn, limit, &s.id, Some(true)).unwrap();
+        assert_eq!(vp_75.compaction_threshold, 640_000);
+        assert!(!vp_75.is_compaction_recommended, "75% 时不应提前触发 80% 压缩");
+
+        // 当达到 >= 80% (640,000+) 时触发推荐压缩
+        conn.execute(
+            "UPDATE messages SET prompt_tokens = 640000, completion_tokens = 1000 WHERE id = ?1",
+            rusqlite::params![&asst.id],
+        )
+        .unwrap();
+        let vp_80 = evaluate_context_viewport(&conn, limit, &s.id, Some(true)).unwrap();
+        assert!(vp_80.is_compaction_recommended, "达到 80% 时应精确触发压缩推荐");
+    }
+
+    #[test]
+    fn test_format_compaction_history_preserves_tools_and_budget() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        let s = crate::store::create_session(&conn, ".", None, "test-hist", "confirm").unwrap();
+
+        let _ = crate::store::new_message(&conn, &s.id, "user", Some("请修改 main.rs".into()), false).unwrap();
+        let asst = crate::store::new_message(&conn, &s.id, "assistant", Some("".into()), false).unwrap();
+        let tc = serde_json::json!([{
+            "id": "call_1",
+            "type": "function",
+            "function": { "name": "edit_file", "arguments": "{\"Path\":\"src/main.rs\"}" }
+        }]);
+        crate::store::update_message_tool_calls(&conn, &asst.id, &tc, "", None).unwrap();
+        let _ = crate::store::new_message(&conn, &s.id, "tool", Some("edit ok".into()), false).unwrap();
+
+        let msgs = crate::store::all_messages(&conn, &s.id).unwrap();
+        let formatted = format_compaction_history(&msgs, 10_000);
+        assert!(formatted.contains("请修改 main.rs"));
+        assert!(formatted.contains("edit_file"));
+        assert!(formatted.contains("edit ok"));
     }
 }

@@ -1,6 +1,10 @@
 use crate::models::{GrowthItem, Session};
 use crate::store;
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
+
+const KV_FROZEN_SYSTEM_PROMPT: &str = "frozen_system_prompt";
+const KV_FROZEN_SYSTEM_CONFIG_HASH: &str = "frozen_system_config_hash";
 
 #[derive(Debug, Clone)]
 pub struct ResolvedLink {
@@ -339,6 +343,84 @@ pub fn build_static_system_prompt(
     full
 }
 
+/// 计算显式静态配置指纹（刻意排除 `.harness/memory/` 动态档案，避免 `record_memory` 写盘击穿 `messages[0]` 缓存）
+pub fn compute_system_config_hash(
+    session: &Session,
+    disabled_sops: &[String],
+    plan_mode: &str,
+    static_project_section: Option<&str>,
+    static_collab_section: Option<&str>,
+) -> String {
+    let mut sops = disabled_sops.to_vec();
+    sops.sort();
+    let canonical = serde_json::json!({
+        "workspace": &session.workspace_path,
+        "session_type": &session.session_type,
+        "subagent_role": &session.subagent_role,
+        "subagent_task": &session.subagent_task,
+        "is_sub": session.session_type == "collaborator"
+            || session.session_type == "subprocess"
+            || session.session_type == "subagent"
+            || session.parent_session_id.is_some(),
+        "plan_mode": plan_mode,
+        "disabled_sops": sops,
+        "project_section": static_project_section,
+        "collab_section": static_collab_section,
+    });
+    let digest = Sha256::digest(canonical.to_string().as_bytes());
+    format!("{:x}", digest)
+}
+
+/// 解析或锁定会话级静态 System Prompt (Layer 1 & Layer 2)
+///
+/// 核心保障：
+/// - 仅在显式配置（工作区、计划模式、禁用 SOP、项目约束/关联/协作者）变化或首次执行时生成并锁定基线；
+/// - 会话内即使调用 `record_memory` 写盘更新 `profile.md` / `conventions.md`，只要显式配置未变，
+///   后续轮次直接复用 `session_kv` 中锁定的 `messages[0]`，确保前缀 100% 字节级恒定且记忆零重复、零冲突。
+pub fn resolve_or_freeze_system_prompt<F>(
+    session_conn: &Connection,
+    session: &Session,
+    disabled_sops: &[String],
+    plan_mode: &str,
+    static_project_section: Option<&str>,
+    static_collab_section: Option<&str>,
+    load_memory: F,
+) -> String
+where
+    F: FnOnce() -> Option<String>,
+{
+    let config_hash = compute_system_config_hash(
+        session,
+        disabled_sops,
+        plan_mode,
+        static_project_section,
+        static_collab_section,
+    );
+
+    if let (Ok(Some(saved_hash)), Ok(Some(saved_prompt))) = (
+        store::get_kv(session_conn, &session.id, KV_FROZEN_SYSTEM_CONFIG_HASH),
+        store::get_kv(session_conn, &session.id, KV_FROZEN_SYSTEM_PROMPT),
+    ) {
+        if saved_hash == config_hash && !saved_prompt.trim().is_empty() {
+            return saved_prompt;
+        }
+    }
+
+    let mem_section = load_memory();
+    let prompt = build_static_system_prompt(
+        session,
+        disabled_sops,
+        plan_mode,
+        static_project_section,
+        mem_section.as_deref(),
+        static_collab_section,
+    );
+
+    let _ = store::set_kv(session_conn, &session.id, KV_FROZEN_SYSTEM_CONFIG_HASH, &config_hash);
+    let _ = store::set_kv(session_conn, &session.id, KV_FROZEN_SYSTEM_PROMPT, &prompt);
+    prompt
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,5 +446,49 @@ mod tests {
         assert!(!p.contains("<runtime_environment_anchor>"));
         assert!(!p.contains("断点恢复与进度重对齐提示"));
         assert!(!p.contains("💡 本项目近期边读边记重点沉淀"));
+    }
+
+    #[test]
+    fn test_resolve_or_freeze_system_prompt_ignores_memory_drift_but_respects_explicit_config() {
+        let conn = Connection::open_in_memory().unwrap();
+        store::init_schema(&conn).unwrap();
+        let s = store::create_session(&conn, "D:\\test_ws", None, "基线锁定测试", "confirm").unwrap();
+
+        // 第 1 轮：载入初始记忆 v1 并锁定基线
+        let p1 = resolve_or_freeze_system_prompt(
+            &conn,
+            &s,
+            &[],
+            "standard",
+            Some("## 静态约束"),
+            None,
+            || Some("初始技术大盘 v1".to_string()),
+        );
+        assert!(p1.contains("初始技术大盘 v1"));
+
+        // 第 2 轮：即使磁盘上的 Memory 被 record_memory 更新成 v2，显式配置未变时仍字节级复用 v1（绝不调用 load_memory）
+        let p2 = resolve_or_freeze_system_prompt(
+            &conn,
+            &s,
+            &[],
+            "standard",
+            Some("## 静态约束"),
+            None,
+            || panic!("命中冻结基线时不应重复读取磁盘 memory"),
+        );
+        assert_eq!(p1, p2, "动态记忆更新后同会话 messages[0] 必须保持 100% 字节级一致");
+
+        // 第 3 轮：当用户显式修改配置（如禁用 SOP）时，应触发指纹失效并载入最新记忆重建基线
+        let p3 = resolve_or_freeze_system_prompt(
+            &conn,
+            &s,
+            &["todo_first_gate".to_string()],
+            "standard",
+            Some("## 静态约束"),
+            None,
+            || Some("更新后技术大盘 v2".to_string()),
+        );
+        assert!(p3.contains("更新后技术大盘 v2"));
+        assert_ne!(p1, p3);
     }
 }
