@@ -96,13 +96,17 @@ pub fn resolve_session_context_limit(
         crate::models::resolve_active_model(settings).map(|(p, m)| (p.id.clone(), m.to_string()))
     };
 
-    if let Some((pid, model)) = resolved_model {
+    let model_limit = if let Some((pid, model)) = resolved_model {
         settings.resolve_context_limit(Some(&pid), &model)
     } else if settings.context_token_limit > 0 {
         settings.context_token_limit
     } else {
         64_000
-    }
+    };
+
+    // 实用安全水位封顶：在未显式为特定会话设置 context_token_limit 时，
+    // 治理引擎将有效上限封顶在 64,000 Tokens（75% 触发线为 48,000），杜绝 800k 超大上限导致自动压缩机制彻底哑火
+    model_limit.min(64_000)
 }
 
 /// 解析会话关联的大模型调用配置
@@ -523,39 +527,56 @@ pub async fn propose_and_execute_compaction(
         timeout_seconds: timeout_secs,
     };
 
-    state.compactions.lock().insert(
-        event_id.clone(),
-        crate::PendingCompaction {
-            session_id: session_id.to_string(),
-            tx,
-        },
-    );
-
-    state
-        .snapshot
-        .set_pending_compaction(session_id, Some(req.clone()));
-    state.emit("compaction:request", &req);
-
-    // 等待用户确认（默认阻塞等待 30 秒；超时自动应用）
-    let decision = match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
-        Ok(Ok(d)) => {
-            state.snapshot.set_pending_compaction(session_id, None);
-            d
+    let is_running = crate::agent::is_run_active(state, session_id);
+    let decision = if is_running {
+        // 自治执行态自动压缩：直接应用生成的结构化摘要，零等待零阻塞继续运行
+        state.emit(
+            "compaction:auto_applied",
+            &json!({
+                "eventId": event_id,
+                "sessionId": session_id,
+                "summary": initial_summary,
+            }),
+        );
+        CompactionDecision {
+            approved: true,
+            final_summary: initial_summary.clone(),
         }
-        _ => {
-            state.compactions.lock().remove(&event_id);
-            state.snapshot.set_pending_compaction(session_id, None);
-            state.emit(
-                "compaction:timeout",
-                &json!({
-                    "eventId": event_id,
-                    "sessionId": session_id,
-                    "autoApplied": true,
-                }),
-            );
-            CompactionDecision {
-                approved: true,
-                final_summary: initial_summary.clone(),
+    } else {
+        state.compactions.lock().insert(
+            event_id.clone(),
+            crate::PendingCompaction {
+                session_id: session_id.to_string(),
+                tx,
+            },
+        );
+
+        state
+            .snapshot
+            .set_pending_compaction(session_id, Some(req.clone()));
+        state.emit("compaction:request", &req);
+
+        // 等待用户确认（默认阻塞等待 30 秒；超时自动应用）
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+            Ok(Ok(d)) => {
+                state.snapshot.set_pending_compaction(session_id, None);
+                d
+            }
+            _ => {
+                state.compactions.lock().remove(&event_id);
+                state.snapshot.set_pending_compaction(session_id, None);
+                state.emit(
+                    "compaction:timeout",
+                    &json!({
+                        "eventId": event_id,
+                        "sessionId": session_id,
+                        "autoApplied": true,
+                    }),
+                );
+                CompactionDecision {
+                    approved: true,
+                    final_summary: initial_summary.clone(),
+                }
             }
         }
     };

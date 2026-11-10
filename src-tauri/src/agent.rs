@@ -1608,7 +1608,6 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
     let mut modified_files: Vec<String> = Vec::new();
     let mut sop_retry_count = 0usize;
     let mut tool_tracker = ToolErrorTracker::new(2);
-    let mut has_checked_compaction = false;
     let mut created_plan_in_this_turn = false;
     let mut _step = 0usize;
     let reached_max_steps;
@@ -1732,8 +1731,8 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         }
         let current_sys = &sys;
 
-        // ---- 步骤 0：在首步或上下文逼近上限时检测是否触发自动压缩与确认 ----
-        if !has_checked_compaction {
+        // ---- 步骤 0：在首步或每 5 步检测是否触发阶段性自动压缩（实用安全水位检测） ----
+        if _step == 0 || _step % 5 == 0 {
             let compacted = check_and_trigger_compaction(
                 app,
                 &state,
@@ -1746,7 +1745,6 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             if compacted {
                 let _ = app.emit("session:compacted", json!({ "sessionId": session_id }));
             }
-            has_checked_compaction = true;
         }
 
         // ---- 步骤 1/2：组装上下文（含运行中被"引导"注入的新消息） ----
@@ -1794,31 +1792,8 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             }
         }
 
-        // 临界步数倒计时收敛提醒：当步数接近上限时注入高优先级系统收敛提示，防止达到 maxSteps 硬性强杀导致无输出
-        let remaining_steps = current_max_steps.saturating_sub(_step);
-        if remaining_steps <= 2 && current_max_steps > 2 {
-            let limit_label = format!("最大步数上限（{current_max_steps}）");
-            let warn_content = format!(
-                "【⚠️ 临界步数紧急预警：当前仅剩最后 {remaining_steps} 步，即将达到{limit_label}！严禁继续调用任何探索、排查或读取类工具！必须立即根据目前已掌握的所有信息，按规定结构化格式输出最终总结与交付回复！】"
-            );
-            messages.push(json!({
-                "role": "user",
-                "content": warn_content,
-            }));
-        }
-
-        // 每 10 步后台无痕预算感知敲钟提醒（不落库，界面无垃圾气泡，仅供模型单轮感知预算收敛）
-        if _step > 0 && _step % 10 == 0 && remaining_steps > 2 {
-            let role_label = if is_subagent { "专职子任务" } else { "主对话任务" };
-            let reminder = format!(
-                "【⏱️ 步数预算感知】：当前{}已执行 {}/{} 步（剩余 {} 步预算）。请严格收敛工作，优先完成核心交付目标，避免非必要发散；若阶段目标已达成，请尽快输出交付成果。",
-                role_label, _step, current_max_steps, remaining_steps
-            );
-            messages.push(json!({
-                "role": "user",
-                "content": reminder,
-            }));
-        }
+        // 注：步数预算感知与临界预警已统一挂载至 Tool 结果并落库持久化，
+        // 彻底根除内存临时注入导致的「下一轮凭空消失」与 Prefix Cache 击穿。
 
         // ---- 步骤 3：流式调用 LLM（先预占 assistant 消息位，供增量事件引用） ----
         let step_start = Instant::now();
@@ -2332,7 +2307,8 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             }
         }
 
-        for tc in &tcs {
+        let total_tcs = tcs.len();
+        for (tc_idx, tc) in tcs.iter().enumerate() {
             let ctc = tools::CanonicalToolCall::from_raw(&tc.id, &tc.name, &tc.args);
 
             let is_modifying = ctc.name == "write_file"
@@ -2474,7 +2450,25 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
             } else {
                 None
             };
-            let normalized_result = crate::context::normalize_tool_output_for_ingress(&ctc.name, &result_text);
+            let mut normalized_result = crate::context::normalize_tool_output_for_ingress(&ctc.name, &result_text);
+
+            // 步数预算感知与临界预警：仅挂载至本轮最后一个工具执行结果，保证落库持久化且前缀严格不可变
+            if tc_idx + 1 == total_tcs {
+                let next_step = _step + 1;
+                let remaining_steps = current_max_steps.saturating_sub(next_step);
+                if remaining_steps <= 2 && current_max_steps > 2 {
+                    let limit_label = format!("最大步数上限（{current_max_steps}）");
+                    normalized_result.push_str(&format!(
+                        "\n\n【⚠️ 临界步数紧急预警：当前仅剩最后 {remaining_steps} 步，即将达到{limit_label}！严禁继续调用任何探索、排查或读取类工具！必须立即根据目前已掌握的所有信息，按规定结构化格式输出最终总结与交付回复！】"
+                    ));
+                } else if next_step > 0 && next_step % 10 == 0 && remaining_steps > 2 {
+                    let role_label = if is_subagent { "专职子任务" } else { "主对话任务" };
+                    normalized_result.push_str(&format!(
+                        "\n\n【⏱️ 步数预算感知】：当前{}已执行 {}/{} 步（剩余 {} 步预算）。请严格收敛工作，优先完成核心交付目标，避免非必要发散；若阶段目标已达成，请尽快输出交付成果。",
+                        role_label, next_step, current_max_steps, remaining_steps
+                    ));
+                }
+            }
             let tool_msg = state.with_session_db(session_id, |conn| {
                 let r = store::new_message_with_attachments(conn, session_id, "tool", Some(normalized_result), tool_attachments, false, None);
                 if let Ok(ref m) = r {

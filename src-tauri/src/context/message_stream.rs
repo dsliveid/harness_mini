@@ -28,7 +28,8 @@ fn truncate_preview(s: &str, max_chars: usize) -> String {
 /// 1. messages[0] 为纯静态 System Prompt；
 /// 2. 历史消息（User/Assistant/Tool）严格保持 Append-only，废除事后篡改；
 /// 3. 用户消息附带其产生时刻冻结的 runtime_anchor，保证多轮次间前缀 100% 字节级一致；
-/// 4. 仅在极端 token 压力（超 80% 水位）时才对远期历史实施保护性收敛。
+/// 4. 工具输出入库即定型，消息流装配绝不就地二次滑动折叠，保护全量 Prefix Cache；
+/// 5. 仅在极端 token 压力（超 token_limit 水位）时才对远期历史实施轮次级原子裁切。
 pub fn assemble_execution_context(
     conn: &Connection,
     session_id: &str,
@@ -235,172 +236,11 @@ pub fn assemble_execution_context(
         }
     }
 
-    // ---- 动态上下文感知工具输出语义分级滑动衰减 (Tiered Ephemeral Horizon) ----
-    // 核心准则：
-    // 1. 滑动保护窗放宽至最近 10 步 (Horizon = 10)，近 10 步内所有工具结果 100% 完整原貌；
-    // 2. 超 10 步历史工具实施语义分级衰减：
-    //    - 参考类工具 (read_file <= 5000 字符)：100% 永久保持原文，小文件免衰减；
-    //    - 超大参考类工具 (read_file > 5000 字符)：温和收敛至 2,000 字符核心骨架（头 1200 + 尾 800）；
-    //    - 瞬态工具 (run_command / grep / list_dir / glob / browser 等 > 2500 字符)：
-    //      非对称折叠至 2,500 字符（头 500 + 尾 2000 报错栈底与退出诊断）；
-    // 3. 活跃轮次 (is_active) 绝对保护不衰减。
-    let safe_threshold = token_limit * 80 / 100;
-    {
-        struct ToolInvocation {
-            index: usize,
-            tool_name: String,
-        }
-
-        struct AssistantToolGroup {
-            assistant_idx: usize,
-            tools: Vec<ToolInvocation>,
-            is_active: bool,
-        }
-
-        fn fold_tool_output(tool_name: &str, text: &str) -> Option<String> {
-            if tool_name == "read_file" {
-                if text.len() > 5000 {
-                    let head_safe = text.char_indices().nth(1200).map(|(i, _)| i).unwrap_or(1200.min(text.len()));
-                    let total_chars = text.chars().count();
-                    let tail_start_char = total_chars.saturating_sub(800);
-                    let tail_safe = text.char_indices().nth(tail_start_char).map(|(i, _)| i).unwrap_or(text.len().saturating_sub(800));
-                    Some(format!(
-                        "{}\n\n...[历史参考文件已温和收敛（原始共 {} 字符，保留骨架与核心签名），如需精读特定区域请调用 read_file 指定行号]...\n\n{}",
-                        &text[..head_safe],
-                        text.len(),
-                        &text[tail_safe..]
-                    ))
-                } else {
-                    None
-                }
-            } else {
-                if text.len() > 2500 {
-                    let head_safe = text.char_indices().nth(500).map(|(i, _)| i).unwrap_or(500.min(text.len()));
-                    let total_chars = text.chars().count();
-                    let tail_start_char = total_chars.saturating_sub(2000);
-                    let tail_safe = text.char_indices().nth(tail_start_char).map(|(i, _)| i).unwrap_or(text.len().saturating_sub(2000));
-                    Some(format!(
-                        "{}\n\n...[历史工具输出过长（原始共 {} 字符，已折叠中间日志，保留首尾关键输出与退出诊断）]...\n\n{}",
-                        &text[..head_safe],
-                        text.len(),
-                        &text[tail_safe..]
-                    ))
-                } else {
-                    None
-                }
-            }
-        }
-
-        fn apply_decay(msg: &mut Value, tool_name: &str, est: &mut usize) {
-            if let Some(content_str) = msg.get("content").and_then(|v| v.as_str()).map(|s| s.to_string()) {
-                if let Some(slimmed) = fold_tool_output(tool_name, &content_str) {
-                    let old_tokens = estimate_tokens(&content_str);
-                    let new_tokens = estimate_tokens(&slimmed);
-                    *est = est.saturating_sub(old_tokens).saturating_add(new_tokens);
-                    msg["content"] = Value::String(slimmed);
-                }
-            } else if let Some(arr) = msg.get_mut("content").and_then(|v| v.as_array_mut()) {
-                if let Some(first) = arr.first_mut() {
-                    if first.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        if let Some(text) = first.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()) {
-                            if let Some(slimmed) = fold_tool_output(tool_name, &text) {
-                                let old_tokens = estimate_tokens(&text);
-                                let new_tokens = estimate_tokens(&slimmed);
-                                *est = est.saturating_sub(old_tokens).saturating_add(new_tokens);
-                                first["text"] = Value::String(slimmed);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut groups: Vec<AssistantToolGroup> = Vec::new();
-        let mut curr_group: Option<AssistantToolGroup> = None;
-        let mut id_to_name: HashMap<String, String> = HashMap::new();
-
-        for (idx, m) in out.iter().enumerate() {
-            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-            if role == "assistant" {
-                if let Some(g) = curr_group.take() {
-                    groups.push(g);
-                }
-                let has_tools = m
-                    .get("tool_calls")
-                    .and_then(|tc| tc.as_array())
-                    .map(|a| !a.is_empty())
-                    .unwrap_or(false);
-                if has_tools {
-                    if let Some(tcs) = m.get("tool_calls").and_then(|tc| tc.as_array()) {
-                        for tc in tcs {
-                            if let (Some(id), Some(name)) = (
-                                tc.get("id").and_then(|v| v.as_str()),
-                                tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()),
-                            ) {
-                                id_to_name.insert(id.to_string(), name.to_string());
-                            }
-                        }
-                    }
-                    curr_group = Some(AssistantToolGroup {
-                        assistant_idx: idx,
-                        tools: Vec::new(),
-                        is_active: false,
-                    });
-                }
-            } else if role == "tool" {
-                if let Some(ref mut g) = curr_group {
-                    let call_id = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
-                    let tool_name = id_to_name.get(call_id).cloned().unwrap_or_default();
-                    g.tools.push(ToolInvocation {
-                        index: idx,
-                        tool_name,
-                    });
-                }
-            } else if role == "user" {
-                if let Some(g) = curr_group.take() {
-                    groups.push(g);
-                }
-            }
-        }
-        if let Some(g) = curr_group.take() {
-            groups.push(g);
-        }
-
-        if let Some(last_g) = groups.last_mut() {
-            if last_g.assistant_idx + last_g.tools.len() + 1 == out.len() {
-                last_g.is_active = true;
-            }
-        }
-
-        let recent_cutoff = groups.len().saturating_sub(10);
-
-        // 阶段 1：对超过最近 10 组前的远期历史工具组执行语义分级滑动衰减
-        for g in groups.iter().take(recent_cutoff) {
-            for item in &g.tools {
-                apply_decay(&mut out[item.index], &item.tool_name, &mut est);
-            }
-        }
-
-        // 阶段 2：若远期折叠后总 Token 仍然超出安全水位 (80%)，允许对近期非活跃瞬态工具实施同样折叠（保护 read_file 与 is_active）
-        if est > safe_threshold {
-            for g in groups.iter().skip(recent_cutoff) {
-                if g.is_active {
-                    continue;
-                }
-                for item in &g.tools {
-                    if est <= safe_threshold {
-                        break;
-                    }
-                    if item.tool_name != "read_file" {
-                        apply_decay(&mut out[item.index], &item.tool_name, &mut est);
-                    }
-                }
-                if est <= safe_threshold {
-                    break;
-                }
-            }
-        }
-    }
+    // ★ 核心架构准则：不可变执行上下文（Immutable Execution Context） ★
+    // 1. 工具结果在初次入库时已由 ingress_normalizer 结构化定型；
+    // 2. 装配消息流时终生保持只读不可变，严禁在单轮多步执行中进行任何就地滑动篡改，确保服务端 Prefix Cache 100% 字节级命中；
+    // 3. 超长会话的宏观瘦身由治理引擎（governance::propose_and_execute_compaction）在阶段检查点生成结构化备忘，
+    //    或由下方的「轮次级原子截断防护」在超出极限物理水位时做整轮安全裁切。
 
     // ---- 轮次级原子截断防护（Turn-based Atomic Pruning） ----
     let mut notice: Option<TruncationNotice> = None;
@@ -482,7 +322,7 @@ mod tests {
     use rusqlite::Connection;
 
     #[test]
-    fn test_tool_decay_10_step_horizon_and_tiered_rules() {
+    fn test_tool_results_immutable_across_steps() {
         let conn = Connection::open_in_memory().unwrap();
         store::init_schema(&conn).unwrap();
         let s = store::create_session(&conn, "D:\\workspace", None, "衰减测试", "confirm").unwrap();
@@ -557,25 +397,16 @@ mod tests {
         let (msgs, _, _) = assemble_execution_context(&conn, &s.id, "sys", 128000);
         let msgs = msgs.unwrap();
 
-        // 验证 Step 1 (t1, read_file short): 必须 100% 完整保留！
+        // 验证不可变前缀准则：所有工具结果（无论距当前步多远）均 100% 完整保留原文，杜绝中途折叠篡改引发 Prefix Cache 击穿
         let t1_msg = msgs.iter().find(|m| m.get("tool_call_id").and_then(|v| v.as_str()) == Some("call_1")).unwrap();
-        assert_eq!(t1_msg["content"].as_str().unwrap(), &short_code, "read_file <= 5000 字符必须 100% 免疫衰减");
+        assert_eq!(t1_msg["content"].as_str().unwrap(), &short_code, "短文件工具输出保持原文");
 
-        // 验证 Step 2 (t2, read_file long): 必须包含温和收敛标记，且保留首尾骨架
         let t2_msg = msgs.iter().find(|m| m.get("tool_call_id").and_then(|v| v.as_str()) == Some("call_2")).unwrap();
-        let t2_content = t2_msg["content"].as_str().unwrap();
-        assert!(t2_content.contains("历史参考文件已温和收敛"), "超大 read_file 必须温和收敛");
-        assert!(t2_content.len() < long_code.len(), "超大文件必须被削减");
-        assert!(t2_content.contains("pub fn large_module_feature_code_block"), "必须保留代码头部骨架");
+        assert_eq!(t2_msg["content"].as_str().unwrap(), &long_code, "长代码工具输出保持原文不可变");
 
-        // 验证 Step 3 (t3, run_command long log): 必须非对称保留头部与尾部报错
         let t3_msg = msgs.iter().find(|m| m.get("tool_call_id").and_then(|v| v.as_str()) == Some("call_3")).unwrap();
-        let t3_content = t3_msg["content"].as_str().unwrap();
-        assert!(t3_content.contains("历史工具输出过长"), "超过 2500 字符的瞬态工具必须折叠");
-        assert!(t3_content.contains("cargo build --verbose"), "必须保留头部 500 字符的执行入口");
-        assert!(t3_content.contains("FAIL: 1 test failed"), "必须保留尾部 2000 字符的退出诊断与错误栈底");
+        assert_eq!(t3_msg["content"].as_str().unwrap(), &long_log, "编译日志工具输出保持原文不可变");
 
-        // 验证最近 10 步内的工具（如 call_11）：100% 完整无衰减
         let t13_msg = msgs.iter().find(|m| m.get("tool_call_id").and_then(|v| v.as_str()) == Some("call_13")).unwrap();
         assert_eq!(t13_msg["content"].as_str().unwrap(), "dir output for step 13");
     }
