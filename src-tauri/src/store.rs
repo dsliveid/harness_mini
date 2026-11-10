@@ -4484,6 +4484,80 @@ pub fn get_tool_event_with_session(conn: &Connection, event_id: &str) -> Result<
     }
 }
 
+/// 获取单条消息的 seq
+pub fn get_message_seq(conn: &Connection, message_id: &str) -> Result<Option<i64>, String> {
+    conn.query_row(
+        "SELECT seq FROM messages WHERE id = ?1",
+        params![message_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+/// 获取会话当前轮次（最后一条未撤回且非排队的用户消息）的起始 seq；若无用户消息返回 0
+pub fn current_turn_min_seq(conn: &Connection, session_id: &str) -> i64 {
+    conn.query_row(
+        "SELECT seq FROM messages
+         WHERE session_id = ?1 AND role = 'user' AND reverted_at IS NULL AND queued = 0
+         ORDER BY seq DESC LIMIT 1",
+        params![session_id],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// 查询指定 seq 下界内（默认全会话）最新一条未撤回且成功的 todo 工具事件及其宿主消息 seq
+pub fn latest_todo_tool_event(
+    conn: &Connection,
+    session_id: &str,
+    min_seq: Option<i64>,
+) -> Result<Option<(ToolEvent, i64)>, String> {
+    let min_seq = min_seq.unwrap_or(0);
+    let mut stmt = conn
+        .prepare(
+            "SELECT te.id, te.message_id, te.tool_name, te.tool_call_id, te.params_json, te.result_text, te.status, te.approval_scope, te.created_at, te.subprocess_id,
+                    (SELECT reverted_at FROM tool_file_snapshots WHERE tool_event_id = te.id ORDER BY rowid DESC LIMIT 1),
+                    m.seq
+             FROM tool_events te
+             JOIN messages m ON te.message_id = m.id
+             WHERE m.session_id = ?1
+               AND m.seq >= ?2
+               AND m.reverted_at IS NULL
+               AND te.tool_name = 'todo'
+               AND te.status = 'success'
+             ORDER BY m.seq DESC, te.created_at DESC
+             LIMIT 1",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query_map(params![session_id, min_seq], |r| {
+            let pj: String = r.get(4)?;
+            let ev = ToolEvent {
+                id: r.get(0)?,
+                message_id: r.get(1)?,
+                tool_name: r.get(2)?,
+                tool_call_id: r.get(3)?,
+                params: serde_json::from_str(&pj).unwrap_or(serde_json::Value::Null),
+                result_text: r.get(5)?,
+                status: r.get(6)?,
+                approval_scope: r.get(7)?,
+                created_at: r.get(8)?,
+                subprocess_id: r.get(9)?,
+                reverted_at: r.get(10)?,
+            };
+            let msg_seq: i64 = r.get(11)?;
+            Ok((ev, msg_seq))
+        })
+        .map_err(|e| e.to_string())?;
+
+    if let Some(r) = rows.next() {
+        r.map(Some).map_err(|e| e.to_string())
+    } else {
+        Ok(None)
+    }
+}
+
 /// 全部运行中的 run（跨会话）：前端界面刷新后据此恢复各会话的运行状态
 pub fn all_running_runs(conn: &Connection) -> Result<Vec<(String, String)>, String> {
     let mut stmt = conn
@@ -6509,46 +6583,6 @@ pub fn collect_active_snapshot_hashes(conn: &Connection) -> Result<std::collecti
     }
 
     Ok(hashes)
-}
-
-/// 在撤回或重做消息后，将 session_kv 中的 "todos" 同步回溯到会话中最近一个未被撤回的 todo 工具事件
-pub fn sync_session_todos_after_revert(
-    conn: &Connection,
-    session_id: &str,
-) -> Result<Option<serde_json::Value>, String> {
-    let raw_params: Option<String> = conn
-        .query_row(
-            "SELECT te.params_json
-             FROM tool_events te
-             JOIN messages m ON te.message_id = m.id
-             WHERE m.session_id = ?1
-               AND m.reverted_at IS NULL
-               AND te.tool_name = 'todo'
-               AND te.status = 'success'
-             ORDER BY m.seq DESC, te.created_at DESC
-             LIMIT 1",
-            params![session_id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?
-        .flatten();
-
-    if let Some(ref params_str) = raw_params {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(params_str) {
-            if let Some(todos_arr) = val.get("todos") {
-                let _ = set_kv(conn, session_id, "todos", params_str);
-                return Ok(Some(todos_arr.clone()));
-            }
-        }
-    }
-
-    // 若当前会话中已经没有任何未撤回的有效 todo 事件，清理 session_kv 中的 todos
-    let _ = conn.execute(
-        "DELETE FROM session_kv WHERE session_id = ?1 AND key = 'todos'",
-        params![session_id],
-    );
-    Ok(Some(serde_json::json!([])))
 }
 
 /// 多维度查询全景活动日志（工具调用、对话消息、系统通知）与异常审计记录

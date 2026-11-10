@@ -913,10 +913,12 @@ function TodoList({
   todos,
   isRunning,
   lastRunOutcome,
+  isCurrentTurn,
 }: {
   todos: any[];
   isRunning: boolean;
   lastRunOutcome?: string;
+  isCurrentTurn?: boolean;
 }) {
   const isAbnormalStop =
     lastRunOutcome === "cancelled" ||
@@ -927,9 +929,11 @@ function TodoList({
   return (
     <div className="flex flex-col gap-1.5 py-1.5 pl-5">
       {todos.map((t, i) => {
+        // 历史轮次忠实信任数据库持久化状态，避免被后续新轮次的全局状态误覆写
         const isDone =
           t.status === "done" ||
-          (!isRunning &&
+          (isCurrentTurn !== false &&
+            !isRunning &&
             !isAbnormalStop &&
             (t.status === "in_progress" || t.status === "pending" || i === todos.length - 1));
         const inProgress = t.status === "in_progress" && isRunning;
@@ -1618,7 +1622,15 @@ export function resolveEffectiveTool(ev: ToolEvent): EffectiveToolInfo {
   };
 }
 
-export function ToolCard({ ev }: { ev: ToolEvent }) {
+export function ToolCard({
+  ev,
+  isTurnRunning,
+  isCurrentTurn,
+}: {
+  ev: ToolEvent;
+  isTurnRunning?: boolean;
+  isCurrentTurn?: boolean;
+}) {
   const effective = resolveEffectiveTool(ev);
   const normalizedEv: ToolEvent = effective.isExtended
     ? {
@@ -1637,7 +1649,8 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
   const killCommand = useStore((s) => s.killCommand);
   const pushToast = useStore((s) => s.pushToast);
   const setLightboxImage = useStore((s) => s.setLightboxImage);
-  const isRunning = useStore((s) => (s.currentId ? s.runStatus[s.currentId] === "running" : false));
+  const storeIsRunning = useStore((s) => (s.currentId ? s.runStatus[s.currentId] === "running" : false));
+  const isRunning = isTurnRunning !== undefined ? isTurnRunning : storeIsRunning;
   const lastRunOutcome = useStore((s) => (s.currentId ? s.lastRunOutcome[s.currentId] : undefined));
   const [terminating, setTerminating] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -2255,7 +2268,12 @@ export function ToolCard({ ev }: { ev: ToolEvent }) {
       </div>
 
       {effective.name === "todo" && Array.isArray(effective.params?.todos) && (
-        <TodoList todos={effective.params.todos} isRunning={isRunning} lastRunOutcome={lastRunOutcome} />
+        <TodoList
+          todos={effective.params.todos}
+          isRunning={isRunning}
+          lastRunOutcome={lastRunOutcome}
+          isCurrentTurn={isCurrentTurn}
+        />
       )}
 
       {/* 展开时：若是方案计划工具，展示专用计划卡片 */}

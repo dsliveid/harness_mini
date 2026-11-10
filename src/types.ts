@@ -836,6 +836,7 @@ export interface TurnMetrics {
   stepIndex?: number;
   turnStartTime: number;
   isCurrentRunningTurn: boolean;
+  isLatestTurn?: boolean;
 }
 
 /**
@@ -946,6 +947,7 @@ export function computeTurnMetrics(messages: Message[], running: boolean): Map<s
         stepIndex: i + 1,
         turnStartTime,
         isCurrentRunningTurn: isCurrentRunning && isTurnEnd,
+        isLatestTurn: isLastTurn,
       });
     }
   };
@@ -1749,6 +1751,7 @@ export interface ActiveStepState {
   runId: string;
   stepIndex: number;
   messageId: string;
+  seq?: number;
   phase: StepPhase;
   updatedAtMs: number;
 }

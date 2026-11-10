@@ -1,6 +1,6 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::Emitter;
@@ -394,30 +394,6 @@ fn available_plans_hint(
     }
 }
 
-/// 同步计划步骤至 session_kv 中的 "todos"
-pub fn sync_steps_to_todos(
-    conn: Option<&rusqlite::Connection>,
-    session_id: &str,
-    steps: &[PlanStep],
-) {
-    if let Some(db) = conn {
-        if steps.is_empty() {
-            return;
-        }
-        let todos_val: Vec<Value> = steps
-            .iter()
-            .map(|s| {
-                json!({
-                    "content": s.content,
-                    "status": s.status
-                })
-            })
-            .collect();
-        let payload = json!({ "todos": todos_val });
-        let _ = crate::store::set_kv(db, session_id, "todos", &payload.to_string());
-    }
-}
-
 /// 计划创建影响详情（用于 CAS 影子快照与撤回恢复）
 #[derive(Debug, Clone)]
 pub struct PlanEffect {
@@ -565,10 +541,6 @@ pub fn create_plan_with_effect(
 
     // 绑定当前会话的 active_plan_id
     set_active_plan_id(conn, session_id, Some(&plan_id))?;
-
-    // 同步步骤到 todo 队列
-    let parsed_steps = parse_steps_from_markdown(&body);
-    sync_steps_to_todos(conn, session_id, &parsed_steps);
 
     let (suspended_plan_rel, suspended_old_bytes, suspended_new_bytes) = match suspended_info {
         Some((rel, ob, nb)) => (Some(rel), ob, Some(nb)),
@@ -814,10 +786,6 @@ pub fn update_plan_with_effect(
     fs::write(&file_path, &full_content)
         .map_err(|e| format!("更新计划文件失败: {e}"))?;
 
-    // 同步更新后的步骤到 todo
-    let steps = parse_steps_from_markdown(&body);
-    sync_steps_to_todos(conn, session_id, &steps);
-
     let status_desc = match meta.status.as_str() {
         "completed" => "已完成验收并解除活动挂载",
         "suspended" => "已挂起",
@@ -933,10 +901,6 @@ pub fn update_plan_step_status(
     let full_content = format_with_frontmatter(&meta, &new_body);
     fs::write(&file_path, full_content).map_err(|e| format!("写入任务方案文件失败: {e}"))?;
 
-    // 同步步骤到 todo 队列
-    let parsed_steps = parse_steps_from_markdown(&new_body);
-    sync_steps_to_todos(conn, &meta.session_id, &parsed_steps);
-
     Ok(())
 }
 
@@ -1030,10 +994,6 @@ pub fn switch_plan(
 
     // 绑定当前 active_plan_id
     set_active_plan_id(conn, session_id, Some(&target_meta.id))?;
-
-    // 同步步骤到 todo 队列
-    let steps = parse_steps_from_markdown(&target_body);
-    sync_steps_to_todos(conn, session_id, &steps);
 
     let filename = target_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     Ok(format!(
@@ -1260,29 +1220,10 @@ fn query_turn_latest_todo(
     session_id: &str,
     min_seq: i64,
 ) -> Option<LatestTodoRecord> {
-    use rusqlite::OptionalExtension;
-    let row: Option<(String, String, i64, String, String)> = conn
-        .query_row(
-            "SELECT te.id, m.id, m.seq, te.params_json, te.created_at
-             FROM tool_events te
-             JOIN messages m ON te.message_id = m.id
-             WHERE m.session_id = ?1
-               AND m.seq >= ?2
-               AND m.reverted_at IS NULL
-               AND te.tool_name = 'todo'
-               AND te.status = 'success'
-             ORDER BY m.seq DESC, te.created_at DESC
-             LIMIT 1",
-            rusqlite::params![session_id, min_seq],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        )
-        .optional()
+    let (ev, seq) = crate::store::latest_todo_tool_event(conn, session_id, Some(min_seq))
         .ok()
-        .flatten();
-
-    let (event_id, message_id, seq, params_str, created_at) = row?;
-    let val: serde_json::Value = serde_json::from_str(&params_str).ok()?;
-    let arr = val.get("todos")?.as_array()?;
+        .flatten()?;
+    let arr = ev.params.get("todos")?.as_array()?;
     if arr.is_empty() {
         return None;
     }
@@ -1297,11 +1238,11 @@ fn query_turn_latest_todo(
         });
     }
     Some(LatestTodoRecord {
-        event_id,
-        message_id,
+        event_id: ev.id,
+        message_id: ev.message_id,
         seq,
         items,
-        created_at,
+        created_at: ev.created_at,
     })
 }
 
@@ -1455,20 +1396,8 @@ pub fn derive_current_board(
         return None;
     }
 
-    // 1. 获取当前会话最新一条未撤回的用户消息序号（当前轮次的起点）
-    let last_user_seq: Option<i64> = conn
-        .query_row(
-            "SELECT seq FROM messages 
-             WHERE session_id = ?1 AND role = 'user' AND reverted_at IS NULL 
-             ORDER BY seq DESC LIMIT 1",
-            rusqlite::params![session_id],
-            |r| r.get(0),
-        )
-        .ok();
-
-    // 若会话存在用户消息，以最后一条用户消息的 seq 为本轮视界起点；
-    // 若会话暂无用户消息（例如自动化子任务或测试数据），则以 0 为起点，确保兼容
-    let min_seq = last_user_seq.unwrap_or(0);
+    // 1. 获取当前会话最新一条未撤回且非排队的用户消息序号（当前轮次的起点）
+    let min_seq = crate::store::current_turn_min_seq(conn, session_id);
 
     // 2. 查询本轮（seq >= min_seq）内产生的最新有效 Todo
     let latest_turn_todo = query_turn_latest_todo(conn, session_id, min_seq);
@@ -1879,6 +1808,7 @@ pub fn sync_session_plans_after_revert(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     struct TempDir(PathBuf);
     impl TempDir {

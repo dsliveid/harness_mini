@@ -439,16 +439,54 @@ function upsertMessage(list: Message[], m: Message): Message[] {
   return sortMessages(next);
 }
 
-function upsertToolEvent(list: Message[], ev: ToolEvent, sessionId: string): Message[] {
-  let idx = list.findIndex((m) => m.id === ev.messageId);
-  let msg: Message;
+export interface UpsertToolEventContext {
+  isRunning?: boolean;
+  messagesLoaded?: boolean;
+  activeStep?: ActiveStepState | null;
+  messageSeq?: number;
+}
+
+export function upsertToolEvent(
+  list: Message[],
+  ev: ToolEvent,
+  sessionId: string,
+  ctx?: UpsertToolEventContext
+): Message[] {
+  const idx = list.findIndex((m) => m.id === ev.messageId);
   if (idx < 0) {
+    const activeStep = ctx?.activeStep;
+    const matchesActiveStep = Boolean(activeStep && activeStep.messageId === ev.messageId);
+    const msgSeq =
+      typeof ctx?.messageSeq === "number"
+        ? ctx.messageSeq
+        : matchesActiveStep && typeof activeStep?.seq === "number"
+        ? activeStep.seq
+        : undefined;
+
+    // 1. 分页窗口外历史消息保护：若已知宿主消息 seq 小于当前已加载窗口首条消息 seq，
+    //    说明事件属于更早未加载轮次，绝不在时间线尾部伪造占位消息。
+    if (msgSeq !== undefined && list.length > 0 && msgSeq < list[0].seq) {
+      return list;
+    }
+
+    // 2. 非活跃/未加载会话保护：仅当会话正在运行且匹配当前活跃步骤或正在运行/审批的工具时才允许占位
+    const isActiveStreaming =
+      matchesActiveStep ||
+      (Boolean(ctx?.isRunning) && (ev.status === "running" || ev.status === "pending_approval"));
+    if (!isActiveStreaming) {
+      return list;
+    }
+    if (ctx?.messagesLoaded === false && !matchesActiveStep) {
+      return list;
+    }
+
     // 模型首次回复即工具调用（无思考/正文增量）时，tool:update 先于消息到达，
-    // 以 messageId 创建占位 assistant 消息承载工具卡片
-    msg = {
+    // 以 messageId 创建占位 assistant 消息承载工具卡片，并优先复用后端真实 seq 与 runId
+    const msg: Message = {
       id: ev.messageId,
       sessionId,
-      seq: Number.MAX_SAFE_INTEGER,
+      runId: matchesActiveStep ? activeStep?.runId : undefined,
+      seq: msgSeq ?? Number.MAX_SAFE_INTEGER,
       role: "assistant",
       content: "",
       reasoning: null,
@@ -459,7 +497,7 @@ function upsertToolEvent(list: Message[], ev: ToolEvent, sessionId: string): Mes
     return sortMessages([...list, msg]);
   }
   const next = list.slice();
-  msg = { ...next[idx] };
+  const msg = { ...next[idx] };
   const evIdx = msg.toolEvents.findIndex((e) => e.id === ev.id);
   const events = msg.toolEvents.slice();
   if (evIdx >= 0) events[evIdx] = { ...events[evIdx], ...ev };
@@ -504,7 +542,11 @@ function mergeToolEvents(localEvs: ToolEvent[] = [], fetchedEvs: ToolEvent[] = [
  * - 流式占位消息的内容领先于库里定期落库的内容（且可能尚未落库），合并时取较新一侧，避免刷新瞬间文字闪断
  * - 本地独有的消息（正在流式、尚未落库）保持在末尾，所有消息按 seq 强制单调递增排序，杜绝前后倒置
  */
-function mergeSessionMessages(local: Message[] | undefined, fetched: Message[]): Message[] {
+export function mergeSessionMessages(
+  local: Message[] | undefined,
+  fetched: Message[],
+  options?: { isRunning?: boolean; activeMessageId?: string | null }
+): Message[] {
   if (!local || local.length === 0) return sortMessages(fetched);
   const byId = new Map(local.map((m) => [m.id, m]));
   const mergedMap = new Map<string, Message>();
@@ -527,6 +569,10 @@ function mergeSessionMessages(local: Message[] | undefined, fetched: Message[]):
 
   for (const l of local) {
     if (!mergedMap.has(l.id)) {
+      // 未落库的无真实序号尾部占位消息，仅在当前仍处于运行态且命中活跃步时保留
+      if (l.seq === Number.MAX_SAFE_INTEGER && !(options?.isRunning && options?.activeMessageId === l.id)) {
+        continue;
+      }
       mergedMap.set(l.id, l);
     }
   }
@@ -633,10 +679,13 @@ function flushStreamBuffer(
     const list = st.messages[sessionId] ?? [];
     const idx = list.findIndex((m: any) => m.id === messageId);
     if (idx < 0) {
+      const activeStep = st.activeStepMap?.[sessionId];
+      const matchesActive = activeStep?.messageId === messageId;
       const placeholder: Message = {
         id: messageId,
         sessionId,
-        seq: Number.MAX_SAFE_INTEGER,
+        runId: matchesActive ? activeStep.runId : undefined,
+        seq: matchesActive && typeof activeStep.seq === "number" ? activeStep.seq : Number.MAX_SAFE_INTEGER,
         role: "assistant",
         content: contentDelta,
         reasoning: reasoningDelta || null,
@@ -868,9 +917,18 @@ export const useStore = create<Store>((set, get) => ({
           };
         }
 
+        const prevStep = st.activeStepMap[sessionId];
+        const nextStep = activeState.activeStep
+          ? {
+              ...activeState.activeStep,
+              seq:
+                activeState.activeStep.seq ??
+                (prevStep?.messageId === activeState.activeStep.messageId ? prevStep?.seq : undefined),
+            }
+          : null;
         const nextStepMap = {
           ...st.activeStepMap,
-          [sessionId]: activeState.activeStep || null,
+          [sessionId]: nextStep,
         };
 
         const list = st.messages[sessionId] ? [...st.messages[sessionId]] : [];
@@ -1281,7 +1339,13 @@ export const useStore = create<Store>((set, get) => ({
       if (currentToken !== latestSelectSessionToken) return;
 
       set((st) => ({
-        messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], page.messages) },
+        messages: {
+          ...st.messages,
+          [id]: mergeSessionMessages(st.messages[id], page.messages, {
+            isRunning: st.runStatus[id] === "running",
+            activeMessageId: st.activeStepMap[id]?.messageId,
+          }),
+        },
         messagesLoaded: { ...st.messagesLoaded, [id]: true },
         hasMore: { ...st.hasMore, [id]: page.hasMore },
       }));
@@ -1396,7 +1460,13 @@ export const useStore = create<Store>((set, get) => ({
     try {
       const page = await ipc.getSessionTurns(id, oldest, 2);
       set((st) => ({
-        messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], page.messages) },
+        messages: {
+          ...st.messages,
+          [id]: mergeSessionMessages(st.messages[id], page.messages, {
+            isRunning: st.runStatus[id] === "running",
+            activeMessageId: st.activeStepMap[id]?.messageId,
+          }),
+        },
         hasMore: { ...st.hasMore, [id]: page.hasMore },
       }));
     } catch (e) {
@@ -1610,7 +1680,7 @@ export const useStore = create<Store>((set, get) => ({
 
   onStepStarted(p) {
     flushStreamBuffer(get, set);
-    const { sessionId, runId, stepIndex, messageId } = p;
+    const { sessionId, runId, stepIndex, messageId, seq } = p;
     set((st) => ({
       activeStepMap: {
         ...st.activeStepMap,
@@ -1619,6 +1689,7 @@ export const useStore = create<Store>((set, get) => ({
           runId,
           stepIndex,
           messageId,
+          seq: typeof seq === "number" ? seq : undefined,
           phase: { type: "connecting" },
           updatedAtMs: Date.now(),
         },
@@ -1638,6 +1709,7 @@ export const useStore = create<Store>((set, get) => ({
             runId: cur?.runId || "",
             stepIndex: cur?.stepIndex || 0,
             messageId: messageId || cur?.messageId || "",
+            seq: messageId && cur?.messageId && messageId !== cur.messageId ? undefined : cur?.seq,
             phase: {
               type: "tool_preparing",
               callId,
@@ -1716,9 +1788,17 @@ export const useStore = create<Store>((set, get) => ({
 
   onToolUpdate(p) {
     const ev: ToolEvent = p.event;
+    const messageSeq = typeof p.messageSeq === "number" ? p.messageSeq : undefined;
     set((st) => {
       const list = st.messages[p.sessionId] ?? [];
-      return { messages: { ...st.messages, [p.sessionId]: upsertToolEvent(list, ev, p.sessionId) } };
+      const nextList = upsertToolEvent(list, ev, p.sessionId, {
+        isRunning: st.runStatus[p.sessionId] === "running",
+        messagesLoaded: Boolean(st.messagesLoaded[p.sessionId]),
+        activeStep: st.activeStepMap[p.sessionId],
+        messageSeq,
+      });
+      if (nextList === list) return st;
+      return { messages: { ...st.messages, [p.sessionId]: nextList } };
     });
     if (ev.status !== "running" && ev.status !== "pending_approval") {
       set((st) => {
@@ -2305,7 +2385,13 @@ export const useStore = create<Store>((set, get) => ({
     if (id) {
       ipc.getSessionTurns(id, undefined, 2).then((page) => {
         set((st) => ({
-          messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], page.messages) },
+          messages: {
+            ...st.messages,
+            [id]: mergeSessionMessages(st.messages[id], page.messages, {
+              isRunning: st.runStatus[id] === "running",
+              activeMessageId: st.activeStepMap[id]?.messageId,
+            }),
+          },
           messagesLoaded: { ...st.messagesLoaded, [id]: true },
           hasMore: { ...st.hasMore, [id]: page.hasMore },
         }));
@@ -2322,7 +2408,13 @@ export const useStore = create<Store>((set, get) => ({
     if (id) {
       ipc.getSessionTurns(id, undefined, 2).then((page) => {
         set((st) => ({
-          messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], page.messages) },
+          messages: {
+            ...st.messages,
+            [id]: mergeSessionMessages(st.messages[id], page.messages, {
+              isRunning: st.runStatus[id] === "running",
+              activeMessageId: st.activeStepMap[id]?.messageId,
+            }),
+          },
           messagesLoaded: { ...st.messagesLoaded, [id]: true },
           hasMore: { ...st.hasMore, [id]: page.hasMore },
         }));
@@ -2798,7 +2890,14 @@ export const useStore = create<Store>((set, get) => ({
     if (id) {
       ipc.getSessionTurns(id, undefined, 2).then((page) => {
         set((st) => ({
-          messages: { ...st.messages, [id]: mergeSessionMessages(st.messages[id], page.messages) },
+          messages: {
+            ...st.messages,
+            [id]: mergeSessionMessages(st.messages[id], page.messages, {
+              isRunning: st.runStatus[id] === "running",
+              activeMessageId: st.activeStepMap[id]?.messageId,
+            }),
+          },
+          messagesLoaded: { ...st.messagesLoaded, [id]: true },
           hasMore: { ...st.hasMore, [id]: page.hasMore },
         }));
       }).catch((e) => get().pushToast(String(e)));

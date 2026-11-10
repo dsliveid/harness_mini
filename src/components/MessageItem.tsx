@@ -979,7 +979,14 @@ export function MessageItem({
 
           }
 
-          return <ToolCard key={g.id} ev={g.event} />;
+          return (
+            <ToolCard
+              key={g.id}
+              ev={g.event}
+              isTurnRunning={isRunningTurn || Boolean(isProcessStep && running)}
+              isCurrentTurn={turnMetrics?.isLatestTurn}
+            />
+          );
 
         })}
 

@@ -1764,22 +1764,32 @@ pub fn kill_command(
             crate::tools::kill_process_tree(pid);
         }
         let _ = rc.tx.send(());
-    } else {
+    } else if let Some(session_id) = state.find_session_by_tool_event_id(&event_id) {
         // 未在活跃进程表（如历史崩溃/重启遗留、已退出的孤立事件）：
-        // 兜底将数据库中的状态由 running 修正为 failed，并广播 tool:update 给前端移除卡片
-        let db = state.db.lock();
-        if let Ok(Some((mut ev, session_id))) = store::get_tool_event_with_session(&db, &event_id) {
-            if ev.status == "running" || ev.status == "pending_approval" {
-                ev.status = "failed".to_string();
-                let msg = "[控制台进程未在运行，已清理状态]".to_string();
-                ev.result_text = Some(msg.clone());
-                let _ = store::update_tool_event(&db, &ev.id, "failed", Some(&msg), None);
-                drop(db);
-                state.emit(
-                    "tool:update",
-                    &json!({"sessionId": session_id, "event": ev}),
-                );
+        // 从会话专属库兜底修正状态为 failed，并附带 messageSeq 广播 tool:update
+        let updated = state
+            .with_session_db(&session_id, |conn| {
+                let Some((mut ev, _)) = store::get_tool_event_with_session(conn, &event_id)? else {
+                    return Ok(None);
+                };
+                if ev.status == "running" || ev.status == "pending_approval" {
+                    ev.status = "failed".to_string();
+                    let msg = "[控制台进程未在运行，已清理状态]".to_string();
+                    ev.result_text = Some(msg.clone());
+                    let _ = store::update_tool_event(conn, &ev.id, "failed", Some(&msg), None);
+                    let msg_seq = store::get_message_seq(conn, &ev.message_id).ok().flatten();
+                    return Ok(Some((ev, msg_seq)));
+                }
+                Ok(None)
+            })
+            .ok()
+            .flatten();
+        if let Some((ev, msg_seq)) = updated {
+            let mut payload = json!({"sessionId": session_id, "event": ev});
+            if let Some(seq) = msg_seq {
+                payload["messageSeq"] = json!(seq);
             }
+            state.emit("tool:update", &payload);
         }
     }
     Ok(())
@@ -2025,109 +2035,40 @@ pub async fn trigger_compaction(
     .await
 }
 
+/// 兼容 RPC（server.rs）：基于会话权威看板推导只读投影返回当前轮次 todo/plan 步骤，绝不副作用篡改历史事件
 #[tauri::command]
 pub fn get_session_todos(state: State<'_, crate::AppState>, session_id: String) -> Result<Value, String> {
-    let running = is_run_active(&state, &session_id);
-    let db = state.db.lock();
-    let raw: Option<String> = db
-        .query_row(
-            "SELECT value FROM session_kv WHERE session_id = ?1 AND key = 'todos'",
-            rusqlite::params![session_id],
-            |r| r.get(0),
-        )
-        .ok();
-    let mut val: Value = raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
-
-    // 若 session_kv 中未找到，尝试从最近的 todo tool event 中获取
-    if val.is_null() {
-        let ev_params: Option<String> = db
-            .query_row(
-                "SELECT te.params_json FROM tool_events te JOIN messages m ON te.message_id = m.id WHERE m.session_id = ?1 AND te.tool_name = 'todo' ORDER BY te.created_at DESC LIMIT 1",
-                rusqlite::params![session_id],
-                |r| r.get(0),
-            )
+    let workspace_path = {
+        let db = state.db.lock();
+        store::get_session(&db, &session_id)
             .ok()
-            .flatten();
-        if let Some(p) = ev_params {
-            val = serde_json::from_str(&p).unwrap_or(Value::Null);
-        }
-    }
+            .flatten()
+            .map(|s| s.workspace_path)
+            .unwrap_or_default()
+    };
+    let ws = Path::new(&workspace_path);
+    let board = state
+        .with_session_db(&session_id, |conn| {
+            Ok(crate::plan::derive_current_board(conn, ws, &session_id))
+        })
+        .unwrap_or(None);
 
-    // 会话当前若未在执行，检查最近一次运行结果；若正常完成（或无记录），自愈修复遗留的 in_progress / pending 任务为 done
-    if !running {
-        let last_run_status: Option<String> = db
-            .query_row(
-                "SELECT status FROM runs WHERE session_id = ?1 ORDER BY started_at DESC LIMIT 1",
-                rusqlite::params![session_id],
-                |r| r.get(0),
-            )
-            .ok();
-        let should_mark_done = match last_run_status.as_deref() {
-            Some("done") | None => true,
-            _ => false,
-        };
-        if let Some(todos_arr) = val.get_mut("todos").and_then(|v| v.as_array_mut()) {
-            let mut changed = false;
-            for item in todos_arr.iter_mut() {
-                let st = item.get("status").and_then(|s| s.as_str());
-                if should_mark_done {
-                    if st == Some("in_progress") || st == Some("pending") {
-                        item["status"] = serde_json::json!("done");
-                        changed = true;
-                    }
-                } else if st == Some("in_progress") {
-                    item["status"] = serde_json::json!("pending");
-                    changed = true;
-                }
-            }
-            if changed {
-                let new_raw = val.to_string();
-                let _ = store::set_kv(&db, &session_id, "todos", &new_raw);
-                let last_todo_ev_id: Option<String> = db
-                    .query_row(
-                        "SELECT te.id FROM tool_events te JOIN messages m ON te.message_id = m.id WHERE m.session_id = ?1 AND te.tool_name = 'todo' ORDER BY te.created_at DESC LIMIT 1",
-                        rusqlite::params![session_id],
-                        |r| r.get(0),
-                    )
-                    .ok();
-                if let Some(ref ev_id) = last_todo_ev_id {
-                    let _ = store::update_tool_event_full(
-                        &db,
-                        ev_id,
-                        "success",
-                        None,
-                        None,
-                        None,
-                        Some(&new_raw),
-                    );
-                }
-            }
+    match board {
+        Some(b) => {
+            let todos: Vec<Value> = b
+                .items
+                .into_iter()
+                .map(|it| {
+                    serde_json::json!({
+                        "content": it.content,
+                        "status": it.status,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({ "todos": todos }))
         }
+        None => Ok(Value::Null),
     }
-
-    // 若当前会话关联了工作区中的活动计划，以计划文件中的步骤作为权威真理源优先同步（仅限进行中计划）
-    if let Ok(Some(sess)) = crate::store::get_session(&db, &session_id) {
-        if !sess.workspace_path.is_empty() {
-            let ws = std::path::Path::new(&sess.workspace_path);
-            if let Some((_, meta, body)) = crate::plan::find_plan_file(ws, &session_id, None, Some(&db)) {
-                if meta.status == "in_progress" {
-                    let steps = crate::plan::parse_steps_from_markdown(&body);
-                    if !steps.is_empty() {
-                        let todos_val: Vec<Value> = steps.iter().map(|s| {
-                            serde_json::json!({
-                                "content": s.content,
-                                "status": s.status
-                            })
-                        }).collect();
-                        val = serde_json::json!({ "todos": todos_val });
-                        let _ = store::set_kv(&db, &session_id, "todos", &val.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(val)
 }
 
 // ---------- 临时空间 ----------
@@ -3345,27 +3286,12 @@ pub fn save_text_file(
         "path": p.to_string_lossy().to_string()
     }));
 
-    // 如果保存的是计划 Markdown 文件，重新解析步骤并同步 todos
+    // 如果保存的是计划 Markdown 文件，重新广播当前权威看板状态
     let norm_path = raw_trimmed.replace('\\', "/");
     if norm_path.contains("/.harness/plans/") || norm_path.starts_with(".harness/plans/") {
-        let steps = crate::plan::parse_steps_from_markdown(&content);
-        let db = state.db.lock();
         if let Some(ref sid) = session_id {
             if !sid.is_empty() {
-                crate::plan::sync_steps_to_todos(Some(&db), sid, &steps);
-                let payload: Vec<serde_json::Value> = steps
-                    .iter()
-                    .map(|s| {
-                        serde_json::json!({
-                            "content": s.content,
-                            "status": s.status
-                        })
-                    })
-                    .collect();
-                let _ = app.emit("session:todos", serde_json::json!({
-                    "sessionId": sid,
-                    "todos": payload,
-                }));
+                crate::plan::emit_board_updated(&app, &state, sid);
             }
         }
     }
@@ -3643,19 +3569,6 @@ pub fn update_plan_step_status(
                 Some(conn),
             )
         })?;
-        if let Ok(Some(raw)) = state.with_session_db(sid, |conn| crate::store::get_kv(conn, sid, "todos")) {
-            if let Ok(val) = serde_json::from_str::<Value>(&raw) {
-                if let Some(todos) = val.get("todos") {
-                    let _ = app.emit(
-                        "session:todos",
-                        serde_json::json!({
-                            "sessionId": sid,
-                            "todos": todos
-                        }),
-                    );
-                }
-            }
-        }
         crate::plan::emit_board_updated(&app, &state, sid);
     } else {
         let db = state.db.lock();
@@ -4023,7 +3936,7 @@ pub async fn revert_to_message(
 
     if res.success {
         let now = store::now();
-        let (affected_msgs, todos, active_plan_opt) = state.with_session_db(&session_id, |conn| {
+        let (affected_msgs, active_plan_opt) = state.with_session_db(&session_id, |conn| {
             let affected_ids = store::mark_messages_and_snapshots_reverted_after_seq(conn, &session_id, target_seq, Some(&now))?;
             let mut msgs = Vec::new();
             for mid in &affected_ids {
@@ -4031,18 +3944,11 @@ pub async fn revert_to_message(
                     msgs.push(msg);
                 }
             }
-            let todos = store::sync_session_todos_after_revert(conn, &session_id).unwrap_or(None);
             let active_plan_opt = crate::plan::sync_session_plans_after_revert(conn, &ws, &session_id).unwrap_or(None);
-            Ok((msgs, todos, active_plan_opt))
+            Ok((msgs, active_plan_opt))
         })?;
         for msg in affected_msgs {
             let _ = app.emit("message:update", &msg);
-        }
-        if let Some(todos) = todos {
-            let _ = app.emit("session:todos", &serde_json::json!({
-                "sessionId": session_id,
-                "todos": todos,
-            }));
         }
         let _ = app.emit("session:plans", &serde_json::json!({
             "sessionId": session_id,
@@ -4098,7 +4004,7 @@ pub async fn reapply_from_message(
     let res = crate::snapshot_revert::reapply_snapshots(&ws, &data_dir, &snapshots, force).await?;
 
     if res.success {
-        let (affected_msgs, todos, active_plan_opt) = state.with_session_db(&session_id, |conn| {
+        let (affected_msgs, active_plan_opt) = state.with_session_db(&session_id, |conn| {
             let affected_ids = store::mark_messages_and_snapshots_reverted_after_seq(conn, &session_id, target_seq, None)?;
             let mut msgs = Vec::new();
             for mid in &affected_ids {
@@ -4106,18 +4012,11 @@ pub async fn reapply_from_message(
                     msgs.push(msg);
                 }
             }
-            let todos = store::sync_session_todos_after_revert(conn, &session_id).unwrap_or(None);
             let active_plan_opt = crate::plan::sync_session_plans_after_revert(conn, &ws, &session_id).unwrap_or(None);
-            Ok((msgs, todos, active_plan_opt))
+            Ok((msgs, active_plan_opt))
         })?;
         for msg in affected_msgs {
             let _ = app.emit("message:update", &msg);
-        }
-        if let Some(todos) = todos {
-            let _ = app.emit("session:todos", &serde_json::json!({
-                "sessionId": session_id,
-                "todos": todos,
-            }));
         }
         let _ = app.emit("session:plans", &serde_json::json!({
             "sessionId": session_id,
@@ -4224,14 +4123,6 @@ pub async fn purge_withdrawn_messages(
     // 4. 刷新界面
     let _ = app.emit("messages:changed", &serde_json::json!({ "sessionId": session_id }));
     emit_session(&state, &app, &session_id);
-    if let Ok(Some(todos)) = state.with_session_db(&session_id, |conn| {
-        store::sync_session_todos_after_revert(conn, &session_id)
-    }) {
-        let _ = app.emit("session:todos", &serde_json::json!({
-            "sessionId": session_id,
-            "todos": todos,
-        }));
-    }
     if let Ok(active_plan_opt) = state.with_session_db(&session_id, |conn| {
         crate::plan::sync_session_plans_after_revert(conn, &ws, &session_id)
     }) {
@@ -4278,7 +4169,7 @@ pub async fn revert_message_turn(
 
     if res.success {
         let now = store::now();
-        let (affected_msgs, todos, active_plan_opt) = state.with_session_db(&session_id, |conn| {
+        let (affected_msgs, active_plan_opt) = state.with_session_db(&session_id, |conn| {
             let affected_ids = store::mark_snapshots_reverted_for_turn(conn, &message_id, Some(&now))?;
             let mut msgs = Vec::new();
             for mid in &affected_ids {
@@ -4286,18 +4177,11 @@ pub async fn revert_message_turn(
                     msgs.push(msg);
                 }
             }
-            let todos = store::sync_session_todos_after_revert(conn, &session_id).unwrap_or(None);
             let active_plan_opt = crate::plan::sync_session_plans_after_revert(conn, &ws, &session_id).unwrap_or(None);
-            Ok((msgs, todos, active_plan_opt))
+            Ok((msgs, active_plan_opt))
         })?;
         for msg in affected_msgs {
             state.emit("message:update", &msg);
-        }
-        if let Some(todos) = todos {
-            state.emit("session:todos", &serde_json::json!({
-                "sessionId": session_id,
-                "todos": todos,
-            }));
         }
         state.emit("session:plans", &serde_json::json!({
             "sessionId": session_id,
@@ -4344,7 +4228,7 @@ pub async fn reapply_message_turn(
     let res = crate::snapshot_revert::reapply_snapshots(&ws, &data_dir, &snapshots, force).await?;
 
     if res.success {
-        let (affected_msgs, todos, active_plan_opt) = state.with_session_db(&session_id, |conn| {
+        let (affected_msgs, active_plan_opt) = state.with_session_db(&session_id, |conn| {
             let affected_ids = store::mark_snapshots_reverted_for_turn(conn, &message_id, None)?;
             let mut msgs = Vec::new();
             for mid in &affected_ids {
@@ -4352,18 +4236,11 @@ pub async fn reapply_message_turn(
                     msgs.push(msg);
                 }
             }
-            let todos = store::sync_session_todos_after_revert(conn, &session_id).unwrap_or(None);
             let active_plan_opt = crate::plan::sync_session_plans_after_revert(conn, &ws, &session_id).unwrap_or(None);
-            Ok((msgs, todos, active_plan_opt))
+            Ok((msgs, active_plan_opt))
         })?;
         for msg in affected_msgs {
             state.emit("message:update", &msg);
-        }
-        if let Some(todos) = todos {
-            state.emit("session:todos", &serde_json::json!({
-                "sessionId": session_id,
-                "todos": todos,
-            }));
         }
         state.emit("session:plans", &serde_json::json!({
             "sessionId": session_id,
