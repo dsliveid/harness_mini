@@ -287,12 +287,15 @@ pub async fn browser_screenshot(args: &Value, ctx: &ToolCtx) -> Result<String, S
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|| original_str.clone());
 
-    // 3. 同时更新一份快捷文件到工作区，保持向下兼容与调试便捷性
-    let legacy_rel_path = ".harness/tmp/browser_screenshot.png";
+    // 3. 同时更新一份快捷文件到工作区，保持向下兼容与调试便捷性（扩展名与真实格式一致）
+    let legacy_ext = crate::models::detect_image_mime_and_ext(&bytes)
+        .map(|(_, ext)| ext)
+        .unwrap_or("png");
+    let legacy_rel_path = format!(".harness/tmp/browser_screenshot.{legacy_ext}");
     let legacy_target = if ctx.workspace.as_os_str().is_empty() {
-        std::env::temp_dir().join("harness_browser_screenshot.png")
+        std::env::temp_dir().join(format!("harness_browser_screenshot.{legacy_ext}"))
     } else {
-        ctx.workspace.join(legacy_rel_path)
+        ctx.workspace.join(&legacy_rel_path)
     };
     if let Some(parent) = legacy_target.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;

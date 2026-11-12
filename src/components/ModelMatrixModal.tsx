@@ -351,7 +351,7 @@ export function ModelMatrixModal() {
               })()}
             </div>
             <p className="text-[11px] text-inkdim leading-relaxed">
-              {MODEL_CAPABILITY_METAS.vision.description}。当用户上传截图、UI 设计稿或图片附件时，自动调度多模态视觉模型进行深度语义理解。
+              {MODEL_CAPABILITY_METAS.vision.description}。仅在当前主对话模型不具备视觉能力时，供识图工具（recognize_image）后台调用，不会替换主对话模型。
             </p>
             <ModelCapabilitySelect
               capability="vision"

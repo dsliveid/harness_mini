@@ -1363,7 +1363,7 @@ export function SettingsModal() {
                           providers={local.providers}
                           settings={local}
                           allowInherit={true}
-                          inheritLabel="未配置（跟随当前对话模型或回落多模态模型）"
+                          inheritLabel="未配置（对话模型无视觉能力时自动回落至可用视觉模型）"
                         />
                       </div>
                     </div>

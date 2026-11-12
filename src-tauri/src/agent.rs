@@ -1304,14 +1304,6 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         return (RunOutcome::Failed, None, run_tokens);
     }
 
-    // 检查当前会话是否包含图片附件
-    let has_images = {
-        state.with_session_db(session_id, |conn| store::all_messages(conn, session_id))
-            .unwrap_or_default().iter().any(|m| {
-                m.attachments.as_ref().map(|atts| atts.iter().any(|a| a.is_image)).unwrap_or(false)
-            })
-    };
-
     // 动态向上继承模型配置（若当前会话未显式指定，且存在父会话，则继承父会话配置）
     let effective_provider_id = session.provider_id.as_deref()
         .or_else(|| parent_session.as_ref().and_then(|p| p.provider_id.as_deref()));
@@ -1328,39 +1320,15 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
     let effective_image_model_id = session.image_model_id.as_deref()
         .or_else(|| parent_session.as_ref().and_then(|p| p.image_model_id.as_deref()));
 
-    // 解析模型配置：
-    // 1. 若当前会话包含图片附件且配置了专属视觉模型（或全局视觉模型），优先使用视觉模型
-    // 2. 否则优先使用会话专属绑定的厂商 + 模型（若已指定），未指定或失效时回退到全局激活模型
-    // 注意：对话引擎必须具备 chat 能力；若用户绑定的模型只具备 image_gen，自动回退到厂商内具备 chat 能力的模型或全局激活模型
-    let resolved_vision_model = if has_images {
-        if let (Some(v_pid), Some(v_mid)) = (effective_vision_provider_id, effective_vision_model_id) {
-            settings.providers.iter().find(|p| &p.id == v_pid && p.models.iter().any(|m| m == v_mid))
-                .map(|p| (p.clone(), v_mid.to_string()))
-        } else {
-            crate::models::resolve_active_vision_model(&settings)
-                .map(|(p, m)| (p.clone(), m.to_string()))
-        }
-    } else {
-        None
-    };
-
-    let resolved_model = if let Some(vm) = resolved_vision_model {
-        Some(vm)
-    } else if let (Some(pid), Some(mid)) = (effective_provider_id, effective_model_id) {
-        if let Some(p) = settings.providers.iter().find(|p| &p.id == pid) {
-            if p.models.iter().any(|m| m == mid) && settings.has_capability(Some(pid), mid, "chat") {
-                Some((p.clone(), mid.to_string()))
-            } else if let Some(chat_m) = p.models.iter().find(|m| settings.has_capability(Some(pid), m, "chat")) {
-                Some((p.clone(), chat_m.clone()))
-            } else {
-                resolve_active_model(&settings).map(|(p, m)| (p.clone(), m.to_string()))
-            }
-        } else {
-            resolve_active_model(&settings).map(|(p, m)| (p.clone(), m.to_string()))
-        }
-    } else {
-        resolve_active_model(&settings).map(|(p, m)| (p.clone(), m.to_string()))
-    };
+    // 解析主对话模型配置（唯一真相源）：
+    // 严格遵守「只要是对话，主对话模型就恒定是对话模型」原则：
+    // 优先级：会话显式绑定 > 父会话继承 > 全局激活对话模型（必须具备 chat 能力）；
+    // 任何情况下均不会因历史或当前消息包含图片而切换为视觉模型。
+    let resolved_model = crate::models::resolve_effective_chat_model(
+        Some(&session),
+        parent_session.as_ref(),
+        &settings,
+    );
 
     let Some((pc, model)) = resolved_model else {
         emit_error(
@@ -1371,6 +1339,7 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         );
         return (RunOutcome::Failed, None, run_tokens);
     };
+    let main_has_vision = settings.has_capability(Some(&pc.id), &model, "vision");
     let effective_reasoning_effort = session
         .reasoning_effort
         .as_deref()
@@ -1457,27 +1426,12 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         false
     };
 
-    let has_collab_vision = if !is_subagent {
-        let db = state.db.lock();
-        store::list_collaborators(&db, session_id)
-            .map(|list| list.iter().any(|c| c.subagent_role.as_deref() == Some("vision") || c.vision_model_id.is_some()))
-            .unwrap_or(false)
-    } else {
-        false
-    };
-
-    let session_has_vision = if session.session_type == "collaborator" && session.subagent_role.as_deref() == Some("vision") {
-        true
-    } else if effective_vision_model_id.is_some() {
-        true
-    } else if !has_collab_vision {
-        settings.active_vision_model_id.is_some()
-            || effective_model_id.map(|m| settings.has_capability(effective_provider_id, m, "vision")).unwrap_or(false)
-            || crate::models::resolve_active_vision_model(&settings).is_some()
-            || resolve_active_model(&settings).map(|(p, m)| settings.has_capability(Some(&p.id), m, "vision")).unwrap_or(false)
-    } else {
-        false
-    };
+    // 视觉工具准入：只要主对话模型具备 vision 能力，或已配置可用的视觉兜底模型（会话专属 / 全局），即下发 recognize_image
+    let session_has_vision = main_has_vision
+        || (effective_vision_provider_id.is_some() && effective_vision_model_id.is_some())
+        || effective_vision_model_id.is_some()
+        || settings.active_vision_model_id.is_some()
+        || crate::models::resolve_active_vision_model(&settings).is_some();
 
     let specs: Vec<ToolSpec> = tools::global_registry()
         .list_specs(session.is_temp, is_subagent)
@@ -1794,7 +1748,13 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
         // ---- 步骤 1/2：组装上下文（含运行中被"引导"注入的新消息） ----
         let (messages, est_in, truncation_notice) = {
             state.with_session_db(session_id, |conn| {
-                Ok(build_context(conn, session_id, current_sys, effective_ctx_limit))
+                Ok(build_context_with_vision(
+                    conn,
+                    session_id,
+                    current_sys,
+                    effective_ctx_limit,
+                    main_has_vision,
+                ))
             }).unwrap_or_else(|e| (Err(e), 0, None))
         };
         if let Some(ref notice) = truncation_notice {
@@ -2440,13 +2400,15 @@ async fn run_once(app: &AppHandle, session_id: &str, run_id: &str, trigger_id: &
                         if let Ok(meta) = std::fs::metadata(p) {
                             let name = p.file_name().and_then(|f| f.to_str()).unwrap_or("image.png").to_string();
                             let ext = p.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()).unwrap_or_default();
-                            let mime = match ext.as_str() {
-                                "jpg" | "jpeg" => "image/jpeg",
-                                "webp" => "image/webp",
-                                "gif" => "image/gif",
-                                "svg" => "image/svg+xml",
-                                _ => "image/png",
+                            let header_bytes = {
+                                use std::io::Read;
+                                let mut buf = [0u8; 512];
+                                match std::fs::File::open(p).and_then(|mut f| f.read(&mut buf)) {
+                                    Ok(n) => buf[..n].to_vec(),
+                                    Err(_) => Vec::new(),
+                                }
                             };
+                            let mime = crate::models::resolve_image_mime(&header_bytes, (!ext.is_empty()).then_some(ext.as_str()));
                             Some(vec![crate::models::Attachment {
                                 id: uuid::Uuid::new_v4().to_string(),
                                 name,
@@ -3325,6 +3287,7 @@ async fn check_and_trigger_compaction(
     .unwrap_or(false)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_context(
     conn: &rusqlite::Connection,
     session_id: &str,
@@ -3332,6 +3295,16 @@ pub fn build_context(
     token_limit: usize,
 ) -> (Result<Vec<Value>, String>, usize, Option<crate::models::TruncationNotice>) {
     crate::context::build_execution_context(conn, session_id, system, token_limit)
+}
+
+pub fn build_context_with_vision(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    system: &str,
+    token_limit: usize,
+    main_has_vision: bool,
+) -> (Result<Vec<Value>, String>, usize, Option<crate::models::TruncationNotice>) {
+    crate::context::build_execution_context_with_vision(conn, session_id, system, token_limit, main_has_vision)
 }
 
 #[allow(unused_imports)]

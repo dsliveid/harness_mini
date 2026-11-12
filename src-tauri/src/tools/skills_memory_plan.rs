@@ -521,29 +521,9 @@ pub(crate) async fn recognize_image_tool(args: &Value, ctx: &ToolCtx) -> Result<
         return Err("图片文件内容为空 (0 字节)".to_string());
     }
 
-    // 3. 智能推断 MIME 类型
+    // 3. 魔数优先推断真实 MIME 类型（防止扩展名与实际编码不一致导致上游 400）
     let ext = target_path.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()).unwrap_or_default();
-    let mime = match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        "gif" => "image/gif",
-        "bmp" => "image/bmp",
-        "svg" => "image/svg+xml",
-        _ => {
-            if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
-                "image/png"
-            } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-                "image/jpeg"
-            } else if bytes.starts_with(b"GIF8") {
-                "image/gif"
-            } else if bytes.starts_with(b"RIFF") && bytes.len() > 12 && &bytes[8..12] == b"WEBP" {
-                "image/webp"
-            } else {
-                "image/png"
-            }
-        }
-    };
+    let mime = crate::models::resolve_image_mime(&bytes, (!ext.is_empty()).then_some(ext.as_str()));
 
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -551,34 +531,26 @@ pub(crate) async fn recognize_image_tool(args: &Value, ctx: &ToolCtx) -> Result<
     let target_display_path = target_path.to_string_lossy().replace('\\', "/");
     let kb = bytes.len() / 1024;
 
-
-
-    // 4. 智能自适应判定：若当前主会话模型自身已原生具备视觉能力 (vision)，且未显式指定委托子模型，
-    // 则直接将高清原图注入多模态上下文，免去冗余的外部二次调用与信息折损。
+    // 4. 智能自适应判定：按与 agent.rs 完全一致的主对话模型解析规则，
+    // 判定当前有效主对话模型是否原生具备视觉能力 (vision)；
+    // 若具备且未显式指定委托子模型，直接注入高清原图；否则由本工具内部单次调用视觉模型识图并返回文字。
     let requested_model = args.get("model").and_then(|v| v.as_str()).map(|s| s.trim()).filter(|s| !s.is_empty());
     let has_native_vision = if requested_model.is_none() {
-        let session = {
-            let db = state.db.lock();
-            crate::store::get_session(&db, session_id)?
-                .ok_or_else(|| format!("会话不存在: {session_id}"))?
-        };
-        let settings = {
+        let (session, parent_session, settings) = {
             let db = state.db.lock();
             let master = state.master_key.lock();
-            crate::store::get_settings_with_secrets(&db, &master)?
+            let s = crate::store::get_session(&db, session_id)?
+                .ok_or_else(|| format!("会话不存在: {session_id}"))?;
+            let p = s
+                .parent_session_id
+                .as_deref()
+                .and_then(|pid| crate::store::get_session(&db, pid).ok().flatten());
+            let cfg = crate::store::get_settings_with_secrets(&db, &master)?;
+            (s, p, cfg)
         };
-        let (pid, mid) = if let (Some(pid), Some(mid)) = (&session.provider_id, &session.model_id) {
-            (Some(pid.clone()), Some(mid.clone()))
-        } else if let Some((p, m)) = crate::models::resolve_active_model(&settings) {
-            (Some(p.id.clone()), Some(m.to_string()))
-        } else {
-            (None, None)
-        };
-        if let (Some(ref p), Some(ref m)) = (pid, mid) {
-            settings.has_capability(Some(p), m, "vision")
-        } else {
-            false
-        }
+        crate::models::resolve_effective_chat_model(Some(&session), parent_session.as_ref(), &settings)
+            .map(|(p, m)| settings.has_capability(Some(&p.id), &m, "vision"))
+            .unwrap_or(false)
     } else {
         false
     };

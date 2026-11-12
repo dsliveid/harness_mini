@@ -36,6 +36,16 @@ pub fn assemble_execution_context(
     system_prompt: &str,
     token_limit: usize,
 ) -> (Result<Vec<Value>, String>, usize, Option<TruncationNotice>) {
+    assemble_execution_context_with_vision(conn, session_id, system_prompt, token_limit, true)
+}
+
+pub fn assemble_execution_context_with_vision(
+    conn: &Connection,
+    session_id: &str,
+    system_prompt: &str,
+    token_limit: usize,
+    main_has_vision: bool,
+) -> (Result<Vec<Value>, String>, usize, Option<TruncationNotice>) {
     let msgs = match store::all_messages(conn, session_id) {
         Ok(m) => m,
         Err(e) => return (Err(e), 0, None),
@@ -110,18 +120,30 @@ pub fn assemble_execution_context(
                 if let Some(ref atts) = m.attachments {
                     for att in atts {
                         if att.is_image {
-                            if let Ok(bytes) = std::fs::read(&att.path) {
-                                use base64::Engine;
-                                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                let mime = if att.mime_type.is_empty() { "image/png" } else { &att.mime_type };
-                                let data_url = format!("data:{};base64,{}", mime, b64);
-                                image_parts.push(json!({
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": data_url
-                                    }
-                                }));
-                                est += 1000;
+                            if main_has_vision {
+                                if let Ok(bytes) = std::fs::read(&att.path) {
+                                    use base64::Engine;
+                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                    let fallback = (!att.mime_type.is_empty()).then_some(att.mime_type.as_str());
+                                    let mime = crate::models::resolve_image_mime(&bytes, fallback);
+                                    let data_url = format!("data:{};base64,{}", mime, b64);
+                                    image_parts.push(json!({
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": data_url
+                                        }
+                                    }));
+                                    est += 1000;
+                                }
+                            } else {
+                                // 方式 B：纯文本主模型不发送 image_url，附加物理路径并引导调用 recognize_image
+                                let display_path = att.path.replace('\\', "/");
+                                let hint = format!(
+                                    "\n\n### 🖼️ 附带图片附件: {} (大小: {} 字节)\n本地物理路径: `{}`\n> 提示：当前主对话模型不具备原生视觉能力，请先调用 `recognize_image(path=\"{}\", prompt=\"...\")` 识别图像内容后再作答。",
+                                    att.name, att.size, display_path, display_path
+                                );
+                                text_content.push_str(&hint);
+                                est += estimate_tokens(&hint);
                             }
                         } else {
                             let file_path = std::path::Path::new(&att.path);
@@ -190,14 +212,15 @@ pub fn assemble_execution_context(
                                 let mut image_parts: Vec<Value> = Vec::new();
 
                                 let is_active_turn = m.seq >= last_user_seq;
-                                if is_active_turn {
+                                if is_active_turn && main_has_vision {
                                     if let Some(ref att_list) = atts {
                                         for att in att_list {
                                             if att.is_image {
                                                 if let Ok(bytes) = std::fs::read(&att.path) {
                                                     use base64::Engine;
                                                     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                                    let mime = if att.mime_type.is_empty() { "image/png" } else { &att.mime_type };
+                                                    let fallback = (!att.mime_type.is_empty()).then_some(att.mime_type.as_str());
+                                                    let mime = crate::models::resolve_image_mime(&bytes, fallback);
                                                     let data_url = format!("data:{};base64,{}", mime, b64);
                                                     image_parts.push(json!({
                                                         "type": "image_url",
@@ -514,5 +537,55 @@ mod tests {
         let (msgs2, _, _) = assemble_execution_context(&conn, &s.id, "sys", 32000);
         let msgs2 = msgs2.unwrap();
         assert_eq!(msgs2[1]["content"], "纯净消息");
+    }
+
+    #[test]
+    fn test_image_attachment_magic_correction_and_text_only_bypass() {
+        let conn = Connection::open_in_memory().unwrap();
+        store::init_schema(&conn).unwrap();
+        let s = store::create_session(&conn, "D:\\workspace", None, "主会话", "confirm").unwrap();
+
+        let temp_dir = std::env::temp_dir().join(format!("harness_msg_img_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let fake_png_path = temp_dir.join("screenshot.png");
+        // 写入 JPEG 魔数内容但扩展名为 .png、mime_type 错标为 image/png
+        let jpeg_bytes = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00];
+        std::fs::write(&fake_png_path, &jpeg_bytes).unwrap();
+
+        let atts = vec![Attachment {
+            id: "att1".into(),
+            name: "screenshot.png".into(),
+            mime_type: "image/png".into(),
+            size: jpeg_bytes.len() as u64,
+            path: fake_png_path.to_string_lossy().to_string(),
+            is_image: true,
+        }];
+        let _u1 = store::new_message_with_attachments(
+            &conn,
+            &s.id,
+            "user",
+            Some("这是截图".into()),
+            Some(atts),
+            false,
+            None,
+        )
+        .unwrap();
+
+        // 1. 多模态主模型：应生成 image_url，且 data URL 自动纠偏为 data:image/jpeg;base64,...
+        let (msgs_vision, _, _) = assemble_execution_context_with_vision(&conn, &s.id, "sys", 32000, true);
+        let msgs_vision = msgs_vision.unwrap();
+        let parts = msgs_vision[1]["content"].as_array().unwrap();
+        let url = parts[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/jpeg;base64,"), "实际 URL: {url}");
+
+        // 2. 纯文本主模型（方式 B）：绝不生成 image_url，转为附带路径和 recognize_image 调用提示
+        let (msgs_text, _, _) = assemble_execution_context_with_vision(&conn, &s.id, "sys", 32000, false);
+        let msgs_text = msgs_text.unwrap();
+        let content_str = msgs_text[1]["content"].as_str().unwrap();
+        assert!(content_str.contains("recognize_image"));
+        assert!(content_str.contains("screenshot.png"));
+        assert!(!content_str.contains("data:image/"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

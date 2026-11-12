@@ -36,8 +36,12 @@ impl ArtifactManager {
         tokio::fs::create_dir_all(&blob_dir).await.map_err(|e| format!("创建快照目录失败: {e}"))?;
         tokio::fs::create_dir_all(&thumb_dir).await.map_err(|e| format!("创建缩略图目录失败: {e}"))?;
 
-        let blob_path = blob_dir.join(format!("{hash_hex}.png"));
-        let thumb_path = thumb_dir.join(format!("{hash_hex}.png"));
+        let (mime_type, ext) = crate::models::detect_image_mime_and_ext(bytes)
+            .unwrap_or(("image/png", "png"));
+        let thumb_ext = if ext == "jpg" { "jpg" } else { "png" };
+
+        let blob_path = blob_dir.join(format!("{hash_hex}.{ext}"));
+        let thumb_path = thumb_dir.join(format!("{hash_hex}.{thumb_ext}"));
 
         // 3. CAS 去重写入 (若物理文件已存在，跳过写盘，实现物理零冗余)
         let mut thumb_created = thumb_path.exists();
@@ -57,7 +61,7 @@ impl ArtifactManager {
         let _ = Self::apply_retention_policy(&artifacts_root, Self::DEFAULT_MAX_SNAPSHOTS).await;
 
         let tag = step_tag.unwrap_or("shot");
-        let display_name = format!("{tag}_{short_hash}.png");
+        let display_name = format!("{tag}_{short_hash}.{ext}");
 
         Ok(SessionArtifact {
             id: uuid::Uuid::new_v4().to_string(),
@@ -66,7 +70,7 @@ impl ArtifactManager {
             file_name: display_name,
             original_path: blob_path,
             thumbnail_path: if thumb_created { Some(thumb_path) } else { None },
-            mime_type: "image/png".to_string(),
+            mime_type: mime_type.to_string(),
             byte_size: bytes.len() as u64,
             is_ephemeral: true,
             created_at: chrono::Utc::now().timestamp_millis(),
@@ -125,11 +129,10 @@ impl ArtifactManager {
                 let _ = tokio::fs::remove_file(&old_blob).await;
                 if let Some(stem) = old_blob.file_stem().and_then(|s| s.to_str()) {
                     if stem.len() >= 2 {
-                        let thumb_file = artifacts_root
-                            .join("thumbs")
-                            .join(&stem[..2])
-                            .join(format!("{stem}.png"));
-                        let _ = tokio::fs::remove_file(thumb_file).await;
+                        let thumb_dir = artifacts_root.join("thumbs").join(&stem[..2]);
+                        for thumb_ext in ["png", "jpg"] {
+                            let _ = tokio::fs::remove_file(thumb_dir.join(format!("{stem}.{thumb_ext}"))).await;
+                        }
                     }
                 }
             }
@@ -242,6 +245,34 @@ mod tests {
         }
 
         assert_eq!(count, 3, "滚动缓冲区应将快照文件数量严格限制在 3 份");
+
+        let _ = ArtifactManager::purge_session(&temp_dir, session_id).await;
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_store_screenshot_uses_real_jpeg_extension_and_mime() {
+        let temp_dir = std::env::temp_dir().join(format!("harness_art_jpg_{}", uuid::Uuid::new_v4()));
+        let session_id = "test-session-jpg";
+
+        let mut img = image::RgbImage::new(2, 2);
+        for pixel in img.pixels_mut() {
+            *pixel = image::Rgb([10, 20, 30]);
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Jpeg)
+            .unwrap();
+        let jpg_bytes = buf.into_inner();
+
+        let art = ArtifactManager::store_screenshot(&temp_dir, session_id, &jpg_bytes, Some("browser"))
+            .await
+            .expect("JPEG 快照应成功存储");
+
+        assert_eq!(art.mime_type, "image/jpeg");
+        assert!(art.original_path.to_string_lossy().ends_with(".jpg"));
+        assert!(art.file_name.ends_with(".jpg"));
+        assert!(art.thumbnail_path.as_ref().unwrap().to_string_lossy().ends_with(".jpg"));
 
         let _ = ArtifactManager::purge_session(&temp_dir, session_id).await;
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;

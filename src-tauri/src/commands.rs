@@ -1141,10 +1141,30 @@ pub async fn save_attachment(
             .iter()
             .any(|ext| name.to_lowercase().ends_with(ext));
 
+    // 若为图片附件，基于真实文件头魔数纠偏 mime_type（防止 .png 扩展名的 JPEG 图片被错标为 image/png）
+    let resolved_mime = if is_img {
+        let head = {
+            use std::io::Read;
+            let mut buf = [0u8; 512];
+            match std::fs::File::open(&target_path).and_then(|mut f| f.read(&mut buf)) {
+                Ok(n) => buf[..n].to_vec(),
+                Err(_) => Vec::new(),
+            }
+        };
+        let fallback = if !mime_type.is_empty() && mime_type != "application/octet-stream" {
+            Some(mime_type.as_str())
+        } else {
+            std::path::Path::new(&name).extension().and_then(|e| e.to_str())
+        };
+        crate::models::resolve_image_mime(&head, fallback).to_string()
+    } else {
+        mime_type
+    };
+
     Ok(crate::models::Attachment {
         id,
         name,
-        mime_type,
+        mime_type: resolved_mime,
         size,
         path: target_path.to_string_lossy().to_string(),
         is_image: is_img,
@@ -2958,16 +2978,7 @@ pub async fn read_file_base64_inner(state: Option<&crate::AppState>, path: &str)
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let mime = match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        "gif" => "image/gif",
-        "svg" => "image/svg+xml",
-        "bmp" => "image/bmp",
-        "ico" => "image/x-icon",
-        _ => "image/png",
-    };
+    let mime = crate::models::resolve_image_mime(&bytes, (!ext.is_empty()).then_some(ext.as_str()));
 
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);

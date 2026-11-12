@@ -654,6 +654,85 @@ pub fn resolve_active_model(settings: &SettingsData) -> Option<(&ProviderCfg, &s
     Some((provider, model.as_str()))
 }
 
+/// 统一解析当前会话实际生效的主对话模型（唯一真相源）：
+/// 优先级：会话显式绑定 > 父会话继承 > 全局激活对话模型（且必须具备 chat 能力）；
+/// 任何情况下均不会因包含图片附件而切换为视觉模型。
+pub fn resolve_effective_chat_model(
+    session: Option<&Session>,
+    parent_session: Option<&Session>,
+    settings: &SettingsData,
+) -> Option<(ProviderCfg, String)> {
+    let effective_provider_id = session
+        .and_then(|s| s.provider_id.as_deref())
+        .or_else(|| parent_session.and_then(|p| p.provider_id.as_deref()));
+    let effective_model_id = session
+        .and_then(|s| s.model_id.as_deref())
+        .or_else(|| parent_session.and_then(|p| p.model_id.as_deref()));
+
+    if let (Some(pid), Some(mid)) = (effective_provider_id, effective_model_id) {
+        if let Some(p) = settings.providers.iter().find(|p| p.id == pid) {
+            if p.models.iter().any(|m| m == mid) && settings.has_capability(Some(pid), mid, "chat") {
+                return Some((p.clone(), mid.to_string()));
+            }
+            if let Some(chat_m) = p.models.iter().find(|m| settings.has_capability(Some(pid), m, "chat")) {
+                return Some((p.clone(), chat_m.clone()));
+            }
+        }
+    }
+
+    resolve_active_model(settings).map(|(p, m)| (p.clone(), m.to_string()))
+}
+
+/// 根据图片二进制魔数检测真实的 `(mime_type, 扩展名)`；魔数优先级高于文件名扩展名与历史声明。
+pub fn detect_image_mime_and_ext(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+    if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        return Some(("image/png", "png"));
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some(("image/jpeg", "jpg"));
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some(("image/gif", "gif"));
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some(("image/webp", "webp"));
+    }
+    if bytes.starts_with(b"BM") {
+        return Some(("image/bmp", "bmp"));
+    }
+    if bytes.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
+        return Some(("image/x-icon", "ico"));
+    }
+    let head_len = bytes.len().min(512);
+    if let Ok(head) = std::str::from_utf8(&bytes[..head_len]) {
+        let trimmed = head.trim_start_matches('\u{feff}').trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("<svg") || (lower.starts_with("<?xml") && lower.contains("<svg")) {
+            return Some(("image/svg+xml", "svg"));
+        }
+    }
+    None
+}
+
+/// 解析图像最终 MIME 类型：优先使用字节魔数，未知格式时回退到传入扩展名或已声明 MIME。
+pub fn resolve_image_mime(bytes: &[u8], fallback_ext_or_mime: Option<&str>) -> &'static str {
+    if let Some((mime, _)) = detect_image_mime_and_ext(bytes) {
+        return mime;
+    }
+    match fallback_ext_or_mime
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg" | "jpeg" | "image/jpeg" | "image/jpg") => "image/jpeg",
+        Some("webp" | "image/webp") => "image/webp",
+        Some("gif" | "image/gif") => "image/gif",
+        Some("bmp" | "image/bmp") => "image/bmp",
+        Some("svg" | "image/svg+xml") => "image/svg+xml",
+        Some("ico" | "image/x-icon") => "image/x-icon",
+        _ => "image/png",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,6 +866,110 @@ mod tests {
         s.model_context_limits.insert("p1:deepseek-chat".into(), 62_000);
         assert_eq!(s.resolve_context_limit(Some("p1"), "deepseek-chat"), 62_000);
         assert_eq!(s.resolve_context_limit(Some("p2"), "deepseek-chat"), 60_000);
+    }
+
+    #[test]
+    fn effective_chat_model_never_overridden_by_vision_settings() {
+        let mut s = SettingsData::default();
+        s.providers = vec![provider("p1", "CommandCode", &["deepseek-v4.1-flash", "glm-5.3-flash"])];
+        s.active_provider_id = Some("p1".into());
+        s.active_model_id = Some("deepseek-v4.1-flash".into());
+        s.active_vision_provider_id = Some("p1".into());
+        s.active_vision_model_id = Some("glm-5.3-flash".into());
+        s.model_capabilities.insert("p1:deepseek-v4.1-flash".into(), vec!["chat".into(), "vision".into()]);
+        s.model_capabilities.insert("p1:glm-5.3-flash".into(), vec!["chat".into(), "vision".into()]);
+
+        let mut sess = Session {
+            id: "s1".into(),
+            title: "t".into(),
+            workspace_path: "".into(),
+            access_mode: None,
+            project_id: None,
+            status: "active".into(),
+            last_message_at: None,
+            created_at: "".into(),
+            updated_at: "".into(),
+            is_temp: false,
+            temp_code: None,
+            temp_root: None,
+            source_workspace: None,
+            merged_seq: None,
+            merged_pending: false,
+            total_tokens: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            cached_tokens: None,
+            cache_hit_rate: None,
+            parent_session_id: None,
+            session_type: "main".into(),
+            subagent_role: None,
+            subagent_task: None,
+            context_token_limit: None,
+            last_reported_msg_id: None,
+            auto_report: None,
+            trigger_tool_event_id: None,
+            provider_id: Some("p1".into()),
+            model_id: Some("deepseek-v4.1-flash".into()),
+            dispatch_rule: None,
+            image_provider_id: None,
+            image_model_id: None,
+            vision_provider_id: Some("p1".into()),
+            vision_model_id: Some("glm-5.3-flash".into()),
+            decision_provider_id: None,
+            decision_model_id: None,
+            forked_from_session_id: None,
+            forked_from_message_id: None,
+            reasoning_effort: None,
+            max_steps: None,
+            last_run_status: None,
+            msg_count: 0,
+            tool_event_count: 0,
+            last_preview: None,
+            storage_state: "hot".into(),
+            bundle_bytes: 0,
+            schema_version: 0,
+            logical_deleted_at: None,
+        };
+
+        let (_, m) = resolve_effective_chat_model(Some(&sess), None, &s).unwrap();
+        assert_eq!(m, "deepseek-v4.1-flash");
+
+        // 即使会话角色是 vision 且未单独绑定主模型，也继承父会话/全局对话模型，不被视觉模型劫持
+        let mut sub = sess.clone();
+        sub.id = "sub1".into();
+        sub.session_type = "collaborator".into();
+        sub.subagent_role = Some("vision".into());
+        sub.provider_id = None;
+        sub.model_id = None;
+        sess.model_id = Some("deepseek-v4.1-flash".into());
+        let (_, m_sub) = resolve_effective_chat_model(Some(&sub), Some(&sess), &s).unwrap();
+        assert_eq!(m_sub, "deepseek-v4.1-flash");
+    }
+
+    #[test]
+    fn image_magic_detection_overrides_wrong_extension_or_mime() {
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+        assert_eq!(detect_image_mime_and_ext(&jpeg), Some(("image/jpeg", "jpg")));
+        assert_eq!(resolve_image_mime(&jpeg, Some("image/png")), "image/jpeg");
+        assert_eq!(resolve_image_mime(&jpeg, Some("png")), "image/jpeg");
+
+        let png = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        assert_eq!(detect_image_mime_and_ext(&png), Some(("image/png", "png")));
+        assert_eq!(resolve_image_mime(&png, Some("image/jpeg")), "image/png");
+
+        let webp = b"RIFF\x12\x00\x00\x00WEBP";
+        assert_eq!(detect_image_mime_and_ext(webp), Some(("image/webp", "webp")));
+
+        let gif = b"GIF89a\x01\x00";
+        assert_eq!(detect_image_mime_and_ext(gif), Some(("image/gif", "gif")));
+
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>";
+        assert_eq!(detect_image_mime_and_ext(svg), Some(("image/svg+xml", "svg")));
+
+        let unknown = b"not-an-image";
+        assert_eq!(detect_image_mime_and_ext(unknown), None);
+        assert_eq!(resolve_image_mime(unknown, Some("image/webp")), "image/webp");
+        assert_eq!(resolve_image_mime(unknown, None), "image/png");
     }
 }
 

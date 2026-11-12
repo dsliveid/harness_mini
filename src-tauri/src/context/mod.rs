@@ -9,7 +9,9 @@ pub use governance::{
     resolve_session_llm_cfg, CompactionConfirmPolicy, ContextViewport,
 };
 pub use ingress_normalizer::normalize_tool_output_for_ingress;
-pub use message_stream::{assemble_execution_context, ExecutionContext};
+pub use message_stream::{
+    assemble_execution_context, assemble_execution_context_with_vision, ExecutionContext,
+};
 pub use static_system::{
     build_static_collaborator_section, build_static_project_section, build_static_system_prompt,
     resolve_or_freeze_system_prompt,
@@ -28,4 +30,15 @@ pub fn build_execution_context(
     token_limit: usize,
 ) -> (Result<Vec<Value>, String>, usize, Option<TruncationNotice>) {
     assemble_execution_context(conn, session_id, system_prompt, token_limit)
+}
+
+/// 上下文工程统一构建门面（显式感知主对话模型视觉能力）
+pub fn build_execution_context_with_vision(
+    conn: &Connection,
+    session_id: &str,
+    system_prompt: &str,
+    token_limit: usize,
+    main_has_vision: bool,
+) -> (Result<Vec<Value>, String>, usize, Option<TruncationNotice>) {
+    assemble_execution_context_with_vision(conn, session_id, system_prompt, token_limit, main_has_vision)
 }
