@@ -271,6 +271,13 @@ impl BrowserSession {
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
+        #[cfg(windows)]
+        {
+            // 剥离 Windows 兼容层并注入跳过重启哨兵，防止 Edge 脱壳重启导致句柄脱钩
+            cmd.env_remove("__COMPAT_LAYER");
+            cmd.arg("--edge-skip-compat-layer-relaunch");
+        }
+
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("启动浏览器窗口实例失败: {e}"))?;

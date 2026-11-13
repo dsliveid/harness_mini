@@ -169,6 +169,10 @@ impl BrowserDaemon {
         {
             const CREATE_NO_WINDOW: u32 = 0x08000000;
             cmd.creation_flags(CREATE_NO_WINDOW);
+            // 剥离父进程可能继承的 Windows 兼容层（如 RunAsInvoker / RUNASADMIN），
+            // 并注入跳过重启哨兵参数，防止 Edge 在启动初期触发 AppCompat Relaunch 脱壳重启并以 ExitCode 0 异常提前退出。
+            cmd.env_remove("__COMPAT_LAYER");
+            cmd.arg("--edge-skip-compat-layer-relaunch");
         }
 
         let mut child = cmd
@@ -274,7 +278,10 @@ impl BrowserDaemon {
         // 则自动自愈切换至全新独立临时目录重试，彻底杜绝多工具冲突与退出报错。
         let spawn_res = match Self::try_spawn_daemon(&browser_bin, &current_profile).await {
             Ok(pair) => Ok(pair),
-            Err(e) if e.contains("EXIT_CODE:Some(21)") => {
+            Err(e) if e.contains("EXIT_CODE:Some(21)")
+                || e.contains("ProcessSingleton")
+                || e.contains("Lock file can not be created") =>
+            {
                 let fallback_dir = std::env::temp_dir().join(format!(
                     "harness_browser_daemon_{}_{}",
                     std::process::id(),
@@ -428,5 +435,38 @@ impl BrowserDaemon {
         }
         let profile_dir = self.daemon_profile_dir.read().await.clone();
         let _ = tokio::fs::remove_dir_all(&profile_dir).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chromium_detection() {
+        let p = detect_chromium_path();
+        assert!(p.is_ok(), "应能检测到系统中安装的 Edge/Chrome: {:?}", p);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_daemon_spawn_survives_compat_layer() {
+        let browser_bin = match detect_chromium_path() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let test_profile = std::env::temp_dir().join(format!("test_daemon_compat_{}", uuid::Uuid::new_v4().simple()));
+        // 模拟父进程继承 Windows 兼容层环境
+        std::env::set_var("__COMPAT_LAYER", "RunAsInvoker");
+
+        let res = BrowserDaemon::try_spawn_daemon(&browser_bin, &test_profile).await;
+        std::env::remove_var("__COMPAT_LAYER");
+
+        assert!(res.is_ok(), "在带有 __COMPAT_LAYER 时启动守护进程应成功且不提前退出: {:?}", res.err());
+        let (mut child, ws) = res.unwrap();
+        assert!(ws.starts_with("ws://"), "应成功获取 DevTools WebSocket URL: {ws}");
+
+        let _ = child.kill().await;
+        let _ = tokio::fs::remove_dir_all(&test_profile).await;
     }
 }
