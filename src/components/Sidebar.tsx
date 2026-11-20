@@ -9,6 +9,8 @@ import {
   ChevronRight,
   ChevronDown,
   ChevronUp,
+  ChevronsDownUp,
+  ChevronsUpDown,
   Plus,
   MoreHorizontal,
   Pin,
@@ -202,6 +204,20 @@ export function Sidebar() {
     setGroupCollapsed((g) => ({ ...g, projects: false }));
   };
 
+  // 全部收起：把项目列表内每个项目都置为收起状态（仅动项目，不影响“对话”分组）
+  const collapseAllProjects = () => {
+    const next: Record<string, boolean> = {};
+    for (const p of projects) next[p.id] = true;
+    setCollapsed(next);
+  };
+
+  // 全部展开：回到默认进入状态——所有项目展开，且每个项目默认展示 PAGE_SIZE 条对话
+  const expandAllProjects = () => {
+    setCollapsed({});
+    setVisibleCount({});
+    setGroupCollapsed((g) => ({ ...g, projects: false }));
+  };
+
   const sorted = [...sessions].sort((a, b) =>
     (b.lastMessageAt ?? b.createdAt).localeCompare(a.lastMessageAt ?? a.createdAt)
   );
@@ -342,6 +358,27 @@ export function Sidebar() {
                     <Chevron collapsed={groupCollapsed.projects} />
                   </button>
                 </div>
+                {/* 批量操作：全部收起 / 全部展开（仅作用于项目，不含“对话”分组）；靠右紧邻“新建项目” */}
+                <button
+                  className="opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-inkdim hover:text-ink transition-opacity"
+                  title="全部收起（收起每个项目的对话）"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    collapseAllProjects();
+                  }}
+                >
+                  <ChevronsDownUp size={13} />
+                </button>
+                <button
+                  className="opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-inkdim hover:text-ink transition-opacity"
+                  title={`全部展开（每个项目展开前 ${PAGE_SIZE} 条对话）`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    expandAllProjects();
+                  }}
+                >
+                  <ChevronsUpDown size={13} />
+                </button>
                 <button
                   className="opacity-0 group-hover:opacity-100 w-6 h-6 rounded hover:bg-edge flex items-center justify-center text-inkdim hover:text-ink transition-opacity"
                   title="新建项目（选择目录）"

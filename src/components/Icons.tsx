@@ -26,6 +26,8 @@ export {
   ChevronRight,
   ChevronUp,
   ChevronLeft,
+  ChevronsDownUp,
+  ChevronsUpDown,
   ArrowLeft,
   X,
   Minus,
