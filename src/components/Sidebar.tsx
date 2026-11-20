@@ -41,6 +41,9 @@ function formatTokens(n?: number): string {
 
 const EMPTY_MENU: any[] = [];
 
+// 侧边栏折叠分批展开：初始展示条数，也是每次点“更多”的增量
+const PAGE_SIZE = 5;
+
 function ItemMenu({
   items,
   onClose,
@@ -189,8 +192,8 @@ export function Sidebar() {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   // 项目视图顶部大分类（项目 / 对话）的收起状态
   const [groupCollapsed, setGroupCollapsed] = useState<{ projects?: boolean; chats?: boolean }>({});
-  // 项目下对话是否展开全部（默认只展示前5条，超出收进“更多”）
-  const [expandedMore, setExpandedMore] = useState<Record<string, boolean>>({});
+  // 每个项目（含 "__ungrouped__"）当前展示的对话条数，缺省 = PAGE_SIZE；点“更多”按批递增
+  const [visibleCount, setVisibleCount] = useState<Record<string, number>>({});
 
   const createProjectByDialog = async () => {
     const picked = await open({ directory: true, multiple: false, title: "新建项目：选择目录" });
@@ -356,9 +359,9 @@ export function Sidebar() {
                     const children = sorted.filter((s) => s.projectId === p.id);
                     const isCollapsed = collapsed[p.id];
                     const isActive = currentId === DRAFT_ID && draft?.projectId === p.id;
-                    const isMoreExpanded = !!expandedMore[p.id];
-                    const hasMore = children.length > 5;
-                    const displayChildren = hasMore && !isMoreExpanded ? children.slice(0, 5) : children;
+                    const total = children.length;
+                    const shown = Math.min(visibleCount[p.id] ?? PAGE_SIZE, total);
+                    const displayChildren = children.slice(0, shown);
                     return (
                       <div key={p.id} className="mb-1">
                         <div
@@ -437,27 +440,28 @@ export function Sidebar() {
                               menuItems={menuFor === s.id ? sessionMenu(s) : EMPTY_MENU}
                             />
                           ))}
-                        {!isCollapsed && hasMore && (
-                          !isMoreExpanded ? (
-                            <div
-                              className="flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] text-inkdim hover:text-ink hover:bg-panel2 cursor-pointer mr-2 ml-4 select-none transition-colors"
-                              title={`共 ${children.length} 条对话，点击展开全部`}
-                              onClick={() => setExpandedMore((prev) => ({ ...prev, [p.id]: true }))}
-                            >
-                              <ChevronDown size={12} className="text-inkdim" />
-                              <span>更多</span>
-                              <span className="text-[11px] text-inkdim">({children.length})</span>
-                            </div>
-                          ) : (
-                            <div
-                              className="flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] text-inkdim hover:text-ink hover:bg-panel2 cursor-pointer mr-2 ml-4 select-none transition-colors"
-                              title="收起对话"
-                              onClick={() => setExpandedMore((prev) => ({ ...prev, [p.id]: false }))}
-                            >
-                              <ChevronUp size={12} className="text-inkdim" />
-                              <span>收起</span>
-                            </div>
-                          )
+                        {!isCollapsed && shown < total && (
+                          <div
+                            className="flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] text-inkdim hover:text-ink hover:bg-panel2 cursor-pointer mr-2 ml-4 select-none transition-colors"
+                            title={`共 ${total} 条对话，点击再展开 ${Math.min(PAGE_SIZE, total - shown)} 条`}
+                            onClick={() =>
+                              setVisibleCount((prev) => ({ ...prev, [p.id]: (prev[p.id] ?? PAGE_SIZE) + PAGE_SIZE }))
+                            }
+                          >
+                            <ChevronDown size={12} className="text-inkdim" />
+                            <span>更多</span>
+                            <span className="text-[11px] text-inkdim">(剩余 {total - shown})</span>
+                          </div>
+                        )}
+                        {!isCollapsed && shown > PAGE_SIZE && (
+                          <div
+                            className="flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] text-inkdim hover:text-ink hover:bg-panel2 cursor-pointer mr-2 ml-4 select-none transition-colors"
+                            title="收起对话"
+                            onClick={() => setVisibleCount((prev) => ({ ...prev, [p.id]: PAGE_SIZE }))}
+                          >
+                            <ChevronUp size={12} className="text-inkdim" />
+                            <span>收起</span>
+                          </div>
                         )}
                         {!isCollapsed && children.length === 0 && (
                           <div className="ml-4 text-[12px] text-inkdim py-1">暂无对话</div>
@@ -504,9 +508,9 @@ export function Sidebar() {
                   </button>
                 </div>
                 {!groupCollapsed.chats && (() => {
-                  const isUngroupedMore = !!expandedMore["__ungrouped__"];
-                  const hasMoreUngrouped = ungrouped.length > 5;
-                  const displayUngrouped = hasMoreUngrouped && !isUngroupedMore ? ungrouped.slice(0, 5) : ungrouped;
+                  const totalUngrouped = ungrouped.length;
+                  const shownUngrouped = Math.min(visibleCount["__ungrouped__"] ?? PAGE_SIZE, totalUngrouped);
+                  const displayUngrouped = ungrouped.slice(0, shownUngrouped);
                   return (
                     <>
                       {displayUngrouped.map((s) => (
@@ -523,27 +527,31 @@ export function Sidebar() {
                           menuItems={menuFor === s.id ? sessionMenu(s) : EMPTY_MENU}
                         />
                       ))}
-                      {hasMoreUngrouped && (
-                        !isUngroupedMore ? (
-                          <div
-                            className="flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] text-inkdim hover:text-ink hover:bg-panel2 cursor-pointer mr-2 ml-2 select-none transition-colors"
-                            title={`共 ${ungrouped.length} 条对话，点击展开全部`}
-                            onClick={() => setExpandedMore((prev) => ({ ...prev, ["__ungrouped__"]: true }))}
-                          >
-                            <ChevronDown size={12} className="text-inkdim" />
-                            <span>更多</span>
-                            <span className="text-[11px] text-inkdim">({ungrouped.length})</span>
-                          </div>
-                        ) : (
-                          <div
-                            className="flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] text-inkdim hover:text-ink hover:bg-panel2 cursor-pointer mr-2 ml-2 select-none transition-colors"
-                            title="收起对话"
-                            onClick={() => setExpandedMore((prev) => ({ ...prev, ["__ungrouped__"]: false }))}
-                          >
-                            <ChevronUp size={12} className="text-inkdim" />
-                            <span>收起</span>
-                          </div>
-                        )
+                      {shownUngrouped < totalUngrouped && (
+                        <div
+                          className="flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] text-inkdim hover:text-ink hover:bg-panel2 cursor-pointer mr-2 ml-2 select-none transition-colors"
+                          title={`共 ${totalUngrouped} 条对话，点击再展开 ${Math.min(PAGE_SIZE, totalUngrouped - shownUngrouped)} 条`}
+                          onClick={() =>
+                            setVisibleCount((prev) => ({
+                              ...prev,
+                              ["__ungrouped__"]: (prev["__ungrouped__"] ?? PAGE_SIZE) + PAGE_SIZE,
+                            }))
+                          }
+                        >
+                          <ChevronDown size={12} className="text-inkdim" />
+                          <span>更多</span>
+                          <span className="text-[11px] text-inkdim">(剩余 {totalUngrouped - shownUngrouped})</span>
+                        </div>
+                      )}
+                      {shownUngrouped > PAGE_SIZE && (
+                        <div
+                          className="flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] text-inkdim hover:text-ink hover:bg-panel2 cursor-pointer mr-2 ml-2 select-none transition-colors"
+                          title="收起对话"
+                          onClick={() => setVisibleCount((prev) => ({ ...prev, ["__ungrouped__"]: PAGE_SIZE }))}
+                        >
+                          <ChevronUp size={12} className="text-inkdim" />
+                          <span>收起</span>
+                        </div>
                       )}
                     </>
                   );
