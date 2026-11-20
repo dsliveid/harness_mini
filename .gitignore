@@ -12,3 +12,6 @@ scratch/
 # 仅保留核心生产/启动脚本（tauri-dev.mjs），忽略临时诊断与基准测试脚本
 scripts/diag/
 scripts/sqlite_bench/
+
+# 第三方输入法注入 WebView2/Chromium 的原生告警日志（非本项目输出，勿提交）
+src-tauri/debug.log

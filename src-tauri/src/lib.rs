@@ -480,16 +480,26 @@ pub fn run() {
     panic_guard::install();
     eprintln!("[Panic Guard] 已安装全局 panic 捕获钩子");
 
+    // 启动诊断（精简版）：WebView2 缓存目录选择依赖 exe 所在目录，且受进程完整性级别
+    // 影响；一旦异常会表现为「进程存活但窗口空白」，故保留一行关键上下文便于排查。
     let dir_hash = single_instance::get_app_dir_hash();
     let pipe_name = format!(r"\\.\pipe\harness_mini_{}", dir_hash);
+    eprintln!(
+        "[Startup] exe = {:?} | dir_hash = {dir_hash} | 继承的 WEBVIEW2_USER_DATA_FOLDER = {:?}",
+        std::env::current_exe(),
+        std::env::var("WEBVIEW2_USER_DATA_FOLDER")
+    );
 
     // 1. 同目录单实例拦截：若已有实例正在运行，唤醒对方窗口并退出当前进程
     if single_instance::try_wakeup_existing_instance(&pipe_name) {
         std::process::exit(0);
     }
 
-    // 2. 多目录实例隔离：为当前目录实例分配专属 WebView2 缓存目录，防止多开时白屏崩溃
-    single_instance::setup_webview_isolation(&dir_hash);
+    // 2. 多目录实例隔离：为当前目录实例分配专属 WebView2 缓存目录，防止多开时白屏崩溃。
+    //    目录选择改为「实测可写性 + 逐级回退」：受限环境（如进程完整性级别被降级）
+    //    无法写 %LOCALAPPDATA% 时自动退到 exe 同级目录，避免 WebView2 静默失败导致空白窗口。
+    let webview_dir = single_instance::setup_webview_isolation(&dir_hash);
+    eprintln!("[Startup] WebView2 用户数据目录（实际生效）= {}", webview_dir.display());
 
     let pipe_name_for_listener = pipe_name.clone();
     let dir_hash_for_tray = dir_hash.clone();
@@ -511,6 +521,11 @@ pub fn run() {
                 .unwrap_or_else(|| std::env::temp_dir().join("harness_mini_data"));
             let (data_dir, master_key, db, pending, unwritable_path) =
                 resolve_and_open(legacy_dir.as_deref(), custom_dir.as_deref(), &default_dir)?;
+            // 启动诊断（精简版）：数据目录解析结果，仅在异常（内存库/不可写）时额外提示。
+            eprintln!(
+                "[Startup] 生效 data_dir = {:?} | 内存库 = {pending} | 不可写路径 = {:?}",
+                data_dir, unwritable_path
+            );
             // 存储模式随库启动加载（默认 hybrid）
             let storage_mode = store::core::get_storage_mode(&db);
             let (event_bus, _) = tokio::sync::broadcast::channel(2048);
@@ -691,6 +706,28 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            // 启动自检（精简版）：WebView2 环境创建失败时进程不会 panic，只是没有渲染进程、
+            // 窗口内容为空；配合 transparent 配置肉眼完全不可见。此处在主窗口应已就绪的时间点
+            // 探明一次可见性，异常时留下可定位的痕迹。
+            {
+                let probe_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    match probe_handle.get_webview_window("main") {
+                        Some(w) => {
+                            if !w.is_visible().unwrap_or(false) {
+                                eprintln!(
+                                    "[Startup][WARN] 5s 后主窗口仍不可见：检查上方 WebView2 用户数据目录是否可写（低完整性级别进程无法写 %LOCALAPPDATA%）"
+                                );
+                            }
+                        }
+                        None => {
+                            eprintln!("[Startup][WARN] 5s 后仍取不到名为 main 的窗口（窗口创建失败）")
+                        }
+                    }
+                });
+            }
             Ok(())
         })
         .on_window_event(|window, event| {

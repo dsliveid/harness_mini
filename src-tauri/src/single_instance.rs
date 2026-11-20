@@ -67,26 +67,105 @@ pub fn try_wakeup_existing_instance(pipe_name: &str) -> bool {
     }
 }
 
-/// 基于目录哈希为当前进程动态隔离 WebView2 用户数据目录
+/// 真写探针：确认目录能否创建并写入文件
 ///
-/// 避免不同目录启动的多个实例争抢同一个 EBWebView 目录导致渲染进程崩溃（界面消失变白屏）。
-pub fn setup_webview_isolation(dir_hash: &str) {
+/// WebView2 创建浏览器进程前必须能写用户数据目录，否则 `CreateCoreWebView2Environment`
+/// 会静默失败（仅打印 "can't open file for write !"），表现为进程存活、无渲染子进程、
+/// 窗口内容空白。Windows 强制完整性控制（MIC）下，低完整性级别（Low IL）进程
+/// 无法写入中完整性（Medium IL）的 `%LOCALAPPDATA%`，因此不能凭假设，必须实测。
+pub fn probe_writable(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(".harness_write_probe");
+    match std::fs::write(&probe, b"probe") {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// 按候选链挑选 WebView2 用户数据目录，并把结果写入环境变量
+///
+/// 候选顺序（逐级回退，第一个可写者胜出）：
+/// 1. 进程启动时已存在的 `WEBVIEW2_USER_DATA_FOLDER`（尊重外部显式配置）
+/// 2. `%LOCALAPPDATA%\com.harness.mini\instances\ebwebview_<hash>`（常规路径，多开隔离）
+/// 3. `<exe 同级>\webview_cache_<hash>`（受限环境下 exe 所在目录通常可写）
+/// 4. `<系统临时目录>\com.harness.mini\ebwebview_<hash>`（最后兜底）
+///
+/// 返回值：最终生效的目录。即使全部不可写也返回首选路径，由 WebView2 自行报错，
+/// 避免调用方拿到 None 后陷入难以定位的空白窗口。
+pub fn setup_webview_isolation(dir_hash: &str) -> PathBuf {
     #[cfg(windows)]
     {
-        if std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none() {
-            let base_dir = std::env::var_os("LOCALAPPDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir);
-            let isolated_path = base_dir
-                .join("com.harness.mini")
-                .join("instances")
-                .join(format!("ebwebview_{}", dir_hash));
-            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", isolated_path);
+        // 候选 1：外部已显式指定时优先尊重（例如 CI 或用户自定义缓存目录）
+        if let Some(existing) = std::env::var_os("WEBVIEW2_USER_DATA_FOLDER") {
+            let path = PathBuf::from(existing);
+            if probe_writable(&path) {
+                return path;
+            }
+            eprintln!(
+                "[single_instance][WARN] 继承的 WEBVIEW2_USER_DATA_FOLDER 不可写，改用隔离目录: {}",
+                path.display()
+            );
         }
+
+        // 候选 2：常规隔离路径
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(base) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+            candidates.push(
+                base.join("com.harness.mini")
+                    .join("instances")
+                    .join(format!("ebwebview_{dir_hash}")),
+            );
+        }
+
+        // 候选 3：exe 同级目录（受限环境下该目录通常仍可写）
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                candidates.push(parent.join(format!("webview_cache_{dir_hash}")));
+            }
+        }
+
+        // 候选 4：系统临时目录兜底
+        candidates.push(
+            std::env::temp_dir()
+                .join("com.harness.mini")
+                .join(format!("ebwebview_{dir_hash}")),
+        );
+
+        let fallback = candidates.last().cloned().unwrap_or_default();
+        for (idx, candidate) in candidates.iter().enumerate() {
+            if probe_writable(candidate) {
+                if idx > 0 {
+                    eprintln!(
+                        "[single_instance][WARN] 首选 WebView2 用户目录不可写（常见原因：进程完整性级别被降级，无法写 %LOCALAPPDATA%），已回退至: {}",
+                        candidate.display()
+                    );
+                }
+                std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", candidate);
+                return candidate.clone();
+            }
+            eprintln!(
+                "[single_instance][WARN] WebView2 候选目录不可写: {}",
+                candidate.display()
+            );
+        }
+
+        // 全部不可写：仍设为首选，让 WebView2 自己报错，但留下明确痕迹
+        eprintln!(
+            "[single_instance][ERROR] 所有 WebView2 候选目录均不可写，窗口可能空白；最后尝试: {}",
+            fallback.display()
+        );
+        std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &fallback);
+        fallback
     }
     #[cfg(not(windows))]
     {
         let _ = dir_hash;
+        std::env::temp_dir()
     }
 }
 
@@ -164,17 +243,24 @@ mod tests {
         #[cfg(windows)]
         {
             let test_hash = "abc123456789def0";
-            // 该测试必须环境无关：宿主进程（如 harness_mini Tauri 应用）可能已设置
-            // WEBVIEW2_USER_DATA_FOLDER，而 setup_webview_isolation 在变量已存在时不会覆盖。
-            // 因此先清除继承的同名变量，测完再还原，避免污染其他测试。
+            // 该测试必须环境无关：宿主进程可能已设置 WEBVIEW2_USER_DATA_FOLDER，
+            // 新实现会先验证其可写性，不可写则回退。这里先清除继承的同名变量，测完再还原。
             let saved = std::env::var_os("WEBVIEW2_USER_DATA_FOLDER");
             std::env::remove_var("WEBVIEW2_USER_DATA_FOLDER");
 
-            setup_webview_isolation(test_hash);
+            let chosen = setup_webview_isolation(test_hash);
 
+            // 返回值与环境变量必须一致，且都带上本次哈希，保证多实例隔离不串味
             let val = std::env::var("WEBVIEW2_USER_DATA_FOLDER").unwrap();
-            assert!(val.contains(test_hash));
-            assert!(val.contains("ebwebview_"));
+            assert_eq!(chosen.to_string_lossy(), val);
+            assert!(val.contains(test_hash), "隔离目录名必须包含实例哈希: {val}");
+            // 常规路径为 ebwebview_<hash>，受限环境回退为 webview_cache_<hash>
+            assert!(
+                val.contains("ebwebview_") || val.contains("webview_cache_"),
+                "隔离目录命名不符合预期: {val}"
+            );
+            // 选中的目录必须真的可写（这正是本改造的核心保证）
+            assert!(probe_writable(&chosen), "选中的目录必须可写: {}", chosen.display());
 
             match saved {
                 Some(v) => std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", v),
@@ -185,5 +271,34 @@ mod tests {
         {
             setup_webview_isolation("abc123456789def0");
         }
+    }
+
+    #[test]
+    fn test_probe_writable_detects_writable_and_unwritable() {
+        // 注意：本测试不假设 %TEMP% 一定可写。受限环境下（进程完整性级别被降级）
+        // 连 %TEMP% 都会被拒绝，此时探针必须如实返回 false —— 那同样是正确行为。
+        // 核心保证是：probe_writable 的返回值必须与「真写一次」的实际结果一致。
+        let tmp = std::env::temp_dir().join("harness_probe_test_dir");
+        let reported = probe_writable(&tmp);
+        let actually_writable = std::fs::write(tmp.join(".verify"), b"x").is_ok();
+        assert_eq!(
+            reported, actually_writable,
+            "探针返回值与实际可写性不一致（目录: {}）",
+            tmp.display()
+        );
+        let _ = std::fs::remove_file(tmp.join(".verify"));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // 深层嵌套：可创建则必须可写，不可创建则必须报告不可写（一致性同样成立）
+        let nested = std::env::temp_dir().join("harness_probe_test_dir/a/b/c");
+        let reported_deep = probe_writable(&nested);
+        if reported_deep {
+            assert!(
+                std::fs::write(nested.join(".verify"), b"x").is_ok(),
+                "报告可写但实际写失败: {}",
+                nested.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("harness_probe_test_dir"));
     }
 }
