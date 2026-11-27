@@ -1,6 +1,13 @@
 # 浏览器智能录制与大模型自动提炼免登契约知识文档
 (BROWSER_SMART_RECORDING_AND_LLM_AUTH_CONTRACT_KNOWLEDGE)
 
+> ⚠️ **【已废弃 · 2026-11-24】本文全篇失效，且其描述的机制从未真正生效。**
+> 本文所属模块 `synthesizer.rs` / `pipeline.rs` / `auth.rs` 三文件**未在 `browser/mod.rs` 声明 `mod`，
+> `cargo` 从未编译**，全项目零调用。`AuthContract` 契约体系、LLM 自动提炼链路、`DistillTrace` 均不存在于运行时。
+> 现行权威方案（去掉契约 JSON，改为 `.harness/login_sop.md` 文档驱动 + `browser_batch` 一次性执行登录流程）请见
+> [`docs/BROWSER_BATCH_AND_SNAPSHOT_DIFF_SPEC.md`](BROWSER_BATCH_AND_SNAPSHOT_DIFF_SPEC.md)。
+> 本文仅作历史演进参考，**不可作为验收依据**。
+
 | 属性 | 说明 |
 | :--- | :--- |
 | **文档代号** | `BROWSER_SMART_RECORDING_AND_LLM_AUTH_CONTRACT_KNOWLEDGE` |

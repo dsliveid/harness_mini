@@ -1,6 +1,14 @@
 # 浏览器登录流程录制与过期自动重放架构知识文档
 (BROWSER_LOGIN_RECORDING_AND_AUTO_REPLAY_KNOWLEDGE)
 
+> ⚠️ **【已废弃 · 2026-11-24】本文全篇失效，且其描述的机制从未真正生效。**
+> 本文所述录制/重放链路依赖 `src-tauri/src/browser/auth.rs` / `pipeline.rs` / `synthesizer.rs`，
+> 经逐行勘察确认：这三个文件**未在 `browser/mod.rs` 中声明 `mod`，`cargo` 从未编译它们**，全项目零调用。
+> 录制器常量 `INJECT_RECORDER_SCRIPT` / `EXTRACT_RECORDED_STEPS_SCRIPT` 同样只有定义、零调用，已随本轮改造删除。
+> 现行权威方案（登录改为 `.harness/login_sop.md` 文档驱动 + `browser_batch` 一次性执行）请见
+> [`docs/BROWSER_BATCH_AND_SNAPSHOT_DIFF_SPEC.md`](BROWSER_BATCH_AND_SNAPSHOT_DIFF_SPEC.md)。
+> 本文仅作历史演进参考，**不可作为验收依据**。
+
 | 属性 | 说明 |
 | :--- | :--- |
 | **文档代号** | `BROWSER_LOGIN_RECORDING_AND_AUTO_REPLAY_KNOWLEDGE` |

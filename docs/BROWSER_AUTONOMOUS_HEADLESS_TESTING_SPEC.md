@@ -1,6 +1,11 @@
 # 基于原生 CDP 的无头自主浏览器调试与免视觉全闭环验证方案规范
 (BROWSER_AUTONOMOUS_HEADLESS_TESTING_SPEC)
 
+> ⚠️ **【已被取代 · 2026-11-24】** 本文第四章中 `browser_interact` 的工具定义、入参说明与调用示例**已失效**。
+> 该工具已从工具面删除，全部单步交互收归 `browser_batch` 的 `steps` 数组。
+> 现行权威方案请见 [`docs/BROWSER_BATCH_AND_SNAPSHOT_DIFF_SPEC.md`](BROWSER_BATCH_AND_SNAPSHOT_DIFF_SPEC.md)（工具面 6→5、批量执行、快照增量 diff）。
+> 本文其余章节（CDP 免视觉验证思路、@eX 语义定位理念）仍然有效，可作为背景知识阅读；按旧第四章验收会得出「工具不存在」的错误结论。
+
 | 属性 | 说明 |
 | :--- | :--- |
 | **文档代号** | `BROWSER_AUTONOMOUS_HEADLESS_TESTING_SPEC` |

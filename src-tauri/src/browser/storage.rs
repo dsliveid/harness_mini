@@ -1,4 +1,4 @@
-use super::cdp::CdpClient;
+use super::transport::CdpClient;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -29,7 +29,8 @@ pub fn resolve_storage_workspace(workspace: &Path) -> PathBuf {
             return cur;
         }
     }
-    std::env::temp_dir().join("harness_storage")
+    // 兜底：优先用可写探测，避免低完整性级别进程写不了 TEMP
+    super::fs_probe::resolve_writable_dir(None, "harness_storage")
 }
 
 pub fn storage_filename_for_url(url: &str) -> String {
@@ -562,7 +563,8 @@ mod tests {
 
     #[test]
     fn test_storage_summary_and_clear_lifecycle() {
-        let temp = std::env::temp_dir().join(format!("test_harness_summary_{}", std::process::id()));
+        let temp = super::super::fs_probe::resolve_writable_dir(None, "harness_storage_test")
+            .join(format!("test_harness_summary_{}", std::process::id()));
         let _ = std::fs::create_dir_all(temp.join(".harness").join("storage_states"));
 
         let test_url = "http://127.0.0.1:19999/test";

@@ -4747,8 +4747,13 @@ pub async fn browser_navigate_url(
     session_id: String,
     url: String,
 ) -> Result<crate::browser::BrowserDebugState, String> {
+    crate::browser::diag::log(
+        "command",
+        format!("browser_navigate_url 进入: session_id={session_id}, url={url}"),
+    );
     let clean_url = url.trim();
     if clean_url.is_empty() {
+        crate::browser::diag::log("command", "URL 为空，直接返回错误");
         return Err("URL 不能为空".to_string());
     }
     let ws_path = {
@@ -4758,9 +4763,30 @@ pub async fn browser_navigate_url(
             .flatten()
             .map(|s| std::path::PathBuf::from(s.workspace_path))
     };
+    crate::browser::diag::log("command", format!("解析到 workspace: {ws_path:?}"));
     let manager = crate::browser::global_browser_manager();
-    let session = manager.get_or_create(&session_id, true, ws_path).await?;
-    session.navigate(clean_url).await
+    // 与 Agent 工具侧共用同一 key 解析，避免「人看 A、Agent 操作 B」
+    let s_key = crate::browser::resolve_session_key(None, Some(&session_id));
+    crate::browser::diag::log("command", format!("session_key={s_key}，开始 get_or_create"));
+    let session = match manager.get_or_create(&s_key, true, ws_path).await {
+        Ok(s) => {
+            crate::browser::diag::log("command", "get_or_create 成功，开始 navigate");
+            s
+        }
+        Err(e) => {
+            crate::browser::diag::log("command", format!("get_or_create 失败: {e}"));
+            return Err(e);
+        }
+    };
+    let res = session.navigate(clean_url).await;
+    match &res {
+        Ok(st) => crate::browser::diag::log(
+            "command",
+            format!("navigate 成功: url={}, 元素数={}", st.url, st.elements.len()),
+        ),
+        Err(e) => crate::browser::diag::log("command", format!("navigate 失败: {e}")),
+    }
+    res
 }
 
 #[tauri::command]

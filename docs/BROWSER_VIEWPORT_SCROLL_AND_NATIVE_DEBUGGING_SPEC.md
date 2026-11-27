@@ -1,5 +1,10 @@
 # 原生浏览器视口感知、滚动探索与全景调试治理规范 (BROWSER_VIEWPORT_SCROLL_AND_NATIVE_DEBUGGING_SPEC)
 
+> ⚠️ **【已被取代 · 2026-11-24】** 本文第四章 4.4 节（`browser_scroll` 工具注册）与 4.3 节滚动建议文案**已失效**。
+> `browser_scroll` 已从工具面删除，滚动改由 `browser_batch` 的 `scroll` op 承载。
+> 现行权威方案请见 [`docs/BROWSER_BATCH_AND_SNAPSHOT_DIFF_SPEC.md`](BROWSER_BATCH_AND_SNAPSHOT_DIFF_SPEC.md)。
+> 本文其余章节（ViewportInfo 视口进度感知、长页面折叠统计、静默无头不抢焦点原则）仍然有效。
+
 | 项目 | 内容 |
 | --- | --- |
 | 文档名称 | 原生浏览器视口感知、滚动探索与全景调试治理规范 |

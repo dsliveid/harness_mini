@@ -1,5 +1,11 @@
 # 浏览器智能录制宏与大模型自动提炼通用免登契约架构规范 (Auth Contract v3.0)
 
+> ⚠️ **【已废弃 · 2026-11-24】本文全篇失效，且其描述的 Auth Contract v3.0 机制从未真正生效。**
+> 相关实现 `synthesizer.rs` / `pipeline.rs` / `auth.rs` **未在 `browser/mod.rs` 声明 `mod`，
+> `cargo` 从未编译**，全项目零调用。本文所述智能录制、契约提炼、后置动作链均不存在于运行时。
+> 现行权威方案请见 [`docs/BROWSER_BATCH_AND_SNAPSHOT_DIFF_SPEC.md`](BROWSER_BATCH_AND_SNAPSHOT_DIFF_SPEC.md)
+> （登录改为 `.harness/login_sop.md` 文档驱动 + `browser_batch` 一次性执行）。本文仅作历史参考。
+
 ## 1. 架构演进背景与设计目标
 
 在企业级 SPA/B-end 系统（如医院 HIS、医务管理、政企审批系统）中，用户登录往往不仅仅是单次“账号 + 密码 + 登录按钮”，而是呈现高度异构的多阶段流程：

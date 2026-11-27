@@ -332,7 +332,7 @@ const handleClick = async () => {
 
         // 扩展工具被收敛，不在顶层直接暴露
         assert!(!names.contains(&"browser_navigate"));
-        assert!(!names.contains(&"browser_interact"));
+        assert!(!names.contains(&"browser_batch"));
         assert!(!names.contains(&"record_memory"));
     }
 

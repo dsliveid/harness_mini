@@ -146,46 +146,46 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
-            name: "browser_interact",
-            description: "在当前受控网页上执行交互操作（如点击、打字输入、回车提交、等待元素加载等）。通过 CDP 虚拟事件通道直接注入内核，绝不抢占物理鼠标键盘。优先使用 @e1, @e2 等 ref 标识符（由 browser_navigate 提取返回）定位元素，也可使用 CSS 选择器。交互完成后自动返回更新后的页面状态、控制台错误及网络异常。",
+            name: "browser_batch",
+            description: "【浏览器操作唯一入口】在一个批次中按顺序执行多个动作，一次工具调用完成原本需要多次往返的连续操作（如登录：填账号→填密码→点登录→选机构→断言进入主页）。\n\n关键优势：\n1. 连续操作只需 1 次调用，不再每动一下都要重调工具；\n2. click 走 CDP 真实鼠标事件（isTrusted=true），并在点击前用 elementFromPoint 校验坐标是否真被目标接收；若被遮罩挡住会重试 3 次（等动画/重滚/偏移点），仍失败则明确报 CLICK_BLOCKED，**绝不静默降级**——避免「点了但没生效却报成功」；\n3. 填充采用原生 value setter，绕过 React _valueTracker，受控组件可正常触发 onChange；\n4. wait_for_* 为真轮询（带超时），超时会附带诊断分级；表达式语法非法会立即报错而非空转；\n5. 密码用 ${secret:KEY} 占位符，明文不入对话、不进日志，回显一律 ***；\n6. probe_options 判断下拉「未展开/加载中/空数据/有 N 项」；probe_page 一次看清「当前有哪些弹窗、表单项、哪些按钮点得动、有什么提示」，**优先用它替代截图**；\n7. wait_for_network_idle 基于 CDP 在途请求数判定（需连续 300ms 静默），**会真实等待表单提交/SPA 路由的 XHR 完成**，不再 0ms 虚假返回；超时会报出在途请求数与前几条 URL；\n8. 元素清单已按「弹窗内元素 / 页面元素」分组，弹窗内元素带 inDialog 标记，同 placeholder 的输入框不会再分不清归属。\n\n操作建议：\n- 打开弹窗后先调 probe_page，拿到表单项与按钮的真实可点击性，再决定怎么填怎么点；\n- 用 @eXXXXXXXX 稳定 ref 或 CSS / :has-text('登录') 语义选择器定位元素；\n- 中间态用 wait_for_selector 而非直接下一步；机构弹窗可能不出现时加 \"optional\": true；\n- 结尾断言（wait_for_url / assert_text）建议加 \"critical\": true，避免被 optional 掩盖；\n- **断言提示文案前先 probe_page 看 notices 里的真实文案，不要靠猜**（「新增成功」可能是「操作成功」/「保存成功」，猜错必然断言失败）：先 probe_page → 复制 notices 原文 → 再 assert_text；\n- wait_for_selector 报「所有 N 个实例均不可见」说明命中了历史残留的隐藏节点；诊断中出现 multiple_instances_some_visible 时，请用 probe_page 或可见实例的 @ref 定位，不要盲目滚动；\n- assert_text 对 body 会自动收窄到提示容器（message/alert/toast），不会拿整页导航文本比对；\n- 看到 ⚠️[合成点击-可能未生效] 时，务必用 probe_page 或 assert_text 复核，不要直接判定成功。",
             risk: Risk::Execute,
             scope: ToolScope::MainOnly,
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["click", "type", "press_enter", "wait_for_selector", "scroll"],
-                        "description": "交互动作类型：click (点击), type (输入文本), press_enter (回车), wait_for_selector (等待元素)"
+                    "steps": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 50,
+                        "description": "按顺序执行的原子动作数组",
+                        "items": {
+                            "type": "object",
+                            "required": ["op"],
+                            "properties": {
+                                "op": {
+                                    "type": "string",
+                                    "enum": ["click", "fill", "type", "press_key", "press_enter", "scroll", "wait_for_selector", "wait_for_url", "wait_for_function", "wait_for_network_idle", "pick_first", "pick_by_index", "pick_by_text", "probe_options", "probe_page", "assert_text", "assert_url", "pause"],
+                                    "description": "动作类型：click(点击) fill(填值) type(输入) press_key(按键) press_enter(回车) scroll(滚动) wait_for_selector(等元素) wait_for_url(等URL) wait_for_function(等JS真值) wait_for_network_idle(等加载完) pick_first(选第一个) pick_by_index(选第N个) pick_by_text(按文字选) probe_options(探测下拉选项数/是否为空) probe_page(探测界面结构:弹窗/表单/按钮可点击性/提示) assert_text(断言文字) assert_url(断言URL) pause(转人工)"
+                                },
+                                "target": {"type": "string", "description": "稳定 ref（如 @e3f8a1c2）、CSS 选择器，或 :has-text('登录') 语义选择器。pick_*/probe_options 时为容器或输入框选择器"},
+                                "value": {"type": "string", "description": "填入文本 / 按键名 / 断言期望值；支持 ${secret:KEY} 占位符（如 ${secret:login_pwd}）"},
+                                "pattern": {"type": "string", "description": "wait_for_url 的正则表达式"},
+                                "index": {"type": "integer", "description": "pick_by_index 的序号（从 1 开始）"},
+                                "timeout_ms": {"type": "integer", "description": "该步超时毫秒，默认 10000（wait_for_url 至少 15000）"},
+                                "optional": {"type": "boolean", "description": "为 true 时该步失败或超时不中断流程，标记为跳过。用于「机构弹窗可能不出现」这类可选步骤"},
+                                "critical": {"type": "boolean", "description": "关键步骤标记：即使同时设了 optional，该步失败也会让整批返回失败。用于结尾的 wait_for_url/assert_url 这类「必须确认成功」的断言"},
+                                "desc": {"type": "string", "description": "该步的人类可读说明，失败时回显便于定位"}
+                            }
+                        }
                     },
-                    "target": {"type": "string", "description": "目标元素 ref 标识符（如 @e1、@e2）或 CSS 选择器"},
-                    "value": {"type": "string", "description": "输入文本（type 操作必填，如用户名密码）"}
-                },
-                "required": ["action", "target"]
-            }),
-        },
-        ToolSpec {
-            name: "browser_scroll",
-            description: "滚动当前受控网页视口。支持按方向滚动(down/up/top/bottom)、按指定像素滚动，或直接滚动到指定交互元素(@eX)使其居中。长页面或表格溢出时，优先调用本工具向下滑动探索未展示内容。执行后自动刷新并返回最新视口内的元素与状态。",
-            risk: Risk::Execute,
-            scope: ToolScope::MainOnly,
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "direction": {
+                    "stop_on_error": {"type": "boolean", "description": "遇错立即中断后续步骤，默认 true"},
+                    "detail": {
                         "type": "string",
-                        "enum": ["down", "up", "top", "bottom", "left", "right"],
-                        "description": "滚动方向：down(向下翻一屏/默认)、up(向上翻一屏)、top(回到顶部)、bottom(直达底部)、left(向左滑)、right(向右滑)"
-                    },
-                    "distance": {
-                        "type": "number",
-                        "description": "滚动的像素距离(px)，默认约为当前视口高度的 80% (约 700px)"
-                    },
-                    "target": {
-                        "type": "string",
-                        "description": "目标元素标识符(如 @e35 或 CSS 选择器)，滚动使该元素在视口中居中显示"
+                        "enum": ["diff", "summary", "full"],
+                        "description": "批次结束后返回的页面状态粒度。diff(默认，只回与上次相比的变化项) / summary(仅计数，最省 token) / full(完整页面，首次导航或需重建元素地图时用)"
                     }
-                }
+                },
+                "required": ["steps"]
             }),
         },
         ToolSpec {

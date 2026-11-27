@@ -89,7 +89,7 @@ pub fn normalize_tool_output_for_ingress(tool_name: &str, raw_output: &str) -> S
                 raw_output.to_string()
             }
         }
-        "browser_interact" | "browser_open" => {
+        "browser_interact" | "browser_open" | "browser_batch" | "browser_navigate" => {
             // 浏览器页面渲染输出若过长 (> 8000 字符)，收敛保留前 5000 字符
             if raw_output.len() > 8000 {
                 let safe_len = raw_output

@@ -1,5 +1,11 @@
 # 原生浏览器调试引擎与 CDP 韧性治理规范 (BROWSER_DEBUGGING_ENGINE_AND_CDP_RESILIENCE_SPEC)
 
+> ⚠️ **【部分被取代 · 2026-11-24】** 本文第 2 节 Mermaid 图中的工具清单（含 `browser_interact`）与第 186 行的
+> `browser_interact` 调用示例**已失效**：该工具已删除，连同 `browser_scroll` 一并收归 `browser_batch` 的 `steps` 数组。
+> 现行工具面为 5 个：`browser_navigate` / `browser_batch` / `browser_screenshot` / `browser_get_debug_state` / `browser_close`。
+> 详见 [`docs/BROWSER_BATCH_AND_SNAPSHOT_DIFF_SPEC.md`](BROWSER_BATCH_AND_SNAPSHOT_DIFF_SPEC.md)。
+> **本文其余全部内容（Windows 管道死锁治理、代理解除、僵尸会话摘除、CDP 韧性机制）仍然完全有效。**
+
 | 项目 | 内容 |
 | --- | --- |
 | 文档名称 | 原生浏览器调试引擎与 CDP 韧性治理规范 |

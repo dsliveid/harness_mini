@@ -1,12 +1,21 @@
-pub mod cdp;
-pub mod daemon;
+pub mod batch;
+pub mod credential;
 pub mod detector;
+pub mod diag;
 pub mod dom_script;
 pub mod evaluator;
+pub mod fs_probe;
+pub mod login_sop;
+pub mod perceive;
 pub mod session;
+pub mod snapshot;
 pub mod storage;
+pub mod transport;
 
-pub use daemon::{global_browser_daemon, BrowserDaemon};
+pub use perceive::model::{
+    ElementDescriptor, ElementState, Lod, Obstruction, Rect,
+};
+pub use transport::{global_browser_daemon, BrowserDaemon, CdpClient};
 pub use evaluator::{evaluate_page_state, PageHealthState};
 pub use session::{BrowserDebugState, BrowserSession, ViewportInfo};
 pub use storage::{
@@ -79,18 +88,28 @@ impl BrowserManager {
 
     pub async fn get(&self, session_id: &str) -> Option<Arc<BrowserSession>> {
         let map = self.sessions.read().await;
+        // 严格按 session_id 命中。
+        //
+        // 历史缺陷：此处曾在未命中时「回退到任意存活实例」，导致 A 会话的 Agent 可能
+        // 操作到 B 会话的浏览器（人多会话/父子会话场景下表现为「界面上看到的是 A，
+        // 实际在动的是 B」）。多会话隔离优先于容错便利，故删除该回退。
         if let Some(s) = map.get(session_id) {
             if s.is_alive().await {
                 return Some(s.clone());
             }
         }
-        // 容错回退：若未精确命中传入的 session_id（如草稿或父子会话场景），尝试回退到任意当前依然存活的调试实例
-        for (_, s) in map.iter() {
+        None
+    }
+
+    /// 当前是否有任意存活会话（供错误提示区分「没开过」与「标识不匹配」）
+    pub async fn has_any_alive(&self) -> bool {
+        let map = self.sessions.read().await;
+        for s in map.values() {
             if s.is_alive().await {
-                return Some(s.clone());
+                return true;
             }
         }
-        None
+        false
     }
 
     pub async fn close(&self, session_id: &str) {
@@ -103,11 +122,26 @@ impl BrowserManager {
 
 // ---------------- Agent 工具接口实现 ----------------
 
+/// 统一的会话 key 解析
+///
+/// 历史缺陷：Agent 工具侧用 `ctx.host.session_id`（缺省 "default_browser_session"），
+/// 而前端 `browser_navigate_url` 命令用传入的 `session_id` 参数。两者不等时
+/// `get_or_create` 会各自新建实例 → 人在看 A、Agent 在操作 B。
+///
+/// 约定：凡是能拿到 host 上下文的调用一律以它为准；前端命令若已按同一 session_id
+/// 传参则自然命中同一实例。
+pub fn resolve_session_key(host_session_id: Option<&str>, fallback: Option<&str>) -> String {
+    if let Some(h) = host_session_id.filter(|s| !s.is_empty()) {
+        return h.to_string();
+    }
+    if let Some(f) = fallback.filter(|s| !s.is_empty()) {
+        return f.to_string();
+    }
+    "default_browser_session".to_string()
+}
+
 fn get_session_key(ctx: &ToolCtx) -> String {
-    ctx.host
-        .as_ref()
-        .map(|h| h.session_id.clone())
-        .unwrap_or_else(|| "default_browser_session".to_string())
+    resolve_session_key(ctx.host.as_ref().map(|h| h.session_id.as_str()), None)
 }
 
 pub async fn browser_navigate(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
@@ -154,19 +188,7 @@ pub async fn browser_navigate(args: &Value, ctx: &ToolCtx) -> Result<String, Str
     }
 }
 
-pub async fn browser_interact(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
-    let action = args
-        .get("action")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "缺少必填参数: action (click, type, press_enter, wait_for_selector)".to_string())?;
-
-    let target = args
-        .get("target")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "缺少必填参数: target (如 @e1 或 CSS 选择器)".to_string())?;
-
-    let value = args.get("value").and_then(|v| v.as_str());
-
+pub async fn browser_batch(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
     let session_key = get_session_key(ctx);
     let manager = global_browser_manager();
     let session = manager
@@ -174,16 +196,60 @@ pub async fn browser_interact(args: &Value, ctx: &ToolCtx) -> Result<String, Str
         .await
         .ok_or_else(|| "未找到活动的浏览器调试会话，请先调用 browser_navigate 打开网页".to_string())?;
 
-    let res = session.interact(action, target, value).await;
-    match res {
-        Ok(debug_state) => Ok(debug_state.to_markdown()),
+    // 操作互斥：防并发批次与人工接管交错在同一 CDP target 上
+    let _guard = session.acquire_op_lock().await?;
+
+    // 登录硬门禁：未登录时直接返回结构化 AUTH_REQUIRED + SOP 路径，
+    // 避免 Agent 忽略软提示继续点业务按钮（原设计只在 markdown 里放一行 ⚠️）。
+    // 例外：批次自身已包含登录动作时不拦截，避免自锁。
+    if !batch::batch_looks_like_login(args) {
+        if let Ok(st) = session.get_debug_state().await {
+            if let crate::browser::evaluator::PageHealthState::Unauthenticated { current_url, reason } = &st.page_state {
+                let ws = if ctx.workspace.as_os_str().is_empty() {
+                    std::path::PathBuf::new()
+                } else {
+                    ctx.workspace.clone()
+                };
+                return Err(login_sop::auth_required_message(&ws, current_url, reason));
+            }
+        }
+    }
+
+    // 凭据查询回调：从工作区加密凭据库按 key 解密明文（仅在内存中使用）
+    let ws = if ctx.workspace.as_os_str().is_empty() {
+        None
+    } else {
+        Some(ctx.workspace.clone())
+    };
+    let master_key = if let Some(host) = &ctx.host {
+        let state = host.app.state::<crate::AppState>();
+        let guard = state.master_key.lock();
+        Some(*guard)
+    } else {
+        None
+    };
+    let lookup = move |key: &str| -> Option<String> {
+        let ws = ws.as_ref()?;
+        let mk = master_key.as_ref()?;
+        crate::browser::credential::load_secret(ws, mk, key).ok().flatten()
+    };
+
+    let outcome = match batch::execute_batch(&session, args, &lookup).await {
+        Ok(o) => o,
         Err(e) => {
             if e.contains("channel closed") || e.contains("CDP 连接已断开") {
                 manager.close(&session_key).await;
             }
-            Err(e)
+            return Err(e);
         }
+    };
+
+    // 通道级异常时摘除故障会话，便于下次自动重建
+    if !outcome.ok && outcome.code.as_deref() == Some("CHANNEL_CLOSED") {
+        manager.close(&session_key).await;
     }
+
+    Ok(batch::render_outcome(&outcome))
 }
 
 pub async fn browser_get_debug_state(ctx: &ToolCtx) -> Result<String, String> {
@@ -195,30 +261,6 @@ pub async fn browser_get_debug_state(ctx: &ToolCtx) -> Result<String, String> {
         .ok_or_else(|| "未找到活动的浏览器调试会话，请先调用 browser_navigate 打开网页".to_string())?;
 
     let res = session.get_debug_state().await;
-    match res {
-        Ok(debug_state) => Ok(debug_state.to_markdown()),
-        Err(e) => {
-            if e.contains("channel closed") || e.contains("CDP 连接已断开") {
-                manager.close(&session_key).await;
-            }
-            Err(e)
-        }
-    }
-}
-
-pub async fn browser_scroll(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
-    let direction = args.get("direction").and_then(|v| v.as_str());
-    let distance = args.get("distance").and_then(|v| v.as_f64());
-    let target = args.get("target").and_then(|v| v.as_str());
-
-    let session_key = get_session_key(ctx);
-    let manager = global_browser_manager();
-    let session = manager
-        .get(&session_key)
-        .await
-        .ok_or_else(|| "未找到活动的浏览器调试会话，请先调用 browser_navigate 打开网页".to_string())?;
-
-    let res = session.scroll(direction, distance, target).await;
     match res {
         Ok(debug_state) => Ok(debug_state.to_markdown()),
         Err(e) => {
@@ -268,7 +310,11 @@ pub async fn browser_screenshot(args: &Value, ctx: &ToolCtx) -> Result<String, S
             .unwrap_or_else(|| state.default_data_dir.clone());
         (dd, host.session_id.clone())
     } else {
-        (std::env::temp_dir().join("harness_mini_data"), session_key.clone())
+        // 无宿主上下文时（如单元测试）用可写探测，避免 TEMP 不可写导致截图落盘失败
+        (
+            fs_probe::resolve_writable_dir(None, "harness_mini_data"),
+            session_key.clone(),
+        )
     };
 
     // 2. 委托资产中台：计算 CAS 内容寻址哈希去重并应用滚动配额管理
@@ -293,7 +339,8 @@ pub async fn browser_screenshot(args: &Value, ctx: &ToolCtx) -> Result<String, S
         .unwrap_or("png");
     let legacy_rel_path = format!(".harness/tmp/browser_screenshot.{legacy_ext}");
     let legacy_target = if ctx.workspace.as_os_str().is_empty() {
-        std::env::temp_dir().join(format!("harness_browser_screenshot.{legacy_ext}"))
+        fs_probe::resolve_writable_dir(None, "harness_screenshot")
+            .join(format!("browser_screenshot.{legacy_ext}"))
     } else {
         ctx.workspace.join(&legacy_rel_path)
     };
@@ -309,7 +356,7 @@ pub async fn browser_screenshot(args: &Value, ctx: &ToolCtx) -> Result<String, S
          - **缩略图路径**: `{thumb_str}`\n\
          - **内容指纹 (CAS)**: `{}`\n\
          - **图像体积**: ~{approx_kb} KB\n\n\
-         > **注意**：请优先依据 `browser_navigate` 与 `browser_interact` 返回的可交互元素、表格与文本进行纯语义断言；确需排查复杂 CSS 排版或渲染瑕疵时，请直接调用 `recognize_image(path=\"{original_str}\")`。",
+         > **注意**：请优先依据 `browser_navigate` 与 `browser_batch` 返回的可交互元素、表格与文本进行纯语义断言；确需排查复杂 CSS 排版或渲染瑕疵时，请直接调用 `recognize_image(path=\"{original_str}\")`。",
         artifact.hash
     ))
 }
@@ -360,7 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_browser_daemon_and_context_lifecycle() {
-        let daemon = super::daemon::global_browser_daemon();
+        let daemon = super::transport::global_browser_daemon();
         let cdp = daemon.ensure_running().await;
         assert!(cdp.is_ok(), "Daemon 应能正常拉起 Chromium 并连接 CDP: {:?}", cdp.err());
 
@@ -384,4 +431,3 @@ mod tests {
         daemon.stop().await;
     }
 }
-

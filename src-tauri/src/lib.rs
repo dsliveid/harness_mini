@@ -564,6 +564,12 @@ pub fn run() {
                 let log_dir = st.default_data_dir.clone();
                 let resolved = st.data_dir.lock().clone().unwrap_or(log_dir);
                 crate::panic_guard::set_log_dir(&resolved);
+                // 浏览器诊断日志同源落盘，便于排查「浏览器一直启动中」这类跨层静默失败
+                crate::browser::diag::set_log_dir(&resolved);
+                crate::browser::diag::log(
+                    "app.start",
+                    format!("启动完成，数据目录={}", resolved.display()),
+                );
             }
 
             // 自动无损分库迁移：若 Catalog 库中仍残留存量消息表数据，自动在启动时迁移至 sessions/{id}/session.db

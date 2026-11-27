@@ -203,9 +203,19 @@ export function BrowserInspector() {
     if (!raw || !sessionId || navigating) return;
     const u = raw.startsWith("http://") || raw.startsWith("https://") ? raw : `http://${raw}`;
     setNavigating(true);
+    // 超时兜底：后端启动链路若因环境原因（profile 锁、安全软件拦截、TEMP 不可写）
+    // 迟迟不返回，这里强制解除 loading，避免 UI 永久停在「启动中...」且无法重试。
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error(
+        "启动超时（45s）：浏览器未能在预期时间内就绪。\n可能原因：profile 被其它实例锁定、安全软件拦截、或临时目录不可写。\n请查看数据目录下的 browser_debug.log 获取详细阶段日志。"
+      )), 45000);
+    });
     try {
       pushToast(`正在启动受控浏览器并导航至: ${u}`, "info");
-      const state = await ipc.browserNavigateUrl(sessionId, u);
+      const state = await Promise.race([
+        ipc.browserNavigateUrl(sessionId, u),
+        timeoutPromise,
+      ]);
       setDebugState(state);
       setManualUrl("");
       try {
@@ -215,7 +225,7 @@ export function BrowserInspector() {
       } catch {}
       pushToast("网页调试会话已建立", "success");
     } catch (err: any) {
-      pushToast(`打开网页失败: ${err}`, "error");
+      pushToast(`打开网页失败: ${err?.message || err}`, "error");
     } finally {
       setNavigating(false);
     }

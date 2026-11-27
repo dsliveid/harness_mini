@@ -1,6 +1,14 @@
 # 浏览器原生持久化上下文与声明式鉴权网关实施方案
 (BROWSER_PERSISTENT_CONTEXT_AND_AUTH_GATEWAY_SPEC)
 
+> ⚠️ **【部分被取代 · 2026-11-24】**
+> 本文的「持久化上下文 / storage_state 注入 / 语义状态机感知」设计**仍然有效并继续沿用**。
+> 但其中依赖 `pipeline.rs` 的**登录自动填充流水线**（`execute_auth_pipeline`）已失效——
+> 该文件从未在 `browser/mod.rs` 声明 `mod`、`cargo` 从未编译、全项目零调用。
+> 登录流程现改为 `.harness/login_sop.md` 文档驱动 + `browser_batch` 一次性执行，
+> 详见 [`docs/BROWSER_BATCH_AND_SNAPSHOT_DIFF_SPEC.md`](BROWSER_BATCH_AND_SNAPSHOT_DIFF_SPEC.md) 第九、十章。
+> 本文第 307 行「接入 browser_interact 后置检查」的待办同样作废（该工具已删除，改为 batch 前置门禁）。
+
 | 属性 | 说明 |
 | :--- | :--- |
 | **文档代号** | `BROWSER_PERSISTENT_CONTEXT_AND_AUTH_GATEWAY_SPEC` |
